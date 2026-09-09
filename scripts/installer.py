@@ -893,14 +893,15 @@ class Installer:
             ("重启智能体应用", "让本次安装的插件、技能和配置立即生效"),
             (f"source {shell_path_text}", "让本次安装的用户级命令立即在当前终端生效"),
         ]
+        if self.command_exists("gitnexus"):
+            rows.append(("仓库根目录执行：gitnexus analyze --embeddings --skills --verbose", "对当前仓库建立gitnexus索引"))
         if self.command_exists("claude"):
             rows.append(("Claude 中输入：/codekit:initialize", "初始化当前仓库"))
         if self.command_exists("opencode"):
             rows.append(("OpenCode 中输入：/initialize", "初始化当前仓库"))
         if self.command_exists("codex"):
             rows.append(("Codex 中输入：$initialize", "初始化当前仓库"))
-        if self.command_exists("gitnexus"):
-            rows.append(("仓库根目录执行：gitnexus analyze --embeddings --skills --verbose", "对当前仓库建立gitnexus索引"))
+
         if self.command_exists("gh"):
             rows.append(("gh auth login", "推荐浏览器登录；Git 操作选择 HTTPS，并确认使用 GitHub 凭据"))
         if self.command_exists("glab"):

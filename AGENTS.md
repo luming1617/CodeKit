@@ -4,32 +4,37 @@
 
 ### Overview
 
-CodeKit is a multi-platform AI development plugin package that distributes seven AI-assisted development workflow skills, installer tooling, and Claude/Codex/OpenCode plugin metadata.
+CodeKit 是一个面向 Claude、OpenCode 和 Codex 的 AI 开发插件包，仓库包含七个工作流技能、安装与卸载工具、平台插件元数据以及初始化索引与上下文脚本。
 
 ### Structure
 
-- `skills/`: Seven workflow skill directories, each centered on SKILL.md and root-level openai.yaml metadata.
-- `skills/initialize/`: Initialize workflow definitions, worker roles, standards, controller scripts, and initialize tests.
-- `scripts/`: Python installer, uninstaller, component registry/selector, state/configuration helpers, and validation utilities.
-- `.claude-plugin/`: Claude plugin and marketplace metadata.
-- `.codex-plugin/`: Codex plugin and marketplace metadata.
-- `.opencode/`: OpenCode package metadata and plugin implementation.
-- `install.sh`: macOS/Linux bootstrap entrypoint for dependency preparation and installation.
-- `uninstall.sh`: macOS/Linux entrypoint for the independent uninstall orchestrator.
-- `README.md`: Repository overview, supported platforms, workflow commands, and installation examples.
-- `GUIDE.md`: User guide covering prerequisites, installation, configuration, initialization, and workflows.
-- `INSTALL.md`: Detailed installer design, component registry, lifecycle, and extension documentation.
-- `lefthook.yml`: Pre-commit and pre-push hook definitions for version synchronization and plugin/skill validation.
-- `plugin-version.json`: Configurable plugin version source used by package manifests and synchronization tooling.
+- `skills/`: 包含 bugfix、code-impl、code-review、initialize、product-doc、release-doc、technical-doc 七个以 SKILL.md 和 openai.yaml 为核心的工作流技能。
+- `skills/initialize/`: 初始化工作流定义、Context Scanner/GitNexus/Graphify 角色、标准模板、控制器脚本和初始化测试。
+- `skills/initialize/scripts/`: 初始化状态机的准备、门禁验证、结果 reconcile、GitNexus 适配与公共辅助脚本。
+- `skills/initialize/tests/`: 覆盖初始化脚本、worker contract、路径边界、结果门禁和端到端状态流转的 Python 测试。
+- `scripts/`: 安装器、卸载器、组件注册与选择、插件 manifest/技能布局校验、全局 agent 管理和版本同步脚本。
+- `.claude-plugin/`: Claude 插件及 marketplace 的 JSON 元数据。
+- `.codex-plugin/`: Codex 插件及 marketplace 的 JSON 元数据。
+- `.opencode/`: OpenCode npm 包元数据及动态注册 skills 命令的插件实现。
+- `.standard/`: 当前仓库已存在的全局规范和 Python 技术栈规范索引及正文。
+- `install.sh`: macOS/Linux 安装或升级入口，调用 scripts 下的安装编排逻辑。
+- `uninstall.sh`: macOS/Linux 卸载入口，调用独立卸载编排逻辑。
 
 ### Commands and Verification
 
-- Validate every skill has a matching SKILL.md and Chinese root-level openai.yaml metadata.: `python3 scripts/validate-skill-layout.py` (evidence: `scripts/validate-skill-layout.py`, `skills/README.md`, `lefthook.yml`)
-- Check the canonical installer component registry without installing components.: `python3 scripts/component-registry.py --check` (evidence: `scripts/component-registry.py`, `INSTALL.md`)
-- Install or upgrade selected CodeKit components from the local repository source.: `bash install.sh install -y` (evidence: `README.md`, `INSTALL.md`, `install.sh`)
-- Uninstall selected CodeKit components.: `bash uninstall.sh -y` (evidence: `README.md`, `INSTALL.md`, `uninstall.sh`)
-- Synchronize plugin-version.json into the Claude, Codex, and OpenCode package manifests.: `python3 scripts/sync-plugin-version.py` (evidence: `scripts/sync-plugin-version.py`, `lefthook.yml`, `plugin-version.json`)
-- Build the GitNexus repository analysis and skill artifacts after installation.: `gitnexus analyze --skills --verbose` (evidence: `GUIDE.md`, `skills/initialize/SKILL.md`)
+- 校验每个技能的 SKILL.md、根级 openai.yaml、agent 元数据和资源引用。: `python3 scripts/validate-skill-layout.py` (evidence: `scripts/validate-skill-layout.py`, `skills/README.md`, `lefthook.yml`)
+- 校验 Claude、Codex、OpenCode 插件 manifest 的 JSON、名称、版本、marketplace 源和入口文件。: `python3 scripts/validate-plugin-manifests.py` (evidence: `scripts/validate-plugin-manifests.py`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `.opencode/package.json`)
+- 校验安装器组件注册表的 ID、分组顺序和描述字段。: `python3 scripts/component-registry.py --check` (evidence: `scripts/component-registry.py`, `INSTALL.md`)
+- 运行初始化控制器、结果契约、路径边界和端到端状态流转测试。: `python3 skills/initialize/tests/test_initialize_scripts.py` (evidence: `skills/initialize/tests/test_initialize_scripts.py`, `skills/initialize/scripts/controller.py`)
+- 运行 bugfix 技能脚本和提案契约测试。: `python3 skills/bugfix/tests/test_bugfix_skill_scripts.py` (evidence: `skills/bugfix/tests/test_bugfix_skill_scripts.py`, `skills/bugfix/scripts/validate_bugfix_proposal.py`)
+- 运行 product-doc 技能脚本测试。: `python3 skills/product-doc/tests/test_product_doc_skill_scripts.py` (evidence: `skills/product-doc/tests/test_product_doc_skill_scripts.py`, `skills/product-doc/scripts/validate_prd.py`)
+- 运行 technical-doc 控制器测试。: `python3 skills/technical-doc/tests/test_tech_doc_controller.py` (evidence: `skills/technical-doc/tests/test_tech_doc_controller.py`, `skills/technical-doc/scripts/tech_doc_controller.py`)
+- 运行 technical-doc 模板契约测试。: `python3 skills/technical-doc/tests/test_template_contract.py` (evidence: `skills/technical-doc/tests/test_template_contract.py`, `skills/technical-doc/references/technical-doc-template.md`)
+- 从本地仓库安装或升级选定的 CodeKit 组件。: `bash install.sh install -y` (evidence: `install.sh`, `README.md`, `INSTALL.md`)
+- 卸载选定的 CodeKit 组件。: `bash uninstall.sh -y` (evidence: `uninstall.sh`, `README.md`, `INSTALL.md`)
+- 把 plugin-version.json 的版本同步到三个平台 manifest。: `python3 scripts/sync-plugin-version.py` (evidence: `scripts/sync-plugin-version.py`, `plugin-version.json`, `lefthook.yml`)
+- 构建 GitNexus 仓库分析和技能索引。: `gitnexus analyze --skills --verbose` (evidence: `GUIDE.md`, `skills/initialize/SKILL.md`)
+- 使用代码模式提取 Graphify 知识图谱到仓库输出目录。: `graphify extract . --out . --code-only` (evidence: `skills/initialize/SKILL.md`, `skills/initialize/agents/initialize-graphify.md`)
 <!-- codekit:initialize:project-context:end -->
 
 <!-- codekit:initialize:standards:start -->
@@ -49,14 +54,14 @@ CodeKit is a multi-platform AI development plugin package that distributes seven
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **marketplace** (1654 symbols, 3093 relationships, 102 execution flows).
+This project is indexed by GitNexus as **CodeKit** (2479 symbols, 5203 relationships, 185 execution flows).
 
 > Index stale? Run `node .gitnexus/run.cjs analyze --index-only` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? Bootstrap with `npx`, `bunx`, or `pnpm dlx` — e.g. `bunx gitnexus@latest analyze` (npm 11 npx crash; #1939).
 
 ## Always Do
 
 - **MUST run impact before editing.** Use `impact({target: "symbolName", direction: "upstream"})` or `node .gitnexus/run.cjs impact "symbolName" --direction upstream --repo .`; report callers, processes, and risk. Never substitute grep for graph analysis.
-- **MUST analyze graph changes before committing.** Use `detect_changes({scope: "all"})` (MCP) or `node .gitnexus/run.cjs detect-changes --scope all --repo .` (CLI fallback). `partial: true` or `truncated: true` is not a clean check — a zero means unseen, not unaffected; re-run it. For regression review: `detect_changes({scope: "compare", base_ref: "main"})` or `node .gitnexus/run.cjs detect-changes --scope compare --base-ref "main" --repo .`.
+- **MUST analyze graph changes before committing.** Use `detect_changes({scope: "all"})` (MCP) or `node .gitnexus/run.cjs detect-changes --scope all --repo .` (CLI fallback). `partial: true` or `truncated: true` is not a clean check — a zero means unseen, not unaffected; re-run it. For regression review: `detect_changes({scope: "compare", base_ref: "master"})` or `node .gitnexus/run.cjs detect-changes --scope compare --base-ref "master" --repo .`.
 - MUST warn on HIGH/CRITICAL `risk` pre-edit; never use `riskSharedAxes` to waive a HIGH/CRITICAL `risk` warning. Compare File/symbol: MCP File omits axes; Graph-RAG expands File.
 - **MUST treat `risk: UNKNOWN` as unresolved, not as low.** An empty caller set is not evidence the symbol is unused — it can also mean the callers are not resolvable by the index (plain-object property access, dynamic dispatch, cross-language calls). `impact` pairs `UNKNOWN` with a `riskNote` saying so. Confirm with a text search before treating the symbol as safe to change or delete; do not proceed on the strength of a zero.
 - **MUST use `query({search_query: "concept"})` for concepts/flows, `context({name: "symbolName"})` for a named symbol, or `impact` for blast radius, on read-only callers, dependencies, imports, or execution flow.** Graph first; text search only for empty/`UNKNOWN`/literals.
@@ -73,10 +78,10 @@ This project is indexed by GitNexus as **marketplace** (1654 symbols, 3093 relat
 
 | Resource | Use for |
 | --- | --- |
-| `gitnexus://repo/marketplace/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/marketplace/clusters` | All functional areas |
-| `gitnexus://repo/marketplace/processes` | All execution flows |
-| `gitnexus://repo/marketplace/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/CodeKit/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/CodeKit/clusters` | All functional areas |
+| `gitnexus://repo/CodeKit/processes` | All execution flows |
+| `gitnexus://repo/CodeKit/process/{name}` | Step-by-step execution trace |
 
 ## CLI
 
@@ -88,5 +93,7 @@ This project is indexed by GitNexus as **marketplace** (1654 symbols, 3093 relat
 | Rename / extract / split / refactor | `.claude/skills/gitnexus-refactoring/SKILL.md` |
 | Tools, resources, schema reference | `.claude/skills/gitnexus-guide/SKILL.md` |
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus-cli/SKILL.md` |
+| Work in the Scripts area (476 symbols) | `.claude/skills/gitnexus-area-scripts/SKILL.md` |
+| Work in the Tests area (202 symbols) | `.claude/skills/gitnexus-area-tests/SKILL.md` |
 
 <!-- gitnexus:end -->

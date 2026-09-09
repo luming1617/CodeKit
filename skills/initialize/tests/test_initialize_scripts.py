@@ -815,15 +815,51 @@ class EndToEndTests(unittest.TestCase):
                     *[part for path in result_paths for part in ("--result", str(path))],
                 ]))
             context_path = manifest_path.parent / "context.json"
-            context_path.write_text(json.dumps({
+            context = {
                 "schema_version": 1,
                 "root": str(root),
                 "overview": "Test repository.",
                 "structure": [{"path": "README.md", "description": "Fixture documentation"}],
-                "commands": [],
+                "commands": [{
+                    "purpose": "Check",
+                    "command": "python3 -c pass",
+                    "evidence": "missing.py",
+                    "required_for_initialize": True,
+                }],
                 "evidence": [{"path": "README.md"}],
                 "warnings": [],
-            }), encoding="utf-8")
+            }
+            context_path.write_text(json.dumps(context), encoding="utf-8")
+
+            managed_before_reconcile = {
+                name: (root / name).read_bytes()
+                for name in ("AGENTS.md", "CLAUDE.md")
+                if (root / name).exists()
+            }
+            with redirect_stderr(StringIO()) as context_error:
+                self.assertEqual(2, controller.main([
+                    "reconcile", "--manifest", str(manifest_path), "--context", str(context_path),
+                    *[part for path in result_paths for part in ("--worker-result", str(path))],
+                ]))
+            context_payload = json.loads(context_error.getvalue())
+            self.assertEqual("input-error", context_payload["status"])
+            self.assertTrue(context_payload["recoverable"])
+            self.assertEqual("gated", context_payload["phase"])
+            self.assertEqual("held", context_payload["lock"])
+            self.assertTrue((root / ".codekit/initialize.lock").exists())
+            self.assertEqual(
+                managed_before_reconcile,
+                {
+                    name: (root / name).read_bytes()
+                    for name in managed_before_reconcile
+                },
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertNotEqual("reconciled", manifest.get("phase"))
+            self.assertNotIn("context_status", manifest)
+
+            context["commands"][0]["evidence"] = "README.md"
+            context_path.write_text(json.dumps(context), encoding="utf-8")
 
             with redirect_stderr(StringIO()) as reconcile_error:
                 self.assertEqual(2, controller.main([
@@ -901,7 +937,12 @@ class EndToEndTests(unittest.TestCase):
                 "root": str(root),
                 "overview": "Test repository.",
                 "structure": [{"path": "README.md", "description": "Fixture documentation"}],
-                "commands": [],
+                "commands": [{
+                    "purpose": "Check",
+                    "command": "python3 -c pass",
+                    "evidence": "README.md",
+                    "required_for_initialize": True,
+                }],
                 "evidence": [{"path": "README.md"}],
                 "warnings": [],
             }), encoding="utf-8")
@@ -1174,7 +1215,7 @@ class ContextContractTests(unittest.TestCase):
         context = scan_context(self.root, [
             {"purpose": "Check", "command": "python3 check.py", "required_for_initialize": True},
         ])
-        with self.assertRaisesRegex(reconcile.ReconcileError, "evidence"):
+        with self.assertRaisesRegex(reconcile.ContextContractError, "evidence"):
             reconcile.validate_context(context, self.root)
 
     def test_single_string_evidence_is_accepted(self):

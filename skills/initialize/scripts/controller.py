@@ -227,6 +227,8 @@ def main(argv: list[str] | None = None) -> int:
             return result
         except RecoverableRunInputError as error:
             return report_recoverable_input_error(args.manifest, error)
+        except reconcile.ContextContractError as error:
+            return report_recoverable_input_error(args.manifest, error)
         except Exception:
             abort_safely(args.manifest, "context reconciliation failed")
             raise

@@ -32,6 +32,10 @@ CONTEXT_LINE_BUDGET = 60
 ReconcileError = InitializeError
 
 
+class ContextContractError(ReconcileError):
+    """A context payload violates the Scanner contract."""
+
+
 def file_sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -40,14 +44,14 @@ def require_repository_path(root: Path, raw: str, label: str) -> None:
     """Accept only existing repository-relative paths as Scanner evidence."""
     relative = PurePosixPath(raw)
     if relative.is_absolute() or ".." in relative.parts or not relative.parts:
-        raise ReconcileError(f"{label} must be repository-relative: {raw!r}")
+        raise ContextContractError(f"{label} must be repository-relative: {raw!r}")
     path = root.joinpath(*relative.parts).resolve()
     try:
         path.relative_to(root)
     except ValueError as exc:
-        raise ReconcileError(f"{label} escapes repository: {raw}") from exc
+        raise ContextContractError(f"{label} escapes repository: {raw}") from exc
     if not path.exists():
-        raise ReconcileError(f"{label} does not exist: {raw}")
+        raise ContextContractError(f"{label} does not exist: {raw}")
 
 
 def evidence_names(item: dict, label: str) -> list[str]:
@@ -57,7 +61,7 @@ def evidence_names(item: dict, label: str) -> list[str]:
         return []
     names = [raw] if isinstance(raw, str) else raw if isinstance(raw, list) else None
     if names is None or not all(isinstance(name, str) and name.strip() for name in names):
-        raise ReconcileError(f"{label} evidence must be one repository path or a list of them")
+        raise ContextContractError(f"{label} evidence must be one repository path or a list of them")
     return [name.strip() for name in names]
 
 
@@ -65,7 +69,7 @@ def require_fields(item: dict, fields: tuple[str, ...], label: str) -> None:
     for field in fields:
         value = item.get(field)
         if not isinstance(value, str) or not value.strip():
-            raise ReconcileError(f"{label} entry needs a non-empty {field!r}: {item}")
+            raise ContextContractError(f"{label} entry needs a non-empty {field!r}: {item}")
 
 
 def validate_context(context: dict, root: Path) -> None:
@@ -76,31 +80,31 @@ def validate_context(context: dict, root: Path) -> None:
     from the renderer in the middle of Phase 3.
     """
     if context.get("schema_version") != 1:
-        raise ReconcileError("unsupported context schema_version")
+        raise ContextContractError("unsupported context schema_version")
     for key in ("structure", "commands", "evidence", "warnings"):
         if not isinstance(context.get(key, []), list):
-            raise ReconcileError(f"context {key} must be a list")
+            raise ContextContractError(f"context {key} must be a list")
     if not isinstance(context.get("overview", ""), str):
-        raise ReconcileError("context overview must be a string")
+        raise ContextContractError("context overview must be a string")
     rendered = json.dumps(context, ensure_ascii=False)
     if any(marker in rendered for marker in RESERVED_MARKERS):
-        raise ReconcileError("context contains reserved managed-block markers")
+        raise ContextContractError("context contains reserved managed-block markers")
     for item in context.get("evidence", []):
         if not isinstance(item, dict) or not isinstance(item.get("path"), str):
-            raise ReconcileError("context evidence entries require a path")
+            raise ContextContractError("context evidence entries require a path")
         require_repository_path(root, item["path"], "context evidence")
     for item in context.get("structure", []):
         if not isinstance(item, dict):
-            raise ReconcileError("context structure entries must be objects")
+            raise ContextContractError("context structure entries must be objects")
         require_fields(item, ("path", "description"), "context structure")
         require_repository_path(root, item["path"], "context structure path")
     for item in context.get("commands", []):
         if not isinstance(item, dict):
-            raise ReconcileError("context command entries must be objects")
+            raise ContextContractError("context command entries must be objects")
         require_fields(item, ("purpose", "command"), "context command")
         names = evidence_names(item, "context command")
         if item.get("required_for_initialize") is True and not names:
-            raise ReconcileError(
+            raise ContextContractError(
                 f"required_for_initialize commands need repository evidence: {item['command']}"
             )
         for name in names:
@@ -269,7 +273,7 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
     root = Path(manifest["root"]).resolve()
     context = load_json(args.context)
     if Path(context.get("root", "")).resolve() != root:
-        raise ReconcileError("context root does not match run manifest")
+        raise ContextContractError("context root does not match run manifest")
     validate_context(context, root)
     if manifest.get("phase") != "gated":
         raise ReconcileError("manifest is not in gated phase")
