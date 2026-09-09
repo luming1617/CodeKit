@@ -1,0 +1,20 @@
+.omc/
+
+# JetBrains IDEs (IntelliJ IDEA, PyCharm, WebStorm, etc.)
+.idea/
+*.iml
+*.ipr
+*.iws
+.claude/
+
+# Python bytecode caches (skills ship runnable test suites)
+__pycache__/
+.venv-wsl/
+*.py[cod]
+
+# codekit:initialize:ignore:start
+.codekit/
+.gitnexus/
+graphify-out/
+.graphifyignore
+# codekit:initialize:ignore:end

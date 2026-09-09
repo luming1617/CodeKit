@@ -1,0 +1,20 @@
+{
+  "name": "codekit",
+  "version": "1.0.0",
+  "description": "AI-assisted development workflow: setup, product and technical proposals, release plans, coding, review, bug fixing",
+  "author": {
+    "name": "Platform Team"
+  },
+  "repository": "ssh://git@git.daming.co:8022/share/keel/marketplace.git",
+  "license": "MIT",
+  "keywords": [
+    "CodeKit",
+    "workflow",
+    "code-impl",
+    "tdd",
+    "code-review",
+    "proposal",
+    "bugfix",
+    "setup"
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "codekit",
+  "version": "1.0.0",
+  "description": "AI-assisted development workflow: setup, product and technical proposals, release plans, coding, review, bug fixing",
+  "author": {
+    "name": "Platform Team"
+  },
+  "skills": "./skills/"
+}

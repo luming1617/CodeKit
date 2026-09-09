@@ -1,0 +1,4 @@
+interface:
+  display_name: "仓库 AI 开发环境初始化"
+  short_description: "强制调用三路 Subagent，安全编排规范、索引、知识图谱与项目上下文初始化"
+  default_prompt: "使用 $initialize [--language java,python,go,cpp] [--embeddings] [--force] [--allow-partial] [--commit]，强制调用 GitNexus、Graphify 和 Context Scanner 三个独立 Subagent，通过确定性控制器初始化当前仓库；默认只生成、验证和报告 diff，不提交。"

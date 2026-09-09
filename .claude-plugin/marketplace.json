@@ -1,0 +1,18 @@
+{
+  "name": "co-daming",
+  "displayName": "Dev Marketplace",
+  "description": "internal marketplace for AI development workflow plugins - coding standards, proposal writing, code review, and inspection tools",
+  "owner": {
+    "name": "Matt Liu",
+    "email": "infra@email.com"
+  },
+  "repository": "ssh://git@git.daming.co:8022/share/keel/marketplace.git",
+  "homepage": "https://git.daming.co/share/keel/marketplace",
+  "plugins": [
+    {
+      "name": "codekit",
+      "source": "./",
+      "description": "AI-assisted development workflow: setup, product and technical proposals, release plans, coding, review, bug fixing (7 skills)"
+    }
+  ]
+}

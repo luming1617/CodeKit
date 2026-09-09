@@ -1,0 +1,56 @@
+pre-commit:
+  parallel: false
+  commands:
+    # Synchronize the configurable plugin version into all package manifests.
+    sync-plugin-version:
+      run: |
+        python3 scripts/sync-plugin-version.py && \
+          git add plugin-version.json .claude-plugin/plugin.json .codex-plugin/plugin.json .opencode/package.json
+        echo "Plugin version synchronized"
+    # Manifests must parse, agree on the plugin name, and point at files that exist.
+    validate-plugins:
+      run: python3 scripts/validate-plugin-manifests.py
+      fail_text: "Plugin manifests are inconsistent (JSON syntax, plugin name, version source, or missing referenced files)."
+
+pre-push:
+  parallel: false
+  commands:
+    validate-marketplace:
+      run: |
+        if [ ! -f ".claude-plugin/marketplace.json" ]; then
+          echo "Missing Claude marketplace.json"
+          exit 1
+        fi
+        if [ ! -f ".codex-plugin/marketplace.json" ]; then
+          echo "Missing Codex marketplace.json"
+          exit 1
+        fi
+        if [ ! -f ".claude-plugin/plugin.json" ]; then
+          echo "Missing Claude plugin.json in repository root"
+          exit 1
+        fi
+        if [ ! -f ".codex-plugin/plugin.json" ]; then
+          echo "Missing Codex plugin.json in repository root"
+          exit 1
+        fi
+        if ! ls skills/*/SKILL.md >/dev/null 2>&1; then
+          echo "No skills found in repository root (expected skills/<name>/SKILL.md)"
+          exit 1
+        fi
+        echo "All plugins valid"
+    # Every skill must ship a root-level openai.yaml with Chinese UI metadata.
+    validate-skill-layout:
+      run: python3 scripts/validate-skill-layout.py
+      fail_text: "Skill layout validation failed (expected skills/<name>/SKILL.md + skills/<name>/openai.yaml)."
+    # Deterministic skill gate scripts must stay verified: run every skills/<name>/tests suite.
+    test-skill-scripts:
+      run: |
+        status=0
+        for tests in skills/*/tests; do
+          [ -d "$tests" ] || continue
+          echo "==> $tests"
+          python3 -m unittest discover -s "$tests" -p 'test_*.py' || status=1
+        done
+        [ "$status" -eq 0 ] || exit 1
+        echo "Skill test suites passed"
+      fail_text: "Skill 门禁脚本的回归测试未通过；先修脚本或测试，不要推送。"
