@@ -14,6 +14,7 @@ TARGET_FILES = (
     Path(".claude-plugin/plugin.json"),
     Path(".codex-plugin/plugin.json"),
     Path(".opencode/package.json"),
+    Path(".qoder-plugin/plugin.json"),
 )
 
 

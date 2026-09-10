@@ -29,6 +29,7 @@ REPO_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_config as config  # noqa: E402
+import installer_qoder as qoder  # noqa: E402
 import installer_sources as source_builder  # noqa: E402
 import installer_state as detector  # noqa: E402
 
@@ -150,6 +151,7 @@ class Installer:
         self.marketplace_local = self._detect_marketplace()
         self.market_dir: Optional[Path] = None
         self.opencode_source_dir: Optional[Path] = None
+        self.qoder_source_dir: Optional[Path] = None
         self.context = detector.Context(
             home=self.home,
             marketplace_local=self.marketplace_local,
@@ -178,6 +180,7 @@ class Installer:
             REPO_DIR / ".codex-plugin" / "plugin.json",
             REPO_DIR / ".opencode" / "plugins" / "codekit.js",
             REPO_DIR / ".opencode" / "package.json",
+            REPO_DIR / ".qoder-plugin" / "plugin.json",
             REPO_DIR / "plugin-version.json",
             REPO_DIR / "skills",
         )
@@ -371,11 +374,21 @@ class Installer:
         except (OSError, UnicodeError):
             return ""
 
+    def agent_notice_box(self, lines: Sequence[str]) -> str:
+        """按终端显示宽度渲染提示边框，避免中英文混排时边框错位。"""
+        width = max(detector.terminal_width(line) for line in lines) + 4
+        border = "═" * (width - 2)
+        rows = "\n".join(
+            "║" + detector.terminal_pad(f"  {line}", width - 2) + "║"
+            for line in lines
+        )
+        return f"╔{border}╗\n{rows}\n╚{border}╝"
+
     def preflight_agents(self) -> bool:
         """检查至少一个 CLI 或 Desktop agent，缺失时显眼提示并结束。"""
         available = [
             (name, detector.agent_presence(name, self.home, self.os_name))
-            for name in ("claude", "codex", "opencode")
+            for name in ("claude", "codex", "opencode", "qoder", "qodercn")
         ]
         available = [(name, source) for name, source in available if source]
         if available:
@@ -383,21 +396,26 @@ class Installer:
             self.logger.success(f"Coding agent(s) detected: {detail}")
             return True
         self.logger.error(
-            "\n"
-            "╔══════════════════════════════════════════════════════════════╗\n"
-            "║  ⚠ 未检测到 Claude、Codex 或 OpenCode                       ║\n"
-            "║  请先安装一个 CLI 或 Desktop agent，再重新运行 CodeKit。     ║\n"
-            "║  本次插件安装流程已结束。                                   ║\n"
-            "╚══════════════════════════════════════════════════════════════╝"
+            "\n" + self.agent_notice_box(
+                (
+                    "⚠ 未检测到 Claude、Codex、OpenCode、Qoder 或 Qoder CN",
+                    "请先安装一个 CLI 或 Desktop agent，再重新运行 CodeKit。",
+                    "本次插件安装流程已结束。",
+                )
+            )
         )
         return False
 
     def prepare_sources(self) -> None:
-        """从本地仓库构建 Claude/Codex/OpenCode 使用的兼容插件源。"""
+        """从本地仓库构建 Claude/Codex/OpenCode/Qoder 使用的兼容插件源。"""
         if not self.marketplace_local:
             return
         try:
-            self.market_dir, self.opencode_source_dir = source_builder.prepare(self.marketplace_local, self.state_dir)
+            (
+                self.market_dir,
+                self.opencode_source_dir,
+                self.qoder_source_dir,
+            ) = source_builder.prepare(self.marketplace_local, self.state_dir)
         except (OSError, ValueError) as exc:
             raise InstallerError(f"Could not prepare compatibility plugin sources: {exc}") from exc
 
@@ -703,9 +721,16 @@ class Installer:
             return True
         args = [sys.executable, str(helper), "install", "--source", str(source)]
         args.extend(["--home", str(self.home), "--tool", tool])
+        try:
+            # Qoder keeps its global agents inside the root shared with the IDE.
+            flags, agents_dir = qoder.agent_location(tool, self.home)
+        except ValueError as exc:
+            self.logger.error(str(exc))
+            return False
+        args.extend(flags)
         result = self.run_command(args)
         if result.returncode == 0:
-            path = {
+            path = agents_dir or {
                 "claude": self.home / ".claude" / "agents",
                 "opencode": self.home / ".config" / "opencode" / "agents",
                 "codex": self.home / ".codex" / "agents",
@@ -769,6 +794,54 @@ class Installer:
         self.record_marketplace_sha()
         return True
 
+    def qoder_run(self, args: Sequence[str], timeout: float = 20.0) -> tuple[int, str]:
+        """通过安装器日志执行 Qoder CLI 命令；超时由外部命令自身控制。"""
+        result = self.run_command(args)
+        return result.returncode, result.stdout
+
+    def install_qoder_plugin(self, platform_key: str) -> bool:
+        """安装 Qoder 插件；CLI 与 Desktop 共享配置根，一次安装两端生效。"""
+        descriptor = qoder.PLATFORMS[platform_key]
+        stage = self.qoder_source_dir
+        if not stage or not stage.is_dir():
+            return False
+        if not detector.agent_presence(platform_key, self.home, self.os_name):
+            self.logger.warn(f"No {descriptor.display_name} CLI or desktop IDE detected.")
+            return False
+        try:
+            root = qoder.resolve_config_root(descriptor, self.home)
+        except ValueError as exc:
+            raise InstallerError(str(exc)) from exc
+        if qoder.foreign_os_roots(descriptor) and not (root / "plugins").is_dir():
+            self.logger.warn(
+                "Qoder keeps a separate configuration root per OS; this install "
+                f"only reaches {root}, so a Qoder running on Windows stays unaware."
+            )
+        command = qoder.capable_cli(descriptor)
+        try:
+            if command:
+                qoder.install_via_cli(command, root, stage, runner=self.qoder_run)
+            else:
+                # Desktop-only machines get the same registry the CLI would write.
+                qoder.install_direct(root, stage, self.plugin_version)
+            self.track(qoder.registry_path(root))
+            self.track(qoder.settings_path(root))
+            if not self.install_platform_agents(platform_key):
+                return False
+            state = qoder.inspect(descriptor, self.home)
+        except ValueError as exc:
+            raise InstallerError(str(exc)) from exc
+        if not state.installed or not state.enabled:
+            raise InstallerError(
+                f"{qoder.PLUGIN_ID} is not enabled in {qoder.registry_path(state.root)} "
+                "after install; the shared Qoder registry was not updated"
+            )
+        self.logger.success(
+            f"{descriptor.display_name} v{state.version} is available to both the "
+            f"Qoder CLI and the Qoder desktop IDE ({detector.display_path(state.root, self.home)})"
+        )
+        return True
+
     def install_brew_component(self, formula: str) -> bool:
         """按平台安装或升级 gh/glab：macOS 用 brew，Linux 用发行版包管理器。"""
         if self.os_name == "Darwin" or self.command_exists("brew"):
@@ -789,6 +862,8 @@ class Installer:
             "claude_plugin": self.install_claude_plugin,
             "opencode_plugin": self.install_opencode_plugin,
             "codex_plugin": self.install_codex_plugin,
+            "qoder_plugin": lambda: self.install_qoder_plugin("qoder"),
+            "qodercn_plugin": lambda: self.install_qoder_plugin("qodercn"),
             "gitnexus": self.install_gitnexus,
             "dingtalk_cli": self.install_dingtalk_cli,
             "feishu_cli": self.install_feishu_cli,
@@ -842,6 +917,8 @@ class Installer:
                 "claude_plugin",
                 "opencode_plugin",
                 "codex_plugin",
+                "qoder_plugin",
+                "qodercn_plugin",
             )
         ]
         sha = config.read_key_value(self.version_file, "marketplace_sha")
@@ -876,6 +953,28 @@ class Installer:
             rows.append(("OpenCode 中输入：/initialize", "初始化当前仓库"))
         if self.command_exists("codex"):
             rows.append(("Codex 中输入：$initialize", "初始化当前仓库"))
+        qoder_labels = [
+            descriptor.display_name.removeprefix("CodeKit Plugin (").removesuffix(")")
+            for descriptor in (
+                qoder.PLATFORMS[key]
+                for key in ("qoder", "qodercn")
+                if detector.agent_presence(key, self.home, self.os_name)
+            )
+        ]
+        for label in qoder_labels:
+            rows.append(
+                (
+                    f"{label} 中输入：/codekit:initialize",
+                    "初始化当前仓库；CLI 与 Desktop 共享同一配置根，安装一次两端生效",
+                )
+            )
+        if qoder_labels:
+            rows.append(
+                (
+                    "重启 " + "、".join(qoder_labels) + " 的 CLI 与 IDE",
+                    "让新安装的插件和全局 subagent 被重新加载",
+                )
+            )
 
         if self.command_exists("gh"):
             rows.append(("gh auth login", "推荐浏览器登录；Git 操作选择 HTTPS，并确认使用 GitHub 凭据"))
@@ -913,6 +1012,7 @@ class Installer:
             SCRIPT_DIR / "installer_config.py",
             SCRIPT_DIR / "installer_state.py",
             SCRIPT_DIR / "installer_sources.py",
+            SCRIPT_DIR / "installer_qoder.py",
             SCRIPT_DIR / "component-selector.py",
         )
         missing = [str(path) for path in required_helpers if not path.is_file()]

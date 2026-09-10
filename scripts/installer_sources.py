@@ -99,7 +99,7 @@ def replace_stages(replacements: Sequence[tuple[Path, Path]]) -> None:
             remove_path(backup)
 
 
-def prepare(source: Path, state_dir: Path) -> tuple[Path, Path]:
+def prepare(source: Path, state_dir: Path) -> tuple[Path, Path, Path]:
     """校验仓库、构建临时兼容源，并以可回滚方式替换最终安装目录。"""
     source = source.resolve()
     state_dir = state_dir.resolve()
@@ -107,6 +107,7 @@ def prepare(source: Path, state_dir: Path) -> tuple[Path, Path]:
         source / ".claude-plugin",
         source / ".codex-plugin",
         source / ".opencode",
+        source / ".qoder-plugin",
         source / "skills",
         source / ".opencode" / "package.json",
         source / "plugin-version.json",
@@ -119,11 +120,17 @@ def prepare(source: Path, state_dir: Path) -> tuple[Path, Path]:
     market_parent = state_dir / "marketplace-source"
     market_stage = market_parent / "codekit"
     opencode_stage = state_dir / "opencode-source"
+    # Qoder's CLI and desktop IDE read one shared configuration root, so a single
+    # staged source installs the plugin for both surfaces at once.
+    qoder_parent = state_dir / "qoder-source"
+    qoder_stage = qoder_parent / "codekit"
     market_parent.mkdir(parents=True, exist_ok=True)
+    qoder_parent.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
 
     market_tmp = Path(tempfile.mkdtemp(prefix=".codekit.tmp.", dir=market_parent))
     opencode_tmp = Path(tempfile.mkdtemp(prefix=".opencode-source.tmp.", dir=state_dir))
+    qoder_tmp = Path(tempfile.mkdtemp(prefix=".qoder-source.tmp.", dir=qoder_parent))
     try:
         for directory in (
             market_tmp / ".claude-plugin",
@@ -132,6 +139,8 @@ def prepare(source: Path, state_dir: Path) -> tuple[Path, Path]:
             market_tmp / "skills",
             opencode_tmp / "plugins" / "codekit" / ".opencode" / "plugins",
             opencode_tmp / "plugins" / "codekit" / "skills",
+            qoder_tmp / ".qoder-plugin",
+            qoder_tmp / "skills",
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -150,6 +159,11 @@ def prepare(source: Path, state_dir: Path) -> tuple[Path, Path]:
             opencode_tmp / "plugins" / "codekit" / "skills",
         )
 
+        copy_contents(source / ".qoder-plugin", qoder_tmp / ".qoder-plugin")
+        # Skill-local agents/ directories stay untouched: Qoder keeps them out of
+        # its subagent namespace, and CodeKit installs subagents globally instead.
+        copy_contents(source / "skills", qoder_tmp / "skills")
+
         stage_skill_interface_files(market_tmp / "skills")
         stage_skill_interface_files(opencode_tmp / "plugins" / "codekit" / "skills")
 
@@ -162,6 +176,10 @@ def prepare(source: Path, state_dir: Path) -> tuple[Path, Path]:
             {"version": plugin_version},
         )
         update_json_fields(
+            qoder_tmp / ".qoder-plugin" / "plugin.json",
+            {"version": plugin_version},
+        )
+        update_json_fields(
             opencode_tmp / "package.json",
             {
                 "version": plugin_version,
@@ -170,13 +188,20 @@ def prepare(source: Path, state_dir: Path) -> tuple[Path, Path]:
         )
 
         # 所有内容先写入临时目录，最后一次性替换，避免中途失败留下半套插件源。
-        replace_stages(((market_tmp, market_stage), (opencode_tmp, opencode_stage)))
+        replace_stages(
+            (
+                (market_tmp, market_stage),
+                (opencode_tmp, opencode_stage),
+                (qoder_tmp, qoder_stage),
+            )
+        )
     except Exception:
         remove_path(market_tmp)
         remove_path(opencode_tmp)
+        remove_path(qoder_tmp)
         raise
 
-    return market_stage, opencode_stage
+    return market_stage, opencode_stage, qoder_stage
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -192,11 +217,11 @@ def main() -> int:
     """执行 prepare 子命令并将构建失败转换为非零退出码。"""
     args = build_parser().parse_args()
     try:
-        market_stage, opencode_stage = prepare(args.source, args.state_dir)
+        market_stage, opencode_stage, qoder_stage = prepare(args.source, args.state_dir)
     except (OSError, ValueError) as exc:
         print(f"installer sources: {exc}", file=os.sys.stderr)
         return 1
-    print(f"{market_stage}\t{opencode_stage}")
+    print(f"{market_stage}\t{opencode_stage}\t{qoder_stage}")
     return 0
 
 

@@ -35,6 +35,8 @@ COMPONENTS: Sequence[Component] = (
     Component("claude_plugin", "CodeKit Plugin (Claude)", "skills"),
     Component("opencode_plugin", "CodeKit Plugin (OpenCode)", "skills"),
     Component("codex_plugin", "CodeKit Plugin (Codex)", "skills"),
+    Component("qoder_plugin", "CodeKit Plugin (Qoder)", "skills"),
+    Component("qodercn_plugin", "CodeKit Plugin (Qoder CN)", "skills"),
     Component("gitnexus", "GitNexus (代码结构分析·推荐)", "intel"),
     Component("graphify", "Graphify (代码知识图谱·推荐)", "intel"),
     Component("gh", "GitHub CLI (推荐)", "third"),

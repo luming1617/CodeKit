@@ -10,11 +10,19 @@ import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 
 MANAGED_MARKER = "managed-by: codekit"
-TOOLS = ("claude", "opencode", "codex")
+TOOLS = ("claude", "opencode", "codex", "qoder", "qodercn")
+
+# Qoder's CLI and desktop IDE share one configuration root, so the global
+# agents written there are visible to both surfaces. The environment
+# variable lets an installation live outside the home directory.
+QODER_LAYOUTS = {
+    "qoder": (".qoder", "QODER_CONFIG_DIR"),
+    "qodercn": (".qoder-cn", "QODERCN_CONFIG_DIR"),
+}
 
 
 def agent_files(source: Path) -> list[Path]:
@@ -112,25 +120,50 @@ def codex_toml(name: str, description: str, body: str) -> str:
     )
 
 
-def destinations(home: Path) -> dict[str, Path]:
-    """返回三种工具的全局 agent 目录。"""
-    return {
+def destinations(
+    home: Path,
+    tools: tuple[str, ...] = TOOLS,
+    config_root: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> dict[str, Path]:
+    """返回各工具的全局 agent 目录，Qoder 使用共享配置根。"""
+    environ = os.environ if environ is None else environ
+    targets = {
         "claude": home / ".claude" / "agents",
         "opencode": home / ".config" / "opencode" / "agents",
         "codex": home / ".codex" / "agents",
     }
+    qoder_tools = tuple(tool for tool in tools if tool in QODER_LAYOUTS)
+    if config_root is not None and len(qoder_tools) > 1:
+        raise SystemExit(
+            "--config-root selects one Qoder configuration root; pass --tool once"
+        )
+    for tool in qoder_tools:
+        directory, env_key = QODER_LAYOUTS[tool]
+        if config_root is not None:
+            root = Path(config_root).expanduser()
+        else:
+            configured = (environ.get(env_key) or "").strip()
+            root = Path(configured).expanduser() if configured else home / directory
+        targets[tool] = root / "agents"
+    return targets
 
 
-def install(source: Path, home: Path, tools: tuple[str, ...] = TOOLS) -> int:
+def install(
+    source: Path,
+    home: Path,
+    tools: tuple[str, ...] = TOOLS,
+    config_root: Optional[Path] = None,
+) -> int:
     """将 canonical agent 原子同步到指定工具的全局目录。"""
     parsed = collect_agents(source)
     if not parsed:
         raise ValueError(f"no agent Markdown files found in {source}")
 
-    target_dirs = destinations(home)
+    target_dirs = destinations(home, tools, config_root)
     backup_root = home / ".local" / "state" / "CodeKit" / "agent-backups"
     changed = 0
-    # 同一份 Markdown 是事实源，两个工具保留 Markdown，Codex 使用等价 TOML。
+    # 同一份 Markdown 是事实源，Codex 转换成等价 TOML，其余工具保留 Markdown。
     for source_file, name, description, body in parsed:
         markdown = source_file.read_text(encoding="utf-8")
         for tool in tools:
@@ -162,9 +195,13 @@ def _is_managed(path: Path) -> bool:
     return MANAGED_MARKER in text or "# Managed by CodeKit" in text
 
 
-def _managed_files(home: Path, tools: tuple[str, ...] = TOOLS) -> list[Path]:
+def _managed_files(
+    home: Path,
+    tools: tuple[str, ...] = TOOLS,
+    config_root: Optional[Path] = None,
+) -> list[Path]:
     """收集指定工具布局中所有由 CodeKit 管理的 agent 文件。"""
-    target_dirs = destinations(home)
+    target_dirs = destinations(home, tools, config_root)
     layouts = tuple(
         (target_dirs[tool], "*.toml" if tool == "codex" else "*.md")
         for tool in tools
@@ -177,14 +214,19 @@ def _managed_files(home: Path, tools: tuple[str, ...] = TOOLS) -> list[Path]:
     )
 
 
-def status(source: Optional[Path], home: Path, tools: tuple[str, ...] = TOOLS) -> int:
+def status(
+    source: Optional[Path],
+    home: Path,
+    tools: tuple[str, ...] = TOOLS,
+    config_root: Optional[Path] = None,
+) -> int:
     """Print a stable state for shell callers: up_to_date, installed, or not_installed."""
     if source is not None and source.is_dir():
         parsed = collect_agents(source)
         if parsed:
             expected = 0
             present = 0
-            target_dirs = destinations(home)
+            target_dirs = destinations(home, tools, config_root)
             for _, name, _, _ in parsed:
                 for tool in tools:
                     expected += 1
@@ -193,14 +235,18 @@ def status(source: Optional[Path], home: Path, tools: tuple[str, ...] = TOOLS) -
             print("up_to_date" if present == expected else "installed" if present else "not_installed")
             return 0
 
-    print("installed" if _managed_files(home, tools) else "not_installed")
+    print("installed" if _managed_files(home, tools, config_root) else "not_installed")
     return 0
 
 
-def uninstall(home: Path, tools: tuple[str, ...] = TOOLS) -> int:
+def uninstall(
+    home: Path,
+    tools: tuple[str, ...] = TOOLS,
+    config_root: Optional[Path] = None,
+) -> int:
     """删除指定工具中带 CodeKit 标记的 agent 文件，并保留用户文件和备份。"""
     removed = 0
-    for path in _managed_files(home, tools):
+    for path in _managed_files(home, tools, config_root):
         try:
             path.unlink()
         except OSError as exc:
@@ -218,15 +264,20 @@ def main() -> int:
     parser.add_argument("--source", type=Path)
     parser.add_argument("--home", default=Path.home(), type=Path)
     parser.add_argument("--tool", choices=TOOLS, action="append", dest="tools")
+    parser.add_argument(
+        "--config-root",
+        type=Path,
+        help="explicit Qoder configuration root shared by its CLI and desktop IDE",
+    )
     args = parser.parse_args()
     tools = tuple(args.tools) if args.tools else TOOLS
     if args.command == "install":
         if args.source is None or not args.source.is_dir():
             raise SystemExit(f"agent source directory not found: {args.source}")
-        return install(args.source, args.home, tools)
+        return install(args.source, args.home, tools, args.config_root)
     if args.command == "status":
-        return status(args.source, args.home, tools)
-    return uninstall(args.home, tools)
+        return status(args.source, args.home, tools, args.config_root)
+    return uninstall(args.home, tools, args.config_root)
 
 
 if __name__ == "__main__":

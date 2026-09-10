@@ -18,7 +18,7 @@
 7. [各阶段详解](#7-各阶段详解)
 8. [各组件安装策略](#8-各组件安装策略)
 9. [卸载流程](#9-卸载流程)
-10. [安装后插件目录变化（三平台）](#10-安装后插件目录变化三平台)
+10. [安装后插件目录变化（五平台）](#10-安装后插件目录变化五平台)
 11. [状态文件与日志](#11-状态文件与日志)
 12. [关键助手函数速查](#12-关键助手函数速查)
 13. [如何新增一个组件](#13-如何新增一个组件)
@@ -30,11 +30,11 @@
 
 `install.sh` 是 CodeKit Plugin 的**一键安装器**，负责把一整套 AI 开发工具链安装到用户环境，包括：
 
-- 编程智能体（Claude / Codex / OpenCode，前置检查保障至少安装一个）
+- 编程智能体（Claude / Codex / OpenCode / Qoder / Qoder CN，前置检查保障至少安装一个）
 - 内部协作工具（git-ai、rtk）
 - 代码智能（GitNexus、Graphify）
 - git 仓库管理（gh、glab）
-- 智能体插件（Claude插件、OpenCode 插件、Codex 插件）
+- 智能体插件（Claude 插件、OpenCode 插件、Codex 插件、Qoder 插件、Qoder CN 插件）
 
 核心原则：
 
@@ -91,7 +91,7 @@ bash uninstall.sh [-y]
 | Node.js      | 未装则 `brew install node` 自动安装；低于 20 则尝试 brew 升级                                                                                         | 安装后仍不满足 ≥ 20 即**退出流程** |
 | Python3      | 未装则 `brew install python3` 自动安装（brew 默认 `python@3.x` 的官方别名）                                                                           | 安装失败即**退出流程** |
 | curl         | 未装则 `brew install curl` 自动安装（brew 的 curl 为 keg-only，装后按 opt 路径兜底挂载）                                                              | 安装失败即**退出流程** |
-| 编程智能体   | 检查 Claude / Codex / OpenCode 的 CLI，以及 macOS/Linux 上对应 Desktop 应用、启动器和常见安装目录 | 三者均不存在时以醒目提示结束流程（退出码 0），不再询问或自动安装 agent |
+| 编程智能体   | 检查 Claude / Codex / OpenCode / Qoder / Qoder CN 的 CLI，以及 macOS/Linux 上对应 Desktop 应用、启动器和常见安装目录；Qoder 另把共享配置根视为可用 | 五者均不存在时以醒目提示结束流程（退出码 0），不再询问或自动安装 agent |
 
 > 前置检查顺序刻意"依赖优先、智能体最后"（Homebrew → git → Node.js → Python3 → curl → 编程智能体）：智能体安装在无 cask 场景会回退 `npm install -g`，需 Node 先就位。
 
@@ -109,12 +109,14 @@ bash uninstall.sh [-y]
 | 3 | `claude_plugin`   | CodeKit Plugin (Claude)           | `skills` |
 | 4 | `opencode_plugin` | CodeKit Plugin (OpenCode)         | `skills` |
 | 5 | `codex_plugin`    | CodeKit Plugin (Codex)            | `skills` |
-| 6 | `gitnexus`        | GitNexus (代码结构分析·推荐)      | `intel`  |
-| 7 | `graphify`        | Graphify (代码知识图谱·推荐)      | `intel`  |
-| 8 | `gh`              | GitHub CLI (推荐)                 | `third`  |
-| 9 | `glab`             | GitLab CLI (推荐)                 | `third`  |
-| 10 | `dingtalk_cli`    | 钉钉 CLI                          | `third`  |
-| 11 | `feishu_cli`      | 飞书 CLI                          | `third`  |
+| 6 | `qoder_plugin`    | CodeKit Plugin (Qoder)            | `skills` |
+| 7 | `qodercn_plugin`  | CodeKit Plugin (Qoder CN)         | `skills` |
+| 8 | `gitnexus`        | GitNexus (代码结构分析·推荐)      | `intel`  |
+| 9 | `graphify`        | Graphify (代码知识图谱·推荐)      | `intel`  |
+| 10 | `gh`              | GitHub CLI (推荐)                 | `third`  |
+| 11 | `glab`             | GitLab CLI (推荐)                 | `third`  |
+| 12 | `dingtalk_cli`    | 钉钉 CLI                          | `third`  |
+| 13 | `feishu_cli`      | 飞书 CLI                          | `third`  |
 
 - **`GROUPS`** 定义交互选择器中的分组标题及顺序（`ai`→AI 开发套件、`skills`→CodeKit Skills、`intel`→代码智能、`third`→三方工具）。
 - **双层守卫**：Python 校验注册数据自身；Bash 校验加载结果、下标数组一致性及处理函数是否齐全。
@@ -132,6 +134,8 @@ bash uninstall.sh [-y]
 | `claude_plugin`     | 当前仓库根目录生成的兼容市场源（`CODEKIT_MARKET_DIR`，重建旧版 `plugins/codekit` 布局） | `claude plugin marketplace add <兼容市场源>` → `claude plugin marketplace update co-daming` 刷新索引 → 未装则 `claude plugin install codekit@co-daming --scope user`、已装则 `claude plugin update codekit@co-daming` → `_record_marketplace_sha`；本地源为空即提示跳过，无回退 | `~/.claude/plugins/known_marketplaces.json`、`~/.claude/plugins/installed_plugins.json`、`~/.claude/settings.json` |
 | `opencode_plugin`   | 安装状态目录生成的兼容 npm 包源（`opencode-source`） | 首装：把条目 `codekit@file://<安装状态目录>/opencode-source` 写入 `~/.config/opencode/opencode.json` 的 `plugin` 数组（`_json_edit`：node 优先、python3 兜底）；已配置：强制刷新兼容包源（无该子命令时仅提示已配置） | `~/.config/opencode/opencode.json`                                                            |
 | `codex_plugin`      | 当前仓库根目录生成的兼容市场源（重建旧版 `plugins/codekit` 布局）       | 清理旧散装 `~/.agents/skills/keel-*` → `codex plugin marketplace add <兼容市场源>` →（已装且市场源为 Git 地址时 `codex plugin marketplace upgrade co-daming`）→ `codex plugin add codekit@co-daming` → `_record_marketplace_sha`；本地源为空即提示跳过，无回退 | 插件缓存 `~/.codex/plugins/cache/`，启用状态写 `~/.codex/config.toml`                           |
+| `qoder_plugin`      | 安装状态目录生成的 Qoder 插件源（`qoder-source/codekit`，仅 `.qoder-plugin/` + `skills/`） | CLI 具备 `plugins install --scope user --json` 时执行 `<cli> --config-dir ~/.qoder plugins install <源> --scope user --json`；否则直接写共享注册表与缓存（Desktop-only 兜底） | `~/.qoder/plugins/installed_plugins_v2.json`、`~/.qoder/settings.json`、`~/.qoder/agents/` |
+| `qodercn_plugin`    | 安装状态目录生成的 Qoder 插件源（`qoder-source/codekit`，与 Qoder 共用同一份构建） | 同上，命令换为 `qodercn`、配置根换为 `~/.qoder-cn` | `~/.qoder-cn/plugins/installed_plugins_v2.json`、`~/.qoder-cn/settings.json`、`~/.qoder-cn/agents/` |
 | `gitnexus`          | 官方 npm 渠道包 `gitnexus`（无 Homebrew formula）                          | `_set_npm`（前缀指向 `~/.npm-global`）→ `npm install -g gitnexus@latest`（用户态、免 sudo）→ 成功后 `gitnexus setup`；无回退                                                                                | `~/.npm-global/bin/gitnexus`                                                                  |
 | `dingtalk_cli`      | npm 包 `dingtalk-workspace-cli`（官方 DingTalk Workspace CLI）              | 安装前检查 `unzip`，缺失时先通过当前平台包管理器安装 → `_set_npm`（前缀指向 `~/.npm-global`）→ `npm install -g dingtalk-workspace-cli@latest`；无自动认证配置                                                                                                                 | `~/.npm-global/bin/dws`                                                                       |
 | `feishu_cli`        | npm 包 `@larksuite/cli`（官方 Lark/Feishu CLI）                              | `_set_npm`（前缀指向 `~/.npm-global`）→ `npm install -g @larksuite/cli@latest` → `npx skills add larksuite/cli -y -g --agent <已安装的智能体>`；显式限定 Claude Code、Codex、OpenCode，避免 PromptScript 导致整批失败                                                                 | `~/.npm-global/bin/lark-cli`                                                                  |
@@ -139,7 +143,7 @@ bash uninstall.sh [-y]
 | `gh`                | Homebrew formula `gh`                                                        | `_brew_install_or_upgrade gh`（已装则 `brew upgrade gh`）；无回退                                                                                                                                            | brew 的 bin 目录                                                                              |
 | `glab`              | Homebrew formula `glab`                                                      | `_brew_install_or_upgrade glab`（已装则 `brew upgrade glab`）；无回退                                                                                                                                        | brew 的 bin 目录                                                                              |
 
-> 三个插件类组件的来源都是**当前仓库本地路径**（脚本相对自身位置探测根目录下的清单，并在安装时生成兼容源），不写死远端地址；若脚本目录保留 `scripts/` 但缺少根目录插件文件，这三项会各自告警并跳过（见 [8.1](#81-marketplace-本地源marketplacelocal)）。
+> 五个插件类组件的来源都是**当前仓库本地路径**（脚本相对自身位置探测根目录下的清单，并在安装时生成兼容源），不写死远端地址；若脚本目录保留 `scripts/` 但缺少根目录插件文件，这五项会各自告警并跳过（见 [8.1](#81-marketplace-本地源marketplacelocal)）。
 > 更细的失败处理与升级路径见 [第 8 节](#8-各组件安装策略)。
 
 ### 5.2 版本探测与升级判定
@@ -153,6 +157,7 @@ bash uninstall.sh [-y]
 | `claude_plugin`     | 状态文件 `marketplace_sha`（显示取前 7 位） | 本地仓库 `git rev-parse HEAD`（`_get_marketplace_latest_sha`）  | 安装状态以 `claude plugin list` 含 `codekit@co-daming` 为准；SHA 相同→最新，不同→有更新 |
 | `opencode_plugin`   | 同上 `marketplace_sha`                    | 同上 `HEAD`                                                    | 安装状态以 `opencode.json` 含 `codekit@` 为准                                         |
 | `codex_plugin`      | 同上 `marketplace_sha`                    | 同上 `HEAD`                                                    | 安装状态以 `codex plugin list --marketplace co-daming` 首列匹配为准                    |
+| `qoder_plugin` / `qodercn_plugin` | 共享注册表 `installed_plugins_v2.json` 的 `version`（读不到时回落 `plugin-version.json`） | 同左：重装即升级，不查询远端 | 安装状态以共享注册表含 `codekit@local` 且缓存目录真实存在为准，**不依赖 CLI 是否在 PATH** |
 | `gitnexus`          | `gitnexus --version`                      | `npm info gitnexus version`                                    | 语义化版本比对                                                                        |
 | `dingtalk_cli`      | `dws version`                   | npm registry `dingtalk-workspace-cli`                          | 语义化版本比对                                                                        |
 | `feishu_cli`        | `lark-cli --version`                      | npm registry `@larksuite/cli`                                  | 语义化版本比对                                                                        |
@@ -229,13 +234,13 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 
 ### 7.3 前置检查（`run_preflight`）
 
-依次执行前置依赖检查和 `preflight_agents`，详见 [5.1](#51-前置检查run_preflight)。原硬性依赖（git ≥ 2.50.0 / Node.js ≥ 20 / Python3 / curl）按 macOS/Linux 平台分别补齐。前置检查同时识别 CLI 和 Desktop agent；如果三者均不存在，会以醒目提示结束插件安装，不再让用户选择或自动安装 agent。全局 agent 在选择对应的 Claude、OpenCode 或 Codex 插件时同步安装；该阶段只在 install 执行，卸载不执行。
+依次执行前置依赖检查和 `preflight_agents`，详见 [5.1](#51-前置检查run_preflight)。原硬性依赖（git ≥ 2.50.0 / Node.js ≥ 20 / Python3 / curl）按 macOS/Linux 平台分别补齐。前置检查同时识别 CLI 和 Desktop agent；如果五者均不存在，会以醒目提示结束插件安装，不再让用户选择或自动安装 agent。Qoder 与 Qoder CN 的 CLI 和桌面 IDE 共用同一个用户级配置根，只要该根、Desktop 或 CLI 任一处出现过即视为平台可用。全局 agent 在选择对应的 Claude、OpenCode、Codex 或 Qoder 插件时同步安装；该阶段只在 install 执行，卸载不执行。
 
-全局 subagent 的统一源文件位于各 Skill 的 `skills/<skill>/agents/*.md`。Claude Code 原样安装到 `~/.claude/agents/`，OpenCode 原样安装到 `~/.config/opencode/agents/`，Codex 则生成同名的 `~/.codex/agents/*.toml`（正文映射到 `developer_instructions`）。`initialize` 随插件安装 `initialize-gitnexus`、`initialize-graphify`、`initialize-context-scanner`，运行时由 `SKILL.md` 强制调用。安装器具备幂等性；同名非 CodeKit 文件会先备份到 `~/.local/state/CodeKit/agent-backups/`。
+全局 subagent 的统一源文件位于各 Skill 的 `skills/<skill>/agents/*.md`。Claude Code 原样安装到 `~/.claude/agents/`，OpenCode 原样安装到 `~/.config/opencode/agents/`，Codex 则生成同名的 `~/.codex/agents/*.toml`（正文映射到 `developer_instructions`），Qoder / Qoder CN 原样安装到与桌面 IDE 共享的 `<配置根>/agents/`（裸名，CLI 与 IDE 两端都能调度）。`initialize` 随插件安装 `initialize-gitnexus`、`initialize-graphify`、`initialize-context-scanner`，运行时由 `SKILL.md` 强制调用。安装器具备幂等性；同名非 CodeKit 文件会先备份到 `~/.local/state/CodeKit/agent-backups/`。
 
 > 各 Skill 与 `SKILL.md` 同级的 `openai.yaml` **不是** subagent 源，也不参与上述全局安装：它是 Codex 的技能界面元数据，随技能目录整体分发，路径换算见第 10 章。
 
-卸载对应的 Claude、OpenCode 或 Codex 插件时，会同步删除该平台带 CodeKit 管理标记的 agent 文件；用户自行创建的 agent 与备份文件会保留。
+卸载对应的 Claude、OpenCode、Codex 或 Qoder 插件时，会同步删除该平台带 CodeKit 管理标记的 agent 文件；用户自行创建的 agent 与备份文件会保留。Claude 与 Qoder 的插件缓存由 CLI 和 Desktop 共享，因此即使对应 CLI 不存在也会完成缓存清理。
 
 ### 7.4 组件检查（`check_all_components`）
 
@@ -308,6 +313,7 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 | `claude_plugin` | `claude plugin update codekit@co-daming`（未装则 `install --scope user`），并记录新的 marketplace SHA |
 | `opencode_plugin` | `opencode plugin <module> -g -f` 强制替换为当前仓库版本并更新配置 |
 | `codex_plugin` | 已装且市场源为 Git 时先 `codex plugin marketplace upgrade` 刷新快照，再 `codex plugin add` 更新到快照版本；本地目录源实时读取，跳过快照刷新 |
+| `qoder_plugin` / `qodercn_plugin` | 重新安装到 `<根>/plugins/cache/local/codekit/<版本>/`（同版本重装即整体替换），不使用 `plugins update`，也不注册 marketplace |
 
 **单个组件失败只告警、不中断**整体流程（便于部分成功）。
 
@@ -335,6 +341,7 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 | `claude_plugin` | `claude plugin marketplace add <安装状态目录>/marketplace-source/codekit`（兼容市场根） | — | 记录版本；本地源为空时提示并跳过；本地源不配置自动更新（打印手动刷新方式） |
 | `opencode_plugin` | 写入 `opencode.json` 的 plugin 数组 | — | 条目为 `codekit@file://<安装状态目录>/opencode-source`（兼容 npm 包入口）；用 node（优先）或 python3 编辑 JSON |
 | `codex_plugin` | `codex plugin marketplace add <安装状态目录>/marketplace-source/codekit`（兼容市场根） | — | 官方插件市场机制；`codex plugin add codekit@co-daming` |
+| `qoder_plugin` / `qodercn_plugin` | Qoder CLI `plugins install <源> --scope user --json` | 直写共享配置根（注册表 + 缓存 + `enabledPlugins`） | CLI 与桌面 IDE 共用同一个根，安装一次两端生效；只支持 `user` 作用域 |
 | `gitnexus` | npm 用户态安装（`npm install -g gitnexus@latest`） | — | 无 Homebrew formula，走官方 npm 渠道；装好后执行 `gitnexus setup` |
 | `graphify` | pipx（`pipx install graphifyy`） | 独立 venv + 软链 | 无 Homebrew formula，走官方 PyPI 渠道（包名 `graphifyy`）；venv 位于 `~/.local/share/CodeKit/venvs/graphify`。不使用裸 `pip install`，因 brew python 受 PEP 668 保护会拒绝直接写入系统环境 |
 | `gh` | Homebrew | — | |
@@ -346,10 +353,10 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 
 ### 8.1 Marketplace 本地源（`MARKETPLACE_LOCAL`）
 
-插件市场相关组件（`claude_plugin` / `opencode_plugin` / `codex_plugin`）不再依赖写死的远端仓库地址：
+插件市场相关组件（`claude_plugin` / `opencode_plugin` / `codex_plugin` / `qoder_plugin` / `qodercn_plugin`）不再依赖写死的远端仓库地址：
 
-- 脚本启动时按自身位置相对定位当前仓库：`SCRIPT_DIR` 下存在根目录的 `.claude-plugin/marketplace.json`、`.codex-plugin/marketplace.json`、`.opencode/package.json`、`.opencode/plugins/codekit.js` 和 `skills/` 时，认定 `MARKETPLACE_LOCAL` 为仓库根目录；
-- 安装时在 `~/.local/state/CodeKit/marketplace-source/codekit` 生成兼容的旧版插件源，在 `~/.local/state/CodeKit/opencode-source` 生成兼容的旧版 OpenCode npm 包。Claude/Codex 注册前者，OpenCode 使用后者；版本追踪仍取本地仓库 `HEAD`；
+- 脚本启动时按自身位置相对定位当前仓库：`SCRIPT_DIR` 下存在根目录的 `.claude-plugin/marketplace.json`、`.codex-plugin/marketplace.json`、`.claude-plugin/plugin.json`、`.codex-plugin/plugin.json`、`.opencode/package.json`、`.opencode/plugins/codekit.js`、`.qoder-plugin/plugin.json`、`plugin-version.json` 和 `skills/` 时，认定 `MARKETPLACE_LOCAL` 为仓库根目录；
+- 安装时在 `~/.local/state/CodeKit/marketplace-source/codekit` 生成兼容的旧版插件源，在 `~/.local/state/CodeKit/opencode-source` 生成兼容的旧版 OpenCode npm 包，在 `~/.local/state/CodeKit/qoder-source/codekit` 生成 Qoder 插件源。Claude/Codex 注册前者，OpenCode 使用后者，Qoder 使用第三个源；版本追踪仍取本地仓库 `HEAD`；
 - 无插件本地源（例如脚本目录保留 `scripts/` 但缺少根目录插件文件）：`MARKETPLACE_LOCAL` 保留为空，`main` 开头统一提示，相关组件各自告警并兜底跳过，**不影响其他组件**；
 - 本地源安装的 marketplace 不配置自动更新（无远端轮询对象），脚本打印刷新方式：仓库内 `git pull` 后重新运行 `bash install.sh install`，由脚本重建兼容源并刷新插件；
 - 历史兼容：已按旧远端地址注册的市场仍可被检测（按市场名识别）与卸载。
@@ -373,17 +380,36 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 
 - 市场注册失败（本地路径注册失败且市场未注册）即告警返回非 0；`codex plugin add` 失败同样告警。
 - 市场升级状态复用 marketplace 的仓库 SHA（`_get_marketplace_latest_sha`，取本地仓库 `HEAD`）：检查阶段通过 `codex plugin list --marketplace co-daming` 探测安装状态，再比对已存 SHA 与本地 `HEAD` SHA 判定 `up_to_date` / `installed`；这与插件包版本相互独立。
-- 插件内容版本由根目录 `plugin-version.json` 的 `version` 参数统一管理；pre-commit 钩子会将它同步到 Claude、Codex 和 OpenCode 清单，版本变更后驱动 Codex 缓存刷新。
+- 插件内容版本由根目录 `plugin-version.json` 的 `version` 参数统一管理；pre-commit 钩子会将它同步到 Claude、Codex、OpenCode 和 Qoder 清单，版本变更后驱动 Codex 缓存刷新。
 
-### 8.3 插件附带的全局 subagent 安装明细
+### 8.3 Qoder 插件安装明细（`qoder_plugin` / `qodercn_plugin`）
 
-安装源是各 Skill 目录下的 `skills/<skill>/agents/*.md`，每个文件对应一个独立角色。`initialize` 的三个 Worker 角色也在此目录中定义，并由其 `SKILL.md` 强制调用。选择插件时，安装器调用 `scripts/manage-global-agents.py --tool`，只同步对应平台：
+Qoder（国际版）与 Qoder CN 是两个独立发行版，各有各的用户级配置根；但**同一发行版的 CLI 与桌面 IDE 共用同一个根**，因此一次安装两端同时生效：
+
+| 平台 | 组件 ID | 默认配置根 | env 覆盖 | CLI 候选 |
+|---|---|---|---|---|
+| Qoder | `qoder_plugin` | `~/.qoder` | `QODER_CONFIG_DIR` | `qoder`、`qodercli` |
+| Qoder CN | `qodercn_plugin` | `~/.qoder-cn` | `QODERCN_CONFIG_DIR` | `qodercn`、`qoderclicn` |
+
+- **安装源**：`~/.local/state/CodeKit/qoder-source/codekit`，只含 `.qoder-plugin/plugin.json` 与 `skills/`。不生成根级 `agents/`（插件内 agents 在 Qoder 里是 `codekit:<名>` 命名空间名，而 CodeKit 技能按**裸名**调度 subagent，故改由全局 agent 目录提供）；也不做 `openai.yaml → agents/` 转写，该转写只服务 Codex/OpenCode。
+- **两条等价路径**：探测到可用 CLI 时执行 `<cli> --config-dir <根> plugins install <源> --scope user --json`；只有桌面 IDE（或 CLI 过旧）时直接写共享存储——复制插件到 `<根>/plugins/cache/local/codekit/<版本>/`，在 `<根>/plugins/installed_plugins_v2.json` 登记 `codekit@local`，并把 `<根>/settings.json` 的 `enabledPlugins` 置真。两条路径产出同一份注册表。
+- **能力探测三条件**：命令存在且不是 IDE 启动器（路径不含 `.app/Contents/`）、`--version` 可取到版本号、`plugins install --help` 同时包含 `--json` 与 `--scope`；任一不满足即降级为直写模式。
+- **读侧容错**：桌面 IDE 写入的条目可能带 `lastUpdated`/`userVisible`/`enabled` 等额外键、无版本子目录的 `installPath`、6 或 9 位小数的时间戳。CodeKit 只增删自己的条目，其余键与其他插件原样保留；注册表或 settings 的 JSON 非法时报错终止，**绝不覆盖用户数据**。
+- **状态判定不依赖 CLI**：`present` / `component_version` / 可升级判定都直接读共享注册表，只装了桌面 IDE 的机器同样能被检测、升级并出现在 recap 中。
+- **不使用 Qoder marketplace，也不执行 `plugins update`**：升级方式是在新版本仓库里重新运行 `bash install.sh install`；同版本重装会整体替换缓存目录（新增文件生效、已删除文件消失），等价于升级。
+- **跨操作系统不共享**：WSL 内安装只写 Linux 侧的 `~/.qoder-cn`，Windows 上的 Qoder IDE 读 `C:\Users\<name>\.qoder-cn`。安装器检测到这种另一侧的根时会提示一行，不跨根写入。
+
+### 8.4 插件附带的全局 subagent 安装明细
+
+安装源是各 Skill 目录下的 `skills/<skill>/agents/*.md`，每个文件对应一个独立角色。`initialize` 的三个 Worker 角色也在此目录中定义，并由其 `SKILL.md` 强制调用。选择插件时，安装器调用 `scripts/manage-global-agents.py --tool`，只同步对应平台（Qoder 系额外传 `--config-root`，跟随共享配置根的 env 覆盖）：
 
 | 工具 | 全局目录 | 文件格式 |
 |---|---|---|
 | Claude Code | `~/.claude/agents/` | 原样复制 Markdown |
 | OpenCode | `~/.config/opencode/agents/` | 原样复制 Markdown |
 | Codex | `~/.codex/agents/` | 从同名 Markdown 生成 TOML，正文映射到 `developer_instructions` |
+| Qoder | `~/.qoder/agents/` | 原样复制 Markdown（裸名，CLI 与桌面 IDE 共享） |
+| Qoder CN | `~/.qoder-cn/agents/` | 原样复制 Markdown（裸名，CLI 与桌面 IDE 共享） |
 
 安装具备幂等性：内容未变化时不改文件；发现同名且不是 CodeKit 管理的文件时，先备份到 `~/.local/state/CodeKit/agent-backups/<tool>/`。缺少本地 agent 源时只告警并跳过，不影响其他组件。
 
@@ -396,22 +422,23 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 1. 移除 CodeKit 插件（Claude：先 `claude plugin uninstall codekit@co-daming` 卸载插件本体，再 `claude plugin marketplace remove` 移除市场注册）
 2. 从 `opencode.json` 移除 CodeKit 插件
 3. 移除 Codex 插件与市场注册（`codex plugin remove codekit@co-daming` + `codex plugin marketplace remove co-daming`，含清理旧散装 `keel-*` 技能）
-4. 卸载 git-ai（含 hooks 清理、删除 `~/.git-ai`、清理 shell 中的 PATH 行）
-5. 移除 CodeKit 全局 subagents（Claude/OpenCode/Codex，仅清理受管文件）
-6. 卸载 rtk、glab、gh（brew）、GitNexus、钉钉 CLI、飞书 CLI（npm）、Graphify（pipx/pip + venv）
-7. 撤销全局 git 配置
-8. 移除各 shell 配置中 `# Added by CodeKit Plugin` 的 PATH 行
-9. 删除版本记录文件
+4. 移除 Qoder / Qoder CN 插件（CLI 可用时先 `plugins uninstall codekit`，随后无条件清理共享配置根中的注册项、`enabledPlugins` 键与缓存目录）
+5. 卸载 git-ai（含 hooks 清理、删除 `~/.git-ai`、清理 shell 中的 PATH 行）
+6. 移除 CodeKit 全局 subagents（Claude/OpenCode/Codex/Qoder/Qoder CN，仅清理受管文件）
+7. 卸载 rtk、glab、gh（brew）、GitNexus、钉钉 CLI、飞书 CLI（npm）、Graphify（pipx/pip + venv）
+8. 撤销全局 git 配置
+9. 移除各 shell 配置中 `# Added by CodeKit Plugin` 的 PATH 行
+10. 删除版本记录文件
 
 > 说明：
-> - **不卸载**智能体本体（Claude/Codex/OpenCode）与依赖（git/Homebrew/curl/Python3/Node.js），仅卸载插件与可选组件。
+> - **不卸载**智能体本体（Claude/Codex/OpenCode/Qoder/Qoder CN）与依赖（git/Homebrew/curl/Python3/Node.js），仅卸载插件与可选组件。
 > - `${CodeKit_STATE_DIR}` 与 `~/.npm-global` 目录会保留，需手动删除。
 
 ---
 
-## 10. 安装后插件目录变化（三平台）
+## 10. 安装后插件目录变化（五平台）
 
-> 实测环境：Claude 2.1.259 / Codex 0.149.0 / OpenCode 1.18.20。三平台均为官方插件机制，以下目录行为均为本机实测观察。
+> 实测环境：Claude 2.1.259 / Codex 0.149.0 / OpenCode 1.18.20 / Qoder CN 1.1.48。各平台均为官方插件机制，以下目录行为均为本机实测观察。
 
 总览：
 
@@ -420,6 +447,8 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 | Claude | `~/.claude/plugins/known_marketplaces.json` + `settings.json` | `~/.claude/plugins/cache/co-daming/codekit/<版本>/` | `~/.claude/settings.json` 的 `enabledPlugins` |
 | Codex | `~/.codex/config.toml` 的 `[marketplaces.*]` 段 | `~/.codex/plugins/cache/co-daming/codekit/<版本>/` | `~/.codex/config.toml` 的 `[plugins.*]` 段 |
 | OpenCode | `~/.config/opencode/opencode.json` 的 `plugin` 数组 | `~/.config/opencode/node_modules/codekit/` | `~/.config/opencode/package.json` 的 `dependencies` |
+| Qoder | 本地目录安装，无市场注册（`codekit@local`） | `~/.qoder/plugins/cache/local/codekit/<版本>/` | `~/.qoder/settings.json` 的 `enabledPlugins` |
+| Qoder CN | 本地目录安装，无市场注册（`codekit@local`） | `~/.qoder-cn/plugins/cache/local/codekit/<版本>/` | `~/.qoder-cn/settings.json` 的 `enabledPlugins` |
 
 ### 10.1 Claude
 
@@ -509,12 +538,44 @@ OpenCode 将 `~/.config/opencode/` 本身当作一个 npm 包管理，插件安�
 - 安装器把根目录的 `.opencode/` 和 `skills/` 重建到兼容包的 `plugins/codekit/` 下；包 `main` 仍指向 `plugins/codekit/.opencode/plugins/codekit.js`，启动时解析 7 个技能并注册为裸命令
 - `node_modules`、`package.json`、锁文件等由该目录的 `.gitignore` 忽略
 
-### 10.4 源包结构合规性（对照官方规范）
+### 10.4 Qoder / Qoder CN
+
+`~/.qoder`（国际版）与 `~/.qoder-cn`（CN 版）结构完全一致；下面以 CN 版为例，两个发行版互不共享配置根：
+
+```
+~/.qoder-cn/
+├── settings.json                          # 新增：enabledPlugins."codekit@local": true（启用状态）
+├── agents/                                # 新增：CodeKit 全局 subagent（裸名，CLI 与 IDE 共用）
+│   └── <角色名>.md
+└── plugins/
+    ├── installed_plugins_v2.json          # 共享注册表：scope / installPath / version / installedAt
+    └── cache/
+        └── local/
+            └── codekit/
+                └── <版本>/                # 插件目录完整副本
+                    ├── .qoder-plugin/
+                    │   └── plugin.json    # version 来自 plugin-version.json
+                    └── skills/
+                        └── <技能名>/
+                            ├── SKILL.md            # 7 个技能
+                            ├── openai.yaml         # 界面元数据（Qoder 不读取）
+                            └── agents/*.md         # 技能内 subagent（Qoder 不提升为插件级 agent）
+```
+
+关键行为：
+
+- **CLI 与桌面 IDE 读写同一份注册表**：`installed_plugins_v2.json` 与 `settings.json` 由两端共同维护，所以 CodeKit 只面向配置根安装一次，两端都能看到 `codekit@local`
+- 本地目录安装的插件固定登记为 `codekit@local`（`local` 是本地目录安装的隐式市场名），不注册 Qoder marketplace
+- `installed_plugins_v2.json` 中其他插件（如桌面 IDE 自带的 `*-@qoderapp-bundler` 条目）与 `userVisible`/`lastUpdated` 等未知键一律保留
+- 卸载按 `installPath` 定位，仅当该路径确实位于 `<根>/plugins/cache/` 之内才删除目录，越界路径只清理登记项而不删文件
+
+### 10.5 源包结构合规性（对照官方规范）
 
 | 平台 | 官方规范要求 | 本仓库实现 | 结论 |
 |------|-------------|-----------|------|
 | Claude | 插件根含 `.claude-plugin/plugin.json`；技能为 `skills/<名>/SKILL.md`；市场清单在**市场根** `.claude-plugin/marketplace.json`（必填 `name`/`owner`/`plugins`，`source` 相对路径以 `./` 开头） | 安装器从仓库根目录重建兼容插件根：`.claude-plugin/plugin.json` + `.claude-plugin/marketplace.json`（`source: "./"`）+ `skills/`（7 技能） | ✅ 符合 |
 | Codex | 插件根含 `.codex-plugin/plugin.json`；市场清单在**市场根** `.codex-plugin/marketplace.json`，条目用 `source.path`（以 `./` 开头） | 安装器从仓库根目录重建兼容插件根：`.codex-plugin/plugin.json`（版本来自 `plugin-version.json`）+ `.codex-plugin/marketplace.json`（`path: "./"`）+ `skills/` | ✅ 符合 |
+| Qoder / Qoder CN | 插件根含 `.qoder-plugin/plugin.json`（必填 `name`，`version` 等可选）；技能为 `skills/<名>/SKILL.md`；用户级插件状态存于共享配置根 | 安装器从仓库根目录重建插件根：`.qoder-plugin/plugin.json`（版本来自 `plugin-version.json`）+ `skills/`（7 技能），按 `user` 作用域登记到 `<根>/plugins/installed_plugins_v2.json` | ✅ 符合 |
 | OpenCode | 插件为导出插件函数的 JS/TS 模块，以 npm 包形式经配置 `plugin` 数组分发 | `.opencode/package.json`（`name: codekit`，`main: plugins/codekit.js`）；安装器生成旧版兼容 npm 包并将其 `main` 改为 `plugins/codekit/.opencode/plugins/codekit.js`；`codekit.js` 导出 `codekitPlugin` 异步函数 | ✅ 符合 |
 
 > 注：Claude 与 Codex 的插件缓存目录都会原样复制整个插件目录（包括其他平台的清单目录，如 Claude 缓存中会含 `.codex-plugin/`、`.opencode/`），属无害冗余。
@@ -531,9 +592,10 @@ OpenCode 将 `~/.config/opencode/` 本身当作一个 npm 包管理，插件安�
 | `~/.local/bin/` | 用户级可执行文件目录 |
 | `~/.npm-global/` | npm 用户态全局安装前缀 |
 | `~/.local/share/CodeKit/venvs/graphify` | Graphify 的 venv 安装目录（pipx 缺失时的兜底策略） |
-| `~/.claude/agents/`、`~/.config/opencode/agents/`、`~/.codex/agents/` | CodeKit 全局 subagent；Codex 目录使用由 Markdown 生成的 TOML |
+| `~/.claude/agents/`、`~/.config/opencode/agents/`、`~/.codex/agents/`、`~/.qoder/agents/`、`~/.qoder-cn/agents/` | CodeKit 全局 subagent；Codex 目录使用由 Markdown 生成的 TOML，Qoder 系目录与桌面 IDE 共享 |
+| `~/.qoder/`、`~/.qoder-cn/` | Qoder CLI 与桌面 IDE 共享的配置根（`plugins/installed_plugins_v2.json`、`settings.json`）；可用 `QODER_CONFIG_DIR` / `QODERCN_CONFIG_DIR` 覆盖 |
 | `~/.local/state/CodeKit/agent-backups/` | 同名非 CodeKit agent 被安装器替换前的备份 |
-| `plugin-version.json` | 插件版本唯一配置源；pre-commit 钩子同步到 `.claude-plugin/plugin.json`、`.codex-plugin/plugin.json` 和 `.opencode/package.json` |
+| `plugin-version.json` | 插件版本唯一配置源；pre-commit 钩子同步到 `.claude-plugin/plugin.json`、`.codex-plugin/plugin.json`、`.opencode/package.json` 和 `.qoder-plugin/plugin.json` |
 | `~/.agents/skills/` | **旧散装机制**的 Codex skills 目录（历史遗留）：当前版本**不再写入**，仅在安装/卸载时清理其中遗留的 `keel-*` 条目；插件机制下技能实体位于 `~/.codex/plugins/cache/`（见第 10 章） |
 
 > 日志输出采用**双通道**：终端用干净符号（✓/✗/⚠），日志文件保留 `[OK]`/`[ERROR]` 等标签。文件描述符 3 固定指向终端，保证管道中仍能向屏幕输出。
@@ -557,18 +619,19 @@ OpenCode 将 `~/.config/opencode/` 本身当作一个 npm 包管理，插件安�
 | `_sed_inplace <脚本> <文件>` | 跨平台原地 sed（先 BSD 后 GNU） |
 | `_git_ai_cmd` | 解析 git-ai 可执行路径（兼容 `~/.git-ai/bin`） |
 | `run_preflight` | 前置检查入口：Homebrew → git（≥ 2.50.0）→ Node.js（≥ 20）→ Python3 → curl → 编程智能体（含原硬性依赖；缺失时 brew 自动安装，失败退出流程；唯一例外：brew update 失败仅警告并继续） |
-| `agent_presence <claude\|codex\|opencode>` | 统一探测对应 CLI、Desktop 应用、Linux 启动器和常见安装目录 |
+| `agent_presence <claude\|codex\|opencode\|qoder\|qodercn>` | 统一探测对应 CLI、Desktop 应用、Linux 启动器和常见安装目录；Qoder 系由 `scripts/installer_qoder.py` 提供探测，并把共享配置根也算作平台可用 |
 | `render_recap` | 所有安装与配置操作完成后打印安装/卸载结果汇总 |
 | `_run_python_selector <install\|uninstall>` | 生成临时组件清单，调用 `scripts/component-selector.py`，校验并回填选择结果 |
 | `_marketplace_remote_host` | 从当前仓库 `origin` 推导 Git 主机名（供 git-ai `allow_repositories` 与安装后 glab 指引使用；无本地源时无输出） |
-| `_prepare_install_sources` | 从仓库根目录重建 Claude/Codex 市场源和 OpenCode 兼容 npm 包 |
+| `_prepare_install_sources` | 从仓库根目录重建 Claude/Codex 市场源、OpenCode 兼容 npm 包和 Qoder 插件源 |
+| `installer_qoder.py` | Qoder 平台适配层：共享根解析、注册表与 settings 读写、CLI 能力探测、直写安装与卸载、平台可用性探测 |
 | `_stage_skill_interface_files` | 在生成的兼容源里把 `skills/<名>/openai.yaml` 派生为 Codex 读取的 `agents/openai.yaml`，并校验每个技能都具备该文件 |
 | `_get_marketplace_latest_sha` | 取本地仓库 `HEAD` 作为 marketplace 版本（无本地源时为空，调用方兜底） |
 | `_extract_ver` | 从版本字符串提取语义化版本号 |
 | `_ver_ge` | 点分版本号大小比较（`$1 >= $2` 返回 0，bash 3.x 兼容），用于 git ≥ 2.50.0 等版本门槛 |
 | `_track_change <路径>` | 记录本次运行变更的文件/目录（去重），供安装后检测汇总打印 |
 | `_verify_dep <名> <命令>` | 验证汇总表中的依赖组件行（Homebrew/git/Node.js/Python3/curl） |
-| `report_plugins_and_changes` | 打印三平台插件安装目录与本次变更的文件/目录 |
+| `report_plugins_and_changes` | 打印各平台插件安装目录与本次变更的文件/目录 |
 | `_set_status` / `_get_status` 等 | 读写组件状态/版本/最新版（`eval` 动态变量名） |
 
 ---

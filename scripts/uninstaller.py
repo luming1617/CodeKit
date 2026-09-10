@@ -21,6 +21,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_config as config  # noqa: E402
+import installer_qoder as qoder  # noqa: E402
 import installer_state as detector  # noqa: E402
 from installer import (  # noqa: E402
     CLAUDE_MARKETPLACE,
@@ -126,10 +127,16 @@ class Uninstaller(Installer):
             return True
         args = [sys.executable, str(helper), "uninstall"]
         args.extend(["--home", str(self.home), "--tool", tool])
+        try:
+            flags, _agents_dir = qoder.agent_location(tool, self.home)
+        except ValueError as exc:
+            self.logger.error(str(exc))
+            return False
+        args.extend(flags)
         return self.run_command(args).returncode == 0
 
     def uninstall_claude_plugin(self) -> bool:
-        """卸载 Claude 插件及其 marketplace 注册，并校验注册信息是否已移除。"""
+        """卸载 Claude 插件及其 marketplace 注册；CLI 缺失时也清理共享缓存。"""
         plugin_ok = True
         if self.command_exists("claude"):
             package = f"{CLAUDE_PLUGIN}@{CLAUDE_MARKETPLACE}"
@@ -140,7 +147,9 @@ class Uninstaller(Installer):
             marketplace = self.run_capture(["claude", "plugin", "marketplace", "list", "--json"]).stdout
             # CLI 只负责标记/登记的内容也要检查，避免界面显示卸载成功但仍可被加载。
             plugin_ok = package not in remaining and f'"{CLAUDE_MARKETPLACE}"' not in marketplace
-            shutil.rmtree(self.home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE, ignore_errors=True)
+        # The plugin cache is shared with the desktop app, so it is always
+        # removed; a missing CLI must not leave a loadable plugin behind.
+        shutil.rmtree(self.home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE, ignore_errors=True)
         return plugin_ok and self.uninstall_platform_agents("claude")
 
     def uninstall_opencode_plugin(self) -> bool:
@@ -233,6 +242,18 @@ class Uninstaller(Installer):
                 shutil.rmtree(path)
         return self.uninstall_platform_agents("codex")
 
+    def uninstall_qoder_plugin(self, platform_key: str) -> bool:
+        """移除 Qoder 共享配置根中的插件与全局 subagent；CLI 可用时先走 CLI 登记。"""
+        descriptor = qoder.PLATFORMS[platform_key]
+        try:
+            plugin_ok = qoder.uninstall(
+                descriptor, self.home, runner=self.qoder_run
+            )
+        except ValueError as exc:
+            self.logger.error(str(exc))
+            plugin_ok = False
+        return plugin_ok and self.uninstall_platform_agents(platform_key)
+
     def uninstall_component(self, component_id: str) -> bool:
         """按组件注册 ID 分发卸载处理器，并把单项异常转换为失败结果。"""
         handlers = {
@@ -241,6 +262,8 @@ class Uninstaller(Installer):
             "claude_plugin": self.uninstall_claude_plugin,
             "opencode_plugin": self.uninstall_opencode_plugin,
             "codex_plugin": self.uninstall_codex_plugin,
+            "qoder_plugin": lambda: self.uninstall_qoder_plugin("qoder"),
+            "qodercn_plugin": lambda: self.uninstall_qoder_plugin("qodercn"),
             "gitnexus": self.uninstall_gitnexus,
             "dingtalk_cli": self.uninstall_dingtalk_cli,
             "feishu_cli": self.uninstall_feishu_cli,
@@ -319,6 +342,7 @@ class Uninstaller(Installer):
             SCRIPT_DIR / "installer_config.py",
             SCRIPT_DIR / "installer_state.py",
             SCRIPT_DIR / "installer_sources.py",
+            SCRIPT_DIR / "installer_qoder.py",
             SCRIPT_DIR / "component-selector.py",
         )
         missing = [str(path) for path in required_helpers if not path.is_file()]

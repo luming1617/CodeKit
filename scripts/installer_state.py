@@ -27,6 +27,11 @@ from typing import Any, Iterable, Optional
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "installer_config.py"
 REGISTRY_PATH = SCRIPT_DIR / "component-registry.py"
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+
+import installer_qoder as qoder  # noqa: E402
 
 
 def load_module(path: Path, name: str) -> Any:
@@ -55,7 +60,9 @@ ANSI_RESET = "\033[0m"
 # Desktop applications expose the same coding-agent capability as their CLI
 # counterparts, but they do not consistently install a command on PATH. Keep
 # these probes explicit and conservative: a config/data directory alone is not
-# proof that the application is installed.
+# proof that the application is installed. Qoder is the exception documented in
+# installer_qoder.py: its shared configuration root *is* the plugin storage both
+# surfaces read, so an existing root does count as availability.
 AGENT_COMMANDS = {
     "claude": ("claude", "claude-desktop"),
     "codex": ("codex",),
@@ -192,6 +199,9 @@ def _linux_application_dirs(home: Path) -> tuple[Path, ...]:
 
 def agent_presence(name: str, home: Path, os_name: Optional[str] = None) -> str:
     """返回 agent 的发现来源；CLI 和 Desktop 均视为已安装。"""
+    if name in qoder.PLATFORMS:
+        # Qoder 的 CLI 与 Desktop 地位一致，任一方可用的共享配置根即视为可用。
+        return qoder.agent_presence(name, home, os_name)
     if name not in AGENT_COMMANDS:
         return ""
     for command in AGENT_COMMANDS[name]:
@@ -324,11 +334,45 @@ def platform_subagents_state(context: Context, tool: str) -> str:
     if not helper.exists():
         return ""
     args = [sys.executable, str(helper), "status", "--home", str(context.home), "--tool", tool]
+    try:
+        flags, _agents_dir = qoder.agent_location(tool, context.home)
+    except ValueError:
+        return ""
+    args.extend(flags)
     if context.marketplace_local:
         source = context.marketplace_local / "skills"
         if source.is_dir():
             args.extend(["--source", str(source)])
     return run_command(args)
+
+
+def repository_plugin_version(context: Context) -> str:
+    """读取插件源中的版本，作为无法从安装状态取版本时的回退。"""
+    version_file = (
+        context.marketplace_local / "plugin-version.json"
+        if context.marketplace_local
+        else SCRIPT_DIR.parent / "plugin-version.json"
+    )
+    try:
+        return config.validate_plugin_version(version_file)
+    except (OSError, ValueError):
+        return "installed"
+
+
+def claude_cache_present(home: Path) -> bool:
+    """判断 Claude 插件缓存是否已由 CLI 或 Desktop 写入共享目录。"""
+    return (home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE / CLAUDE_PLUGIN).is_dir()
+
+
+def qoder_present(descriptor: Any, context: Context) -> bool:
+    """按共享配置根判断 Qoder 插件状态，不要求 CLI 或 Desktop 正在运行。"""
+    try:
+        state = qoder.inspect(descriptor, context.home)
+    except ValueError:
+        return False
+    if not state.installed or not state.enabled:
+        return False
+    return platform_subagents_state(context, descriptor.key) in {"installed", "up_to_date"}
 
 
 def component_version(component: str, context: Context) -> str:
@@ -354,15 +398,17 @@ def component_version(component: str, context: Context) -> str:
     if component == "git_ai":
         return git_ai_version(context.home)
     if component in {"claude_plugin", "opencode_plugin", "codex_plugin"}:
-        version_file = (
-            context.marketplace_local / "plugin-version.json"
-            if context.marketplace_local
-            else SCRIPT_DIR.parent / "plugin-version.json"
-        )
+        return repository_plugin_version(context)
+    qoder_platform = qoder.platform_for_component(component)
+    if qoder_platform is not None:
+        # 共享注册表里的版本就是 CLI 与 Desktop 两端共同看到的结果。
         try:
-            return config.validate_plugin_version(version_file)
-        except (OSError, ValueError):
-            return "installed"
+            state = qoder.inspect(qoder_platform, context.home)
+        except ValueError:
+            state = None
+        if state is not None and state.version:
+            return state.version
+        return repository_plugin_version(context)
     return ""
 
 
@@ -376,7 +422,13 @@ def present(component: str, context: Context) -> bool:
         return shutil.which(NPM_COMPONENTS[component]["command"]) is not None
     if component == "claude_plugin":
         listing = plugin_listing("claude", ["plugin", "list"])
-        return bool(listing) and has_line(listing, f"{CLAUDE_PLUGIN}@{CLAUDE_MARKETPLACE}", False) and platform_subagents_state(context, "claude") in {"installed", "up_to_date"}
+        registered = bool(listing) and has_line(
+            listing, f"{CLAUDE_PLUGIN}@{CLAUDE_MARKETPLACE}", False
+        )
+        if not registered:
+            # 只装 Desktop 的机器没有 CLI 命令，但插件缓存由两端共享写入。
+            registered = claude_cache_present(context.home)
+        return registered and platform_subagents_state(context, "claude") in {"installed", "up_to_date"}
     if component == "codex_plugin":
         listing = plugin_listing("codex", ["plugin", "list", "--marketplace", CODEX_MARKETPLACE])
         return bool(listing) and has_line(listing, f"{CODEX_PLUGIN}@{CODEX_MARKETPLACE}") and platform_subagents_state(context, "codex") in {"installed", "up_to_date"}
@@ -384,6 +436,9 @@ def present(component: str, context: Context) -> bool:
         return config.opencode_has_plugin(
             context.home / ".config" / "opencode" / "opencode.json"
         ) and platform_subagents_state(context, "opencode") in {"installed", "up_to_date"}
+    qoder_platform = qoder.platform_for_component(component)
+    if qoder_platform is not None:
+        return qoder_present(qoder_platform, context)
     return False
 
 
@@ -395,6 +450,22 @@ def detect_component(component: str, context: Context, latest: dict[str, str]) -
     state.installed_version = component_version(component, context)
 
     if component == "git_ai":
+        state.status = "up_to_date"
+        return state
+    qoder_platform = qoder.platform_for_component(component)
+    if qoder_platform is not None:
+        if platform_subagents_state(context, qoder_platform.key) != "up_to_date":
+            state.status = "installed"
+            return state
+        target = repository_plugin_version(context)
+        if target and target != "installed":
+            state.latest_version = target
+            # Qoder 走本地目录安装，重装即升级，因此版本较旧就标记可升级。
+            if not state.installed_version or not config.version_greater_or_equal(
+                state.installed_version, target
+            ):
+                state.status = "installed"
+                return state
         state.status = "up_to_date"
         return state
     if component in {"claude_plugin", "opencode_plugin", "codex_plugin"}:
@@ -573,6 +644,13 @@ def component_install_path(component: str, context: Context) -> str:
             "graphify": context.home / ".local" / "bin" / "graphify",
         }.get(component)
         return display_path(fallback, context.home) if fallback else "—"
+    qoder_platform = qoder.platform_for_component(component)
+    if qoder_platform is not None:
+        try:
+            root = qoder.resolve_config_root(qoder_platform, context.home)
+        except ValueError:
+            return "—"
+        return display_path(qoder.plugin_cache_root(root), context.home)
     plugin_paths = {
         "claude_plugin": context.home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE,
         "opencode_plugin": context.home / ".config" / "opencode" / "node_modules" / "codekit",

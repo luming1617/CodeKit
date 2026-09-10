@@ -104,6 +104,7 @@ def main() -> int:
         assert_name_and_version(ROOT / ".claude-plugin" / "plugin.json", version)
         assert_name_and_version(ROOT / ".codex-plugin" / "plugin.json", version)
         assert_name_and_version(ROOT / ".opencode" / "package.json", version)
+        assert_name_and_version(ROOT / ".qoder-plugin" / "plugin.json", version)
         check_marketplaces()
         check_opencode_entry()
         count = check_skill_tree()

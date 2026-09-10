@@ -5,7 +5,7 @@ pre-commit:
     sync-plugin-version:
       run: |
         python3 scripts/sync-plugin-version.py && \
-          git add plugin-version.json .claude-plugin/plugin.json .codex-plugin/plugin.json .opencode/package.json
+          git add plugin-version.json .claude-plugin/plugin.json .codex-plugin/plugin.json .opencode/package.json .qoder-plugin/plugin.json
         echo "Plugin version synchronized"
     # Manifests must parse, agree on the plugin name, and point at files that exist.
     validate-plugins:
@@ -33,6 +33,10 @@ pre-push:
           echo "Missing Codex plugin.json in repository root"
           exit 1
         fi
+        if [ ! -f ".qoder-plugin/plugin.json" ]; then
+          echo "Missing Qoder plugin.json in repository root"
+          exit 1
+        fi
         if ! ls skills/*/SKILL.md >/dev/null 2>&1; then
           echo "No skills found in repository root (expected skills/<name>/SKILL.md)"
           exit 1
@@ -42,6 +46,10 @@ pre-push:
     validate-skill-layout:
       run: python3 scripts/validate-skill-layout.py
       fail_text: "Skill layout validation failed (expected skills/<name>/SKILL.md + skills/<name>/openai.yaml)."
+    # Installer helpers are pure Python; their regressions gate every push.
+    test-installer:
+      run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      fail_text: "安装器脚本的回归测试未通过；先修 installer_qoder/installer_state 或其测试，不要推送。"
     # Deterministic skill gate scripts must stay verified: run every skills/<name>/tests suite.
     test-skill-scripts:
       run: |
