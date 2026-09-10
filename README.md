@@ -16,9 +16,11 @@
 bash install.sh
 ```
 
-安装内容：编程智能体（Claude / Codex / OpenCode 至少一个，脚本自动保障） · CodeKit 插件（Claude / OpenCode / Codex，分别包含对应平台的 subagent） · GitNexus · Graphify · gh · glab · 钉钉 CLI · 飞书 CLI · git-ai · rtk(节省token)
+安装内容：编程智能体（Claude / Codex / OpenCode 至少一个，CLI 或 Desktop 均可） · CodeKit 插件（Claude / OpenCode / Codex，分别包含对应平台的 subagent） · GitNexus · Graphify · gh · glab · 钉钉 CLI · 飞书 CLI · git-ai · rtk(节省token)
 
 > 安装前脚本会按操作系统补齐依赖：macOS 使用 Homebrew，Linux 使用检测到的 `apt-get`、`dnf`、`yum`、`pacman`、`zypper` 或 `apk`；两者都会检查 git ≥ 2.50.0、Node.js ≥ 20、Python3、npm 和 curl。安装后会打印包含安装路径、安装版本和未选择项的结果汇总，以及带作用说明的后续操作提示。
+
+> 安装前会检查 Claude、Codex、OpenCode 的 CLI，以及 macOS/Linux 上对应的 Desktop 应用和启动器；三者均不存在时会醒目提示并结束流程，不会再询问或自动安装 agent。
 
 > 脚本以当前仓库（`install.sh` 所在目录）作为 CodeKit 插件市场源，相对定位、不依赖远端地址；仓库根目录包含插件元数据、`.opencode/` OpenCode 包和 `skills/`，安装时会重建兼容的插件源布局。组件注册表和交互选择器位于 `scripts/`，因此安装与卸载都需要完整仓库，不能只通过 `curl ... | bash` 执行单个 `install.sh`。
 

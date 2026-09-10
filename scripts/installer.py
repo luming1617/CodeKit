@@ -371,51 +371,26 @@ class Installer:
         except (OSError, UnicodeError):
             return ""
 
-    def install_agent(self, name: str) -> bool:
-        """安装指定编程智能体，并在安装命令成功后再次确认可执行文件存在。"""
-        if name == "claude":
-            if self.os_name == "Darwin" and self.run_command(["brew", "install", "--cask", "claude-code"]).returncode == 0 and self.command_exists("claude"):
-                return True
-            self.set_npm()
-            return self.run_command(["npm", "install", "-g", "@anthropic-ai/claude-code"]).returncode == 0 and self.command_exists("claude")
-        if name == "codex":
-            if self.os_name == "Darwin" and self.run_command(["brew", "install", "--cask", "codex"]).returncode == 0 and self.command_exists("codex"):
-                return True
-            self.set_npm()
-            return self.run_command(["npm", "install", "-g", "@openai/codex"]).returncode == 0 and self.command_exists("codex")
-        if name == "opencode":
-            if self.os_name == "Darwin" or self.command_exists("brew"):
-                return self.run_command(["brew", "install", "opencode"]).returncode == 0 and self.command_exists("opencode")
-            self.set_npm()
-            return self.run_command(["npm", "install", "-g", "opencode-ai"]).returncode == 0 and self.command_exists("opencode")
-        return False
-
-    def preflight_agents(self) -> None:
-        """确保至少有一个编程智能体可用；非交互模式默认安装 Claude。"""
-        available = [name for name in ("claude", "codex", "opencode") if self.command_exists(name)]
+    def preflight_agents(self) -> bool:
+        """检查至少一个 CLI 或 Desktop agent，缺失时显眼提示并结束。"""
+        available = [
+            (name, detector.agent_presence(name, self.home, self.os_name))
+            for name in ("claude", "codex", "opencode")
+        ]
+        available = [(name, source) for name, source in available if source]
         if available:
-            self.logger.success(f"Coding agent(s) detected: {' '.join(available)}")
-            return
-        self.logger.warn("No coding agent detected (Claude / Codex / OpenCode).")
-        if self.auto_yes or not Path("/dev/tty").exists():
-            if not self.install_agent("claude"):
-                raise InstallerError("Claude installation failed.")
-            return
-        print("请选择要安装的编程智能体：1) Claude  2) Codex  3) OpenCode  q) 退出")
-        while True:
-            choice = input("输入编号（可用空格分隔多选，q 退出）: ").strip()
-            if choice.lower().startswith("q"):
-                raise SystemExit(0)
-            installed = False
-            for item in choice.split():
-                name = {"1": "claude", "2": "codex", "3": "opencode"}.get(item)
-                if name and self.install_agent(name):
-                    self.logger.success(f"{name} installed")
-                    installed = True
-                elif name:
-                    self.logger.warn(f"{name} install failed")
-            if installed:
-                return
+            detail = ", ".join(f"{name}: {source}" for name, source in available)
+            self.logger.success(f"Coding agent(s) detected: {detail}")
+            return True
+        self.logger.error(
+            "\n"
+            "╔══════════════════════════════════════════════════════════════╗\n"
+            "║  ⚠ 未检测到 Claude、Codex 或 OpenCode                       ║\n"
+            "║  请先安装一个 CLI 或 Desktop agent，再重新运行 CodeKit。     ║\n"
+            "║  本次插件安装流程已结束。                                   ║\n"
+            "╚══════════════════════════════════════════════════════════════╝"
+        )
+        return False
 
     def prepare_sources(self) -> None:
         """从本地仓库构建 Claude/Codex/OpenCode 使用的兼容插件源。"""
@@ -948,7 +923,8 @@ class Installer:
         if not self.marketplace_local:
             self.logger.warn("Marketplace repo not detected; plugin components may be skipped.")
         self.prepare_sources()
-        self.preflight_agents()
+        if not self.preflight_agents():
+            return 0
         self.load_states()
         self.select_components()
         if not self.selected:

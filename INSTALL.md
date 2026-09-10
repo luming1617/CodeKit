@@ -91,7 +91,7 @@ bash uninstall.sh [-y]
 | Node.js      | 未装则 `brew install node` 自动安装；低于 20 则尝试 brew 升级                                                                                         | 安装后仍不满足 ≥ 20 即**退出流程** |
 | Python3      | 未装则 `brew install python3` 自动安装（brew 默认 `python@3.x` 的官方别名）                                                                           | 安装失败即**退出流程** |
 | curl         | 未装则 `brew install curl` 自动安装（brew 的 curl 为 keg-only，装后按 opt 路径兜底挂载）                                                              | 安装失败即**退出流程** |
-| 编程智能体   | Claude / Codex / OpenCode 一个都未安装时，提示用户选择（Homebrew 安装：macOS 上 claude-code/codex 为 cask、opencode 为 formula；Linux 回退 npm） | 用户选择退出 → **结束流程**（退出码 0）；`-y`/非交互模式默认安装 Claude |
+| 编程智能体   | 检查 Claude / Codex / OpenCode 的 CLI，以及 macOS/Linux 上对应 Desktop 应用、启动器和常见安装目录 | 三者均不存在时以醒目提示结束流程（退出码 0），不再询问或自动安装 agent |
 
 > 前置检查顺序刻意"依赖优先、智能体最后"（Homebrew → git → Node.js → Python3 → curl → 编程智能体）：智能体安装在无 cask 场景会回退 `npm install -g`，需 Node 先就位。
 
@@ -229,7 +229,7 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 
 ### 7.3 前置检查（`run_preflight`）
 
-依次执行前置依赖检查和 `preflight_agents`，详见 [5.1](#51-前置检查run_preflight)。原硬性依赖（git ≥ 2.50.0 / Node.js ≥ 20 / Python3 / curl）按 macOS/Linux 平台分别补齐。全局 agent 在选择对应的 Claude、OpenCode 或 Codex 插件时同步安装；该阶段只在 install 执行，卸载不执行。
+依次执行前置依赖检查和 `preflight_agents`，详见 [5.1](#51-前置检查run_preflight)。原硬性依赖（git ≥ 2.50.0 / Node.js ≥ 20 / Python3 / curl）按 macOS/Linux 平台分别补齐。前置检查同时识别 CLI 和 Desktop agent；如果三者均不存在，会以醒目提示结束插件安装，不再让用户选择或自动安装 agent。全局 agent 在选择对应的 Claude、OpenCode 或 Codex 插件时同步安装；该阶段只在 install 执行，卸载不执行。
 
 全局 subagent 的统一源文件位于各 Skill 的 `skills/<skill>/agents/*.md`。Claude Code 原样安装到 `~/.claude/agents/`，OpenCode 原样安装到 `~/.config/opencode/agents/`，Codex 则生成同名的 `~/.codex/agents/*.toml`（正文映射到 `developer_instructions`）。`initialize` 随插件安装 `initialize-gitnexus`、`initialize-graphify`、`initialize-context-scanner`，运行时由 `SKILL.md` 强制调用。安装器具备幂等性；同名非 CodeKit 文件会先备份到 `~/.local/state/CodeKit/agent-backups/`。
 
@@ -557,7 +557,7 @@ OpenCode 将 `~/.config/opencode/` 本身当作一个 npm 包管理，插件安�
 | `_sed_inplace <脚本> <文件>` | 跨平台原地 sed（先 BSD 后 GNU） |
 | `_git_ai_cmd` | 解析 git-ai 可执行路径（兼容 `~/.git-ai/bin`） |
 | `run_preflight` | 前置检查入口：Homebrew → git（≥ 2.50.0）→ Node.js（≥ 20）→ Python3 → curl → 编程智能体（含原硬性依赖；缺失时 brew 自动安装，失败退出流程；唯一例外：brew update 失败仅警告并继续） |
-| `_install_agent <claude\|codex\|opencode>` | 用 Homebrew 安装指定编程智能体（macOS 走 cask；Linux 回退 npm） |
+| `agent_presence <claude\|codex\|opencode>` | 统一探测对应 CLI、Desktop 应用、Linux 启动器和常见安装目录 |
 | `render_recap` | 所有安装与配置操作完成后打印安装/卸载结果汇总 |
 | `_run_python_selector <install\|uninstall>` | 生成临时组件清单，调用 `scripts/component-selector.py`，校验并回填选择结果 |
 | `_marketplace_remote_host` | 从当前仓库 `origin` 推导 Git 主机名（供 git-ai `allow_repositories` 与安装后 glab 指引使用；无本地源时无输出） |

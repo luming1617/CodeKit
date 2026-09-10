@@ -52,6 +52,59 @@ ANSI_RED = "\033[0;31m"
 ANSI_RESET = "\033[0m"
 
 
+# Desktop applications expose the same coding-agent capability as their CLI
+# counterparts, but they do not consistently install a command on PATH. Keep
+# these probes explicit and conservative: a config/data directory alone is not
+# proof that the application is installed.
+AGENT_COMMANDS = {
+    "claude": ("claude", "claude-desktop"),
+    "codex": ("codex",),
+    "opencode": ("opencode", "opencode-desktop"),
+}
+
+MACOS_AGENT_APPS = {
+    "claude": ("Claude.app",),
+    # The Codex app was merged into the new ChatGPT desktop app. Keep the old
+    # Codex bundle name as a compatibility probe for installations not yet
+    # migrated.
+    "codex": ("ChatGPT.app", "Codex.app"),
+    "opencode": ("OpenCode.app", "OpenCode Beta.app"),
+}
+
+LINUX_DESKTOP_FILES = {
+    "claude": ("claude.desktop", "claude-desktop.desktop"),
+    "codex": (
+        "chatgpt.desktop",
+        "codex.desktop",
+        "com.openai.chatgpt.desktop",
+        "com.openai.codex.desktop",
+    ),
+    "opencode": (
+        "opencode.desktop",
+        "opencode-desktop.desktop",
+        "ai.opencode.desktop.desktop",
+        "com.anomalyco.opencode.desktop",
+    ),
+}
+
+LINUX_AGENT_PATHS = {
+    "claude": (
+        Path("/opt/Claude"),
+        Path("/opt/claude-desktop"),
+        Path("/usr/lib/claude-desktop"),
+    ),
+    "codex": (
+        Path("/opt/ChatGPT"),
+        Path("/opt/Codex"),
+    ),
+    "opencode": (
+        Path("/opt/OpenCode"),
+        Path("/opt/opencode-desktop"),
+        Path("/usr/lib/opencode-desktop"),
+    ),
+}
+
+
 # npm 包名、可执行命令和版本参数的唯一映射，供状态检测、安装路径和
 # 安装/卸载流程共同复用。
 NPM_COMPONENTS = {
@@ -120,6 +173,65 @@ def command_version(command: str, args: list[str]) -> str:
         return ""
     output = run_command([command, *args])
     return output.splitlines()[0] if output else ""
+
+
+def _linux_application_dirs(home: Path) -> tuple[Path, ...]:
+    """返回 XDG 应用目录，覆盖用户级和常见系统级安装位置。"""
+    configured_home = os.environ.get("XDG_DATA_HOME")
+    data_home = (
+        Path(configured_home).expanduser()
+        if configured_home
+        else home / ".local" / "share"
+    )
+    configured_dirs = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
+    system_dirs = tuple(
+        Path(value).expanduser() for value in configured_dirs.split(os.pathsep) if value
+    )
+    return tuple(dict.fromkeys((data_home, *system_dirs)))
+
+
+def agent_presence(name: str, home: Path, os_name: Optional[str] = None) -> str:
+    """返回 agent 的发现来源；CLI 和 Desktop 均视为已安装。"""
+    if name not in AGENT_COMMANDS:
+        return ""
+    for command in AGENT_COMMANDS[name]:
+        found = shutil.which(command)
+        if found:
+            return f"{command} ({found})"
+
+    os_name = os_name or platform.system()
+    if os_name == "Darwin":
+        for app_name in MACOS_AGENT_APPS[name]:
+            for app_dir in (Path("/Applications"), home / "Applications"):
+                candidate = app_dir / app_name
+                if candidate.is_dir():
+                    return str(candidate)
+        return ""
+
+    if os_name == "Linux":
+        for application_dir in _linux_application_dirs(home):
+            for desktop_file in LINUX_DESKTOP_FILES[name]:
+                candidate = application_dir / "applications" / desktop_file
+                if candidate.is_file():
+                    return str(candidate)
+        for candidate in LINUX_AGENT_PATHS[name]:
+            if candidate.exists():
+                return str(candidate)
+        # User-local unpacked desktop bundles are common for AppImage-style
+        # installs and do not necessarily create a desktop entry.
+        for relative in (
+            Path(".local") / "share" / "applications" / f"{name}-desktop",
+            Path(".local") / "opt" / name,
+        ):
+            candidate = home / relative
+            if candidate.exists():
+                return str(candidate)
+    return ""
+
+
+def agent_present(name: str, home: Path, os_name: Optional[str] = None) -> bool:
+    """判断 Claude、Codex 或 OpenCode 的 CLI/Desktop 是否可用。"""
+    return bool(agent_presence(name, home, os_name))
 
 
 def git_ai_command(home: Path) -> Optional[str]:
