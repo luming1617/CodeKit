@@ -499,12 +499,21 @@ class SharedStateTests(unittest.TestCase):
         self.root.mkdir()
         self.stage = make_stage(self.home)
         self.target = qoder.install_direct(self.root, self.stage, "1.0.0")
+        # 插件状态以 CLI 为前置，测试里放一个可执行的假 CLI，等价于已装 CLI。
+        self.cli = self.root / "entry" / "qodercn"
+        self.cli.parent.mkdir(parents=True, exist_ok=True)
+        self.write_cli()
         self.context = detector.Context(
             home=self.home,
             marketplace_local=REPO_DIR,
             version_file=self.home / "installed_versions",
         )
         self.no_cli_env = empty_environment()
+
+    def write_cli(self) -> None:
+        """写入一个可执行的假 CLI，供只探测存在性的检测路径使用。"""
+        self.cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.cli.chmod(0o755)
 
     def detect(self, agents_state: str = "up_to_date") -> detector.ComponentState:
         with patch.object(shutil, "which", return_value=None):
@@ -513,7 +522,12 @@ class SharedStateTests(unittest.TestCase):
                     os.environ.pop(self.descriptor.config_env, None)
                     return detector.detect_component("qodercn_plugin", self.context, {})
 
-    def test_desktop_only_install_is_detected_without_any_cli(self) -> None:
+    def test_plugin_state_requires_the_platform_cli(self) -> None:
+        # 只装了桌面端、没有 CLI 时，插件不算已安装，选择器会默认勾选并自动补 CLI。
+        self.cli.unlink()
+        state = self.detect()
+        self.assertEqual(state.status, "not_installed")
+        self.write_cli()
         state = self.detect()
         self.assertEqual(state.status, "up_to_date")
         self.assertEqual(state.installed_version, "1.0.0")
@@ -563,7 +577,7 @@ class SharedStateTests(unittest.TestCase):
                     detector.repository_plugin_version(self.context),
                 )
 
-    def test_claude_plugin_is_detected_from_the_shared_cache_without_a_cli(self) -> None:
+    def test_claude_plugin_install_state_needs_the_cli(self) -> None:
         cache = self.home / ".claude" / "plugins" / "cache" / "co-daming" / "codekit"
         cache.mkdir(parents=True)
         context = detector.Context(
@@ -573,7 +587,13 @@ class SharedStateTests(unittest.TestCase):
         )
         with patch.object(shutil, "which", return_value=None):
             with patch.object(detector, "platform_subagents_state", return_value="up_to_date"):
+                # 缓存由两端共享写入，卸载复核仍认它；安装状态则必须另有 CLI。
                 self.assertTrue(detector.present("claude_plugin", context))
+                self.assertFalse(detector.plugin_ready("claude_plugin", context))
+                self.assertEqual(
+                    detector.detect_component("claude_plugin", context, {}).status,
+                    "not_installed",
+                )
                 self.assertFalse(detector.present("codex_plugin", context))
 
     def test_claude_without_cli_or_cache_stays_absent(self) -> None:
@@ -595,14 +615,16 @@ class PreflightTests(unittest.TestCase):
         installer.logger = Mock()
         return installer
 
-    def test_shared_qoder_root_satisfies_the_agent_preflight(self) -> None:
+    def test_shared_qoder_root_alone_does_not_satisfy_the_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             (home / ".qoder").mkdir()
             installer = self.build(home)
             with patch.object(shutil, "which", return_value=None):
                 self.assertTrue(installer.preflight_agents())
-            installer.logger.error.assert_not_called()
+            # 只有共享配置根（桌面端痕迹）时按无 CLI 处理：提示但不阻断流程。
+            installer.logger.warn.assert_called_once()
+            installer.logger.success.assert_not_called()
 
     def test_qodercn_cli_alone_satisfies_the_agent_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -613,15 +635,16 @@ class PreflightTests(unittest.TestCase):
 
             with patch.object(shutil, "which", side_effect=which):
                 self.assertTrue(installer.preflight_agents())
-            installer.logger.error.assert_not_called()
+            installer.logger.warn.assert_not_called()
 
     def test_preflight_message_names_every_supported_platform(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             installer = self.build(Path(directory))
             with patch.object(shutil, "which", return_value=None):
-                self.assertFalse(installer.preflight_agents())
-        message = installer.logger.error.call_args[0][0]
-        for label in ("Claude", "Codex", "OpenCode", "Qoder", "Qoder CN"):
+                # 没有任何 CLI 时不再结束流程，只提示后续由勾选的插件自动安装。
+                self.assertTrue(installer.preflight_agents())
+        message = "\n".join(str(call.args[0]) for call in installer.logger.info.call_args_list)
+        for label in ("Claude Code", "Codex", "OpenCode", "Qoder", "Qoder CN"):
             self.assertIn(label, message)
 
 
@@ -656,7 +679,9 @@ class InstallFlowTests(unittest.TestCase):
         )
         self.environment.start()
         self.addCleanup(self.environment.stop)
-        presence = patch.object(detector, "agent_presence", return_value="qodercn (/usr/bin/qodercn)")
+        presence = patch.object(
+            detector, "agent_cli_presence", return_value="qodercn (/usr/bin/qodercn)"
+        )
         presence.start()
         self.addCleanup(presence.stop)
         foreign = patch.object(qoder, "foreign_os_roots", return_value=[])
@@ -669,8 +694,8 @@ class InstallFlowTests(unittest.TestCase):
                 self.calls = agents
                 return self.installer.install_qoder_plugin("qodercn")
 
-    def test_absent_shared_root_is_not_installed_without_a_cli(self) -> None:
-        # The desktop-only path writes the very registry the CLI would create.
+    def test_cli_without_plugin_support_writes_the_shared_registry(self) -> None:
+        # CLI 存在但太旧、不支持 plugins install 时，安装器直接写共享注册表。
         self.assertTrue(self.install(""))
         state = qoder.inspect(self.descriptor, self.home)
         self.assertTrue(state.installed)
@@ -703,8 +728,9 @@ class InstallFlowTests(unittest.TestCase):
         installer = build_installer(self.home, None)
         self.assertFalse(installer.install_qoder_plugin("qodercn"))
 
-    def test_platform_without_any_trace_is_skipped_with_a_warning(self) -> None:
-        with patch.object(detector, "agent_presence", return_value=""):
+    def test_platform_without_a_cli_is_skipped_with_a_warning(self) -> None:
+        # 自动安装 CLI 失败（无 CLI）时不写共享注册表，也不继续装插件。
+        with patch.object(self.installer, "ensure_agent_cli", return_value=False):
             self.assertFalse(self.installer.install_qoder_plugin("qodercn"))
         self.assertFalse(qoder.plugin_entries(qoder.read_registry(self.root)))
 

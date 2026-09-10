@@ -385,6 +385,52 @@ def looks_like_desktop_launcher(path: str) -> bool:
     return "/contents/" in normalized or "/.app/" in normalized
 
 
+def cli_path(
+    platform_key: str,
+    home: Path,
+    environ: Optional[Mapping[str, str]] = None,
+) -> str:
+    """Return the platform CLI's executable path, ignoring desktop launchers.
+
+    The official installer drops the CLI inside the shared configuration root
+    (``<root>/entry``) and only then adds it to PATH from the shell profile, so
+    a plain PATH lookup misses a CLI that was just installed in this process.
+    """
+    descriptor = PLATFORMS[platform_key]
+    environ = os.environ if environ is None else environ
+    _name, found = find_cli(descriptor, environ)
+    if found and not looks_like_desktop_launcher(found):
+        return found
+    try:
+        root = resolve_config_root(descriptor, home, environ)
+    except ValueError:
+        return ""
+    for directory in (root / "entry", root / "bin"):
+        for command in descriptor.cli_commands:
+            candidate = directory / command
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+    return ""
+
+
+def cli_presence(
+    platform_key: str,
+    home: Path,
+    environ: Optional[Mapping[str, str]] = None,
+) -> str:
+    """Describe the platform CLI's location; an empty string means missing."""
+    descriptor = PLATFORMS[platform_key]
+    path = cli_path(platform_key, home, environ)
+    if not path:
+        return ""
+    name = Path(path).name
+    command = next(
+        (item for item in descriptor.cli_commands if item == name),
+        descriptor.cli_commands[0],
+    )
+    return f"{command} ({path})"
+
+
 def capable_cli(
     descriptor: Platform,
     environ: Optional[Mapping[str, str]] = None,

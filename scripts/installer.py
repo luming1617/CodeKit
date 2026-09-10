@@ -28,6 +28,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+import installer_agents as agents  # noqa: E402
 import installer_config as config  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 import installer_sources as source_builder  # noqa: E402
@@ -385,26 +386,27 @@ class Installer:
         return f"╔{border}╗\n{rows}\n╚{border}╝"
 
     def preflight_agents(self) -> bool:
-        """检查至少一个 CLI 或 Desktop agent，缺失时显眼提示并结束。"""
+        """只检查五个平台的 CLI，缺失时提示后续由勾选的插件自动安装 CLI。"""
         available = [
-            (name, detector.agent_presence(name, self.home, self.os_name))
-            for name in ("claude", "codex", "opencode", "qoder", "qodercn")
+            (entry.key, detector.agent_cli_presence(entry.key, self.home))
+            for entry in agents.AGENT_CLIS
         ]
-        available = [(name, source) for name, source in available if source]
+        available = [(key, source) for key, source in available if source]
         if available:
-            detail = ", ".join(f"{name}: {source}" for name, source in available)
-            self.logger.success(f"Coding agent(s) detected: {detail}")
+            detail = ", ".join(f"{key}: {source}" for key, source in available)
+            self.logger.success(f"\n \n Coding agent CLI(s) detected: {detail}")
             return True
-        self.logger.error(
+        self.logger.warn("未检测到任何编程智能体 CLI。")
+        self.logger.info(
             "\n" + self.agent_notice_box(
                 (
-                    "⚠ 未检测到 Claude、Codex、OpenCode、Qoder 或 Qoder CN",
-                    "请先安装一个 CLI 或 Desktop agent，再重新运行 CodeKit。",
-                    "本次插件安装流程已结束。",
+                    "未检测到编程智能体 CLI：Claude Code / Codex / OpenCode / Qoder / Qoder CN",
+                    "在选择器中勾选某个平台的插件后，安装器会先自动安装该平台 CLI，再安装插件。",
+                    "未勾选任何平台插件时，安装器不会自动安装 CLI。",
                 )
             )
         )
-        return False
+        return True
 
     def prepare_sources(self) -> None:
         """从本地仓库构建 Claude/Codex/OpenCode/Qoder 使用的兼容插件源。"""
@@ -427,9 +429,30 @@ class Installer:
         except (OSError, RuntimeError, ValueError) as exc:
             raise InstallerError(f"Component state detection failed: {exc}") from exc
 
+    def agent_cli_status(self, platform_key: str) -> tuple[str, str]:
+        """返回平台 CLI 的发现来源与版本；同一次运行内复用探测结果。"""
+        cache = getattr(self, "agent_cli_cache", None)
+        if cache is None:
+            cache = self.agent_cli_cache = {}
+        if platform_key not in cache:
+            source = detector.agent_cli_presence(platform_key, self.home)
+            version = agents.cli_version(platform_key, self.home) if source else ""
+            cache[platform_key] = (source, version)
+        return cache[platform_key]
+
+    def refresh_agent_cli_status(self, platform_key: str) -> tuple[str, str]:
+        """安装 CLI 后丢弃缓存，让后续状态展示读取最新探测结果。"""
+        cache = getattr(self, "agent_cli_cache", None)
+        if cache is not None:
+            cache.pop(platform_key, None)
+        return self.agent_cli_status(platform_key)
+
     def component_tag(self, component_id: str) -> str:
-        """生成安装组件选择器中的状态提示。"""
+        """生成安装组件选择器中的状态提示，插件额外区分 CLI 本体的状态与版本。"""
         item = self.states[component_id]
+        entry = agents.component_agent(component_id)
+        if entry is not None:
+            return self.plugin_component_tag(item, entry)
         installed_version = item.installed_version or "unknown"
         if component_id == "gh":
             # gh --version 会附带日期、平台和构建信息，选择器只保留三段版本号。
@@ -441,6 +464,22 @@ class Installer:
         if component_id == "git_ai":
             return f" (组件已最新 {installed_version} · 无公开版本源，勾选后重装)"
         return f" (组件已最新 {installed_version}，勾选后重装)"
+
+    def plugin_component_tag(self, item, entry) -> str:
+        """插件条目同时显示插件状态/版本与对应平台 CLI 的状态/版本。"""
+        source, cli_version = self.agent_cli_status(entry.key)
+        if source:
+            cli_text = f"CLI 已安装 {cli_version or 'unknown'}"
+        else:
+            cli_text = f"CLI 未安装（勾选后自动安装 {entry.display_name} CLI）"
+        plugin_version = item.installed_version or "unknown"
+        if item.status == "not_installed":
+            return f" (插件未安装 · {cli_text}，勾选后安装插件)"
+        if item.status == "installed":
+            if item.latest_version:
+                return f" (插件有更新 {plugin_version} → {item.latest_version} · {cli_text}，勾选后升级)"
+            return f" (插件有更新 · {cli_text}，勾选后升级)"
+        return f" (插件已最新 {plugin_version} · {cli_text}，勾选后重装)"
 
     def shell_config(self) -> tuple[Path, str]:
         """根据用户 shell 返回配置文件路径及需要写入的 PATH 配置行。"""
@@ -459,12 +498,21 @@ class Installer:
         except (OSError, UnicodeDecodeError):
             return False
 
+    def cli_available_for(self, component_id: str) -> bool:
+        """判断组件是否没有 CLI 前置要求，或该前置已经满足。"""
+        entry = agents.component_agent(component_id)
+        if entry is None:
+            return True
+        return bool(self.agent_cli_status(entry.key)[0])
+
     def select_components(self) -> list[str]:
         """按安装状态生成默认选择，并在交互模式下调用选择器回填用户选择。"""
         default = [
             item.component_id
             for item in self.components
             if self.states[item.component_id].status != "up_to_date"
+            # 缺 CLI 的插件不默认勾选：自动安装 CLI 必须来自用户的显式勾选。
+            and self.cli_available_for(item.component_id)
         ]
         path_selected = not self.path_configured()
         # 非交互执行必须可用于 CI：采用默认选择，并跳过终端选择器。
@@ -617,7 +665,9 @@ class Installer:
         self.set_npm()
         package = definition["package"]
         command = definition["command"]
-        result = self.run_command(["npm", "install", "-g", f"{package}@latest"])
+        result = self.run_command(
+            ["npm", "install", "-g", f"{package}@latest", *config.NPM_REGISTRY_ARGS]
+        )
         return result.returncode == 0 and self.command_exists(command)
 
     def ensure_unzip(self) -> bool:
@@ -705,7 +755,17 @@ class Installer:
             self.logger.warn("No supported coding agent found; skipped Feishu skills.")
             return True
         result = self.run_command(
-            ["npx", "skills", "add", "larksuite/cli", "-y", "-g", "--agent", *agents]
+            [
+                "npx",
+                f"--registry={config.NPM_REGISTRY}",
+                "skills",
+                "add",
+                "larksuite/cli",
+                "-y",
+                "-g",
+                "--agent",
+                *agents,
+            ]
         )
         return result.returncode == 0
 
@@ -738,9 +798,60 @@ class Installer:
             self.track(path)
         return result.returncode == 0
 
+    def ensure_agent_cli(self, platform_key: str) -> bool:
+        """安装插件前确保平台 CLI 可用；缺失时自动安装 CLI 本体。"""
+        entry = agents.agent_cli(platform_key)
+        if entry is None:
+            return False
+        source, _version = self.agent_cli_status(platform_key)
+        if source:
+            self.logger.info(f"{entry.display_name} CLI already available: {source}")
+            return True
+        if not agents.supports_install(entry, self.os_name):
+            self.logger.error(
+                f"未检测到 {entry.display_name} CLI，且当前平台没有可用的自动安装渠道。"
+            )
+            return False
+
+        self.logger.section(f"安装智能体 CLI：{entry.display_name}")
+        self.logger.info(
+            f"未检测到 {entry.display_name} CLI，先自动安装 CLI，随后再安装对应插件。"
+        )
+        # 官方脚本把 CLI 放进配置根下的 entry/bin 目录，只有先补进 PATH，
+        # 后续的可用性校验和插件安装才能在同一进程里直接调用它。
+        for directory in reversed(agents.cli_extra_paths(entry, self.home)):
+            self.prepend_path(directory)
+        installed = False
+        for command in agents.install_plan(entry, self.os_name):
+            if command[0] == "npm":
+                self.set_npm()
+            self.run_command(list(command))
+            if detector.agent_cli_presence(platform_key, self.home):
+                installed = True
+                break
+        if not installed and entry.script_url:
+            installed = self.run_remote_script(entry.script_url) or self.run_command(
+                ["bash", "-c", f"curl -fsSL {entry.script_url} | bash"]
+            ).returncode == 0
+            installed = installed and bool(detector.agent_cli_presence(platform_key, self.home))
+        if not installed:
+            note = agents.fallback_note(entry)
+            self.logger.error(
+                f"{entry.display_name} CLI 安装失败；请手动执行：{note}，然后重新运行安装。"
+            )
+            return False
+        source, version = self.refresh_agent_cli_status(platform_key)
+        self.logger.success(
+            f"{entry.display_name} CLI 已就绪：{version or 'unknown'} ({source})"
+        )
+        return True
+
     def install_claude_plugin(self) -> bool:
         """注册本地 Claude marketplace，并按已安装状态执行插件安装或更新。"""
-        if not self.command_exists("claude") or not self.market_dir:
+        if not self.market_dir:
+            return False
+        # 勾选插件但缺少 CLI 时先自动安装 CLI，再安装插件。
+        if not self.ensure_agent_cli("claude"):
             return False
         if self.run_command(["claude", "plugin", "marketplace", "add", str(self.market_dir)]).returncode != 0:
             return False
@@ -757,7 +868,9 @@ class Installer:
 
     def install_opencode_plugin(self) -> bool:
         """把本地 OpenCode 插件源写入全局配置；已存在时尝试强制刷新插件。"""
-        if not self.command_exists("opencode") or not self.opencode_source_dir:
+        if not self.opencode_source_dir:
+            return False
+        if not self.ensure_agent_cli("opencode"):
             return False
         path = self.home / ".config" / "opencode" / "opencode.json"
         plugin = f"codekit@file://{self.opencode_source_dir}"
@@ -776,7 +889,9 @@ class Installer:
 
     def install_codex_plugin(self) -> bool:
         """注册本地 Codex marketplace，清理旧技能残留后添加 CodeKit 插件。"""
-        if not self.command_exists("codex") or not self.market_dir:
+        if not self.market_dir:
+            return False
+        if not self.ensure_agent_cli("codex"):
             return False
         # 旧版本可能把兼容技能放进 ~/.agents；安装前清掉旧生成物，避免重复加载。
         for path in (self.home / ".agents" / "skills").glob("keel-*"):
@@ -805,8 +920,8 @@ class Installer:
         stage = self.qoder_source_dir
         if not stage or not stage.is_dir():
             return False
-        if not detector.agent_presence(platform_key, self.home, self.os_name):
-            self.logger.warn(f"No {descriptor.display_name} CLI or desktop IDE detected.")
+        # 插件以 CLI 为前置：CLI 缺失时先自动安装，再写共享注册表。
+        if not self.ensure_agent_cli(platform_key):
             return False
         try:
             root = qoder.resolve_config_root(descriptor, self.home)
@@ -965,16 +1080,16 @@ class Installer:
             rows.append(
                 (
                     f"{label} 中输入：/codekit:initialize",
-                    "初始化当前仓库；CLI 与 Desktop 共享同一配置根，安装一次两端生效",
+                    "初始化当前仓库",
                 )
             )
-        if qoder_labels:
-            rows.append(
-                (
-                    "重启 " + "、".join(qoder_labels) + " 的 CLI 与 IDE",
-                    "让新安装的插件和全局 subagent 被重新加载",
-                )
-            )
+        # if qoder_labels:
+        #     rows.append(
+        #         (
+        #             "重启 " + "、".join(qoder_labels) + " 的 CLI 与 IDE",
+        #             "让新安装的插件和全局 subagent 被重新加载",
+        #         )
+        #     )
 
         if self.command_exists("gh"):
             rows.append(("gh auth login", "推荐浏览器登录；Git 操作选择 HTTPS，并确认使用 GitHub 凭据"))
@@ -1004,11 +1119,12 @@ class Installer:
 
     def run(self) -> int:
         """执行完整安装生命周期：前置检查、安装、配置和结果收尾。"""
-        self.logger.info(f"=== CodeKit Plugin Install v{self.plugin_version} ===")
+        self.logger.info(f"\n \n === CodeKit Plugin Install v{self.plugin_version} ===")
         if platform.system() not in {"Darwin", "Linux"}:
             raise InstallerError(f"Unsupported OS: {platform.system()}. Only macOS/Linux.")
         required_helpers = (
             SCRIPT_DIR / "component-registry.py",
+            SCRIPT_DIR / "installer_agents.py",
             SCRIPT_DIR / "installer_config.py",
             SCRIPT_DIR / "installer_state.py",
             SCRIPT_DIR / "installer_sources.py",

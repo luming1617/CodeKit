@@ -31,6 +31,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 
+import installer_agents as agents  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 
 
@@ -244,6 +245,29 @@ def agent_present(name: str, home: Path, os_name: Optional[str] = None) -> bool:
     return bool(agent_presence(name, home, os_name))
 
 
+def agent_cli_presence(
+    platform_key: str,
+    home: Path,
+    environ: Optional[dict[str, str]] = None,
+) -> str:
+    """只探测 agent 平台的 CLI 本体。
+
+    Desktop 应用、Linux 启动器和共享配置根都不算可用：插件安装以 CLI 为前置，
+    缺少 CLI 时安装器会先自动安装 CLI 再装插件。
+    """
+    return agents.cli_presence(platform_key, home, environ)
+
+
+def agent_cli_state(component_id: str, context: Context) -> tuple[bool, str]:
+    """返回插件对应平台 CLI 的存在性与版本，供安装选择器和结果汇总展示。"""
+    entry = agents.component_agent(component_id)
+    if entry is None:
+        return False, ""
+    if not agents.cli_presence(entry.key, context.home):
+        return False, ""
+    return True, agents.cli_version(entry.key, context.home)
+
+
 def git_ai_command(home: Path) -> Optional[str]:
     """查找 PATH 中或 CodeKit 用户目录中的 git-ai 可执行文件。"""
     found = shutil.which("git-ai")
@@ -302,17 +326,18 @@ def fetch_json(url: str) -> Any:
 
 
 def latest_versions(components: Iterable[str]) -> dict[str, str]:
-    """从各组件的官方源读取最新版本，供安装选择器判断是否可升级。"""
+    """从各组件的发布源读取最新版本，供安装选择器判断是否可升级。"""
     sources = {
         "glab": ("https://gitlab.com/api/v4/projects/34675721/releases/permalink/latest", "tag_name"),
         "rtk": ("https://api.github.com/repos/rtk-ai/rtk/releases/latest", "tag_name"),
         "gh": ("https://api.github.com/repos/cli/cli/releases/latest", "tag_name"),
-        "gitnexus": ("https://registry.npmjs.org/gitnexus/latest", "version"),
+        # npm 元数据同样走镜像源：直连 registry.npmjs.org 探测会拖慢甚至超时。
+        "gitnexus": (f"{config.NPM_REGISTRY}/gitnexus/latest", "version"),
         "dingtalk_cli": (
-            "https://registry.npmjs.org/dingtalk-workspace-cli/latest",
+            f"{config.NPM_REGISTRY}/dingtalk-workspace-cli/latest",
             "version",
         ),
-        "feishu_cli": ("https://registry.npmjs.org/@larksuite%2fcli/latest", "version"),
+        "feishu_cli": (f"{config.NPM_REGISTRY}/@larksuite/cli/latest", "version"),
         "graphify": ("https://pypi.org/pypi/graphifyy/json", "version"),
     }
     result: dict[str, str] = {}
@@ -359,13 +384,8 @@ def repository_plugin_version(context: Context) -> str:
         return "installed"
 
 
-def claude_cache_present(home: Path) -> bool:
-    """判断 Claude 插件缓存是否已由 CLI 或 Desktop 写入共享目录。"""
-    return (home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE / CLAUDE_PLUGIN).is_dir()
-
-
 def qoder_present(descriptor: Any, context: Context) -> bool:
-    """按共享配置根判断 Qoder 插件状态，不要求 CLI 或 Desktop 正在运行。"""
+    """按共享配置根判断 Qoder 插件文件状态，不要求 CLI 或 Desktop 正在运行。"""
     try:
         state = qoder.inspect(descriptor, context.home)
     except ValueError:
@@ -412,8 +432,17 @@ def component_version(component: str, context: Context) -> str:
     return ""
 
 
+def claude_cache_present(home: Path) -> bool:
+    """判断 Claude 插件缓存是否已由 CLI 或 Desktop 写入共享目录。"""
+    return (home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE / CLAUDE_PLUGIN).is_dir()
+
+
 def present(component: str, context: Context) -> bool:
-    """判断组件是否存在；插件同时要求对应平台的 agent 已同步。"""
+    """判断组件文件是否存在；插件同时要求对应平台的 agent 已同步。
+
+    这里只看文件层面的落盘结果，卸载复核与 `--present` 子命令依赖它；
+    安装状态是否成立另由 plugin_ready 追加 CLI 前置判断。
+    """
     if component == "git_ai":
         return git_ai_command(context.home) is not None
     if component in {"rtk", "graphify", "gh", "glab"}:
@@ -442,10 +471,22 @@ def present(component: str, context: Context) -> bool:
     return False
 
 
+def plugin_ready(component: str, context: Context) -> bool:
+    """判断插件是否已安装且其平台 CLI 可用。
+
+    安装状态以 CLI 为准：只有桌面端时插件视为未安装，安装器会默认勾选，
+    并先自动安装 CLI 再安装插件。
+    """
+    entry = agents.component_agent(component)
+    if entry is not None and not agent_cli_presence(entry.key, context.home):
+        return False
+    return present(component, context)
+
+
 def detect_component(component: str, context: Context, latest: dict[str, str]) -> ComponentState:
     """计算组件当前状态，并在可取得最新版本时区分已安装和可升级。"""
     state = ComponentState(component)
-    if not present(component, context):
+    if not plugin_ready(component, context):
         return state
     state.installed_version = component_version(component, context)
 
@@ -545,6 +586,17 @@ def recap_presence_version(component: str, context: Context) -> tuple[bool, str]
     """同时读取组件存在性和版本，供安装/卸载结果汇总复核。"""
     is_present = present(component, context)
     return is_present, component_version(component, context) if is_present else ""
+
+
+def component_cli_note(component: str, context: Context) -> str:
+    """返回插件对应平台 CLI 本体的状态与版本；非插件组件返回空字符串。"""
+    entry = agents.component_agent(component)
+    if entry is None:
+        return ""
+    is_present, version = agent_cli_state(component, context)
+    if not is_present:
+        return f"CLI {entry.display_name} 未安装"
+    return f"CLI {version or 'unknown'}"
 
 
 def terminal_width(value: str) -> int:
@@ -662,9 +714,9 @@ def component_install_path(component: str, context: Context) -> str:
 
 def render_install_table(rows: list[tuple[str, str, str, str]]) -> None:
     """按内容计算列宽并输出紧凑的安装结果表。"""
-    headers = ("组件", "安装结果", "安装路径", "安装版本")
+    headers = ("组件", "安装结果", "安装路径", "版本（插件 · CLI）")
     max_path_width = 48
-    max_version_width = 40
+    max_version_width = 56
     normalized_rows = [
         (
             component,
@@ -716,12 +768,17 @@ def render_recap(mode: str, records: Iterable[str], context: Context) -> None:
                 ok_count += 1
             else:
                 fail_count += 1
+            # 插件组件同时给出插件本体与对应平台 CLI 的状态/版本。
+            cli_note = component_cli_note(component, context)
+            version_cell = version or "---"
+            if cli_note:
+                version_cell = f"{version_cell} · {cli_note}"
             install_rows.append(
                 (
                     component_description(component),
                     "成功" if succeeded else "失败",
                     component_install_path(component, context) if succeeded else "---",
-                    version or "---",
+                    version_cell,
                 )
             )
         render_install_table(install_rows)

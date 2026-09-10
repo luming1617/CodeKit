@@ -47,6 +47,8 @@
 | **交互式选择** | 提供可视化多选界面，用户可自由勾选要装的组件 |
 | **快速失败** | 前置依赖缺失时立即退出，避免半途失败 |
 
+> **npm 镜像源**：所有 npm 安装（Claude / Codex / OpenCode 的 CLI、`gitnexus`、钉钉 CLI、飞书 CLI）统一附加 `--registry=https://registry.npmmirror.com`，飞书的 `npx skills add` 同样指定该源；`gitnexus`、钉钉 CLI、飞书 CLI 的**版本探测**也走该镜像的 `/<包名>/latest`。避免直连 `registry.npmjs.org` 超时。唯一来源是 `scripts/installer_config.py` 的 `NPM_REGISTRY`。
+
 ---
 
 ## 2. 安装与调用方式
@@ -93,7 +95,7 @@ bash uninstall.sh [-y]
 | curl         | 未装则 `brew install curl` 自动安装（brew 的 curl 为 keg-only，装后按 opt 路径兜底挂载）                                                              | 安装失败即**退出流程** |
 | 编程智能体   | 检查 Claude / Codex / OpenCode / Qoder / Qoder CN 的 CLI，以及 macOS/Linux 上对应 Desktop 应用、启动器和常见安装目录；Qoder 另把共享配置根视为可用 | 五者均不存在时以醒目提示结束流程（退出码 0），不再询问或自动安装 agent |
 
-> 前置检查顺序刻意"依赖优先、智能体最后"（Homebrew → git → Node.js → Python3 → curl → 编程智能体）：智能体安装在无 cask 场景会回退 `npm install -g`，需 Node 先就位。
+> 前置检查顺序刻意"依赖优先、智能体最后"（Homebrew → git → Node.js → Python3 → curl → 编程智能体）：智能体安装在无 cask 场景会回退 `npm install -g`（统一走 npmmirror 镜像源），需 Node 先就位。
 
 
 ---
@@ -136,9 +138,9 @@ bash uninstall.sh [-y]
 | `codex_plugin`      | 当前仓库根目录生成的兼容市场源（重建旧版 `plugins/codekit` 布局）       | 清理旧散装 `~/.agents/skills/keel-*` → `codex plugin marketplace add <兼容市场源>` →（已装且市场源为 Git 地址时 `codex plugin marketplace upgrade co-daming`）→ `codex plugin add codekit@co-daming` → `_record_marketplace_sha`；本地源为空即提示跳过，无回退 | 插件缓存 `~/.codex/plugins/cache/`，启用状态写 `~/.codex/config.toml`                           |
 | `qoder_plugin`      | 安装状态目录生成的 Qoder 插件源（`qoder-source/codekit`，仅 `.qoder-plugin/` + `skills/`） | CLI 具备 `plugins install --scope user --json` 时执行 `<cli> --config-dir ~/.qoder plugins install <源> --scope user --json`；否则直接写共享注册表与缓存（Desktop-only 兜底） | `~/.qoder/plugins/installed_plugins_v2.json`、`~/.qoder/settings.json`、`~/.qoder/agents/` |
 | `qodercn_plugin`    | 安装状态目录生成的 Qoder 插件源（`qoder-source/codekit`，与 Qoder 共用同一份构建） | 同上，命令换为 `qodercn`、配置根换为 `~/.qoder-cn` | `~/.qoder-cn/plugins/installed_plugins_v2.json`、`~/.qoder-cn/settings.json`、`~/.qoder-cn/agents/` |
-| `gitnexus`          | 官方 npm 渠道包 `gitnexus`（无 Homebrew formula）                          | `_set_npm`（前缀指向 `~/.npm-global`）→ `npm install -g gitnexus@latest`（用户态、免 sudo）→ 成功后 `gitnexus setup`；无回退                                                                                | `~/.npm-global/bin/gitnexus`                                                                  |
-| `dingtalk_cli`      | npm 包 `dingtalk-workspace-cli`（官方 DingTalk Workspace CLI）              | 安装前检查 `unzip`，缺失时先通过当前平台包管理器安装 → `_set_npm`（前缀指向 `~/.npm-global`）→ `npm install -g dingtalk-workspace-cli@latest`；无自动认证配置                                                                                                                 | `~/.npm-global/bin/dws`                                                                       |
-| `feishu_cli`        | npm 包 `@larksuite/cli`（官方 Lark/Feishu CLI）                              | `_set_npm`（前缀指向 `~/.npm-global`）→ `npm install -g @larksuite/cli@latest` → `npx skills add larksuite/cli -y -g --agent <已安装的智能体>`；显式限定 Claude Code、Codex、OpenCode，避免 PromptScript 导致整批失败                                                                 | `~/.npm-global/bin/lark-cli`                                                                  |
+| `gitnexus`          | 官方 npm 渠道包 `gitnexus`（无 Homebrew formula）                          | `_set_npm`（前缀指向 `~/.npm-global`）→ `npm install -g gitnexus@latest --registry=https://registry.npmmirror.com`（用户态、免 sudo）→ 成功后 `gitnexus setup`；无回退                                                                                | `~/.npm-global/bin/gitnexus`                                                                  |
+| `dingtalk_cli`      | npm 包 `dingtalk-workspace-cli`（官方 DingTalk Workspace CLI）              | 安装前检查 `unzip`，缺失时先通过当前平台包管理器安装 → `_set_npm`（前缀指向 `~/.npm-global`）→ `npm install -g dingtalk-workspace-cli@latest --registry=https://registry.npmmirror.com`；无自动认证配置                                                                                                                 | `~/.npm-global/bin/dws`                                                                       |
+| `feishu_cli`        | npm 包 `@larksuite/cli`（官方 Lark/Feishu CLI）                              | `_set_npm`（前缀指向 `~/.npm-global`）→ `npm install -g @larksuite/cli@latest --registry=https://registry.npmmirror.com` → `npx --registry=https://registry.npmmirror.com skills add larksuite/cli -y -g --agent <已安装的智能体>`；显式限定 Claude Code、Codex、OpenCode，避免 PromptScript 导致整批失败                                                                 | `~/.npm-global/bin/lark-cli`                                                                  |
 | `graphify`          | 官方 PyPI 渠道包 `graphifyy`（无 Homebrew formula）                          | `pipx install graphifyy`（已装则 `pipx upgrade graphifyy`）→ 失败回退独立 venv：`python3 -m venv` + `bin/pip install -U graphifyy` + 软链到 `~/.local/bin` → 按已检测智能体执行 `graphify install --platform <agent>` → `graphify hook install` | pipx 托管环境，或 `~/.local/share/CodeKit/venvs/graphify` + `~/.local/bin/graphify`             |
 | `gh`                | Homebrew formula `gh`                                                        | `_brew_install_or_upgrade gh`（已装则 `brew upgrade gh`）；无回退                                                                                                                                            | brew 的 bin 目录                                                                              |
 | `glab`              | Homebrew formula `glab`                                                      | `_brew_install_or_upgrade glab`（已装则 `brew upgrade glab`）；无回退                                                                                                                                        | brew 的 bin 目录                                                                              |
@@ -158,9 +160,9 @@ bash uninstall.sh [-y]
 | `opencode_plugin`   | 同上 `marketplace_sha`                    | 同上 `HEAD`                                                    | 安装状态以 `opencode.json` 含 `codekit@` 为准                                         |
 | `codex_plugin`      | 同上 `marketplace_sha`                    | 同上 `HEAD`                                                    | 安装状态以 `codex plugin list --marketplace co-daming` 首列匹配为准                    |
 | `qoder_plugin` / `qodercn_plugin` | 共享注册表 `installed_plugins_v2.json` 的 `version`（读不到时回落 `plugin-version.json`） | 同左：重装即升级，不查询远端 | 安装状态以共享注册表含 `codekit@local` 且缓存目录真实存在为准，**不依赖 CLI 是否在 PATH** |
-| `gitnexus`          | `gitnexus --version`                      | `npm info gitnexus version`                                    | 语义化版本比对                                                                        |
-| `dingtalk_cli`      | `dws version`                   | npm registry `dingtalk-workspace-cli`                          | 语义化版本比对                                                                        |
-| `feishu_cli`        | `lark-cli --version`                      | npm registry `@larksuite/cli`                                  | 语义化版本比对                                                                        |
+| `gitnexus`          | `gitnexus --version`                      | npmmirror `gitnexus/latest` 的 `version`                       | 语义化版本比对                                                                        |
+| `dingtalk_cli`      | `dws version`                   | npmmirror `dingtalk-workspace-cli/latest` 的 `version`          | 语义化版本比对                                                                        |
+| `feishu_cli`        | `lark-cli --version`                      | npmmirror `@larksuite/cli/latest` 的 `version`                  | 语义化版本比对                                                                        |
 | `graphify`          | `graphify --version`                      | PyPI `https://pypi.org/pypi/graphifyy/json` 的 `version`        | 语义化版本比对                                                                        |
 | `gh`                | `gh --version`                            | GitHub API `repos/cli/cli/releases/latest`                     | 语义化版本比对                                                                        |
 | `glab`              | `glab version`                            | GitLab API `projects/34675721/releases/permalink/latest`        | 语义化版本比对                                                                        |
@@ -307,8 +309,8 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 |------|----------|
 | `glab` / `gh` / `rtk` | `_brew_install_or_upgrade`：已装则 `brew upgrade`；无新版时 `brew` 报错，脚本降级为提示 `already latest` |
 | `git_ai` | 官方安装脚本总是拉取最新版，勾选即重装刷新 |
-| `gitnexus` | `npm install -g gitnexus@latest` |
-| `dingtalk_cli` / `feishu_cli` | 分别执行 `npm install -g dingtalk-workspace-cli@latest` / `npm install -g @larksuite/cli@latest` |
+| `gitnexus` | `npm install -g gitnexus@latest --registry=https://registry.npmmirror.com` |
+| `dingtalk_cli` / `feishu_cli` | 分别执行 `npm install -g dingtalk-workspace-cli@latest --registry=https://registry.npmmirror.com` / `npm install -g @larksuite/cli@latest --registry=https://registry.npmmirror.com` |
 | `graphify` | pipx 已托管 → `pipx upgrade graphifyy`；否则重建 venv 后 `pip install -U` |
 | `claude_plugin` | `claude plugin update codekit@co-daming`（未装则 `install --scope user`），并记录新的 marketplace SHA |
 | `opencode_plugin` | `opencode plugin <module> -g -f` 强制替换为当前仓库版本并更新配置 |
@@ -342,12 +344,12 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 | `opencode_plugin` | 写入 `opencode.json` 的 plugin 数组 | — | 条目为 `codekit@file://<安装状态目录>/opencode-source`（兼容 npm 包入口）；用 node（优先）或 python3 编辑 JSON |
 | `codex_plugin` | `codex plugin marketplace add <安装状态目录>/marketplace-source/codekit`（兼容市场根） | — | 官方插件市场机制；`codex plugin add codekit@co-daming` |
 | `qoder_plugin` / `qodercn_plugin` | Qoder CLI `plugins install <源> --scope user --json` | 直写共享配置根（注册表 + 缓存 + `enabledPlugins`） | CLI 与桌面 IDE 共用同一个根，安装一次两端生效；只支持 `user` 作用域 |
-| `gitnexus` | npm 用户态安装（`npm install -g gitnexus@latest`） | — | 无 Homebrew formula，走官方 npm 渠道；装好后执行 `gitnexus setup` |
+| `gitnexus` | npm 用户态安装（`npm install -g gitnexus@latest --registry=https://registry.npmmirror.com`） | — | 无 Homebrew formula，走官方 npm 渠道；装好后执行 `gitnexus setup` |
 | `graphify` | pipx（`pipx install graphifyy`） | 独立 venv + 软链 | 无 Homebrew formula，走官方 PyPI 渠道（包名 `graphifyy`）；venv 位于 `~/.local/share/CodeKit/venvs/graphify`。不使用裸 `pip install`，因 brew python 受 PEP 668 保护会拒绝直接写入系统环境 |
 | `gh` | Homebrew | — | |
 | `glab` | Homebrew | — | |
-| `dingtalk_cli` | npm 用户态安装（`npm install -g dingtalk-workspace-cli@latest`） | — | 命令为 `dws`；卸载时同时清理用户态和默认 npm 前缀 |
-| `feishu_cli` | npm 用户态安装（`npm install -g @larksuite/cli@latest`） | — | 命令为 `lark-cli`；卸载时同时清理用户态和默认 npm 前缀 |
+| `dingtalk_cli` | npm 用户态安装（`npm install -g dingtalk-workspace-cli@latest --registry=https://registry.npmmirror.com`） | — | 命令为 `dws`；卸载时同时清理用户态和默认 npm 前缀 |
+| `feishu_cli` | npm 用户态安装（`npm install -g @larksuite/cli@latest --registry=https://registry.npmmirror.com`） | — | 命令为 `lark-cli`；卸载时同时清理用户态和默认 npm 前缀 |
 
 > 编程智能体（Claude / Codex / OpenCode）在前置检查阶段安装（见 [5.1](#51-前置检查run_preflight)），不属于组件选择器条目。
 

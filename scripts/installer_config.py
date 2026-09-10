@@ -26,6 +26,10 @@ SEMVER_PATTERN = re.compile(
 )
 MCP_SECTION_PATTERN = re.compile(r"^\[mcp_servers\.([^\]]+)\]\s*$")
 
+# 直连 registry.npmjs.org 在国内网络下常超时，所有 npm 安装统一走镜像源。
+NPM_REGISTRY = "https://registry.npmmirror.com"
+NPM_REGISTRY_ARGS = ("--registry", NPM_REGISTRY)
+
 
 def extract_version(value: str) -> str:
     """Extract the first dotted numeric version from arbitrary command output."""
