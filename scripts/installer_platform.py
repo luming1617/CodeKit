@@ -82,6 +82,20 @@ def resolve_exe(name: str) -> Optional[str]:
     return str(found) if found else None
 
 
+def resolve_argv(args: Sequence[str]) -> list[str]:
+    """把 argv[0] 解析成可执行文件全路径，其余参数原样保留。
+
+    npm/venv 落地的入口在 Windows 上是 ``.cmd``，裸命令名会直接抛 WinError 2；
+    已经是路径形式（含分隔符）的 argv[0] 原样返回，不做二次查找。
+    """
+    resolved = [str(item) for item in args]
+    if resolved and not any(separator in resolved[0] for separator in (os.sep, "/", "\\")):
+        found = resolve_exe(resolved[0])
+        if found:
+            resolved[0] = found
+    return resolved
+
+
 def text_kwargs() -> dict:
     """子进程文本模式参数，强制 UTF-8 解码。"""
     return {"text": True, "encoding": SUBPROCESS_ENCODING, "errors": "replace"}

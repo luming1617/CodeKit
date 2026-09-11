@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+import installer_agents as agents  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 import installer_state as detector  # noqa: E402
 from installer import Installer, InstallerError  # noqa: E402
@@ -680,6 +681,26 @@ class PreflightTests(unittest.TestCase):
         message = "\n".join(str(call.args[0]) for call in installer.logger.info.call_args_list)
         for label in ("Claude Code", "Codex", "OpenCode", "Qoder", "Qoder CN"):
             self.assertIn(label, message)
+
+    def test_detected_clis_are_tabulated_one_row_each_with_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self.build(Path(directory))
+
+            def which(command: str, path: str | None = None) -> str | None:
+                return f"/usr/bin/{command}"
+
+            with patch.object(shutil, "which", side_effect=which):
+                with patch.object(agents, "cli_version", return_value="1.2.3"):
+                    self.assertTrue(installer.preflight_agents())
+
+        installer.logger.warn.assert_not_called()
+        message = "\n".join(str(call.args[0]) for call in installer.logger.info.call_args_list)
+        # 表格边框行数 = 表头 1 行 + 每个已检测到的 CLI 1 行。
+        rows = [line for line in message.splitlines() if line.lstrip().startswith("║")]
+        self.assertEqual(len(rows), 1 + len(agents.AGENT_CLIS))
+        for entry in agents.AGENT_CLIS:
+            self.assertIn(entry.key, message)
+        self.assertIn("1.2.3", message)
 
 
 def build_installer(home: Path, stage: Path | None) -> Installer:

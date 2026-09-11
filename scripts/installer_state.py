@@ -154,12 +154,12 @@ def run_command_capture(args: list[str], timeout: float = 15.0) -> tuple[int, st
     """静默执行探测命令，返回 (退出码, stdout, stderr)；异常与超时按失败处理。"""
     try:
         completed = subprocess.run(
-            args,
+            platform_layer.resolve_argv(args),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             timeout=timeout,
             check=False,
+            **platform_layer.text_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 1, "", str(exc)
@@ -430,9 +430,10 @@ def component_version(component: str, context: Context) -> str:
     definition = registry.component_by_id(component)
     if definition is not None and definition.command:
         value = command_version(definition.command, list(definition.version_args))
-        # `gh --version` includes the build date and platform after the
-        # semantic version.  Result pages only need the three-part version.
-        return config.extract_version(value) if component == "gh" else value
+        # CLI 的首行版本输出普遍是 "工具名 version 1.2.3 (构建信息)" 这类文本
+        # （`gh --version`、`lark-cli --version` 都是），结果页只需要三段版本号；
+        # 提取不到版本号时原样返回，避免把探测结果整条丢掉。
+        return config.extract_version(value) or value
     if component in {"claude_plugin", "opencode_plugin", "codex_plugin"}:
         return installed_plugin_version(component, context)
     qoder_platform = qoder.platform_for_component(component)

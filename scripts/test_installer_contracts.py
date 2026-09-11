@@ -908,6 +908,68 @@ class FeishuSkillsSyncTests(unittest.TestCase):
             self.assertTrue(installer.run_command.called)
 
 
+class GraphifyRegistrationCwdTests(unittest.TestCase):
+    """graphify 的注册命令按 cwd 落盘，安装器必须显式给出目录而不是继承启动位置。
+
+    实测：`graphify install --platform opencode` 无条件往 cwd 写项目级
+    `.opencode/plugins/graphify.js`，`graphify hook install` 要求 cwd 在 git 仓库内。
+    从 `C:\\Windows` 启动安装器时前者抛 PermissionError、后者抛
+    `No git repository found at or above C:\\Windows`，整个组件被判失败。
+    """
+
+    def _installer(self, home: Path, repo_root: str = "") -> Installer:
+        installer = bare_installer(home)
+        installer.install_via_channels = Mock(return_value=True)
+        installer.command_exists = Mock(return_value=True)
+        installer.run_capture = Mock(
+            return_value=RunResult(0, repo_root) if repo_root else RunResult(1)
+        )
+        installer.run_command = Mock(return_value=RunResult(0))
+        return installer
+
+    def _commands(self, installer: Installer) -> list[list[str]]:
+        return [entry.args[0] for entry in installer.run_command.call_args_list]
+
+    def _cwds(self, installer: Installer) -> set[Path]:
+        return {entry.kwargs.get("cwd") for entry in installer.run_command.call_args_list}
+
+    def test_registration_runs_inside_the_launched_repository(self) -> None:
+        # 在仓库里启动时，graphify 的项目级产物（.opencode/plugins、git hooks）应当
+        # 落在这个仓库，而不是别处。
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            project = home / "project"
+            installer = self._installer(home, repo_root=str(project))
+            self.assertTrue(installer.install_graphify())
+            self.assertIn(["graphify", "hook", "install"], self._commands(installer))
+            self.assertEqual(self._cwds(installer), {project})
+
+    def test_hook_failure_inside_a_repository_still_fails_the_component(self) -> None:
+        # 仓库里钩子装不上是真失败，不能被「不在仓库就跳过」的逻辑吞掉。
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            installer = self._installer(home, repo_root=str(home / "project"))
+            installer.run_command = Mock(
+                side_effect=lambda args, **_: RunResult(
+                    1 if list(args)[:2] == ["graphify", "hook"] else 0
+                )
+            )
+            self.assertFalse(installer.install_graphify())
+
+    def test_missing_repository_skips_hooks_into_a_writable_owned_directory(self) -> None:
+        # 仓库外启动（双击快捷方式时 cwd 可能是 C:\Windows）：没有仓库可挂钩子，
+        # 注册改为落在安装器自己的可写目录，只告警、不把组件判成失败。
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            installer = self._installer(home)
+            self.assertTrue(installer.install_graphify())
+            self.assertNotIn(["graphify", "hook", "install"], self._commands(installer))
+            fallback = installer.state_dir / "graphify-project"
+            self.assertEqual(self._cwds(installer), {fallback})
+            self.assertTrue(fallback.is_dir())
+            self.assertTrue(installer.logger.warn.called)
+
+
 class WindowsPlatformAdapterTests(unittest.TestCase):
     """Windows 分支的离线用例：靠假 Platform 覆盖，不要求宿主是 Windows。"""
 
@@ -1009,6 +1071,19 @@ class WindowsPlatformAdapterTests(unittest.TestCase):
         self.assertEqual(Installer._resolve_command(["./tool", "-v"])[0], "./tool")
         self.assertEqual(Installer._resolve_command(["C:/tools/x.exe"])[0], "C:/tools/x.exe")
 
+    def test_resolve_argv_expands_only_a_bare_command_name(self) -> None:
+        # 平台层是解析 argv[0] 的唯一入口：状态探测与安装/卸载共用同一份规则。
+        with patch.object(platform_layer, "resolve_exe", return_value="/npm/lark-cli.cmd"):
+            self.assertEqual(
+                platform_layer.resolve_argv(["lark-cli", "--version"]),
+                ["/npm/lark-cli.cmd", "--version"],
+            )
+            self.assertEqual(
+                platform_layer.resolve_argv(["C:/tools/x.exe", "-v"]),
+                ["C:/tools/x.exe", "-v"],
+            )
+            self.assertEqual(platform_layer.resolve_argv(["./tool"]), ["./tool"])
+
 
     def windows_installer(self, home: Path) -> Installer:
         installer = bare_installer(home)
@@ -1062,6 +1137,41 @@ class WindowsPlatformAdapterTests(unittest.TestCase):
         if platform_layer.is_windows():
             self.skipTest("Windows 上会真的请求提权")
         self.assertEqual(platform_layer.run_elevated(["winget", "uninstall"]), 127)
+
+
+class ComponentVersionProbeTests(unittest.TestCase):
+    def test_probe_resolves_a_bare_command_to_its_full_path(self) -> None:
+        # Windows 上 npm 落地的是 lark-cli.cmd：裸命令名会抛 WinError 2，探测必须
+        # 先把 argv[0] 换成 shutil.which 的结果，否则版本会被静默读成空串。
+        completed = subprocess.CompletedProcess([], 0, stdout="1.0.95\n", stderr="")
+        with patch.object(
+            platform_layer, "resolve_exe", return_value="/npm/lark-cli.cmd"
+        ), patch("subprocess.run", return_value=completed) as run:
+            returncode, output, _error = detector.run_command_capture(
+                ["lark-cli", "--version"]
+            )
+        self.assertEqual(returncode, 0)
+        self.assertEqual(output, "1.0.95")
+        self.assertEqual(run.call_args.args[0], ["/npm/lark-cli.cmd", "--version"])
+
+    def test_cli_component_version_keeps_only_the_version_number(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = plugin_context(Path(directory))
+            with patch.object(
+                detector, "command_version", return_value="lark-cli version 1.0.95"
+            ):
+                version = detector.component_version("feishu_cli", context)
+        self.assertEqual(version, "1.0.95")
+
+    def test_cli_component_version_falls_back_to_the_raw_output(self) -> None:
+        # 提取不到版本号时必须保留原文，不能把探测结果整条丢掉。
+        with tempfile.TemporaryDirectory() as directory:
+            context = plugin_context(Path(directory))
+            with patch.object(
+                detector, "command_version", return_value="lark-cli unknown"
+            ):
+                version = detector.component_version("feishu_cli", context)
+        self.assertEqual(version, "lark-cli unknown")
 
 
 class WingetChannelTests(unittest.TestCase):
@@ -1179,6 +1289,141 @@ class UninstallWingetTests(unittest.TestCase):
                 self.assertTrue(uninstaller.uninstall_winget_package("GitHub.cli"))
             run.assert_not_called()
             elevated.assert_not_called()
+
+
+class UninstallLockedNpmPackageTests(unittest.TestCase):
+    """npm 全局包被运行中进程占用时（Windows EBUSY），不擅自结束用户进程。
+
+    gitnexus 包内带原生模块 ``lbugjs.node``，宿主 IDE 拉起的 ``gitnexus mcp`` 会一直
+    映射它；Windows 上 npm 卸载要先给包目录改名，于是必定失败并只留下一个退出码。
+    卸载器改为找出占用进程、经用户确认后终止再重试，非交互会话只报告。
+    """
+
+    LOCKED = [RunResult(4294963214, "npm error code EBUSY")]
+    HOLDERS = [("4242", "node gitnexus/dist/cli/index.js mcp")]
+
+    def build(self, directory: str) -> Uninstaller:
+        uninstaller = bare_uninstaller(Path(directory))
+        uninstaller.auto_yes = False
+        return uninstaller
+
+    def test_consented_termination_retries_and_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = self.build(directory)
+            with patch.object(
+                uninstaller, "npm_package_process_holders", return_value=self.HOLDERS
+            ), patch.object(uninstaller, "terminate_processes") as terminate, patch.object(
+                uninstaller, "run_command"
+            ) as retry, patch.object(uninstaller, "set_npm"), patch.object(
+                uninstaller, "command_exists", return_value=False
+            ), patch("builtins.input", return_value="y"):
+                self.assertTrue(
+                    uninstaller.resolve_unremoved_npm_package(
+                        "gitnexus", "gitnexus", "gitnexus", self.LOCKED
+                    )
+                )
+            terminate.assert_called_once_with(self.HOLDERS)
+            retry.assert_called_once()
+            self.assertIn("gitnexus", retry.call_args[0][0])
+
+    def test_declining_termination_leaves_the_processes_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = self.build(directory)
+            with patch.object(
+                uninstaller, "npm_package_process_holders", return_value=self.HOLDERS
+            ), patch.object(uninstaller, "terminate_processes") as terminate, patch.object(
+                uninstaller, "run_command"
+            ) as retry, patch("builtins.input", return_value="n"):
+                self.assertFalse(
+                    uninstaller.resolve_unremoved_npm_package(
+                        "gitnexus", "gitnexus", "gitnexus", self.LOCKED
+                    )
+                )
+            terminate.assert_not_called()
+            retry.assert_not_called()
+            # 拒绝后给的是下一步怎么做，而不是一条红字错误。
+            self.assertFalse(uninstaller.logger.error.called)
+            self.assertIn("npm uninstall -g gitnexus", str(uninstaller.logger.info.call_args))
+
+    def test_non_interactive_session_reports_instead_of_killing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = self.build(directory)
+            uninstaller.platform.can_interact.return_value = False
+            with patch.object(
+                uninstaller, "npm_package_process_holders", return_value=self.HOLDERS
+            ), patch.object(uninstaller, "terminate_processes") as terminate, patch.object(
+                uninstaller, "run_command"
+            ) as retry:
+                self.assertFalse(
+                    uninstaller.resolve_unremoved_npm_package(
+                        "gitnexus", "gitnexus", "gitnexus", self.LOCKED
+                    )
+                )
+            terminate.assert_not_called()
+            retry.assert_not_called()
+            self.assertIn("npm uninstall -g gitnexus", str(uninstaller.logger.error.call_args))
+
+    def test_auto_yes_session_never_prompts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = self.build(directory)
+            uninstaller.auto_yes = True
+            with patch.object(
+                uninstaller, "npm_package_process_holders", return_value=self.HOLDERS
+            ), patch.object(uninstaller, "terminate_processes") as terminate, patch(
+                "builtins.input"
+            ) as prompt:
+                self.assertFalse(
+                    uninstaller.resolve_unremoved_npm_package(
+                        "gitnexus", "gitnexus", "gitnexus", self.LOCKED
+                    )
+                )
+            prompt.assert_not_called()
+            terminate.assert_not_called()
+
+    def test_unlocked_failure_points_at_the_manual_command(self) -> None:
+        # 不是占用（网络、registry 等）时不要去找进程，直接给手动命令。
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = self.build(directory)
+            with patch.object(uninstaller, "npm_package_process_holders") as holders:
+                self.assertFalse(
+                    uninstaller.resolve_unremoved_npm_package(
+                        "dingtalk_cli",
+                        "dingtalk-workspace-cli",
+                        "dws",
+                        [RunResult(1, "npm error code E404")],
+                    )
+                )
+            holders.assert_not_called()
+            self.assertIn("npm uninstall -g dingtalk-workspace-cli", str(uninstaller.logger.error.call_args))
+
+    def test_lock_detection_is_windows_only(self) -> None:
+        # POSIX 上 unlink 不受文件占用影响，不存在这个失败模式。
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = self.build(directory)
+            uninstaller.platform = platform_layer.platform_for("Linux")
+            self.assertFalse(uninstaller.npm_package_locked(self.LOCKED))
+            self.assertEqual(uninstaller.npm_package_process_holders("gitnexus"), [])
+
+    def test_process_probe_targets_the_package_dir_and_skips_shells(self) -> None:
+        # 探测脚本自身的命令行里带着这个片段：不排除 powershell 就会把自己列成占用者，
+        # 那个 PID 事后复用时会误杀无关进程。
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = self.build(directory)
+            with patch.object(
+                platform_layer, "resolve_exe", return_value="powershell.exe"
+            ), patch.object(
+                uninstaller,
+                "run_capture",
+                return_value=RunResult(0, "4242\tnode index.js mcp\nnot-a-pid\tjunk"),
+            ) as capture:
+                holders = uninstaller.npm_package_process_holders("@larksuite/cli")
+            script = capture.call_args[0][0][-1]
+            self.assertIn("-notin @('powershell.exe', 'pwsh.exe')", script)
+            self.assertIn("node_modules" + os.sep + "@larksuite" + os.sep + "cli", script)
+            # 曾经把 f-string 拆成两段，`}}` 没被还原，脚本多一个 `}` 直接解析失败；
+            # 只有真实执行才会暴露，所以这里显式断言花括号配平。
+            self.assertEqual(script.count("{"), script.count("}"))
+            self.assertEqual(holders, [("4242", "node index.js mcp")])
 
 
 class UninstallGitConfigTests(unittest.TestCase):

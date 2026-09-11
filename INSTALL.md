@@ -281,7 +281,7 @@ render_recap           # 打印卸载结果汇总
 `load_states` 遍历 `COMPONENTS`，调用 `installer_state.detect_component` 逐组件探测状态并缓存为 `self.states`（`ComponentState`：`status` / `installed_version` / `latest_version`）。每个组件：
 
 1. 判断组件是否已安装；
-2. 读取当前版本（统一走 `installer_state.component_version`）；
+2. 读取当前版本（统一走 `installer_state.component_version`）；CLI 输出会归一化为三段版本号（`gh version 2.60.0` / `lark-cli version 1.0.95` → `2.60.0` / `1.0.95`），提取不到版本号时保留原文；
 3. 尽力查询最新版本（npm / PyPI / GitLab API / GitHub API；marketplace 版本取**本地仓库 `HEAD`**，无本地仓库源时为空并由调用方兜底）；
 4. 比对得出状态：
    - 未安装 → `not_installed`
@@ -377,7 +377,7 @@ render_recap           # 打印卸载结果汇总
 | `codex_plugin` | `codex plugin marketplace add <安装状态目录>/marketplace-source/codekit`（兼容市场根） | — | 官方插件市场机制；`codex plugin add codekit@co-daming` |
 | `qoder_plugin` / `qodercn_plugin` | Qoder CLI `plugins install <源> --scope user --json` | 直写共享配置根（注册表 + 缓存 + `enabledPlugins`） | CLI 与桌面 IDE 共用同一个根，安装一次两端生效；只支持 `user` 作用域 |
 | `gitnexus` | npm 用户态安装（`npm install -g gitnexus@latest`，镜像由 `set_npm` 注入） | — | 无 Homebrew formula，走官方 npm 渠道；装好后执行 `gitnexus setup` |
-| `graphify` | pipx（`pipx install graphifyy`） | 独立 venv + 软链 | 无 Homebrew formula，走官方 PyPI 渠道（包名 `graphifyy`）；venv 位于 `~/.local/share/CodeKit/venvs/graphify`。不使用裸 `pip install`，因 brew python 受 PEP 668 保护会拒绝直接写入系统环境 |
+| `graphify` | pipx（`pipx install graphifyy`） | 独立 venv + 软链 | 无 Homebrew formula，走官方 PyPI 渠道（包名 `graphifyy`）；venv 位于 `~/.local/share/CodeKit/venvs/graphify`。不使用裸 `pip install`，因 brew python 受 PEP 668 保护会拒绝直接写入系统环境。注册命令（`install --platform <agent>`、`hook install`）按「项目」落盘，安装器显式指定工作目录：启动目录在仓库内即用该仓库根目录，否则用 `<状态目录>/graphify-project`，**不继承启动位置**（双击 `install.cmd` 时 cwd 可能是 `C:\Windows`，会因不可写且无仓库而整体失败）；`hook install` 只在仓库内执行，仓库外跳过并提示按仓库手动执行，不判组件失败 |
 | `gh` | `brew`（中科大镜像 + 关闭自动更新） | `apt`（sudo，源中无包则跳过）→ GitHub release | release 资产优先 gh-proxy、失败回退直连，经 SHA-256 校验 |
 | `glab` | `brew` | `apt`（sudo，源中无包则跳过）→ GitLab release | |
 | `dingtalk_cli` | npm 用户态安装（`npm install -g dingtalk-workspace-cli@latest`，镜像由 `set_npm` 注入） | — | 命令为 `dws`；卸载时同时清理用户态和默认 npm 前缀 |
@@ -466,6 +466,7 @@ Qoder（国际版）与 Qoder CN 是两个独立发行版，各有各的用户�
 
 > 说明：
 > - **不卸载**智能体本体（Claude/Codex/OpenCode/Qoder/Qoder CN）与依赖（git/Homebrew/curl/Python3/Node.js），仅卸载插件与可选组件。
+> - **Windows 上 npm 全局包被运行中进程占用**时（典型是 `gitnexus` 的原生模块 `lbugjs.node` 被宿主 IDE 拉起的 `gitnexus mcp` 进程映射），Windows 不允许改名删除该包目录，`npm uninstall -g` 只会以 EBUSY（终端显示退出码 4294963214）失败。卸载器会列出占用进程的 PID 与命令行：交互终端询问用户后再终止它们并重试（拒绝则只提示），非交互（`-y` 或无终端）会话只报告并给出手动命令，**绝不擅自结束用户进程**。占用进程的角色是宿主里的 MCP / 智能体，因此需要用户决定是否中断。
 > - `${CodeKit_STATE_DIR}` 与 `~/.npm-global` 目录会保留，需手动删除。
 
 ---

@@ -253,12 +253,7 @@ class Installer:
         WinError 2（npm 实际是 npm.CMD）；换成全路径后可以直接启动，既不必动用
         `shell=True`（避免引号与注入风险），也不用关心具体是 .exe 还是 .cmd。
         """
-        resolved = [str(item) for item in command]
-        if resolved and not any(separator in resolved[0] for separator in (os.sep, "/", "\\")):
-            found = platform_layer.resolve_exe(resolved[0])
-            if found:
-                resolved[0] = found
-        return resolved
+        return platform_layer.resolve_argv(command)
 
     def run_command(
         self,
@@ -491,16 +486,44 @@ class Installer:
         )
         return f"╔{border}╗\n{rows}\n╚{border}╝"
 
+    def render_table(self, headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+        """按终端显示宽度渲染带列分隔的表格，避免中英文混排时列错位。"""
+        widths = [
+            max(
+                detector.terminal_width(header),
+                *(detector.terminal_width(row[index]) for row in rows),
+            )
+            for index, header in enumerate(headers)
+        ]
+        border = "  ╔" + "╤".join("═" * (width + 2) for width in widths) + "╗"
+        separator = "  ╟" + "┼".join("─" * (width + 2) for width in widths) + "╢"
+        bottom = "  ╚" + "╧".join("═" * (width + 2) for width in widths) + "╝"
+
+        def render_row(values: Sequence[str]) -> str:
+            cells = " │ ".join(
+                detector.terminal_pad(value, widths[index])
+                for index, value in enumerate(values)
+            )
+            return f"  ║ {cells} ║"
+
+        lines = [border, render_row(headers), separator]
+        lines.extend(render_row(row) for row in rows)
+        lines.append(bottom)
+        return "\n".join(lines)
+
     def preflight_agents(self) -> bool:
         """只检查五个平台的 CLI，缺失时提示后续由勾选的插件自动安装 CLI。"""
-        available = [
-            (entry.key, detector.agent_cli_presence(entry.key, self.home))
-            for entry in agents.AGENT_CLIS
-        ]
-        available = [(key, source) for key, source in available if source]
-        if available:
-            detail = ", ".join(f"{key}: {source}" for key, source in available)
-            self.logger.success(f"\n \n Coding agent CLI(s) detected: {detail}")
+        rows = []
+        for entry in agents.AGENT_CLIS:
+            source, version = self.agent_cli_status(entry.key)
+            if not source:
+                continue
+            rows.append(
+                (entry.key, version or "unknown", agents.cli_command_path(entry, self.home))
+            )
+        if rows:
+            self.logger.success("\nCoding agent CLI(s) detected:")
+            self.logger.info(f"\n{self.render_table(('平台', '版本', '路径'), rows)}\n")
             return True
         self.logger.warn("未检测到任何编程智能体 CLI。")
         self.logger.info(
@@ -1196,7 +1219,14 @@ class Installer:
         return self.install_via_channels("dingtalk_cli")
 
     def install_graphify(self) -> bool:
-        """按策略表安装 graphify（pipx → 独立 venv），再为已装智能体注册。"""
+        """按策略表安装 graphify（pipx → 独立 venv），再为已装智能体注册。
+
+        graphify 的注册命令按「当前项目」落盘，因此必须显式指定工作目录：opencode
+        平台无条件往 cwd 写 `.opencode/plugins/graphify.js`（没有只装用户级的开关），
+        `hook install` 更是要求 cwd 在 git 仓库内（`hooks.py` 从 cwd 向上找 `.git`）。
+        而 cwd 取决于用户怎么启动安装器 —— 双击快捷方式时可能是 `C:\\Windows`，
+        那里既不可写也没有仓库，注册会直接抛 PermissionError。
+        """
         if not self.install_via_channels("graphify"):
             return False
         platforms = [
@@ -1210,12 +1240,39 @@ class Installer:
         ]
         if not platforms:
             platforms = ["claude"]
+        repo_root = self.git_repo_root()
+        workdir = repo_root or self.graphify_project_dir()
         results = [
-            self.run_command(["graphify", "install", "--platform", platform])
+            self.run_command(["graphify", "install", "--platform", platform], cwd=workdir)
             for platform in platforms
         ]
-        results.append(self.run_command(["graphify", "hook", "install"]))
+        if repo_root is None:
+            # 提交钩子是「按仓库」安装的附加步骤：安装器是全局工具链，无从得知用户
+            # 想在哪个仓库里用图谱，因此只提示、不判组件失败。
+            self.logger.warn(
+                "当前目录不在 git 仓库内，跳过 graphify hook install；"
+                "该步骤按仓库安装，请在需要图谱提交钩子的仓库根目录执行："
+                "graphify hook install"
+            )
+        else:
+            results.append(self.run_command(["graphify", "hook", "install"], cwd=workdir))
         return all(result.returncode == 0 for result in results)
+
+    def git_repo_root(self) -> Optional[Path]:
+        """启动目录所在的 git 仓库根目录；不在任何仓库内时返回 None。"""
+        result = self.run_capture(["git", "rev-parse", "--show-toplevel"])
+        root = (result.stdout or "").strip() if result.returncode == 0 else ""
+        return Path(root) if root else None
+
+    def graphify_project_dir(self) -> Path:
+        """仓库外启动 graphify 注册命令时的落点。
+
+        opencode 平台的项目级产物无法关闭，只能改落点：放进安装器自己的状态目录，
+        既不污染用户目录，也不会因为启动目录不可写而失败。
+        """
+        directory = self.state_dir / "graphify-project"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
 
     def install_feishu_cli(self) -> bool:
         """按策略表安装飞书 CLI，并向已装智能体同步 skills。
@@ -1640,21 +1697,12 @@ class Installer:
             rows.append(("lark-cli config init", "创建或选择飞书应用并保存 App ID 和 App Secret"))
             rows.append(("lark-cli auth login --recommend", "登录飞书，启用飞书 CLI 的业务操作"))
 
-        widths = [
-            max(detector.terminal_width(header), *(detector.terminal_width(row[index]) for row in rows))
-            for index, header in enumerate(("安装后操作", "作用"))
-        ]
-        border = "  ╔" + "╤".join("═" * (width + 2) for width in widths) + "╗"
-        separator = "  ╟" + "┼".join("─" * (width + 2) for width in widths) + "╢"
-        bottom = "  ╚" + "╧".join("═" * (width + 2) for width in widths) + "╝"
-        lines = ["\n\n\n  ⚠ 安装后操作（建议按顺序执行）", border]
         headers = ("安装后操作", "作用")
-        lines.append("  ║ " + " │ ".join(detector.terminal_pad(value, widths[index]) for index, value in enumerate(headers)) + " ║")
-        lines.append(separator)
-        for row in rows:
-            lines.append("  ║ " + " │ ".join(detector.terminal_pad(value, widths[index]) for index, value in enumerate(row)) + " ║")
-        lines.extend((bottom, f"\n日志：{self.logger.log_path}"))
-        self.logger.info("\n".join(lines))
+        self.logger.info(
+            "\n\n\n  ⚠ 安装后操作（建议按顺序执行）\n"
+            + self.render_table(headers, rows)
+            + f"\n\n日志：{self.logger.log_path}"
+        )
 
     def run(self) -> int:
         """执行完整安装生命周期：前置检查、安装、配置和结果收尾。"""

@@ -39,7 +39,13 @@ from installer import (  # noqa: E402
     CODEX_PLUGIN,
     Installer,
     InstallerError,
+    RunResult,
 )
+
+# npm 在 Windows 上先给包目录改名成临时名再删除；包内原生模块（.node）被运行中的
+# 进程内存映射时改名必定失败，npm 以 EBUSY 退出（uv errno -4082，终端显示为
+# 4294963214）。这类失败只能让占用进程退出，换参数或原地重试都无解。
+NPM_LOCK_MARKERS = ("EBUSY", "resource busy or locked")
 
 
 class Uninstaller(Installer):
@@ -260,11 +266,130 @@ class Uninstaller(Installer):
         package = definition["package"]
         command = definition["command"]
         self.set_npm()
-        self.run_command(["npm", "uninstall", "-g", package])
+        results = [self.run_command(["npm", "uninstall", "-g", package])]
         env = os.environ.copy()
         env.pop("npm_config_prefix", None)
-        self.run_with_input(["npm", "uninstall", "-g", package], "", env)
-        return not self.command_exists(command)
+        results.append(self.run_with_input(["npm", "uninstall", "-g", package], "", env))
+        if not self.command_exists(command):
+            return True
+        return self.resolve_unremoved_npm_package(component_id, package, command, results)
+
+    def resolve_unremoved_npm_package(
+        self,
+        component_id: str,
+        package: str,
+        command: str,
+        results: Sequence[RunResult],
+    ) -> bool:
+        """npm 卸载后包还在 PATH 上时，定位原因并给出可操作的处置。
+
+        Windows 上最常见的原因是包里带原生模块（如 gitnexus 的 ``lbugjs.node``）
+        正被智能体宿主拉起的进程占用，此时 npm 只会报 EBUSY 和一个退出码；卸载器
+        自己把占用进程找出来，交互模式下经用户确认后终止它们再重试，非交互模式
+        只报告，绝不擅自结束用户进程。
+        """
+        holders = (
+            self.npm_package_process_holders(package)
+            if self.npm_package_locked(results)
+            else []
+        )
+        if not holders:
+            self.logger.error(
+                f"{component_id} 卸载后仍在 PATH 上（{command}）；"
+                f"请手动执行：npm uninstall -g {package}"
+            )
+            return False
+
+        self.logger.warn(
+            f"{package} 正被 {len(holders)} 个运行中的进程占用，npm 无法删除其包目录："
+        )
+        for pid, command_line in holders:
+            self.logger.info(f"    PID {pid}  {command_line}")
+        retry_hint = (
+            f"请退出正在使用 {package} 的程序（宿主 IDE 里的 MCP / 智能体）后重新运行卸载，"
+            f"或手动执行：npm uninstall -g {package}"
+        )
+        if self.auto_yes or not self.platform.can_interact():
+            self.logger.error(retry_hint)
+            return False
+
+        answer = input(f"是否终止这些进程并重试卸载 {package}？[y/N]: ").strip().lower()
+        if answer not in {"y", "yes"}:
+            self.logger.info(f"已跳过。{retry_hint}")
+            return False
+
+        self.terminate_processes(holders)
+        self.set_npm()
+        self.run_command(["npm", "uninstall", "-g", package])
+        if not self.command_exists(command):
+            return True
+        self.logger.error(
+            f"{package} 仍未能卸载：占用进程可能还在，也可能已被宿主重新拉起。{retry_hint}"
+        )
+        return False
+
+    def npm_package_locked(self, results: Sequence[RunResult]) -> bool:
+        """判断 npm 卸载失败是否由「包内文件被运行中进程占用」引起。"""
+        if not self.platform.is_windows:
+            return False
+        return any(
+            marker in (result.stdout or "")
+            for result in results
+            for marker in NPM_LOCK_MARKERS
+        )
+
+    def npm_package_process_holders(self, package: str) -> list[tuple[str, str]]:
+        """列出命令行指向该全局包目录的进程，返回 (PID, 命令行) 列表。
+
+        Windows 上拿不到「谁打开了这个文件」，改用命令行做启发式匹配：从包目录内部
+        启动的进程正是加载了其原生模块、也是让 npm 改名失败的那一个。
+
+        排除 powershell/pwsh：探测脚本自身的命令行里就带着这个片段，不排除就会把
+        自己列成占用者，而那个 PID 事后复用时会误杀无关进程。
+        """
+        if not self.platform.is_windows:
+            return []
+        powershell = platform_layer.resolve_exe("powershell") or platform_layer.resolve_exe(
+            "pwsh"
+        )
+        if not powershell:
+            return []
+        fragment = "*node_modules" + os.sep + package.replace("/", os.sep) + "*"
+        pattern = platform_layer.powershell_literal(fragment)
+        condition = (
+            f"$_.CommandLine -like {pattern} "
+            "-and $_.Name -notin @('powershell.exe', 'pwsh.exe')"
+        )
+        script = (
+            "Get-CimInstance Win32_Process | "
+            f"Where-Object {{ {condition} }} | "
+            'ForEach-Object { "$($_.ProcessId)`t$($_.CommandLine)" }'
+        )
+        result = self.run_capture(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", script], timeout=30
+        )
+        if result.returncode != 0:
+            return []
+        holders: list[tuple[str, str]] = []
+        for line in (result.stdout or "").splitlines():
+            pid, _, command_line = line.partition("\t")
+            if pid.strip().isdigit():
+                holders.append((pid.strip(), command_line.strip()))
+        return holders
+
+    def terminate_processes(self, holders: Sequence[tuple[str, str]]) -> None:
+        """终止占用进程，让 Windows 能改名并删除被内存映射的原生模块。
+
+        不解读 PowerShell 的退出码：同一批 PID 里只要有一个已经自行退出，
+        ``Stop-Process`` 就返回 1，而其余进程其实已经终止；能否卸载以随后的 npm
+        重试为准。
+        """
+        pids = [pid for pid, _ in holders if pid.isdigit()]
+        if not pids:
+            return
+        platform_layer.run_powershell_script(
+            "Stop-Process -Id " + ",".join(pids) + " -Force -ErrorAction SilentlyContinue"
+        )
 
     def uninstall_dingtalk_cli(self) -> bool:
         """卸载钉钉 npm CLI。"""
