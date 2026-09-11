@@ -62,11 +62,11 @@ npm  →  brew  →  brew_cask  →  apt  →  winget  →  pipx  →  venv  →
 | `brew` | formula | `brew` 存在 | 已装且由 brew 管理则 `brew upgrade`，否则 `brew install`；命令已存在但不在 brew 管理下时**让位给下一通道**（避免装出第二份拷贝）；强制中科大镜像并关闭 brew 自动更新 |
 | `brew_cask` | cask | `brew` 存在 | 已装且由 brew 管理则 `brew upgrade --cask`，否则 `brew install --cask`；同样让位条件；镜像环境同 `brew` |
 | `apt` | 发行版包名 | Linux 且有包管理器 | `apt-get install -y`（需 sudo，见 §3）；包不存在则跳到下一通道 |
-| `winget` | winget 包 ID | **Windows 且 `winget` 存在** | 命令缺失走 `winget install`，已存在走 `winget upgrade`；非交互必须带 `--accept-package-agreements --accept-source-agreements --silent --disable-interactivity`，否则 winget 会挂起等待输入 |
+| `winget` | winget 包 ID | **Windows 且 `winget` 存在** | 语义与 `brew` 对齐：命令缺失才 `winget install`；命令已存在时先用 `winget list` 确认由 winget 管理，再由 `winget upgrade` 升级，**"已是最新"返回非零（实测 `0x8A15002B`）不算失败**，否则会降级到 release 装出第二份；不在 winget 管理下则让位给下一通道。非交互必须带 `--accept-package-agreements --accept-source-agreements --silent --disable-interactivity`，否则 winget 会挂起等待输入 |
 | `pipx` | PyPI 发行名 | `pipx` 存在（缺失则先按 apt→brew 装 pipx） | `pipx install` / `pipx upgrade` |
 | `venv` | PyPI 发行名 | `python3 -m venv` 可用 | 独立 venv + 用户级命令入口，始终可重装 |
 | `release` | `Component.release` | `curl` 或 `wget` 存在 | 解析最新版 → 按模板展开资产名 → 下载 → 校验（如可）→ 解包 → 安装到用户 bin 目录；GitHub 地址优先走 gh-proxy。模板除 `{version}/{os}/{arch}/{ext}` 外还支持按 Rust target triple 命名的 `{target}` |
-| `script` | 官方安装脚本 URL | 存在可用的 POSIX shell | 下载后经 stdin 交给 shell 执行；GitHub 地址优先走 gh-proxy（见 §2.3） |
+| `script` | 官方安装脚本 URL | **非 Windows** 且存在可用的 POSIX shell | 下载后经 stdin 交给 shell 执行；GitHub 地址优先走 gh-proxy（见 §2.3）。Windows 上禁用该通道：Git for Windows 会把 `bash` 放进 PATH，只判断"有没有 shell"会让安装器用 Git Bash 跑 Unix 脚本（见 §8.3） |
 | `powershell` | Windows 专用 `.ps1` URL | **Windows 且存在 powershell** | 下载后经 stdin 交给 PowerShell 执行（`-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command -`） |
 
 > `script` 的可用性判定从「有 curl/wget」改为「有 POSIX shell」：脚本下载本身由
@@ -135,9 +135,9 @@ Homebrew 镜像同时把 `HOMEBREW_NO_AUTO_UPDATE=1` 写入环境：组件是否
 
 Windows 侧的三处差异：
 
-- **发布资产令牌补了 `Windows`**：gh 用 `gh_{version}_Windows_{arch}.zip`，glab 用
-  `glab_{version}_windows_{arch}.zip`（注意 gh 的 os token 首字母大写、glab 全小写），
-  rtk 用 Rust 三元组 `rtk-x86_64-pc-windows-msvc.zip` 且扩展名是 `zip`。
+- **发布资产令牌补了 `windows`**：gh 用 `gh_{version}_windows_{arch}.zip`，glab 用
+  `glab_{version}_windows_{arch}.zip`（两者都是**全小写** `windows`，已对真实资产核对），
+  rtk 用 Rust 三元组 `rtk-x86_64-pc-windows-msvc.zip` 且扩展名是 `zip`（无 Windows arm64 资产）。
 - **解压工具不再写成静态 `requires`**：钉钉的 `install.js` 在 win32 分支用 PowerShell 的
   `Expand-Archive` 解压 zip，Windows 上并不需要 `unzip`；把它写成 `requires=("unzip",)`
   会让整个组件在 Windows 上被误判为不可安装。该前置由 `installer.ensure_unzip()` 按平台
@@ -201,6 +201,17 @@ Windows 上的对应关系：包管理器分支为 `winget uninstall --id <id> -
 --accept-source-agreements --disable-interactivity`；shell 配置清理为空（没有可写的 rc 文件）；
 venv 与发布包的清理要同时尝试 `<name>.exe` 与 `<name>.cmd` 两种落盘形态。
 
+winget 的 uninstall **不会自己提权**，而 gh 是机器级 MSI：非管理员会话里 msiexec 被 Windows
+Installer 直接拒绝（事件 11730，Error 1730），winget 再把 1603 包成不透明的 `0x8A150030`。
+卸载器按 §3 的 sudo 策略只对这条命令提权：非管理员先静默试一次（glab 这类用户态包就此成功，
+不打扰用户），确实失败且当前会话弹得出 UAC 时才用 `platform_layer.run_elevated` 重跑同一条
+命令（退出码经临时文件回传）；弹不出 UAC（CI、无桌面）或用户点了「否」时，直接给出
+「请在管理员终端重新运行卸载」，不再抛退出码。
+
+`git config --global --unset <key>` 对不存在的键返回 **5**（"you try to unset an option
+which does not exist"）：安装中断、用户手工改过、重复卸载都会命中。卸载器把 0 与 5 都视为
+「配置本来就干净」，只有其他退出码才告警，避免每次卸载都亮一条红字。
+
 ## 8. Windows 平台
 
 ### 8.1 入口
@@ -248,6 +259,9 @@ MSYS/MINGW 走 POSIX 入口，避免出现"能跑但 PATH / 前缀全是错的"�
 | stdout 默认 ANSI 代码页 | 输出 `▶`、`╔` 等字符时 `UnicodeEncodeError` | 入口脚本传 `-X utf8`；`Logger` 初始化时再 `sys.stdout.reconfigure(encoding="utf-8")` 兜底 |
 | 子进程文本模式默认 ANSI 解码 | CLI 的 UTF-8 输出解码失败，读线程异常，**捕获到的 stdout 静默为空**（于是"判断是否已安装"之类的分支会走错） | 所有 `subprocess` 调用统一 `encoding="utf-8", errors="replace"` |
 | 没有 `/dev/tty` | 用 `Path("/dev/tty").exists()` 判断可交互性时恒为假，交互选择器被静默跳过 | 改用 `sys.stdin.isatty() and sys.stdout.isatty()`；选择器仍不可用时**显式打印默认选择**，不再静默采用默认值 |
+| 安装器只改注册表 PATH | winget / 官方 `.ps1` 装完后命令在注册表里，但**已运行的进程看不到**：安装器把成功通道判为失败，再降级到下一通道装出第二份拷贝 | `platform_layer.refresh_process_path()` 在 `Installer.__init__` 与每次 winget/远程脚本成功后，把用户级 + 机器级 PATH 合并进当前进程 |
+| Git for Windows 把 `bash` 放进 PATH | `script` 通道在 Windows 上被误判为可用，退化成用 Git Bash 执行 Unix 安装脚本，把文件装进 MSYS 目录树；失败提示还会给出 `curl … \| bash` | `script` 通道严格限定非 Windows（与 `powershell` 严格限定 Windows 对称）；`manual_note` 在 Windows 上不再输出 bash 一行式 |
+| `winget uninstall` 不会自己提权 | 机器级 MSI（gh）在非管理员会话里卸不掉：msiexec 被 MSI 拒绝（事件 11730，Error 1730），winget 只回一个不透明的 `0x8A150030`；同一台机器上 glab（用户态 Inno）却能直接卸掉 | `platform_layer.run_elevated()` 只对该条命令经 UAC 提权重跑（静默试探→提权重试的顺序保证用户态包不弹窗）；弹不出 UAC 或用户点「否」时给「管理员终端重跑」的可操作提示（见 §7） |
 
 ### 8.4 Windows 文件语义
 

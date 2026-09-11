@@ -158,6 +158,9 @@ class Installer:
         # 适配层给出，安装/卸载/状态检测三处不再各自硬编码 POSIX 假设。
         self.platform = platform_layer.platform_for()
         self.os_name = self.platform.os_name
+        # Windows 上 winget 与官方 .ps1 安装器只把 PATH 写进注册表，不会更新已经运行的
+        # 进程；先同步一次，状态检测才能看到用户此前装好的工具。
+        platform_layer.refresh_process_path()
         probed_prefix = platform_layer.probe_npm_prefix() if self.platform.is_windows else ""
         self.npm_prefix = self.platform.npm_prefix(self.home, probed_prefix)
         self.npm_bin_dir = self.platform.npm_bin_dir(self.npm_prefix)
@@ -264,13 +267,17 @@ class Installer:
         check: bool = False,
         cwd: Optional[Path] = None,
         timeout: Optional[float] = None,
+        quiet: bool = False,
     ) -> RunResult:
         """执行外部命令并显示摘要；完整输出写入安装日志。
 
         timeout 到期后终止子进程并返回 124，避免挂起的 CLI 让安装/卸载无限阻塞。
+        quiet 用于「先试一次、失败就换策略」的探针式调用：终端不打印开始/结束行，
+        免得留下一条其实不算失败的红字；完整输出照样写进安装日志。
         """
         command = self._resolve_command(args)
-        self.logger.command_start(command)
+        if not quiet:
+            self.logger.command_start(command)
         try:
             process = subprocess.Popen(
                 command,
@@ -302,7 +309,8 @@ class Installer:
             self.logger.warn(
                 f"命令超时（{timeout:g}s），已终止：{self.logger.command_text(command)}"
             )
-        self.logger.command_finished(command, returncode, output_text)
+        if not quiet:
+            self.logger.command_finished(command, returncode, output_text)
         if check and returncode != 0:
             raise InstallerError(f"command failed ({returncode}): {' '.join(command)}")
         return RunResult(returncode, output_text)
@@ -355,6 +363,12 @@ class Installer:
     def command_version(self, command: str, args: Sequence[str]) -> str:
         """调用统一的状态检测逻辑读取命令版本；命令不存在时返回空字符串。"""
         return detector.command_version(command, list(args))
+
+    def refresh_path(self) -> None:
+        """把注册表 PATH 同步进本进程，让刚装好的命令立即可见（Windows）。"""
+        added = platform_layer.refresh_process_path()
+        if added:
+            self.logger.info(f"PATH 已刷新，新增 {len(added)} 个目录：{added[0]}")
 
     def set_brew_mirror(self) -> None:
         """把 Homebrew 切到中科大镜像并关闭自动更新。
@@ -886,21 +900,45 @@ class Installer:
             return False
         return self.command_exists(command)
 
+    def winget_manages(self, package: str) -> bool:
+        """判断该包是否由 winget 自己管理；本地查询，不触发安装。"""
+        result = self.run_capture(
+            [
+                "winget", "list", "--id", package, "--exact",
+                "--accept-source-agreements", "--disable-interactivity",
+            ],
+            timeout=180,
+        )
+        return result.returncode == 0 and package.lower() in result.stdout.lower()
+
     def install_winget_package(self, package: str, command: str) -> bool:
         """经 winget 安装或升级一个组件。
 
-        非交互场景必须显式接受包协议与源协议，否则 winget 会挂起等待输入；
-        `--disable-interactivity` 同时关掉可能弹出的进度交互。
+        非交互场景必须显式接受包协议与源协议，否则 winget 会挂起等待输入。语义与 brew
+        通道对齐：命令缺失才 install；命令已存在时先确认由 winget 管理再 upgrade，且
+        upgrade 返回"已是最新"（实测退出码 43）不算失败 —— 否则会降级到下一通道装出
+        第二份拷贝。
         """
         common = (
             "--id", package, "--exact", "--silent",
             "--accept-package-agreements", "--accept-source-agreements",
             "--disable-interactivity",
         )
-        action = "upgrade" if self.command_exists(command) else "install"
-        if self.run_command(["winget", action, *common], timeout=1200).returncode != 0:
+        if not self.command_exists(command):
+            result = self.run_command(["winget", "install", *common], timeout=1200)
+            # winget 只改注册表：不刷新会把"装好了"误判成"通道失败"。
+            self.refresh_path()
+            return result.returncode == 0 and self.command_exists(command)
+        if not self.winget_manages(package):
+            self.logger.info(f"{package} 不在 winget 管理下，跳过 winget 通道交给原通道升级。")
             return False
-        return self.command_exists(command)
+        result = self.run_command(["winget", "upgrade", *common], timeout=1200)
+        self.refresh_path()
+        if result.returncode != 0:
+            self.logger.warn(
+                f"{package} 升级未返回成功（退出码 {result.returncode}），保持现有 winget 安装。"
+            )
+        return True
 
     def ensure_pipx(self) -> bool:
         """确保 pipx 可用；缺失时按发行版包管理器 → Homebrew 补装。"""
@@ -1093,7 +1131,11 @@ class Installer:
         command = platform_layer.remote_script_command(shell)
         if not command:
             return False
-        return self.run_with_input(list(command), script, env).returncode == 0
+        if self.run_with_input(list(command), script, env).returncode != 0:
+            return False
+        # 官方 .ps1 安装器同样把 PATH 写进注册表，刷新后才能校验命令可用性。
+        self.refresh_path()
+        return True
 
     def configure_rtk(self) -> bool:
         """为已存在的 AI 编程工具注册 rtk 的全局 token 优化配置。"""

@@ -146,8 +146,9 @@ COMPONENTS: Sequence[Component] = (
             target_tokens={
                 "Darwin-arm64": "aarch64-apple-darwin",
                 "Darwin-x86_64": "x86_64-apple-darwin",
+                # x86_64 与 arm64 的 libc 不同名：前者 musl、后者 gnu（实测 v0.49.0 资产）。
                 "Linux-x86_64": "x86_64-unknown-linux-musl",
-                "Linux-arm64": "aarch64-unknown-linux-musl",
+                "Linux-arm64": "aarch64-unknown-linux-gnu",
                 "Windows-x86_64": "x86_64-pc-windows-msvc",
             },
             ext_tokens={"Darwin": "tar.gz", "Linux": "tar.gz", "Windows": "zip"},
@@ -189,7 +190,7 @@ COMPONENTS: Sequence[Component] = (
             repo="github:cli/cli",
             asset="gh_{version}_{os}_{arch}.{ext}",
             binary="gh",
-            os_tokens={"Darwin": "macOS", "Linux": "linux", "Windows": "Windows"},
+            os_tokens={"Darwin": "macOS", "Linux": "linux", "Windows": "windows"},
             arch_tokens={"x86_64": "amd64", "arm64": "arm64"},
             ext_tokens={"Darwin": "zip", "Linux": "tar.gz", "Windows": "zip"},
         ),

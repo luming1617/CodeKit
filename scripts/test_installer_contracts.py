@@ -29,6 +29,7 @@ import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 import installer_state as detector  # noqa: E402
 from installer import Installer, InstallerError, RunResult  # noqa: E402
+from uninstaller import Uninstaller  # noqa: E402
 
 HELPER_SCRIPT = SCRIPT_DIR / "manage-global-agents.py"
 SELECTOR_SCRIPT = SCRIPT_DIR / "component-selector.py"
@@ -49,6 +50,17 @@ def bare_installer(home: Path) -> Installer:
     installer.marketplace_local = None
     installer.changed_paths = []
     return installer
+
+
+def bare_uninstaller(home: Path) -> Uninstaller:
+    """装配仅含卸载所需字段的卸载会话；平台对象用 Mock，便于逐例控制交互能力。"""
+    uninstaller = Uninstaller.__new__(Uninstaller)
+    uninstaller.home = home
+    uninstaller.platform = Mock(can_interact=Mock(return_value=True))
+    uninstaller.os_name = "Windows"
+    uninstaller.bin_dir = home / ".local" / "bin"
+    uninstaller.logger = Mock()
+    return uninstaller
 
 
 def handler_keys(path: Path, function: str) -> set[str]:
@@ -196,7 +208,8 @@ class StrategyTableTests(unittest.TestCase):
         self.assertIn("script", component.channels)
         cases = {
             ("Linux", "x86_64"): "rtk-x86_64-unknown-linux-musl.tar.gz",
-            ("Linux", "arm64"): "rtk-aarch64-unknown-linux-musl.tar.gz",
+            # arm64 的 Linux 资产是 gnu 而不是 musl（实测 v0.49.0）。
+            ("Linux", "arm64"): "rtk-aarch64-unknown-linux-gnu.tar.gz",
             ("Darwin", "arm64"): "rtk-aarch64-apple-darwin.tar.gz",
             ("Darwin", "x86_64"): "rtk-x86_64-apple-darwin.tar.gz",
             # Windows 资产是 msvc 三元组 + zip，与 Unix 的 tar.gz 不同。
@@ -213,8 +226,10 @@ class StrategyTableTests(unittest.TestCase):
                         )
 
     def test_windows_release_assets_use_the_native_os_token_and_zip(self) -> None:
+        # 两个项目都用全小写 windows（实测 gh_2.100.0_windows_amd64.zip、glab_1.117.0_windows_amd64.zip）；
+        # 写成 `Windows` 会解析不到资产。
         cases = {
-            "gh": "gh_2.100.0_Windows_amd64.zip",
+            "gh": "gh_2.100.0_windows_amd64.zip",
             "glab": "glab_1.117.0_windows_amd64.zip",
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -980,6 +995,173 @@ class WindowsPlatformAdapterTests(unittest.TestCase):
         self.assertIn("rtk-ai/rtk", rtk_note)
         self.assertIn("winget install --id GitHub.cli", gh_note)
         self.assertNotIn("| bash", graphify_note)
+
+
+    def test_refresh_process_path_only_extends_and_stays_idempotent(self) -> None:
+        # winget / 官方 .ps1 装完后命令在注册表 PATH 里，进程内必须能立刻看到它。
+        environ = {"PATH": "C:\\existing"}
+        first = platform_layer.refresh_process_path(environ)
+        if not platform_layer.is_windows():
+            self.assertEqual(first, ())
+            self.assertEqual(environ["PATH"], "C:\\existing")
+            return
+        self.assertTrue(environ["PATH"].startswith("C:\\existing"))
+        self.assertTrue(first)
+        # 第二次调用不应再新增，避免 PATH 无限增长。
+        self.assertEqual(platform_layer.refresh_process_path(environ), ())
+
+    def test_powershell_literal_escapes_single_quotes(self) -> None:
+        # 提权脚本靠它拼参数，含引号的路径不能把命令拆散。
+        self.assertEqual(platform_layer.powershell_literal("a'b"), "'a''b'")
+
+    def test_elevation_is_refused_off_windows(self) -> None:
+        # Windows 上真去提权会弹 UAC，只有其余平台有确定的拒绝语义。
+        if platform_layer.is_windows():
+            self.skipTest("Windows 上会真的请求提权")
+        self.assertEqual(platform_layer.run_elevated(["winget", "uninstall"]), 127)
+
+
+class WingetChannelTests(unittest.TestCase):
+    """winget 通道语义：与 brew 对齐，避免把"已最新"当失败而降级装出第二份。"""
+
+    def test_upgrade_of_a_latest_package_counts_as_success(self) -> None:
+        # 实测 winget 对"找不到可用升级"返回 43；判成失败会降级到 release 再装一份。
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            with patch.object(installer, "command_exists", return_value=True), patch.object(
+                installer, "winget_manages", return_value=True
+            ), patch.object(installer, "run_command", return_value=RunResult(43)) as run:
+                self.assertTrue(installer.install_winget_package("GitHub.cli", "gh"))
+            run.assert_called_once()
+            self.assertEqual(run.call_args[0][0][1], "upgrade")
+
+    def test_package_outside_winget_lets_the_next_channel_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            with patch.object(installer, "command_exists", return_value=True), patch.object(
+                installer, "winget_manages", return_value=False
+            ), patch.object(installer, "run_command") as run:
+                self.assertFalse(installer.install_winget_package("GitHub.cli", "gh"))
+            run.assert_not_called()
+
+    def test_missing_command_installs_then_rechecks_availability(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            probes = {"count": 0}
+
+            def command_exists(_command: str) -> bool:
+                probes["count"] += 1
+                return probes["count"] > 1
+
+            with patch.object(installer, "command_exists", side_effect=command_exists), patch.object(
+                installer, "run_command", return_value=RunResult(0)
+            ) as run:
+                self.assertTrue(installer.install_winget_package("GitHub.cli", "gh"))
+            self.assertEqual(run.call_args[0][0][1], "install")
+
+
+class UninstallWingetTests(unittest.TestCase):
+    """卸载 winget 接管的包：机器级 MSI 需要管理员，只在必要时才提权。"""
+
+    def test_user_scope_package_uninstalls_without_elevation(self) -> None:
+        # glab 这类用户态包在普通会话里就卸得掉，不该平白弹一次 UAC。
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = bare_uninstaller(Path(directory))
+            with patch.object(uninstaller, "winget_manages", return_value=True), patch.object(
+                platform_layer, "is_admin", return_value=False
+            ), patch.object(uninstaller, "run_command", return_value=RunResult(0)) as run, patch.object(
+                platform_layer, "run_elevated"
+            ) as elevated:
+                self.assertTrue(uninstaller.uninstall_winget_package("GLab.GLab"))
+            self.assertTrue(run.call_args.kwargs["quiet"])
+            elevated.assert_not_called()
+
+    def test_machine_scope_msi_is_retried_elevated(self) -> None:
+        # 实测 Event 11730 / Error 1730：非管理员卸不掉 gh，同一条命令要经 UAC 重跑。
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = bare_uninstaller(Path(directory))
+            with patch.object(uninstaller, "winget_manages", return_value=True), patch.object(
+                platform_layer, "is_admin", return_value=False
+            ), patch.object(uninstaller, "run_command", return_value=RunResult(2316632112)), patch.object(
+                platform_layer, "run_elevated", return_value=0
+            ) as elevated:
+                self.assertTrue(uninstaller.uninstall_winget_package("GitHub.cli"))
+            command = elevated.call_args[0][0]
+            self.assertEqual(command[:3], ["winget", "uninstall", "--id"])
+            self.assertIn("GitHub.cli", command)
+
+    def test_admin_session_uninstalls_without_a_second_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = bare_uninstaller(Path(directory))
+            with patch.object(uninstaller, "winget_manages", return_value=True), patch.object(
+                platform_layer, "is_admin", return_value=True
+            ), patch.object(uninstaller, "run_command", return_value=RunResult(0)) as run, patch.object(
+                platform_layer, "run_elevated"
+            ) as elevated:
+                self.assertTrue(uninstaller.uninstall_winget_package("GitHub.cli"))
+            self.assertFalse(run.call_args.kwargs.get("quiet", False))
+            elevated.assert_not_called()
+
+    def test_declined_elevation_reports_an_actionable_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = bare_uninstaller(Path(directory))
+            with patch.object(uninstaller, "winget_manages", return_value=True), patch.object(
+                platform_layer, "is_admin", return_value=False
+            ), patch.object(uninstaller, "run_command", return_value=RunResult(2316632112)), patch.object(
+                platform_layer, "run_elevated", return_value=platform_layer.ELEVATION_CANCELLED
+            ):
+                self.assertFalse(uninstaller.uninstall_winget_package("GitHub.cli"))
+            self.assertIn("管理员终端", str(uninstaller.logger.error.call_args))
+
+    def test_non_interactive_session_never_tries_to_elevate(self) -> None:
+        # CI 里弹不出 UAC：直接说明需要管理员权限，不留下一个看不懂的退出码。
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = bare_uninstaller(Path(directory))
+            uninstaller.platform.can_interact.return_value = False
+            with patch.object(uninstaller, "winget_manages", return_value=True), patch.object(
+                platform_layer, "is_admin", return_value=False
+            ), patch.object(uninstaller, "run_command", return_value=RunResult(2316632112)), patch.object(
+                platform_layer, "run_elevated"
+            ) as elevated:
+                self.assertFalse(uninstaller.uninstall_winget_package("GitHub.cli"))
+            elevated.assert_not_called()
+            self.assertIn("管理员权限", str(uninstaller.logger.error.call_args))
+
+    def test_package_outside_winget_is_left_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = bare_uninstaller(Path(directory))
+            with patch.object(uninstaller, "winget_manages", return_value=False), patch.object(
+                uninstaller, "run_command"
+            ) as run, patch.object(platform_layer, "run_elevated") as elevated:
+                self.assertTrue(uninstaller.uninstall_winget_package("GitHub.cli"))
+            run.assert_not_called()
+            elevated.assert_not_called()
+
+
+class UninstallGitConfigTests(unittest.TestCase):
+    """`git config --unset` 对不存在的键返回 5，那是"本来就干净"，不是失败。"""
+
+    def test_missing_key_is_not_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = bare_uninstaller(Path(directory))
+            with patch.object(uninstaller, "run_capture", return_value=RunResult(5)):
+                uninstaller.unset_git_config("advice.addIgnoredFile")
+            uninstaller.logger.warn.assert_not_called()
+
+    def test_removed_key_is_not_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = bare_uninstaller(Path(directory))
+            with patch.object(uninstaller, "run_capture", return_value=RunResult(0)):
+                uninstaller.unset_git_config("push.autoSetupRemote")
+            uninstaller.logger.warn.assert_not_called()
+
+    def test_unexpected_exit_code_warns(self) -> None:
+        # 例如 4（配置文件写不进去）：这是真问题，但没必要让整次卸载失败。
+        with tempfile.TemporaryDirectory() as directory:
+            uninstaller = bare_uninstaller(Path(directory))
+            with patch.object(uninstaller, "run_capture", return_value=RunResult(4)):
+                uninstaller.unset_git_config("push.autoSetupRemote")
+            self.assertIn("push.autoSetupRemote", str(uninstaller.logger.warn.call_args))
 
 
 class QoderEntryDetectionTests(unittest.TestCase):

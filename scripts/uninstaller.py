@@ -186,6 +186,48 @@ class Uninstaller(Installer):
             (self.bin_dir / name).unlink(missing_ok=True)
         return True
 
+    def uninstall_winget_package(self, winget_id: str) -> bool:
+        """经 winget 移除一个包；机器级 MSI 需要管理员时只对这一条命令提权。
+
+        winget 的 uninstall 不会自己提权：机器级 MSI（gh 就是）会被 Windows Installer
+        直接拒绝（事件 11730，Error 1730），winget 再把 1603 包成 ``0x8A150030`` 返回。
+        这里按 §3 的 sudo 策略处理：用户态包（glab 这类）静默试一次就成功，不必打扰
+        用户；只有确实失败、而且当前会话弹得出 UAC 时才提权重跑同一条命令。
+        """
+        if not self.winget_manages(winget_id):
+            self.logger.info(f"{winget_id} 不在 winget 管理下，跳过 winget 卸载。")
+            return True
+        command = [
+            "winget", "uninstall", "--id", winget_id, "--exact", "--silent",
+            "--accept-source-agreements", "--disable-interactivity",
+        ]
+        if platform_layer.is_admin():
+            return self.run_command(command, timeout=600).returncode == 0
+        if self.run_command(command, timeout=600, quiet=True).returncode == 0:
+            # 探针式调用不打印开始/结束行；成功这一条要自己补，日志才读得通。
+            self.logger.success(f"完成：{self.logger.command_text(command)}")
+            return True
+        if not self.platform.can_interact():
+            # 无终端可弹 UAC：给出可操作提示，而不是一个看不懂的退出码。
+            self.logger.error(
+                f"{winget_id} 是机器级安装，卸载需要管理员权限，当前会话无法提权；"
+                "请在管理员终端重新运行卸载。"
+            )
+            return False
+        self.logger.info(
+            f"{winget_id} 是机器级安装，卸载需要管理员权限；"
+            "请在 UAC 对话框中选择「是」完成卸载。"
+        )
+        code = platform_layer.run_elevated(command, timeout=600)
+        if code == platform_layer.ELEVATION_CANCELLED:
+            self.logger.error(f"提权被取消，{winget_id} 未卸载；请在管理员终端重新运行卸载。")
+            return False
+        if code != 0:
+            self.logger.error(f"winget 卸载 {winget_id} 失败（退出码 {code}）。")
+            return False
+        self.logger.success(f"完成（已提权）：{self.logger.command_text(command)}")
+        return True
+
     def uninstall_package_component(self, component_id: str) -> bool:
         """按平台卸载由包管理器接管的 gh/glab，并清理 CodeKit 用户 bin 残留。"""
         for name in dict.fromkeys(
@@ -201,14 +243,7 @@ class Uninstaller(Installer):
         definition = self.component(component_id)
         winget_id = definition.channels.get("winget", "") if definition else ""
         if winget_id and self.channel_available("winget"):
-            result = self.run_command(
-                [
-                    "winget", "uninstall", "--id", winget_id, "--exact", "--silent",
-                    "--accept-source-agreements", "--disable-interactivity",
-                ],
-                timeout=600,
-            )
-            return result.returncode == 0
+            return self.uninstall_winget_package(winget_id)
         return True
 
     def uninstall_gitnexus(self) -> bool:
@@ -332,11 +367,22 @@ class Uninstaller(Installer):
         for path in self.shell_rcs():
             self.remove_matching_lines(path, "git-ai/bin")
 
+    def unset_git_config(self, key: str) -> None:
+        """撤销 CodeKit 写入的全局 Git 选项；键本来就不存在时不算失败。
+
+        ``git config --unset`` 对不存在的键返回 **5**（"you try to unset an option
+        which does not exist"）。安装中断、用户手工删过、或重复卸载都会走到这里，
+        把 5 当成失败会让每次卸载都亮一条红字，而实际上配置本来就是干净的。
+        """
+        code = self.run_capture(["git", "config", "--global", "--unset", key]).returncode
+        if code not in (0, 5):
+            self.logger.warn(f"未能撤销 git 全局配置 {key}（退出码 {code}）。")
+
     def cleanup_global_config(self) -> None:
         """清理 Git 全局配置、CodeKit PATH 块和版本状态文件。"""
         self.cleanup_legacy_git_ai()
-        self.run_command(["git", "config", "--global", "--unset", "advice.addIgnoredFile"])
-        self.run_command(["git", "config", "--global", "--unset", "push.autoSetupRemote"])
+        for key in ("advice.addIgnoredFile", "push.autoSetupRemote"):
+            self.unset_git_config(key)
         for path in self.shell_rcs():
             if not path.is_file():
                 continue

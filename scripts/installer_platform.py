@@ -35,7 +35,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional, Tuple
+from typing import Mapping, Optional, Sequence, Tuple
 
 
 MACOS = "macos"
@@ -45,6 +45,9 @@ WINDOWS = "windows"
 # 子进程输出统一按 UTF-8 解码；非法字节用替换字符兜底，绝不让解码失败冒到
 # 调用方（那会丢掉整段输出，比多几个替换字符严重得多）。
 SUBPROCESS_ENCODING = "utf-8"
+
+# UAC 被拒绝或根本弹不出对话框时 Windows 给出的错误码（ERROR_CANCELLED）。
+ELEVATION_CANCELLED = 1223
 
 
 def os_key(system: Optional[str] = None) -> str:
@@ -175,6 +178,120 @@ def run_powershell_script(script: str, timeout: float = 300) -> int:
     except (OSError, subprocess.SubprocessError):
         return 127
     return completed.returncode
+
+
+def powershell_literal(value: str) -> str:
+    """把任意字符串包成 PowerShell 单引号字面量。"""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def run_elevated(command: Sequence[str], timeout: float = 600) -> int:
+    """经 UAC 提权执行单条命令，返回该命令的真实退出码。
+
+    机器级 MSI 的卸载需要管理员权限，而 ``winget uninstall`` 不会自己提权：实测
+    msiexec 被 Windows Installer 直接拒绝（事件 11730，Error 1730），winget 把
+    1603 包成 ``0x8A150030`` 返回。因此这里按 §3 的 sudo 策略只对**这一条命令**
+    提权，而不是把整个卸载器提权 —— 卸载器的其余动作全是用户态操作。
+
+    提权经 PowerShell 的 ``Start-Process -Verb RunAs``；子进程退出码写进临时文件，
+    因为 ShellExecute 拉起的进程在父进程里拿不到可靠的 ``ExitCode``。用户在 UAC
+    上点「否」或当前会话弹不出对话框时返回 :data:`ELEVATION_CANCELLED`。
+    """
+    if not is_windows():
+        return 127
+    shell = resolve_exe("powershell") or resolve_exe("pwsh")
+    executable = resolve_exe(command[0])
+    if shell is None or executable is None:
+        return 127
+    with tempfile.TemporaryDirectory() as directory:
+        code_file = Path(directory) / "exit-code.txt"
+        steps = Path(directory) / "elevated.ps1"
+        # 先在父进程把文件建好：提权进程新建的文件属主是 Administrators，非提权令牌里
+        # 这个 SID 是 deny-only，读回来会 PermissionError。写进一个已存在的用户文件
+        # 没有这个限制（管理员令牌同时带着用户 SID）。
+        code_file.write_text("", encoding="ascii")
+        # 子脚本只由提权后的进程执行；CJK 路径要靠 BOM 才不会被 PS 5.1 按 ANSI 解析。
+        steps.write_text(
+            "\n".join(
+                (
+                    "& " + " ".join(powershell_literal(item) for item in (executable, *command[1:])),
+                    f"Set-Content -LiteralPath {powershell_literal(str(code_file))}"
+                    " -Value $LASTEXITCODE -Encoding ascii",
+                )
+            ),
+            encoding="utf-8-sig",
+        )
+        launcher = (
+            f"Start-Process -FilePath {powershell_literal(shell)} -Verb RunAs -Wait -PassThru"
+            " -ErrorAction Stop -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',"
+            f" '-File', {powershell_literal(str(steps))})"
+        )
+        try:
+            completed = subprocess.run(
+                [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", launcher],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=False,
+                **text_kwargs(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return 127
+        try:
+            recorded = code_file.read_text(encoding="ascii", errors="replace").strip()
+        except OSError:
+            recorded = ""
+        if recorded.startswith("-"):
+            recorded = recorded[1:]
+        if recorded.isdigit():
+            return int(recorded)
+        # 没有退出码 = 提权那一步就没跑起来（UAC 被拒、无交互桌面等）。
+        return ELEVATION_CANCELLED if completed.returncode != 0 else 127
+
+
+def refresh_process_path(environ: Optional[dict] = None) -> Tuple[str, ...]:
+    """把注册表里的用户/系统 PATH 合并进当前进程，返回新增的目录。
+
+    Windows 安装器（winget、官方 .ps1 等）只写注册表，不会改变**已经运行**的进程；
+    不刷新就会出现"安装成功但 command_exists 仍为假"：安装器把成功通道误判为失败，
+    再降级到下一个通道装出第二份拷贝。
+    """
+    if not is_windows():
+        return ()
+    import winreg
+
+    env = os.environ if environ is None else environ
+    current = env.get("PATH", "")
+    known = {
+        os.path.normcase(os.path.normpath(entry))
+        for entry in current.split(os.pathsep)
+        if entry
+    }
+    added: list[str] = []
+    for hive, key in (
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+    ):
+        try:
+            with winreg.OpenKey(hive, key) as handle:
+                value, _ = winreg.QueryValueEx(handle, "Path")
+        except OSError:
+            continue
+        for raw in str(value).split(os.pathsep):
+            entry = os.path.expandvars(raw.strip())
+            if not entry:
+                continue
+            normalized = os.path.normcase(os.path.normpath(entry))
+            if normalized in known:
+                continue
+            known.add(normalized)
+            added.append(entry)
+    if added:
+        env["PATH"] = os.pathsep.join(entry for entry in (current, *added) if entry)
+    return tuple(added)
 
 
 def probe_npm_prefix(timeout: float = 15) -> str:
