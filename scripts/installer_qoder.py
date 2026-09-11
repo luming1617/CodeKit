@@ -413,6 +413,15 @@ def cli_path(
     return ""
 
 
+def describe_cli(commands: Sequence[str], path: str) -> str:
+    """把 CLI 路径渲染为 ``命令 (路径)``；空路径表示未找到。"""
+    if not path:
+        return ""
+    name = Path(path).name
+    command = next((item for item in commands if item == name), commands[0])
+    return f"{command} ({path})"
+
+
 def cli_presence(
     platform_key: str,
     home: Path,
@@ -420,15 +429,9 @@ def cli_presence(
 ) -> str:
     """Describe the platform CLI's location; an empty string means missing."""
     descriptor = PLATFORMS[platform_key]
-    path = cli_path(platform_key, home, environ)
-    if not path:
-        return ""
-    name = Path(path).name
-    command = next(
-        (item for item in descriptor.cli_commands if item == name),
-        descriptor.cli_commands[0],
+    return describe_cli(
+        descriptor.cli_commands, cli_path(platform_key, home, environ)
     )
-    return f"{command} ({path})"
 
 
 def capable_cli(
@@ -556,18 +559,6 @@ def uninstall(
     return not plugin_entries(read_registry(root))
 
 
-def _linux_application_dirs(
-    home: Path, environ: Optional[Mapping[str, str]] = None
-) -> tuple[Path, ...]:
-    """Return the XDG application directories searched for desktop entries."""
-    environ = os.environ if environ is None else environ
-    data_home = environ.get("XDG_DATA_HOME")
-    bases = [Path(data_home).expanduser()] if data_home else [Path(home) / ".local" / "share"]
-    configured = environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
-    bases.extend(Path(value).expanduser() for value in configured.split(os.pathsep) if value)
-    return tuple(dict.fromkeys(bases))
-
-
 def desktop_presence(
     descriptor: Platform,
     home: Path,
@@ -586,7 +577,7 @@ def desktop_presence(
     if os_name != "Linux":
         return ""
     environ = os.environ if environ is None else environ
-    for directory in _linux_application_dirs(home, environ):
+    for directory in config.linux_application_dirs(home, environ):
         for desktop_file in descriptor.linux_desktop_files:
             candidate = directory / "applications" / desktop_file
             if candidate.is_file():

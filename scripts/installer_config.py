@@ -30,6 +30,53 @@ MCP_SECTION_PATTERN = re.compile(r"^\[mcp_servers\.([^\]]+)\]\s*$")
 NPM_REGISTRY = "https://registry.npmmirror.com"
 NPM_REGISTRY_ARGS = ("--registry", NPM_REGISTRY)
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# 安装器运行期依赖的辅助模块清单（含 installer.py，供卸载器复用）。
+# installer.py / uninstaller.py 在导入这些模块之前先调用 require_helper_files()：
+# 否则残缺检出会在模块加载期抛出原始 ModuleNotFoundError，而不是受控的单行错误。
+REQUIRED_HELPER_FILES = (
+    "component-registry.py",
+    "component-selector.py",
+    "installer.py",
+    "installer_agents.py",
+    "installer_config.py",
+    "installer_qoder.py",
+    "installer_sources.py",
+    "installer_state.py",
+    "manage-global-agents.py",
+)
+
+
+def require_helper_files(directory: Optional[Path] = None) -> None:
+    """校验辅助模块是否齐全，缺失时抛出带绝对路径的 ValueError。"""
+    target = Path(directory) if directory is not None else SCRIPT_DIR
+    missing = [
+        str(target / name)
+        for name in REQUIRED_HELPER_FILES
+        if not (target / name).is_file()
+    ]
+    if missing:
+        raise ValueError(f"installer helper missing: {', '.join(missing)}")
+
+
+def linux_application_dirs(
+    home: Path, environ: Optional[Mapping[str, str]] = None
+) -> tuple[Path, ...]:
+    """返回 XDG 应用目录，覆盖用户级和常见系统级安装位置。"""
+    environ = os.environ if environ is None else environ
+    configured_home = environ.get("XDG_DATA_HOME")
+    bases = (
+        [Path(configured_home).expanduser()]
+        if configured_home
+        else [Path(home) / ".local" / "share"]
+    )
+    configured_dirs = environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
+    bases.extend(
+        Path(value).expanduser() for value in configured_dirs.split(os.pathsep) if value
+    )
+    return tuple(dict.fromkeys(bases))
+
 
 def extract_version(value: str) -> str:
     """Extract the first dotted numeric version from arbitrary command output."""

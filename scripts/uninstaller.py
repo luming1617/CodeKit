@@ -21,6 +21,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_config as config  # noqa: E402
+
+# 导入期门禁：与 installer.py 共用同一份 helper 清单，缺失时给出单行受控错误。
+try:
+    config.require_helper_files(SCRIPT_DIR)
+except ValueError as exc:
+    print(f"  ✗  {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
 import installer_qoder as qoder  # noqa: E402
 import installer_state as detector  # noqa: E402
 from installer import (  # noqa: E402
@@ -122,18 +130,7 @@ class Uninstaller(Installer):
 
     def uninstall_platform_agents(self, tool: str) -> bool:
         """随对应插件移除该平台的全局 subagent。"""
-        helper = SCRIPT_DIR / "manage-global-agents.py"
-        if not helper.is_file():
-            return True
-        args = [sys.executable, str(helper), "uninstall"]
-        args.extend(["--home", str(self.home), "--tool", tool])
-        try:
-            flags, _agents_dir = qoder.agent_location(tool, self.home)
-        except ValueError as exc:
-            self.logger.error(str(exc))
-            return False
-        args.extend(flags)
-        return self.run_command(args).returncode == 0
+        return self.run_platform_agents("uninstall", tool)
 
     def uninstall_claude_plugin(self) -> bool:
         """卸载 Claude 插件及其 marketplace 注册；CLI 缺失时也清理共享缓存。"""
@@ -336,18 +333,6 @@ class Uninstaller(Installer):
         self.logger.info(f"=== CodeKit Plugin Uninstall v{self.plugin_version} ===")
         if self.os_name not in {"Darwin", "Linux"}:
             raise InstallerError(f"Unsupported OS: {self.os_name}. Only macOS/Linux.")
-        required_helpers = (
-            SCRIPT_DIR / "component-registry.py",
-            SCRIPT_DIR / "installer.py",
-            SCRIPT_DIR / "installer_config.py",
-            SCRIPT_DIR / "installer_state.py",
-            SCRIPT_DIR / "installer_sources.py",
-            SCRIPT_DIR / "installer_qoder.py",
-            SCRIPT_DIR / "component-selector.py",
-        )
-        missing = [str(path) for path in required_helpers if not path.is_file()]
-        if missing:
-            raise InstallerError(f"Uninstaller helper missing: {', '.join(missing)}")
         detector.registry.validate_registry()
         # npm 全局包默认落在用户前缀；卸载前挂载用户 bin，确保未 source shell
         # 配置时也能检测到并清理 GitNexus、钉钉 CLI、飞书 CLI。

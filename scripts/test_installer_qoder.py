@@ -316,15 +316,18 @@ class DirectInstallTests(unittest.TestCase):
     def test_reinstall_is_idempotent_and_replaces_the_cache(self) -> None:
         qoder.install_direct(self.root, self.stage, "1.0.0")
         first = self.state()
+        first_entry = qoder.plugin_entries(qoder.read_registry(self.root))[0]
+        installed_at = first_entry["installedAt"]
+        self.assertNotIn("lastUpdated", first_entry)
         (self.stage / "skills" / "extra").mkdir()
         qoder.install_direct(self.root, self.stage, "1.0.0")
         second = self.state()
         entries = qoder.plugin_entries(qoder.read_registry(self.root))
         self.assertEqual(len(entries), 1)
         self.assertEqual(second.install_path, first.install_path)
-        self.assertEqual(entries[0].get("installedAt"), json.loads(
-            qoder.registry_path(self.root).read_text(encoding="utf-8")
-        )["plugins"][qoder.PLUGIN_ID][0]["installedAt"])
+        # 重装保留首次安装时间，并刷新 lastUpdated。
+        self.assertEqual(entries[0]["installedAt"], installed_at)
+        self.assertIn("lastUpdated", entries[0])
         self.assertTrue((Path(second.install_path) / "skills" / "extra").is_dir())
 
     def test_superseded_versions_and_staging_leftovers_are_removed(self) -> None:
@@ -722,7 +725,9 @@ class InstallFlowTests(unittest.TestCase):
 
     def test_unsynchronized_global_agents_abort_the_component(self) -> None:
         self.assertFalse(self.install("", agents_ok=False))
-        self.assertFalse(qoder.plugin_entries(qoder.read_registry(self.root)) and False)
+        # 全局 subagent 同步失败必须中止安装，且不得留下已写入的插件缓存与注册表。
+        self.assertFalse(qoder.plugin_entries(qoder.read_registry(self.root)))
+        self.assertFalse(qoder.plugin_cache_root(self.root).exists())
 
     def test_missing_staged_source_is_rejected_before_touching_the_root(self) -> None:
         installer = build_installer(self.home, None)

@@ -159,20 +159,26 @@ class Context:
     version_file: Path
 
 
-def run_command(args: list[str], timeout: float = 15.0) -> str:
-    """静默执行探测命令；命令失败、异常或超时均返回空字符串。"""
+def run_command_capture(args: list[str], timeout: float = 15.0) -> tuple[int, str, str]:
+    """静默执行探测命令，返回 (退出码, stdout, stderr)；异常与超时按失败处理。"""
     try:
         completed = subprocess.run(
             args,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return completed.stdout.strip() if completed.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, "", str(exc)
+    return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
+
+
+def run_command(args: list[str], timeout: float = 15.0) -> str:
+    """静默执行探测命令；命令失败、异常或超时均返回空字符串。"""
+    returncode, output, _error = run_command_capture(args, timeout)
+    return output if returncode == 0 else ""
 
 
 def command_version(command: str, args: list[str]) -> str:
@@ -181,21 +187,6 @@ def command_version(command: str, args: list[str]) -> str:
         return ""
     output = run_command([command, *args])
     return output.splitlines()[0] if output else ""
-
-
-def _linux_application_dirs(home: Path) -> tuple[Path, ...]:
-    """返回 XDG 应用目录，覆盖用户级和常见系统级安装位置。"""
-    configured_home = os.environ.get("XDG_DATA_HOME")
-    data_home = (
-        Path(configured_home).expanduser()
-        if configured_home
-        else home / ".local" / "share"
-    )
-    configured_dirs = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
-    system_dirs = tuple(
-        Path(value).expanduser() for value in configured_dirs.split(os.pathsep) if value
-    )
-    return tuple(dict.fromkeys((data_home, *system_dirs)))
 
 
 def agent_presence(name: str, home: Path, os_name: Optional[str] = None) -> str:
@@ -220,7 +211,7 @@ def agent_presence(name: str, home: Path, os_name: Optional[str] = None) -> str:
         return ""
 
     if os_name == "Linux":
-        for application_dir in _linux_application_dirs(home):
+        for application_dir in config.linux_application_dirs(home):
             for desktop_file in LINUX_DESKTOP_FILES[name]:
                 candidate = application_dir / "applications" / desktop_file
                 if candidate.is_file():
@@ -360,7 +351,8 @@ def platform_subagents_state(context: Context, tool: str) -> str:
         return ""
     args = [sys.executable, str(helper), "status", "--home", str(context.home), "--tool", tool]
     try:
-        flags, _agents_dir = qoder.agent_location(tool, context.home)
+        # 与安装/卸载共用同一份目录解析：避免 Qoder 共享根在探测与落盘之间漂移。
+        flags, _agents_dir = agents.global_agent_plan(tool, context.home)
     except ValueError:
         return ""
     args.extend(flags)
@@ -368,7 +360,17 @@ def platform_subagents_state(context: Context, tool: str) -> str:
         source = context.marketplace_local / "skills"
         if source.is_dir():
             args.extend(["--source", str(source)])
-    return run_command(args)
+    returncode, output, error = run_command_capture(args)
+    if returncode != 0 or not output:
+        # 区分“确实未安装”和“探测失败”：失败必须留下可见线索，
+        # 否则组件状态会被静默降级为未安装并反复提示重装。
+        detail = error.splitlines()[0] if error else f"exit code {returncode}"
+        print(
+            f"installer state: agent 状态探测失败（tool={tool}）：{detail}",
+            file=sys.stderr,
+        )
+        return ""
+    return output
 
 
 def repository_plugin_version(context: Context) -> str:

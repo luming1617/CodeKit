@@ -103,6 +103,40 @@ def component_agent(component_id: str) -> Optional[AgentCLI]:
     return AGENT_CLIS_BY_COMPONENT.get(component_id)
 
 
+# 非 Qoder 平台全局 subagent 的默认目录；与 manage-global-agents.py 共用这一事实源。
+DEFAULT_AGENT_DIRECTORIES = {
+    "claude": (".claude", "agents"),
+    "opencode": (".config", "opencode", "agents"),
+    "codex": (".codex", "agents"),
+}
+
+
+def default_agent_directory(tool: str, home: Path) -> Path:
+    """返回非 Qoder 平台全局 subagent 的默认目录。"""
+    parts = DEFAULT_AGENT_DIRECTORIES.get(tool)
+    if parts is None:
+        raise ValueError(f"unknown agent tool: {tool}")
+    return Path(home).joinpath(*parts)
+
+
+def global_agent_plan(
+    tool: str,
+    home: Path,
+    config_root: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> tuple[list[str], Path]:
+    """返回同步/清理某平台全局 subagent 的额外参数与目标目录。
+
+    Qoder 系共用共享配置根：显式 config_root 优先，其次环境变量，最后默认目录。
+    """
+    if tool not in qoder.PLATFORMS:
+        return [], default_agent_directory(tool, home)
+    if config_root is not None:
+        root = Path(config_root).expanduser()
+        return ["--config-root", str(root)], root / "agents"
+    return qoder.agent_location(tool, home, environ)
+
+
 def cli_command_path(
     entry: AgentCLI,
     home: Path,
@@ -130,12 +164,7 @@ def cli_presence(
     entry = agent_cli(platform_key)
     if entry is None:
         return ""
-    path = cli_command_path(entry, home, environ)
-    if not path:
-        return ""
-    name = Path(path).name
-    command = next((item for item in entry.commands if item == name), entry.commands[0])
-    return f"{command} ({path})"
+    return qoder.describe_cli(entry.commands, cli_command_path(entry, home, environ))
 
 
 def cli_version(

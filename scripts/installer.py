@@ -28,8 +28,17 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-import installer_agents as agents  # noqa: E402
 import installer_config as config  # noqa: E402
+
+# 导入期门禁：残缺检出必须以单行受控错误结束，而不是让下面的 import 抛出
+# ModuleNotFoundError。这也是卸载器复用的同一份 helper 清单。
+try:
+    config.require_helper_files(SCRIPT_DIR)
+except ValueError as exc:
+    print(f"  ✗  {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+import installer_agents as agents  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 import installer_sources as source_builder  # noqa: E402
 import installer_state as detector  # noqa: E402
@@ -134,6 +143,9 @@ class Logger:
 
 
 class Installer:
+    # 外部命令超时后返回的退出码，与 GNU timeout(1) 保持一致。
+    TIMEOUT_RETURNCODE = 124
+
     def __init__(self, auto_yes: bool) -> None:
         """创建一次安装会话，并初始化路径、状态和结果记录。"""
         self.auto_yes = auto_yes
@@ -212,8 +224,18 @@ class Installer:
         os.environ["npm_config_prefix"] = str(self.npm_prefix)
         self.prepend_path(self.npm_prefix / "bin")
 
-    def run_command(self, args: Sequence[str], *, check: bool = False, cwd: Optional[Path] = None) -> RunResult:
-        """执行外部命令并显示摘要；完整输出写入安装日志。"""
+    def run_command(
+        self,
+        args: Sequence[str],
+        *,
+        check: bool = False,
+        cwd: Optional[Path] = None,
+        timeout: Optional[float] = None,
+    ) -> RunResult:
+        """执行外部命令并显示摘要；完整输出写入安装日志。
+
+        timeout 到期后终止子进程并返回 124，避免挂起的 CLI 让安装/卸载无限阻塞。
+        """
         command = [str(item) for item in args]
         self.logger.command_start(command)
         try:
@@ -232,13 +254,21 @@ class Installer:
             if check:
                 raise InstallerError(f"could not run {' '.join(command)}: {exc}") from exc
             return RunResult(127)
-        output: list[str] = []
-        assert process.stdout is not None
-        for line in process.stdout:
-            output.append(line)
+        timed_out = False
+        try:
+            output_text, _ = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            output_text, _ = process.communicate()
+        output_text = output_text or ""
+        for line in output_text.splitlines(True):
             self.logger.command_output(line)
-        returncode = process.wait()
-        output_text = "".join(output)
+        returncode = self.TIMEOUT_RETURNCODE if timed_out else process.returncode
+        if timed_out:
+            self.logger.warn(
+                f"命令超时（{timeout:g}s），已终止：{self.logger.command_text(command)}"
+            )
         self.logger.command_finished(command, returncode, output_text)
         if check and returncode != 0:
             raise InstallerError(f"command failed ({returncode}): {' '.join(command)}")
@@ -769,34 +799,39 @@ class Installer:
         )
         return result.returncode == 0
 
-    def install_platform_agents(self, tool: str) -> bool:
-        """随对应插件同步该平台的全局 subagent。"""
+    def platform_agents_plan(self, action: str, tool: str) -> Optional[tuple[list[str], Path]]:
+        """构造平台全局 subagent 的同步/清理命令与目标目录；无可执行动作时返回 None。"""
         helper = SCRIPT_DIR / "manage-global-agents.py"
         if not helper.is_file():
-            return True
-        if not self.marketplace_local:
-            return True
-        source = self.marketplace_local / "skills"
-        if not source.is_dir():
-            return True
-        args = [sys.executable, str(helper), "install", "--source", str(source)]
-        args.extend(["--home", str(self.home), "--tool", tool])
+            return None
+        args = [sys.executable, str(helper), action, "--home", str(self.home), "--tool", tool]
+        if action == "install":
+            source = self.marketplace_local / "skills" if self.marketplace_local else None
+            if source is None or not source.is_dir():
+                return None
+            args.extend(["--source", str(source)])
+        flags, agents_dir = agents.global_agent_plan(tool, self.home)
+        args.extend(flags)
+        return args, agents_dir
+
+    def run_platform_agents(self, action: str, tool: str) -> bool:
+        """同步或清理某平台的全局 subagent；安装与卸载共用同一实现与路径解析。"""
         try:
-            # Qoder keeps its global agents inside the root shared with the IDE.
-            flags, agents_dir = qoder.agent_location(tool, self.home)
+            plan = self.platform_agents_plan(action, tool)
         except ValueError as exc:
             self.logger.error(str(exc))
             return False
-        args.extend(flags)
+        if plan is None:
+            return True
+        args, agents_dir = plan
         result = self.run_command(args)
         if result.returncode == 0:
-            path = agents_dir or {
-                "claude": self.home / ".claude" / "agents",
-                "opencode": self.home / ".config" / "opencode" / "agents",
-                "codex": self.home / ".codex" / "agents",
-            }[tool]
-            self.track(path)
+            self.track(agents_dir)
         return result.returncode == 0
+
+    def install_platform_agents(self, tool: str) -> bool:
+        """随对应插件同步该平台的全局 subagent。"""
+        return self.run_platform_agents("install", tool)
 
     def ensure_agent_cli(self, platform_key: str) -> bool:
         """安装插件前确保平台 CLI 可用；缺失时自动安装 CLI 本体。"""
@@ -853,6 +888,9 @@ class Installer:
         # 勾选插件但缺少 CLI 时先自动安装 CLI，再安装插件。
         if not self.ensure_agent_cli("claude"):
             return False
+        # 先同步全局 subagent：失败即中止，避免“插件已写入并启用、组件却上报失败”的半安装状态。
+        if not self.install_platform_agents("claude"):
+            return False
         if self.run_command(["claude", "plugin", "marketplace", "add", str(self.market_dir)]).returncode != 0:
             return False
         self.track(self.home / ".claude" / "plugins" / "known_marketplaces.json")
@@ -860,7 +898,7 @@ class Installer:
         listing = self.run_capture(["claude", "plugin", "list"]).stdout
         package = f"{CLAUDE_PLUGIN}@{CLAUDE_MARKETPLACE}"
         result = self.run_command(["claude", "plugin", "update", package]) if package in listing else self.run_command(["claude", "plugin", "install", package, "--scope", "user"])
-        if result.returncode != 0 or not self.install_platform_agents("claude"):
+        if result.returncode != 0:
             return False
         self.track(self.home / ".claude" / "plugins" / "installed_plugins.json")
         self.record_marketplace_sha()
@@ -872,6 +910,8 @@ class Installer:
             return False
         if not self.ensure_agent_cli("opencode"):
             return False
+        if not self.install_platform_agents("opencode"):
+            return False
         path = self.home / ".config" / "opencode" / "opencode.json"
         plugin = f"codekit@file://{self.opencode_source_dir}"
         try:
@@ -882,7 +922,7 @@ class Installer:
                 result = RunResult(0)
         except ValueError:
             return False
-        if result.returncode != 0 or not self.install_platform_agents("opencode"):
+        if result.returncode != 0:
             return False
         self.track(path)
         return True
@@ -892,6 +932,8 @@ class Installer:
         if not self.market_dir:
             return False
         if not self.ensure_agent_cli("codex"):
+            return False
+        if not self.install_platform_agents("codex"):
             return False
         # 旧版本可能把兼容技能放进 ~/.agents；安装前清掉旧生成物，避免重复加载。
         for path in (self.home / ".agents" / "skills").glob("keel-*"):
@@ -904,14 +946,14 @@ class Installer:
             return False
         self.track(self.home / ".codex" / "config.toml")
         result = self.run_command(["codex", "plugin", "add", f"{CODEX_PLUGIN}@{CODEX_MARKETPLACE}"])
-        if result.returncode != 0 or not self.install_platform_agents("codex"):
+        if result.returncode != 0:
             return False
         self.record_marketplace_sha()
         return True
 
     def qoder_run(self, args: Sequence[str], timeout: float = 20.0) -> tuple[int, str]:
-        """通过安装器日志执行 Qoder CLI 命令；超时由外部命令自身控制。"""
-        result = self.run_command(args)
+        """执行 Qoder CLI 命令；到期即终止子进程，避免安装/卸载无限阻塞。"""
+        result = self.run_command(args, timeout=timeout)
         return result.returncode, result.stdout
 
     def install_qoder_plugin(self, platform_key: str) -> bool:
@@ -932,6 +974,10 @@ class Installer:
                 "Qoder keeps a separate configuration root per OS; this install "
                 f"only reaches {root}, so a Qoder running on Windows stays unaware."
             )
+        # 先同步全局 subagent：失败即中止且不写注册表，避免出现
+        # “插件已写入并启用、但组件上报失败”的半安装状态。
+        if not self.install_platform_agents(platform_key):
+            return False
         command = qoder.capable_cli(descriptor)
         try:
             if command:
@@ -941,8 +987,6 @@ class Installer:
                 qoder.install_direct(root, stage, self.plugin_version)
             self.track(qoder.registry_path(root))
             self.track(qoder.settings_path(root))
-            if not self.install_platform_agents(platform_key):
-                return False
             state = qoder.inspect(descriptor, self.home)
         except ValueError as exc:
             raise InstallerError(str(exc)) from exc
@@ -1122,18 +1166,6 @@ class Installer:
         self.logger.info(f"\n \n === CodeKit Plugin Install v{self.plugin_version} ===")
         if platform.system() not in {"Darwin", "Linux"}:
             raise InstallerError(f"Unsupported OS: {platform.system()}. Only macOS/Linux.")
-        required_helpers = (
-            SCRIPT_DIR / "component-registry.py",
-            SCRIPT_DIR / "installer_agents.py",
-            SCRIPT_DIR / "installer_config.py",
-            SCRIPT_DIR / "installer_state.py",
-            SCRIPT_DIR / "installer_sources.py",
-            SCRIPT_DIR / "installer_qoder.py",
-            SCRIPT_DIR / "component-selector.py",
-        )
-        missing = [str(path) for path in required_helpers if not path.is_file()]
-        if missing:
-            raise InstallerError(f"Installer helper missing: {', '.join(missing)}")
         detector.registry.validate_registry()
         self.ensure_user_bin()
         if not self.marketplace_local:

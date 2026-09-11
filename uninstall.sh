@@ -49,24 +49,8 @@ run_python_uninstall() {
     return 1
   fi
 
-  # 先确认仓库内的卸载编排器和共享辅助模块完整，避免卸载过程中途缺少关键逻辑。
-  local helper
-  local -a required_helpers=(
-    "${SCRIPT_DIR}/scripts/uninstaller.py"
-    "${SCRIPT_DIR}/scripts/installer.py"
-    "${SCRIPT_DIR}/scripts/installer_config.py"
-    "${SCRIPT_DIR}/scripts/installer_state.py"
-    "${SCRIPT_DIR}/scripts/installer_sources.py"
-    "${SCRIPT_DIR}/scripts/component-selector.py"
-  )
-  for helper in "${required_helpers[@]}"; do
-    if [ ! -f "${helper}" ]; then
-      error "Uninstaller helper missing: ${helper}"
-      return 1
-    fi
-  done
-
-  # 进入独立卸载编排器，保留 -y/--yes 等用户参数。
+  # 辅助模块清单的唯一来源是 scripts/installer_config.py：uninstaller.py 在导入期
+  # 自检并在缺失时输出单行受控错误，因此这里不再维护第二份清单。
   python3 "${SCRIPT_DIR}/scripts/uninstaller.py" "$@"
 }
 

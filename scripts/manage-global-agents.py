@@ -7,22 +7,25 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Optional
 
 
-MANAGED_MARKER = "managed-by: codekit"
-TOOLS = ("claude", "opencode", "codex", "qoder", "qodercn")
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
-# Qoder's CLI and desktop IDE share one configuration root, so the global
-# agents written there are visible to both surfaces. The environment
-# variable lets an installation live outside the home directory.
-QODER_LAYOUTS = {
-    "qoder": (".qoder", "QODER_CONFIG_DIR"),
-    "qodercn": (".qoder-cn", "QODERCN_CONFIG_DIR"),
-}
+import installer_agents as agents  # noqa: E402
+import installer_qoder as qoder  # noqa: E402
+
+
+MANAGED_MARKER = "managed-by: codekit"
+# 平台键与全局 agent 目录的唯一来源：installer_agents 负责目录布局，
+# installer_qoder 负责两个 Qoder 发行版的共享配置根。
+TOOLS = ("claude", "opencode", "codex", *qoder.PLATFORMS)
 
 
 def agent_files(source: Path) -> list[Path]:
@@ -128,25 +131,15 @@ def destinations(
 ) -> dict[str, Path]:
     """返回各工具的全局 agent 目录，Qoder 使用共享配置根。"""
     environ = os.environ if environ is None else environ
-    targets = {
-        "claude": home / ".claude" / "agents",
-        "opencode": home / ".config" / "opencode" / "agents",
-        "codex": home / ".codex" / "agents",
-    }
-    qoder_tools = tuple(tool for tool in tools if tool in QODER_LAYOUTS)
+    qoder_tools = tuple(tool for tool in tools if tool in qoder.PLATFORMS)
     if config_root is not None and len(qoder_tools) > 1:
         raise SystemExit(
             "--config-root selects one Qoder configuration root; pass --tool once"
         )
-    for tool in qoder_tools:
-        directory, env_key = QODER_LAYOUTS[tool]
-        if config_root is not None:
-            root = Path(config_root).expanduser()
-        else:
-            configured = (environ.get(env_key) or "").strip()
-            root = Path(configured).expanduser() if configured else home / directory
-        targets[tool] = root / "agents"
-    return targets
+    return {
+        tool: agents.global_agent_plan(tool, home, config_root, environ)[1]
+        for tool in tools
+    }
 
 
 def install(

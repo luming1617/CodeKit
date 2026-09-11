@@ -33,8 +33,8 @@ interface:
 5. `SKILL.md` 的 `name` 必须与目录名一致；仓库内**不得**提交 `skills/<skill>/agents/openai.yaml`。
 
 **路径换算**：Codex 官方只读取 `skills/<skill>/agents/openai.yaml`。仓库把源文件与 `SKILL.md`
-同级存放以保持一致和可读，安装时由 `install.sh` 的 `_stage_skill_interface_files` 在生成的兼容
-市场源里复制出 Codex 约定路径，因此无需人工维护两份文件。
+同级存放以保持一致和可读，安装时由 `installer_sources.stage_skill_interface_files`（`installer_sources.prepare`
+调用）在生成的兼容市场源里复制出 Codex 约定路径，因此无需人工维护两份文件。
 
 ## agents/：全局 subagent 规范源
 

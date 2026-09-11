@@ -15,8 +15,8 @@ CodeKit 是一套基于 Claude / OpenCode / Codex / Qoder 的 AI 开发套件，
 | npm | macOS 用 Homebrew，Linux 用发行版包管理器安装 |
 | curl | macOS 用 Homebrew，Linux 用发行版包管理器安装 |
 | Homebrew | 仅 macOS 自动安装（安装失败退出；已装则自动更新，更新失败仅警告并继续） |
-| Git >= 2.50.0 | macOS 用 Homebrew，Linux 用发行版包管理器安装/升级 |
-| 编程智能体（Claude / Codex / OpenCode / Qoder / Qoder CN） | macOS 优先用 Homebrew/cask，Linux 使用 npm；Qoder 与 Qoder CN 由官方 IDE/CLI 分发，五者都未安装时脚本提示选择 |
+| Git >= 2.50.1 | macOS 用 Homebrew，Linux 用发行版包管理器安装/升级 |
+| 编程智能体（Claude / Codex / OpenCode / Qoder / Qoder CN） | macOS 优先用 Homebrew/cask，Linux 使用 npm；Qoder 与 Qoder CN 由官方 IDE/CLI 分发；五者都未安装时仅提示并继续，勾选平台插件后才会自动安装对应 CLI |
 | SSH Key（访问 GitLab） | `ssh -T git@<your-git-host>` |
 
 > `<your-git-host>` 指本仓库所在的 Git 主机。在本仓库内运行 `bash install.sh` 时，安装后的配置指引会自动打印实际主机名。
@@ -29,7 +29,7 @@ CodeKit 是一套基于 Claude / OpenCode / Codex / Qoder 的 AI 开发套件，
 bash install.sh
 ```
 
-安装内容：git-ai（AI code tracking）、rtk（节省 token 60-90%）、GitNexus（代码智能）、Graphify（知识图谱）、gh（GitHub CLI）、glab（GitLab CLI）、钉钉 CLI（`dws`）、飞书 CLI（`lark-cli`）、CodeKit 插件（Claude + OpenCode + Codex + Qoder + Qoder CN，插件分别包含对应平台的全局 subagent；Qoder 插件同时服务其 CLI 与桌面 IDE）。安装前脚本会按平台自动保障 git ≥ 2.50.0、Node.js ≥ 20、Python3、npm、curl 与至少一个编程智能体；macOS 使用 Homebrew，Linux 使用发行版包管理器，失败即退出；安装后会打印包含安装路径、安装版本和未选择项的结果汇总，以及带作用说明的后续操作提示。
+安装内容：git-ai（AI code tracking）、rtk（节省 token 60-90%）、GitNexus（代码智能）、Graphify（知识图谱）、gh（GitHub CLI）、glab（GitLab CLI）、钉钉 CLI（`dws`）、飞书 CLI（`lark-cli`）、CodeKit 插件（Claude + OpenCode + Codex + Qoder + Qoder CN，插件分别包含对应平台的全局 subagent；Qoder 插件同时服务其 CLI 与桌面 IDE）。安装前脚本会按平台自动保障 git ≥ 2.50.1、Node.js ≥ 20、Python3、npm 与 curl；macOS 使用 Homebrew，Linux 使用发行版包管理器，失败即退出。编程智能体 CLI 不在此阶段强制准备：没有可用 CLI 时只提示，勾选平台插件后才自动安装对应 CLI。
 
 > CodeKit 的 7 个技能同时支持 **Claude**、**OpenCode**、**Codex**、**Qoder** 和 **Qoder CN**，可以同时安装，互不冲突。Linux 上 Claude、Codex 和 OpenCode 使用 npm 安装（统一走 `registry.npmmirror.com` 镜像源）；macOS 优先使用官方 Homebrew/cask。Qoder 与 Qoder CN 的 CLI 和桌面 IDE 共用同一个用户级配置根，安装一次两端生效。
 >

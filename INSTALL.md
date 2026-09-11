@@ -20,7 +20,7 @@
 9. [卸载流程](#9-卸载流程)
 10. [安装后插件目录变化（五平台）](#10-安装后插件目录变化五平台)
 11. [状态文件与日志](#11-状态文件与日志)
-12. [关键助手函数速查](#12-关键助手函数速查)
+12. [关键实现位置速查](#12-关键实现位置速查)
 13. [如何新增一个组件](#13-如何新增一个组件)
 14. [行为与退出码约定](#14-行为与退出码约定)
 
@@ -40,10 +40,10 @@
 
 | 原则 | 说明 |
 |------|------|
-| **职责分离** | `install.sh` 编排安装流程，`scripts/component-registry.py` 管理组件注册，`scripts/component-selector.py` 管理交互界面 |
+| **职责分离** | `install.sh` / `uninstall.sh` 只准备系统依赖并转交 `scripts/installer.py` / `scripts/uninstaller.py` 编排；组件注册由 `scripts/component-registry.py` 管理，交互界面由 `scripts/component-selector.py` 管理 |
 | **本地源优先** | 在仓库内执行时，以 `install.sh` 所在目录（当前仓库）作为插件市场源，相对定位、不写死远端地址；检测不到本地源时保留为空，打印提示并兜底跳过相关组件，不影响其他操作 |
 | **用户态安装** | 全部装到 `~/.local/`、`~/.npm-global/` 等用户目录，不用 `sudo` |
-| **幂等** | 已装组件自动识别并显示 `latest`，默认不勾选；勾选到 `install_*` 时按"已装即升级/刷新"处理，因此重复执行同一命令不会重复安装，未勾选的组件不被改动 |
+| **幂等** | 已装组件自动识别并在选择器中标注「已最新」，默认不勾选；勾选到 `install_*` 时按"已装即升级/刷新"处理，因此重复执行同一命令不会重复安装，未勾选的组件不被改动 |
 | **交互式选择** | 提供可视化多选界面，用户可自由勾选要装的组件 |
 | **快速失败** | 前置依赖缺失时立即退出，避免半途失败 |
 
@@ -89,11 +89,11 @@ bash uninstall.sh [-y]
 | 检查项       | 行为                                                                                                                                                  | 失败处理 |
 |--------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|----------|
 | Homebrew     | 未装则用**中科大镜像脚本**自动安装（`mirrors.ustc.edu.cn/misc/brew-install.sh`，非交互模式）；已装则执行 `brew update`；安装/更新前注入中科大镜像源（`HOMEBREW_BREW_GIT_REMOTE` / `HOMEBREW_API_DOMAIN` / `HOMEBREW_ARTIFACT_DOMAIN`） | **安装失败**即**退出流程**；**更新失败**仅警告并继续（多为瞬时网络问题，不影响后续安装） |
-| git          | 未装则 `brew install git` 自动安装；低于 2.50.0 则 `brew upgrade git` 升级                                                                           | 安装/升级后仍不满足 ≥ 2.50.0 即**退出流程** |
+| git          | 未装则 `brew install git` 自动安装；低于 2.50.1 则 `brew upgrade git` 升级                                                                           | 安装/升级后仍不满足 ≥ 2.50.1 即**退出流程** |
 | Node.js      | 未装则 `brew install node` 自动安装；低于 20 则尝试 brew 升级                                                                                         | 安装后仍不满足 ≥ 20 即**退出流程** |
 | Python3      | 未装则 `brew install python3` 自动安装（brew 默认 `python@3.x` 的官方别名）                                                                           | 安装失败即**退出流程** |
 | curl         | 未装则 `brew install curl` 自动安装（brew 的 curl 为 keg-only，装后按 opt 路径兜底挂载）                                                              | 安装失败即**退出流程** |
-| 编程智能体   | 检查 Claude / Codex / OpenCode / Qoder / Qoder CN 的 CLI，以及 macOS/Linux 上对应 Desktop 应用、启动器和常见安装目录；Qoder 另把共享配置根视为可用 | 五者均不存在时以醒目提示结束流程（退出码 0），不再询问或自动安装 agent |
+| 编程智能体   | `preflight_agents` 只探测 Claude / Codex / OpenCode / Qoder / Qoder CN 的 **CLI 本体** | 五者 CLI 均不存在时只提示并**继续流程**（退出码 0），不自动安装 agent；勾选某个平台插件时会先自动安装该平台 CLI |
 
 > 前置检查顺序刻意"依赖优先、智能体最后"（Homebrew → git → Node.js → Python3 → curl → 编程智能体）：智能体安装在无 cask 场景会回退 `npm install -g`（统一走 npmmirror 镜像源），需 Node 先就位。
 
@@ -102,7 +102,7 @@ bash uninstall.sh [-y]
 
 ## 5. 安装组件清单
 
-组件的唯一注册源是 `scripts/component-registry.py` 中的 `COMPONENTS` 和 `GROUPS`。Python 启动时校验组件 ID、重复项、分组引用、分组顺序及 TSV 安全性；`install.sh` 的 `_load_component_registry` 再把导出的四列 TSV 加载到运行期数组，并校验每个组件都存在 `check_*`、`install_*`、`uninstall_*` 处理函数。
+组件的唯一注册源是 `scripts/component-registry.py` 中的 `COMPONENTS` 和 `GROUPS`。`installer_state.py` 在启动时校验组件 ID、重复项、分组引用、分组顺序及 TSV 安全性；`installer.py` 的 `install_component` 与 `uninstaller.py` 的 `uninstall_component` 各用一张分发表把组件 ID 映射到对应的 `install_*` / `uninstall_*` 处理器，覆盖性由 `scripts/test_installer_contracts.py` 断言（注册表、安装分发、卸载分发、版本记录四方必须一致）。
 
 | # | 组件 ID           | 展示名称                          | 分组     |
 |---|-------------------|-----------------------------------|----------|
@@ -121,8 +121,8 @@ bash uninstall.sh [-y]
 | 13 | `feishu_cli`      | 飞书 CLI                          | `third`  |
 
 - **`GROUPS`** 定义交互选择器中的分组标题及顺序（`ai`→AI 开发套件、`skills`→CodeKit Skills、`intel`→代码智能、`third`→三方工具）。
-- **双层守卫**：Python 校验注册数据自身；Bash 校验加载结果、下标数组一致性及处理函数是否齐全。
-- **表驱动调用**：每个组件对应 `check_<组件>` / `install_<组件>` / `uninstall_<组件>`，由 `_dispatch` 按名字拼接分发，代码中无需逐组件调用。
+- **单一来源**：注册表由 `scripts/component-registry.py` 维护，`component-registry.py --check` 校验 ID、分组顺序和描述字段；安装器与卸载器都从同一份注册数据派生处理器集合。
+- **表驱动调用**：每个组件对应一个 `install_<组件>` / `uninstall_<组件>` 处理器，由 `installer.py` 的 `install_component` 与 `uninstaller.py` 的 `uninstall_component` 两张分发表调用；状态探测统一由 `installer_state.detect_component` 完成。
 
 
 
@@ -133,30 +133,30 @@ bash uninstall.sh [-y]
 |---------------------|-------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------|
 | `git_ai`            | 官方安装脚本 `https://usegitai.com/install.sh`                           | `curl -fsSL ... \| bash`（官方无 Homebrew formula/tap，此为唯一自动化渠道，无回退）；安装器不额外写入 Git-AI 配置                                                                       | `~/.git-ai/bin/git-ai`                                                     |
 | `rtk`               | Homebrew formula `rtk`；回退源 `rtk-ai/rtk` 官方脚本                      | `brew install\|upgrade rtk` → 失败回退 `curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh \| sh` → 成功后按已安装智能体执行 `rtk init -g`，Codex 另执行 `rtk init -g --codex`                | brew 的 bin 目录；配置写入对应全局目录                                             |
-| `claude_plugin`     | 当前仓库根目录生成的兼容市场源（`CODEKIT_MARKET_DIR`，重建旧版 `plugins/codekit` 布局） | `claude plugin marketplace add <兼容市场源>` → `claude plugin marketplace update co-daming` 刷新索引 → 未装则 `claude plugin install codekit@co-daming --scope user`、已装则 `claude plugin update codekit@co-daming` → `_record_marketplace_sha`；本地源为空即提示跳过，无回退 | `~/.claude/plugins/known_marketplaces.json`、`~/.claude/plugins/installed_plugins.json`、`~/.claude/settings.json` |
-| `opencode_plugin`   | 安装状态目录生成的兼容 npm 包源（`opencode-source`） | 首装：把条目 `codekit@file://<安装状态目录>/opencode-source` 写入 `~/.config/opencode/opencode.json` 的 `plugin` 数组（`_json_edit`：node 优先、python3 兜底）；已配置：强制刷新兼容包源（无该子命令时仅提示已配置） | `~/.config/opencode/opencode.json`                                                            |
-| `codex_plugin`      | 当前仓库根目录生成的兼容市场源（重建旧版 `plugins/codekit` 布局）       | 清理旧散装 `~/.agents/skills/keel-*` → `codex plugin marketplace add <兼容市场源>` →（已装且市场源为 Git 地址时 `codex plugin marketplace upgrade co-daming`）→ `codex plugin add codekit@co-daming` → `_record_marketplace_sha`；本地源为空即提示跳过，无回退 | 插件缓存 `~/.codex/plugins/cache/`，启用状态写 `~/.codex/config.toml`                           |
+| `claude_plugin`     | 当前仓库根目录生成的兼容市场源（`CODEKIT_MARKET_DIR`，重建旧版 `plugins/codekit` 布局） | `claude plugin marketplace add <兼容市场源>` → `claude plugin marketplace update co-daming` 刷新索引 → 未装则 `claude plugin install codekit@co-daming --scope user`、已装则 `claude plugin update codekit@co-daming` → `record_marketplace_sha`；本地源为空即提示跳过，无回退 | `~/.claude/plugins/known_marketplaces.json`、`~/.claude/plugins/installed_plugins.json`、`~/.claude/settings.json` |
+| `opencode_plugin`   | 安装状态目录生成的兼容 npm 包源（`opencode-source`） | 首装：把条目 `codekit@file://<安装状态目录>/opencode-source` 写入 `~/.config/opencode/opencode.json` 的 `plugin` 数组（`installer_config.add_opencode_plugin` 原子写入）；已配置：强制刷新兼容包源（无该子命令时仅提示已配置） | `~/.config/opencode/opencode.json`                                                            |
+| `codex_plugin`      | 当前仓库根目录生成的兼容市场源（重建旧版 `plugins/codekit` 布局）       | 清理旧散装 `~/.agents/skills/keel-*` → `codex plugin marketplace add <兼容市场源>` →（已装且市场源为 Git 地址时 `codex plugin marketplace upgrade co-daming`）→ `codex plugin add codekit@co-daming` → `record_marketplace_sha`；本地源为空即提示跳过，无回退 | 插件缓存 `~/.codex/plugins/cache/`，启用状态写 `~/.codex/config.toml`                           |
 | `qoder_plugin`      | 安装状态目录生成的 Qoder 插件源（`qoder-source/codekit`，仅 `.qoder-plugin/` + `skills/`） | CLI 具备 `plugins install --scope user --json` 时执行 `<cli> --config-dir ~/.qoder plugins install <源> --scope user --json`；否则直接写共享注册表与缓存（Desktop-only 兜底） | `~/.qoder/plugins/installed_plugins_v2.json`、`~/.qoder/settings.json`、`~/.qoder/agents/` |
 | `qodercn_plugin`    | 安装状态目录生成的 Qoder 插件源（`qoder-source/codekit`，与 Qoder 共用同一份构建） | 同上，命令换为 `qodercn`、配置根换为 `~/.qoder-cn` | `~/.qoder-cn/plugins/installed_plugins_v2.json`、`~/.qoder-cn/settings.json`、`~/.qoder-cn/agents/` |
-| `gitnexus`          | 官方 npm 渠道包 `gitnexus`（无 Homebrew formula）                          | `_set_npm`（前缀指向 `~/.npm-global`）→ `npm install -g gitnexus@latest --registry=https://registry.npmmirror.com`（用户态、免 sudo）→ 成功后 `gitnexus setup`；无回退                                                                                | `~/.npm-global/bin/gitnexus`                                                                  |
-| `dingtalk_cli`      | npm 包 `dingtalk-workspace-cli`（官方 DingTalk Workspace CLI）              | 安装前检查 `unzip`，缺失时先通过当前平台包管理器安装 → `_set_npm`（前缀指向 `~/.npm-global`）→ `npm install -g dingtalk-workspace-cli@latest --registry=https://registry.npmmirror.com`；无自动认证配置                                                                                                                 | `~/.npm-global/bin/dws`                                                                       |
-| `feishu_cli`        | npm 包 `@larksuite/cli`（官方 Lark/Feishu CLI）                              | `_set_npm`（前缀指向 `~/.npm-global`）→ `npm install -g @larksuite/cli@latest --registry=https://registry.npmmirror.com` → `npx --registry=https://registry.npmmirror.com skills add larksuite/cli -y -g --agent <已安装的智能体>`；显式限定 Claude Code、Codex、OpenCode，避免 PromptScript 导致整批失败                                                                 | `~/.npm-global/bin/lark-cli`                                                                  |
+| `gitnexus`          | 官方 npm 渠道包 `gitnexus`（无 Homebrew formula）                          | `set_npm`（前缀指向 `~/.npm-global`）→ `npm install -g gitnexus@latest --registry=https://registry.npmmirror.com`（用户态、免 sudo）→ 成功后 `gitnexus setup`；无回退                                                                                | `~/.npm-global/bin/gitnexus`                                                                  |
+| `dingtalk_cli`      | npm 包 `dingtalk-workspace-cli`（官方 DingTalk Workspace CLI）              | 安装前检查 `unzip`，缺失时先通过当前平台包管理器安装 → `set_npm`（前缀指向 `~/.npm-global`）→ `npm install -g dingtalk-workspace-cli@latest --registry=https://registry.npmmirror.com`；无自动认证配置                                                                                                                 | `~/.npm-global/bin/dws`                                                                       |
+| `feishu_cli`        | npm 包 `@larksuite/cli`（官方 Lark/Feishu CLI）                              | `set_npm`（前缀指向 `~/.npm-global`）→ `npm install -g @larksuite/cli@latest --registry=https://registry.npmmirror.com` → `npx --registry=https://registry.npmmirror.com skills add larksuite/cli -y -g --agent <已安装的智能体>`；显式限定 Claude Code、Codex、OpenCode，避免 PromptScript 导致整批失败                                                                 | `~/.npm-global/bin/lark-cli`                                                                  |
 | `graphify`          | 官方 PyPI 渠道包 `graphifyy`（无 Homebrew formula）                          | `pipx install graphifyy`（已装则 `pipx upgrade graphifyy`）→ 失败回退独立 venv：`python3 -m venv` + `bin/pip install -U graphifyy` + 软链到 `~/.local/bin` → 按已检测智能体执行 `graphify install --platform <agent>` → `graphify hook install` | pipx 托管环境，或 `~/.local/share/CodeKit/venvs/graphify` + `~/.local/bin/graphify`             |
-| `gh`                | Homebrew formula `gh`                                                        | `_brew_install_or_upgrade gh`（已装则 `brew upgrade gh`）；无回退                                                                                                                                            | brew 的 bin 目录                                                                              |
-| `glab`              | Homebrew formula `glab`                                                      | `_brew_install_or_upgrade glab`（已装则 `brew upgrade glab`）；无回退                                                                                                                                        | brew 的 bin 目录                                                                              |
+| `gh`                | Homebrew formula `gh`                                                        | `brew_install_or_upgrade gh`（已装则 `brew upgrade gh`）；无回退                                                                                                                                            | brew 的 bin 目录                                                                              |
+| `glab`              | Homebrew formula `glab`                                                      | `brew_install_or_upgrade glab`（已装则 `brew upgrade glab`）；无回退                                                                                                                                        | brew 的 bin 目录                                                                              |
 
-> 五个插件类组件的来源都是**当前仓库本地路径**（脚本相对自身位置探测根目录下的清单，并在安装时生成兼容源），不写死远端地址；若脚本目录保留 `scripts/` 但缺少根目录插件文件，这五项会各自告警并跳过（见 [8.1](#81-marketplace-本地源marketplacelocal)）。
+> 五个插件类组件的来源都是**当前仓库本地路径**（脚本相对自身位置探测根目录下的清单，并在安装时生成兼容源），不写死远端地址；若脚本目录保留 `scripts/` 但缺少根目录插件文件，这五项会各自告警并跳过（见 [8.1](#81-marketplace-本地源marketplace_local)）。
 > 更细的失败处理与升级路径见 [第 8 节](#8-各组件安装策略)。
 
 ### 5.2 版本探测与升级判定
 
-检查阶段由 `_component_version` 统一探测已装版本，再与最新版比对；`_check_up_to_date` 用 `_ver_ge`（逐段数字比较）判定，**已装版本不低于最新版**即置 `up_to_date`，避免本地构建领先于已发布版本时误提示降级。
+检查阶段由 `installer_state.component_version` 统一探测已装版本，再与最新版比对；`detect_component` 用 `version_greater_or_equal`（逐段数字比较）判定，**已装版本不低于最新版**即置 `up_to_date`，避免本地构建领先于已发布版本时误提示降级。
 
 | 组件                | 已装版本探测                             | 最新版来源                                                    | 判定要点                                                                             |
 |---------------------|------------------------------------------|---------------------------------------------------------------|--------------------------------------------------------------------------------------|
-| `git_ai`            | `_git_ai_cmd` 解析路径后 `git-ai --version` | 上游无公开版本源，**不查询**                                   | 探测到即直接置 `up_to_date`（选择器标注"勾选可重装"，重装脚本即刷新到最新）           |
+| `git_ai`            | `installer_state.git_ai_command` 解析路径后 `git-ai --version` | 上游无公开版本源，**不查询**                                   | 探测到即直接置 `up_to_date`（选择器标注"勾选可重装"，重装脚本即刷新到最新）           |
 | `rtk`               | `rtk --version`                           | GitHub API `repos/rtk-ai/rtk/releases/latest` 的 `tag_name`    | 查询失败（超时 5s）时置 `up_to_date`，不提示升级                                      |
-| `claude_plugin`     | 状态文件 `marketplace_sha`（显示取前 7 位） | 本地仓库 `git rev-parse HEAD`（`_get_marketplace_latest_sha`）  | 安装状态以 `claude plugin list` 含 `codekit@co-daming` 为准；SHA 相同→最新，不同→有更新 |
+| `claude_plugin`     | 状态文件 `marketplace_sha`（显示取前 7 位） | 本地仓库 `git rev-parse HEAD`（`installer_state.marketplace_sha`）  | 安装状态以 `claude plugin list` 含 `codekit@co-daming` 为准；SHA 相同→最新，不同→有更新 |
 | `opencode_plugin`   | 同上 `marketplace_sha`                    | 同上 `HEAD`                                                    | 安装状态以 `opencode.json` 含 `codekit@` 为准                                         |
 | `codex_plugin`      | 同上 `marketplace_sha`                    | 同上 `HEAD`                                                    | 安装状态以 `codex plugin list --marketplace co-daming` 首列匹配为准                    |
 | `qoder_plugin` / `qodercn_plugin` | 共享注册表 `installed_plugins_v2.json` 的 `version`（读不到时回落 `plugin-version.json`） | 同左：重装即升级，不查询远端 | 安装状态以共享注册表含 `codekit@local` 且缓存目录真实存在为准，**不依赖 CLI 是否在 PATH** |
@@ -167,51 +167,48 @@ bash uninstall.sh [-y]
 | `gh`                | `gh --version`                            | GitHub API `repos/cli/cli/releases/latest`                     | 语义化版本比对                                                                        |
 | `glab`              | `glab version`                            | GitLab API `projects/34675721/releases/permalink/latest`        | 语义化版本比对                                                                        |
 
-每个组件的状态由三组动态变量保存（通过 `eval` 拼接变量名实现）：
+每个组件的状态由 `installer_state.ComponentState` 保存：
 
-- `_status_<组件>`：状态（`not_checked` / `not_installed` / `installed` / `up_to_date`）
-- `_ver_<组件>`：当前已装版本
-- `_latest_<组件>`：远端最新版本
+- `status`：状态（`not_installed` / `installed` / `up_to_date`）
+- `installed_version`：当前已装版本
+- `latest_version`：远端最新版本（探测失败时为空）
 
-> 三态勾选规则（见 [7.5](#75-摘要与交互选择show_summary_and_confirm)）：`not_installed` 与 `installed`（有新版）默认勾选，`up_to_date` 默认不勾选，但用户主动勾选仍会重装/升级。
+> 三态勾选规则（见 [7.5](#75-摘要与交互选择select_components)）：`not_installed` 与 `installed`（有新版）默认勾选，`up_to_date` 默认不勾选，但用户主动勾选仍会重装/升级。
 
 ---
 
 
 ## 6. 总体执行流程
 
-入口为 `main`（文件末尾 `main "$@"`）。`install` 主流程（原 `upgrade` 已合并进来）：
+`install.sh` 是 bootstrap：只按平台准备系统依赖（Homebrew、Python3、npm、curl、git、Node.js），最后 `exec python3 scripts/installer.py`。安装编排全部在 Python 中完成，`Installer.run`（`scripts/installer.py`）的生命周期：
 
 ```
-parse_args          # 解析参数，确定 ACTION
+读取并校验 plugin-version.json        # 插件版本唯一源
+校验组件注册表（component-registry.py）
+prepare_sources                       # 重建 Claude/Codex/OpenCode/Qoder 兼容插件源
+preflight_agents                      # 只探测五平台 CLI：缺失时提示，不中断流程
+load_states                           # 逐个探测组件当前/最新版本（分发表驱动）
+select_components                     # 打印摘要 + 交互选择（非交互用默认选择；缺 CLI 的插件不默认勾选）
   ↓
-setup_logging       # 初始化日志目录与文件
-detect_os           # 检测操作系统（仅支持 macOS/Linux）
-detect_arch         # 检测 CPU 架构（amd64/arm64）
-ensure_user_bin     # 创建并临时挂载用户级 bin 目录
+run_installs                          # 依次安装/升级选中组件（未安装→安装；有新版→升级/重装；单组件失败不中断）
+configure_git                         # 配置全局 git 选项
+save_versions                         # 写入版本记录文件
+[可选] setup_shell_path               # 将用户级 bin 永久写入 shell 配置
   ↓
-run_preflight               # 前置检查：Homebrew → git(≥2.50.0) → Node.js(≥20) → Python3 → curl → 编程智能体（含原硬性依赖，失败退出/结束）
-check_all_components        # 逐个探测各组件的当前版本与最新版本（表驱动分发）
-show_summary_and_confirm    # 打印摘要 + 交互选择组件（未安装→默认勾选；有新版→显示"当前 → 最新"由用户勾选；无新版→显示 latest）
-  ↓
-run_selected_installs       # 依次处理选中的组件：勾选即决定（未安装→安装，已安装→升级/重装刷新；单组件失败不中断）
-configure_git               # 配置全局 git 选项
-save_installed_versions     # 写入版本记录文件
-[可选] setup_shell_path     # 将用户级 bin 永久写入 shell 配置
-  ↓
-print_next_steps            # 打印带作用说明的安装后操作表格
-render_recap                # 所有安装与配置操作完成后打印最终结果汇总
+print_next_steps                      # 打印带作用说明的安装后操作表格
+render_recap                          # 打印最终结果汇总
 ```
 
-`uninstall` 流程：
+`uninstall.sh` 是独立入口：不准备安装依赖，只要求 Python3，随后 `exec python3 scripts/uninstaller.py`。`Uninstaller.run`（`scripts/uninstaller.py`）的流程：
 
 ```
-show_uninstall_confirmation  # 二次确认（-y 跳过）
-  ↓
-run_uninstalls               # 逐项卸载 + 清理配置与 PATH
+load_states            # 探测组件状态
+select_components      # 二次确认 + 交互选择（-y 或没有终端时用默认选择）
+run_uninstalls         # 逐项卸载，并清理 Git 全局配置、CodeKit PATH 块与版本记录文件
+render_recap           # 打印卸载结果汇总
 ```
 
-> 安装与升级共用同一条 `install` 流程（本节第一个流程图）：一次运行里既能补装缺失组件，也能勾选升级已装组件（见 [7.5](#75-摘要与交互选择)、[7.6](#76-执行安装与升级run_selected_installs)）。
+> 安装与升级共用同一条 `install` 流程（本节第一个流程图）：一次运行里既能补装缺失组件，也能勾选升级已装组件（见 [7.5](#75-摘要与交互选择select_components)、[7.6](#76-执行安装与升级run_installs)）。
 
 ---
 
@@ -227,16 +224,16 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 
 ### 7.2 初始化
 
-| 函数 | 作用 |
-|------|------|
-| `setup_logging` | 创建状态目录，写入启动时间戳到日志 |
-| `detect_os` | `uname -s`，非 Darwin/Linux 报错退出 |
-| `detect_arch` | `uname -m` 归一化为 `amd64`/`arm64`（供二进制下载选包） |
-| `ensure_user_bin` | 创建 `~/.local/bin`、`~/.npm-global/bin` 并临时加入当前会话 PATH |
+| 步骤 | 实现 | 作用 |
+|------|------|------|
+| 日志 | `Logger`（`installer.py`） | 创建状态目录并把分级日志追加到 `<状态目录>/install.log` |
+| 平台识别 | `Installer.__init__` 的 `platform.system()` | 非 Darwin/Linux 时 `run` 报错退出 |
+| 架构识别 | `Installer.git_ai_asset` 的 `platform.machine()` | 归一化为 `amd64`/`arm64`（供二进制下载选包） |
+| 用户 bin | `ensure_user_bin` | 创建 `~/.local/bin`、`~/.npm-global/bin` 并临时加入当前会话 PATH |
 
-### 7.3 前置检查（`run_preflight`）
+### 7.3 前置检查（`preflight_agents`）
 
-依次执行前置依赖检查和 `preflight_agents`，详见 [5.1](#51-前置检查run_preflight)。原硬性依赖（git ≥ 2.50.0 / Node.js ≥ 20 / Python3 / curl）按 macOS/Linux 平台分别补齐。前置检查同时识别 CLI 和 Desktop agent；如果五者均不存在，会以醒目提示结束插件安装，不再让用户选择或自动安装 agent。Qoder 与 Qoder CN 的 CLI 和桌面 IDE 共用同一个用户级配置根，只要该根、Desktop 或 CLI 任一处出现过即视为平台可用。全局 agent 在选择对应的 Claude、OpenCode、Codex 或 Qoder 插件时同步安装；该阶段只在 install 执行，卸载不执行。
+依次执行前置依赖检查和 `preflight_agents`，详见 [7.3](#73-前置检查preflight_agents)。原硬性依赖（git ≥ 2.50.1 / Node.js ≥ 20 / Python3 / curl）按 macOS/Linux 平台分别补齐。前置检查只探测五平台 **CLI 本体**：Desktop 应用、Linux 启动器与 Qoder 共享配置根**不计入 CLI 前置**，而是在 Qoder 平台可用性判断与后续提示中使用。如果五者 CLI 均不存在，只打印醒目提示并继续流程，不再中断插件安装（缺少的 CLI 由用户勾选对应插件后自动补装）。Qoder 与 Qoder CN 的 CLI 和桌面 IDE 共用同一个用户级配置根。全局 agent 在选择对应的 Claude、OpenCode、Codex 或 Qoder 插件时同步安装（先于插件写入注册表，避免半安装状态）；该阶段只在 install 执行，卸载不执行。
 
 全局 subagent 的统一源文件位于各 Skill 的 `skills/<skill>/agents/*.md`。Claude Code 原样安装到 `~/.claude/agents/`，OpenCode 原样安装到 `~/.config/opencode/agents/`，Codex 则生成同名的 `~/.codex/agents/*.toml`（正文映射到 `developer_instructions`），Qoder / Qoder CN 原样安装到与桌面 IDE 共享的 `<配置根>/agents/`（裸名，CLI 与 IDE 两端都能调度）。`initialize` 随插件安装 `initialize-gitnexus`、`initialize-graphify`、`initialize-context-scanner`，运行时由 `SKILL.md` 强制调用。安装器具备幂等性；同名非 CodeKit 文件会先备份到 `~/.local/state/CodeKit/agent-backups/`。
 
@@ -244,23 +241,23 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 
 卸载对应的 Claude、OpenCode、Codex 或 Qoder 插件时，会同步删除该平台带 CodeKit 管理标记的 agent 文件；用户自行创建的 agent 与备份文件会保留。Claude 与 Qoder 的插件缓存由 CLI 和 Desktop 共享，因此即使对应 CLI 不存在也会完成缓存清理。
 
-### 7.4 组件检查（`check_all_components`）
+### 7.4 组件检查（`load_states`）
 
-遍历 `COMPONENTS`，通过 `_dispatch check <组件>` 表驱动调用各 `check_<组件>`。每个检查函数：
+`load_states` 遍历 `COMPONENTS`，调用 `installer_state.detect_component` 逐组件探测状态并缓存为 `self.states`（`ComponentState`：`status` / `installed_version` / `latest_version`）。每个组件：
 
 1. 判断组件是否已安装；
-2. 读取当前版本（统一走 `_component_version`）；
+2. 读取当前版本（统一走 `installer_state.component_version`）；
 3. 尽力查询最新版本（npm / PyPI / GitLab API / GitHub API；marketplace 版本取**本地仓库 `HEAD`**，无本地仓库源时为空并由调用方兜底）；
 4. 比对得出状态：
    - 未安装 → `not_installed`
-   - 已安装且 `_check_up_to_date` 判定「已装版本 ≥ 最新版」→ `up_to_date`（用 `_ver_ge` 逐段数字比较，本地版本更新时不会被误判为有新版而提示降级）
+   - 已安装且 `version_greater_or_equal` 判定「已装版本 ≥ 最新版」→ `up_to_date`（逐段数字比较，本地版本更新时不会被误判为有新版而提示降级）
    - 已安装但落后于最新版 → `installed`（选择器显示 `当前 → 最新`，是否升级由用户勾选决定）
 
-> 最新版本探测失败（拿不到 `_latest_` 或版本号无法解析）时保持 `installed` 且 latest 为空，显示层按「已是最新」处理，不会自动建议升级。
+> 最新版本探测失败（拿不到 `installer_state.latest_versions` 的条目或版本号无法解析）时保持 `installed` 且 latest 为空，显示层按「已是最新」处理，不会自动建议升级。
 
-> 版本探测的唯一入口是 `_component_version`，兜底文案（`unknown`/`N/A`）由调用方提供。
+> 版本探测的唯一入口是 `installer_state.component_version`，兜底文案（`unknown`/`N/A`）由调用方提供。
 
-### 7.5 摘要与交互选择（`show_summary_and_confirm`）
+### 7.5 摘要与交互选择（`select_components`）
 
 1. 打印前置依赖摘要（Node/Python/Git/Homebrew/OS）。
 2. 探测当前 shell 的配置文件，判断 PATH 是否已配置过。
@@ -271,13 +268,13 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
    - `git_ai` 特例：上游无公开版本源，行尾显示 `(<版本> latest · 无公开版本源, 勾选可重装)`，勾选即重装刷新
 4. `-y` 或无交互终端：直接采用默认值（补齐缺失组件、升级有更新的组件，不重装已最新组件）；否则进入交互选择器。
 
-选择器行尾状态文案统一由 `_comp_status_tag` 生成；安装阶段每个组件的表头（`Installing` / `Upgrading 当前 → 最新`）由 `run_selected_installs` 按同一套状态另算。
+选择器行尾状态文案统一由 `Installer.component_tag` 生成；安装阶段每个组件的表头（`Installing` / `Upgrading 当前 → 最新`）由 `run_installs` 按同一套状态另算。
 
-**交互选择器**（`scripts/component-selector.py` + `_run_python_selector`）：
+**交互选择器**（`scripts/component-selector.py`，由 `Installer.select_components` 调用）：
 
-- `install.sh` 把组件序号、名称、分组、状态文案和默认勾选状态写入临时 TSV 清单，再由 `_run_python_selector` 调用 Python。
+- `select_components` 把组件序号、名称、分组、状态文案和默认勾选状态写入临时 TSV 清单，再以子进程调用选择器；`finally` 保证清单在任何退出路径上都被清理。
 - Python 脚本统一负责安装/卸载界面的 Unicode 列宽、备用屏、原始终端模式、按键读取和整帧刷新；不依赖第三方包。
-- Python 确认后仅向 stdout 返回 `selected=<逗号分隔下标>;path=<0|1>`，Bash 校验结果后更新 `SELECTED_INDICES` 和 PATH 选项；`q` 与 Ctrl+C 分别以专用退出码返回，并在退出前恢复终端。
+- Python 确认后仅向 stdout 返回 `selected=<逗号分隔下标>;path=<0|1>`，调用方校验结果后回填 `self.selected` 和 PATH 选项；`q` 与 Ctrl+C 分别以退出码 10 / 130 返回，并在退出前恢复终端。
 - `python3 scripts/component-selector.py --mode <install|uninstall> --manifest <文件> --render` 可在不访问 `/dev/tty` 的情况下输出无颜色单帧，供快照检查。
 
 | 输入 | 行为 |
@@ -290,11 +287,11 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 | `p` | 切换"是否写入 PATH"选项 |
 | `q` | 退出安装流程 |
 
-确认后 `_finalize_selection` 汇总选中下标到 `SELECTED_INDICES`；若无任何选中则直接退出。
+确认后 `select_components` 汇总选中下标回填 `self.selected`；若无任何选中则安装器直接退出。
 
-### 7.6 执行安装与升级（`run_selected_installs`）
+### 7.6 执行安装与升级（`run_installs`）
 
-遍历 `SELECTED_INDICES`，先按 check 阶段状态决定表头文案，随后一律交给 `_dispatch install <组件>`：
+遍历 `self.selected`，先按 `self.states` 里的状态决定表头文案，随后一律交给 `install_component` 分发表：
 
 | 状态 | 表头 | 含义 |
 |------|------|------|
@@ -307,7 +304,7 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 
 | 组件 | 升级方式 |
 |------|----------|
-| `glab` / `gh` / `rtk` | `_brew_install_or_upgrade`：已装则 `brew upgrade`；无新版时 `brew` 报错，脚本降级为提示 `already latest` |
+| `glab` / `gh` / `rtk` | `brew_install_or_upgrade`：已装则 `brew upgrade`；无新版时 `brew` 报错，脚本降级为提示 `already latest` |
 | `git_ai` | 官方安装脚本总是拉取最新版，勾选即重装刷新 |
 | `gitnexus` | `npm install -g gitnexus@latest --registry=https://registry.npmmirror.com` |
 | `dingtalk_cli` / `feishu_cli` | 分别执行 `npm install -g dingtalk-workspace-cli@latest --registry=https://registry.npmmirror.com` / `npm install -g @larksuite/cli@latest --registry=https://registry.npmmirror.com` |
@@ -324,7 +321,7 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 | 步骤 | 函数 | 说明 |
 |------|------|------|
 | 配置 git | `configure_git` | 关闭 `addIgnoredFile` 提示、开启 `push.autoSetupRemote` |
-| 记录版本 | `save_installed_versions` | 把所有组件版本写入版本记录文件 |
+| 记录版本 | `save_versions` | 把所有组件版本写入版本记录文件 |
 | 写 PATH | `setup_shell_path` | 仅当用户在交互中勾选了 `p` 时执行 |
 
 ### 7.8 最终结果与安装后操作
@@ -351,7 +348,7 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 | `dingtalk_cli` | npm 用户态安装（`npm install -g dingtalk-workspace-cli@latest --registry=https://registry.npmmirror.com`） | — | 命令为 `dws`；卸载时同时清理用户态和默认 npm 前缀 |
 | `feishu_cli` | npm 用户态安装（`npm install -g @larksuite/cli@latest --registry=https://registry.npmmirror.com`） | — | 命令为 `lark-cli`；卸载时同时清理用户态和默认 npm 前缀 |
 
-> 编程智能体（Claude / Codex / OpenCode）在前置检查阶段安装（见 [5.1](#51-前置检查run_preflight)），不属于组件选择器条目。
+> 编程智能体（Claude / Codex / OpenCode）在前置检查阶段安装（见 [7.3](#73-前置检查preflight_agents)），不属于组件选择器条目。
 
 ### 8.1 Marketplace 本地源（`MARKETPLACE_LOCAL`）
 
@@ -374,14 +371,14 @@ run_uninstalls               # 逐项卸载 + 清理配置与 PATH
 1. 注册市场：`codex plugin marketplace add <安装状态目录>/marketplace-source/codekit`（兼容市场根；若检测到旧路径下同名市场，会先移除旧注册再切换到兼容源；本地源为空则提示并跳过）
 2. 已装该插件时先刷新市场快照：`codex plugin marketplace upgrade co-daming`（仅当市场源是 Git 地址；兼容源为本地目录时跳过刷新，下一次 `install.sh` 会先重建兼容源）
 3. 安装/更新插件：`codex plugin add codekit@co-daming`（对已装插件即更新到快照版本；插件安装到 `~/.codex/plugins/cache/`，启用状态写入 `~/.codex/config.toml`）
-4. 记录 marketplace SHA（`_record_marketplace_sha`）
+4. 记录 marketplace SHA（`record_marketplace_sha`）
 
 **技能调用名**：插件内技能目录名即调用名（无插件前缀）——`$initialize`、`$technical-doc` 等 7 个（旧散装机制为 `$keel-initialize`，迁移后去掉前缀）。技能亦支持按 description 隐式触发。
 
 **失败与版本策略**：
 
 - 市场注册失败（本地路径注册失败且市场未注册）即告警返回非 0；`codex plugin add` 失败同样告警。
-- 市场升级状态复用 marketplace 的仓库 SHA（`_get_marketplace_latest_sha`，取本地仓库 `HEAD`）：检查阶段通过 `codex plugin list --marketplace co-daming` 探测安装状态，再比对已存 SHA 与本地 `HEAD` SHA 判定 `up_to_date` / `installed`；这与插件包版本相互独立。
+- 市场升级状态复用 marketplace 的仓库 SHA（`installer_state.marketplace_sha`，取本地仓库 `HEAD`）：检查阶段通过 `codex plugin list --marketplace co-daming` 探测安装状态，再比对已存 SHA 与本地 `HEAD` SHA 判定 `up_to_date` / `installed`；这与插件包版本相互独立。
 - 插件内容版本由根目录 `plugin-version.json` 的 `version` 参数统一管理；pre-commit 钩子会将它同步到 Claude、Codex、OpenCode 和 Qoder 清单，版本变更后驱动 Codex 缓存刷新。
 
 ### 8.3 Qoder 插件安装明细（`qoder_plugin` / `qodercn_plugin`）
@@ -513,7 +510,7 @@ Qoder（国际版）与 Qoder CN 是两个独立发行版，各有各的用户�
 关键行为：
 
 - 市场清单读取**兼容市场根**下的 `.codex-plugin/marketplace.json`（Codex 官方 repo-scoped 位置）；`plugin.json` 与 `marketplace.json` 同置于 `.codex-plugin/`
-- **技能界面元数据**：仓库把 `openai.yaml` 与 `SKILL.md` 同级存放（保证 `agents/` 只放 subagent 源）；Codex 官方只读取 `skills/<名>/agents/openai.yaml`，因此 `_prepare_install_sources` 重建兼容源时调用 `_stage_skill_interface_files` 复制出该路径。仓库内不提交 `agents/openai.yaml`；任一技能缺 `openai.yaml` 时安装直接失败
+- **技能界面元数据**：仓库把 `openai.yaml` 与 `SKILL.md` 同级存放（保证 `agents/` 只放 subagent 源）；Codex 官方只读取 `skills/<名>/agents/openai.yaml`，因此 `installer_sources.prepare` 重建兼容源时调用 `stage_skill_interface_files` 复制出该路径。仓库内不提交 `agents/openai.yaml`；任一技能缺 `openai.yaml` 时安装直接失败
 - 版本目录名取自 `.codex-plugin/plugin.json` 的 `version`；该值由 `plugin-version.json` 配置并由 pre-commit 钩子同步，版本号递增驱动 Codex 插件缓存刷新
 - 与 Claude 相同：`codex plugin remove` 不清理 `cache/` 子目录，彻底清理需手动删除 `plugins/cache/co-daming/`
 
@@ -604,37 +601,36 @@ OpenCode 将 `~/.config/opencode/` 本身当作一个 npm 包管理，插件安�
 
 ---
 
-## 12. 关键助手函数速查
+## 12. 关键实现位置速查
 
-| 函数 | 作用 |
+安装编排全部在 Python（`scripts/`）；`install.sh` / `uninstall.sh` 只做系统依赖准备与转交。
+
+| 实现 | 位置 / 作用 |
 |------|------|
-| `_cmd_tee` | 执行命令并把输出同时写日志与终端，返回命令真实退出码（`PIPESTATUS[0]`） |
-| `_setup_brew_mirrors` | 注入 Homebrew 中科大镜像源（`HOMEBREW_BREW_GIT_REMOTE` / `HOMEBREW_API_DOMAIN` / `HOMEBREW_ARTIFACT_DOMAIN`），供 `brew update`/`brew install` 加速 |
-| `_set_npm` | 设置 npm 用户态前缀并加入 PATH |
-| `_load_component_registry` | 调用 `scripts/component-registry.py` 校验并加载组件注册表，同时检查三类处理函数是否齐全 |
-| `_dispatch <前缀> <组件>` | 表驱动分发调用 `check_<组件>` / `install_<组件>` / `uninstall_<组件>` |
-| `_component_version <组件>` | 组件版本探测唯一入口 |
-| `_check_up_to_date <组件>` | 已装版本 ≥ 最新版时把状态改写为 `up_to_date`（避免本地更新时提示降级） |
-| `_comp_status_tag <组件>` | 生成选择器行尾状态文案：`(not installed)` / `(x → y, 勾选可升级)` / `(v latest)` |
-| `_brew_install_or_upgrade <formula> [probe]` | 未装则 `brew install`，已装则 `brew upgrade`（无新版时提示 already latest 并保持已装可用） |
-| `_json_edit <node脚本> <py脚本>` | 用 node（优先）或 python3 编辑 JSON |
-| `_sed_inplace <脚本> <文件>` | 跨平台原地 sed（先 BSD 后 GNU） |
-| `_git_ai_cmd` | 解析 git-ai 可执行路径（兼容 `~/.git-ai/bin`） |
-| `run_preflight` | 前置检查入口：Homebrew → git（≥ 2.50.0）→ Node.js（≥ 20）→ Python3 → curl → 编程智能体（含原硬性依赖；缺失时 brew 自动安装，失败退出流程；唯一例外：brew update 失败仅警告并继续） |
-| `agent_presence <claude\|codex\|opencode\|qoder\|qodercn>` | 统一探测对应 CLI、Desktop 应用、Linux 启动器和常见安装目录；Qoder 系由 `scripts/installer_qoder.py` 提供探测，并把共享配置根也算作平台可用 |
-| `render_recap` | 所有安装与配置操作完成后打印安装/卸载结果汇总 |
-| `_run_python_selector <install\|uninstall>` | 生成临时组件清单，调用 `scripts/component-selector.py`，校验并回填选择结果 |
-| `_marketplace_remote_host` | 从当前仓库 `origin` 推导 Git 主机名（供 git-ai `allow_repositories` 与安装后 glab 指引使用；无本地源时无输出） |
-| `_prepare_install_sources` | 从仓库根目录重建 Claude/Codex 市场源、OpenCode 兼容 npm 包和 Qoder 插件源 |
+| `Installer.run` | `installer.py`：安装生命周期（prepare_sources → preflight_agents → load_states → select_components → run_installs → 收尾） |
+| `Uninstaller.run` | `uninstaller.py`：卸载生命周期（load_states → select_components → run_uninstalls → render_recap） |
+| `install_component` / `uninstall_component` | 两侧分发表：把组件 ID 映射到 `install_*` / `uninstall_*` 处理器 |
+| `installer_state.detect_component` | 每个组件的状态与版本计算（`not_installed` / `installed` / `up_to_date`） |
+| `installer_state.component_version` | 组件版本探测唯一入口 |
+| `installer_state.latest_versions` | 从 npm / PyPI / GitLab / GitHub 读取最新版本 |
+| `installer_config.version_greater_or_equal` | 逐段数字版本比较（替代旧 bash 的 `_ver_ge`） |
+| `installer_config.extract_version` | 从任意输出提取语义化版本 |
+| `Installer.component_tag` / `plugin_component_tag` | 选择器行尾状态文案；插件条目额外显示对应平台 CLI 的状态与版本 |
+| `Installer.select_components` / `Uninstaller.select_components` | 生成临时 TSV 清单、调用 `scripts/component-selector.py` 并回填选择结果 |
+| `installer_sources.prepare` | 从仓库根目录重建 Claude/Codex 市场源、OpenCode 兼容 npm 包和 Qoder 插件源（临时目录 + 原子替换 + 失败回滚） |
+| `installer_sources.stage_skill_interface_files` | 在生成的兼容源里把 `skills/<名>/openai.yaml` 派生为 Codex 读取的 `agents/openai.yaml` |
+| `installer_agents.AGENT_CLIS` | 五平台 CLI 规格单一来源（命令名、brew/npm/脚本安装通道） |
+| `installer_agents.global_agent_plan` | 平台全局 subagent 的附加参数与目标目录（Qoder 使用共享配置根） |
+| `Installer.run_platform_agents` | 安装/卸载共用同一实现的全局 subagent 同步与清理 |
+| `Installer.ensure_agent_cli` | 勾选平台插件时先自动安装对应 CLI |
 | `installer_qoder.py` | Qoder 平台适配层：共享根解析、注册表与 settings 读写、CLI 能力探测、直写安装与卸载、平台可用性探测 |
-| `_stage_skill_interface_files` | 在生成的兼容源里把 `skills/<名>/openai.yaml` 派生为 Codex 读取的 `agents/openai.yaml`，并校验每个技能都具备该文件 |
-| `_get_marketplace_latest_sha` | 取本地仓库 `HEAD` 作为 marketplace 版本（无本地源时为空，调用方兜底） |
-| `_extract_ver` | 从版本字符串提取语义化版本号 |
-| `_ver_ge` | 点分版本号大小比较（`$1 >= $2` 返回 0，bash 3.x 兼容），用于 git ≥ 2.50.0 等版本门槛 |
-| `_track_change <路径>` | 记录本次运行变更的文件/目录（去重），供安装后检测汇总打印 |
-| `_verify_dep <名> <命令>` | 验证汇总表中的依赖组件行（Homebrew/git/Node.js/Python3/curl） |
-| `report_plugins_and_changes` | 打印各平台插件安装目录与本次变更的文件/目录 |
-| `_set_status` / `_get_status` 等 | 读写组件状态/版本/最新版（`eval` 动态变量名） |
+| `installer_state.agent_presence` / `qoder.agent_presence` | 识别 CLI、Desktop 应用、Linux 启动器与共享配置根 |
+| `installer_state.marketplace_sha` | 取本地仓库 `HEAD` 作为 marketplace 版本（替代旧 bash 的 `_get_marketplace_latest_sha`） |
+| `installer_state.git_ai_command` | 解析 git-ai 可执行路径（兼容 `~/.git-ai/bin`） |
+| `installer_state.render_recap` | 所有安装/卸载操作结束后打印结果汇总 |
+| `manage-global-agents.py` | 全局 subagent 的 install / status / uninstall（带 `--tool` 与 `--config-root`） |
+| `install.sh` 的 `ensure_homebrew` / `ensure_python3` / `ensure_npm` / `ensure_curl` / `ensure_versioned` | 系统依赖准备与版本门槛（git ≥ 2.50.1、Node.js ≥ 20） |
+| `installer_config.REQUIRED_HELPER_FILES` / `require_helper_files` | 辅助模块清单的单一来源；`installer.py` / `uninstaller.py` 在导入期自检，缺失时输出单行受控错误 |
 
 ---
 
@@ -643,13 +639,13 @@ OpenCode 将 `~/.config/opencode/` 本身当作一个 npm 包管理，插件安�
 得益于表驱动设计，新增组件只需 **4 步**：
 
 1. 在 `scripts/component-registry.py` 的 `COMPONENTS` 中追加一个 `Component(...)`；新增分组时同时更新 `GROUPS`。
-2. 编写 `check_<组件>` 函数：探测是否已装、当前版本、最新版本，写入状态（已装时用 `_check_up_to_date` 判定是否落后）。
-3. 编写 `install_<组件>` 函数：实现安装逻辑及已安装时的升级/刷新路径（用户态、可回退）。
-4. 编写 `uninstall_<组件>` 函数：只移除该组件管理的内容，并保留用户资产。
+2. 在 `scripts/installer_state.py` 补该组件的状态与版本探测：`present()` 判断落盘结果、`component_version()` 补版本命令、必要时在 `detect_component()` 增加状态分支。
+3. 在 `scripts/installer.py` 的 `install_component` 分发表注册并实现 `install_<组件>`（用户态、可回退，含已安装时的升级/刷新路径）。
+4. 在 `scripts/uninstaller.py` 的 `uninstall_component` 分发表注册并实现 `uninstall_<组件>`：只移除该组件管理的内容，并保留用户资产。
 
-先运行 `python3 scripts/component-registry.py --check`；之后 `check_all_components`、`run_selected_installs`、`run_uninstalls` 和交互选择器会自动识别新组件，无需改动分发逻辑。缺少任一处理函数时，`install.sh` 会在执行组件检查前快速失败。
+先运行 `python3 scripts/component-registry.py --check`；随后 `load_states`、`run_installs`、`run_uninstalls` 与交互选择器会自动识别新组件。注册表、两侧分发表与版本记录四方的一致性由 `scripts/test_installer_contracts.py` 断言——漏注册处理器或漏登记版本会直接让该测试失败。
 
-> 若该组件有独立版本命令，可在 `_component_version` 中补一个 `case` 分支。
+> 若该组件有独立版本命令，在 `installer_state.component_version` 的 `commands` 映射（或 `NPM_COMPONENTS`）中补充即可。
 
 ---
 
@@ -659,17 +655,17 @@ OpenCode 将 `~/.config/opencode/` 本身当作一个 npm 包管理，插件安�
 |------|------|
 | Homebrew 安装失败 | 退出流程（非 0） |
 | brew update 失败 | 警告并继续（瞬时网络问题，不影响后续安装） |
-| 硬性依赖（git ≥ 2.50.0 / Node.js ≥ 20 / Python3 / curl）安装失败或装后仍不满足要求 | 退出流程（非 0） |
-| 无编程智能体且用户选择退出 | 结束流程（退出码 0） |
-| 无编程智能体且非交互模式（`-y`/无 tty） | 默认安装 Claude |
+| 硬性依赖（git ≥ 2.50.1 / Node.js ≥ 20 / Python3 / curl）安装失败或装后仍不满足要求 | 退出流程（非 0） |
+| 五类编程智能体 CLI 均未检测到 | 只打印提示并继续，不中断安装流程 |
 | 传入已取消的 `upgrade` 子命令 | 报错提示改用 `install`，退出码 1 |
 | 未知参数 | 打印用法，退出码 1 |
 | `-h`/`--help` | 打印用法，退出码 0 |
 | 单组件安装失败 | 告警并继续安装其余组件 |
 | 无任何组件被选中 | 打印提示并退出码 0 |
-| 卸载未确认（非 `-y` 且无交互终端） | 拒绝执行，退出码 1 |
+| 卸载时在交互终端拒绝确认 | 打印 `Cancelled.` 并退出码 0 |
+| 卸载非交互且未传 `-y` | 无终端可交互，直接采用默认选择执行卸载 |
 
-> 脚本以 `bash 3.x` 为最低兼容目标（macOS 自带 3.2），不使用关联数组、`mapfile` 等高版本特性。
+> `install.sh` / `uninstall.sh` 只做系统依赖准备与进程转发，以 `bash 3.x` 为最低兼容目标（macOS 自带 3.2），不使用关联数组、`mapfile` 等高版本特性；安装与卸载编排全部在 Python 中完成。
 
 ---
 
