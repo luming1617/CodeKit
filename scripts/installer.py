@@ -507,9 +507,11 @@ class Installer:
         if item.status == "not_installed":
             return f" (插件未安装 · {cli_text}，勾选后安装插件)"
         if item.status == "installed":
-            if item.latest_version:
+            if item.latest_version and item.latest_version != plugin_version:
                 return f" (插件有更新 {plugin_version} → {item.latest_version} · {cli_text}，勾选后升级)"
-            return f" (插件有更新 · {cli_text}，勾选后升级)"
+            # 版本未变但插件源内容已更新（本地 marketplace 换了提交）：只播报
+            # 插件版本，绝不把提交号当作版本号展示。
+            return f" (插件有更新 {plugin_version} · {cli_text}，勾选后升级)"
         return f" (插件已最新 {plugin_version} · {cli_text}，勾选后重装)"
 
     def shell_config(self) -> tuple[Path, str]:
@@ -1092,6 +1094,14 @@ class Installer:
         )
         return True
 
+    def announce_plugin_install(self, component_id: str) -> None:
+        """播报插件的真实安装版本与落盘位置，与 Qoder 的收尾提示保持一致。"""
+        version = detector.installed_plugin_version(component_id, self.context)
+        path = detector.component_install_path(component_id, self.context)
+        self.logger.success(
+            f"{detector.component_description(component_id)} v{version} 已安装（{path}）"
+        )
+
     def install_claude_plugin(self) -> bool:
         """注册本地 Claude marketplace，并按已安装状态执行插件安装或更新。"""
         if not self.market_dir:
@@ -1113,6 +1123,7 @@ class Installer:
             return False
         self.track(self.home / ".claude" / "plugins" / "installed_plugins.json")
         self.record_marketplace_sha()
+        self.announce_plugin_install("claude_plugin")
         return True
 
     def install_opencode_plugin(self) -> bool:
@@ -1136,6 +1147,7 @@ class Installer:
         if result.returncode != 0:
             return False
         self.track(path)
+        self.announce_plugin_install("opencode_plugin")
         return True
 
     def install_codex_plugin(self) -> bool:
@@ -1160,6 +1172,7 @@ class Installer:
         if result.returncode != 0:
             return False
         self.record_marketplace_sha()
+        self.announce_plugin_install("codex_plugin")
         return True
 
     def qoder_run(self, args: Sequence[str], timeout: float = 20.0) -> tuple[int, str]:

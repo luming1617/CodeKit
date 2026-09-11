@@ -27,6 +27,34 @@ MANAGED_MARKER = "managed-by: codekit"
 # installer_qoder 负责两个 Qoder 发行版的共享配置根。
 TOOLS = ("claude", "opencode", "codex", *qoder.PLATFORMS)
 
+# canonical agent 使用 Claude 风格的工具名，OpenCode 的 agent frontmatter 要求
+# `tools` 是“工具 id → 布尔值”的映射；未声明的内建工具一律显式关闭，
+# 否则只读角色会在 OpenCode 上悄悄获得 Bash/Write 能力。
+OPENCODE_TOOL_IDS = {
+    "Read": "read",
+    "Grep": "grep",
+    "Glob": "glob",
+    "Bash": "bash",
+    "Write": "write",
+    "Edit": "edit",
+}
+OPENCODE_TOOLS = (
+    "read",
+    "edit",
+    "write",
+    "glob",
+    "grep",
+    "list",
+    "bash",
+    "task",
+    "todowrite",
+    "question",
+    "webfetch",
+    "websearch",
+    "lsp",
+    "skill",
+)
+
 
 def agent_files(source: Path) -> list[Path]:
     """Return canonical agents stored directly under each Skill directory."""
@@ -123,6 +151,38 @@ def codex_toml(name: str, description: str, body: str) -> str:
     )
 
 
+def opencode_markdown(markdown: str) -> str:
+    """把 canonical Markdown agent 转换成 OpenCode 可校验的 frontmatter。"""
+    lines = markdown.splitlines()
+    if len(lines) < 3 or lines[0].strip() != "---":
+        raise ValueError("missing frontmatter")
+    try:
+        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    except StopIteration as exc:
+        raise ValueError("unterminated frontmatter") from exc
+
+    front: list[str] = []
+    declared: list[str] = []
+    for line in lines[1:end]:
+        key, _, value = line.partition(":")
+        if key.strip() == "tools":
+            declared = [item.strip() for item in value.split(",") if item.strip()]
+            continue
+        front.append(line)
+
+    unknown = [name for name in declared if name not in OPENCODE_TOOL_IDS]
+    if unknown:
+        raise ValueError(
+            f"agent declares tools OpenCode cannot map: {', '.join(unknown)}"
+        )
+    allowed = {OPENCODE_TOOL_IDS[name] for name in declared}
+    front.append("tools:")
+    front.extend(
+        f"  {tool}: {'true' if tool in allowed else 'false'}" for tool in OPENCODE_TOOLS
+    )
+    return "\n".join(["---", *front, "---", *lines[end + 1 :]]).rstrip("\n") + "\n"
+
+
 def destinations(
     home: Path,
     tools: tuple[str, ...] = TOOLS,
@@ -156,13 +216,17 @@ def install(
     target_dirs = destinations(home, tools, config_root)
     backup_root = home / ".local" / "state" / "CodeKit" / "agent-backups"
     changed = 0
-    # 同一份 Markdown 是事实源，Codex 转换成等价 TOML，其余工具保留 Markdown。
+    # 同一份 Markdown 是事实源：Codex 转成等价 TOML，OpenCode 转成
+    # 布尔工具映射，其余工具直接沿用 canonical Markdown。
     for source_file, name, description, body in parsed:
         markdown = source_file.read_text(encoding="utf-8")
         for tool in tools:
             if tool == "codex":
                 destination = target_dirs[tool] / f"{name}.toml"
                 content = codex_toml(name, description, body)
+            elif tool == "opencode":
+                destination = target_dirs[tool] / f"{name}.md"
+                content = opencode_markdown(markdown)
             else:
                 destination = target_dirs[tool] / f"{name}.md"
                 content = markdown

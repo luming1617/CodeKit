@@ -9,6 +9,7 @@ protocol, the shared platform-agent plan, and the external-command timeout.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import subprocess
 import sys
@@ -423,6 +424,56 @@ class SelectComponentsProtocolTests(unittest.TestCase):
                 self.drive(installer, 0, "garbage")
 
 
+def plugin_context(home: Path) -> detector.Context:
+    """构造以仓库为插件源的检测上下文，供状态与版本用例共用。"""
+    return detector.Context(
+        home=home,
+        marketplace_local=REPO_DIR,
+        version_file=home / ".local" / "state" / "CodeKit" / "installed_versions",
+    )
+
+
+class InstalledPluginVersionTests(unittest.TestCase):
+    def test_claude_registry_version_wins_over_the_repository_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            registry = home / ".claude" / "plugins" / "installed_plugins.json"
+            registry.parent.mkdir(parents=True)
+            registry.write_text(
+                json.dumps({"version": 2, "plugins": {"codekit@co-daming": [{"version": "9.9.9"}]}}),
+                encoding="utf-8",
+            )
+            version = detector.installed_plugin_version("claude_plugin", plugin_context(home))
+        self.assertEqual(version, "9.9.9")
+
+    def test_codex_version_comes_from_the_cache_directory_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".codex" / "plugins" / "cache" / "co-daming" / "codekit" / "1.2.3").mkdir(parents=True)
+            version = detector.installed_plugin_version("codex_plugin", plugin_context(home))
+        self.assertEqual(version, "1.2.3")
+
+    def test_opencode_falls_back_to_the_repository_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = plugin_context(Path(directory))
+            version = detector.installed_plugin_version("opencode_plugin", context)
+        self.assertEqual(version, detector.repository_plugin_version(context))
+
+
+class PluginStateVersionTests(unittest.TestCase):
+    def test_marketplace_revision_is_not_reported_as_a_plugin_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = plugin_context(Path(directory))
+            with patch.object(detector, "plugin_ready", return_value=True), patch.object(
+                detector, "platform_subagents_state", return_value="up_to_date"
+            ), patch.object(detector, "saved_marketplace_sha", return_value="aaa1111"), patch.object(
+                detector, "marketplace_sha", return_value="bbb2222"
+            ):
+                state = detector.detect_component("claude_plugin", context, {})
+        self.assertEqual(state.status, "installed")
+        self.assertEqual(state.latest_version, detector.repository_plugin_version(context))
+
+
 class PluginComponentTagTests(unittest.TestCase):
     def test_missing_cli_is_reported_on_the_plugin_entry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -434,6 +485,21 @@ class PluginComponentTagTests(unittest.TestCase):
                 tag = installer.plugin_component_tag(state, entry)
         self.assertIn("CLI 未安装", tag)
         self.assertIn("勾选后安装插件", tag)
+
+    def test_installed_plugin_tag_prints_its_version_and_cli_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            entry = agents.component_agent("claude_plugin")
+            state = detector.ComponentState(
+                "claude_plugin", status="installed", installed_version="1.2.3"
+            )
+            with patch.object(detector, "agent_cli_presence", return_value="claude"), patch.object(
+                agents, "cli_version", return_value="2.1.0"
+            ):
+                installer.agent_cli_cache = {}
+                tag = installer.plugin_component_tag(state, entry)
+        self.assertIn("插件有更新 1.2.3", tag)
+        self.assertIn("CLI 已安装 2.1.0", tag)
 
 
 class GlobalAgentCleanupTests(unittest.TestCase):

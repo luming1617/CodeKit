@@ -245,6 +245,71 @@ class AgentPresenceTests(unittest.TestCase):
             )
             self.assertEqual(status.stdout.strip(), "up_to_date")
 
+    def test_opencode_agents_use_a_boolean_tool_map(self) -> None:
+        # OpenCode validates agent `tools` as a tool-id → boolean mapping, so the
+        # canonical comma separated list must be rewritten or `opencode plugin`
+        # rejects the whole configuration.
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            helper = SCRIPT_DIR / "manage-global-agents.py"
+            installed = subprocess.run(
+                [
+                    sys.executable,
+                    str(helper),
+                    "install",
+                    "--home",
+                    str(home),
+                    "--tool",
+                    "opencode",
+                    "--source",
+                    str(REPO_DIR / "skills"),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stdout)
+            root = home / ".config" / "opencode" / "agents"
+            read_only = (root / "tech-critic.md").read_text(encoding="utf-8")
+            writable = (root / "impl-implementer.md").read_text(encoding="utf-8")
+            claude = (home / ".claude" / "agents" / "tech-critic.md").exists()
+        self.assertIn("tools:\n  read: true\n", read_only)
+        self.assertIn("  bash: false\n", read_only)
+        self.assertIn("  write: false\n", read_only)
+        self.assertIn("  bash: true\n", writable)
+        self.assertIn("  edit: true\n", writable)
+        self.assertNotIn("tools: Read", read_only)
+        self.assertFalse(claude)
+
+    def test_canonical_agents_keep_the_comma_separated_tools_list(self) -> None:
+        # 只有 OpenCode 需要映射；Claude/Qoder 沿用 canonical frontmatter。
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            helper = SCRIPT_DIR / "manage-global-agents.py"
+            installed = subprocess.run(
+                [
+                    sys.executable,
+                    str(helper),
+                    "install",
+                    "--home",
+                    str(home),
+                    "--tool",
+                    "claude",
+                    "--source",
+                    str(REPO_DIR / "skills"),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stdout)
+            content = (
+                home / ".claude" / "agents" / "tech-critic.md"
+            ).read_text(encoding="utf-8")
+        self.assertIn("tools: Read, Grep, Glob\n", content)
+
     def test_preflight_continues_and_only_warns_when_no_cli_exists(self) -> None:
         installer = Installer.__new__(Installer)
         with tempfile.TemporaryDirectory() as directory:

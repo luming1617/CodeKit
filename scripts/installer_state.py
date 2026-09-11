@@ -368,6 +368,49 @@ def repository_plugin_version(context: Context) -> str:
         return "installed"
 
 
+def claude_installed_version(home: Path) -> str:
+    """读取 Claude 插件注册表中记录的实际安装版本。"""
+    document = config.read_json(home / ".claude" / "plugins" / "installed_plugins.json")
+    entries = config.json_path(document, f"plugins.{CLAUDE_PLUGIN}@{CLAUDE_MARKETPLACE}")
+    if not isinstance(entries, list):
+        return ""
+    for entry in entries:
+        version = config.json_field(entry, "version")
+        if version:
+            return version
+    return ""
+
+
+def codex_installed_version(home: Path) -> str:
+    """读取 Codex 插件缓存中以版本号命名的目录，取其中最新的一版。"""
+    root = home / ".codex" / "plugins" / "cache" / CODEX_MARKETPLACE / CODEX_PLUGIN
+    try:
+        versions = [item.name for item in root.iterdir() if item.is_dir()]
+    except OSError:
+        return ""
+    return max(versions, key=config.version_tuple) if versions else ""
+
+
+def installed_plugin_version(component: str, context: Context) -> str:
+    """读取平台实际落盘的插件版本；平台未记录版本时回退到插件源版本。
+
+    OpenCode 直接从本地插件源目录加载，不写版本记录，因此始终走回退分支。
+    """
+    readers = {
+        "claude_plugin": claude_installed_version,
+        "codex_plugin": codex_installed_version,
+    }
+    reader = readers.get(component)
+    if reader is not None:
+        try:
+            version = reader(context.home)
+        except (OSError, ValueError):
+            version = ""
+        if version:
+            return version
+    return repository_plugin_version(context)
+
+
 def qoder_present(descriptor: Any, context: Context) -> bool:
     """按共享配置根判断 Qoder 插件文件状态，不要求 CLI 或 Desktop 正在运行。"""
     try:
@@ -388,7 +431,7 @@ def component_version(component: str, context: Context) -> str:
         # semantic version.  Result pages only need the three-part version.
         return config.extract_version(value) if component == "gh" else value
     if component in {"claude_plugin", "opencode_plugin", "codex_plugin"}:
-        return repository_plugin_version(context)
+        return installed_plugin_version(component, context)
     qoder_platform = qoder.platform_for_component(component)
     if qoder_platform is not None:
         # 共享注册表里的版本就是 CLI 与 Desktop 两端共同看到的结果。
@@ -482,7 +525,10 @@ def detect_component(component: str, context: Context, latest: dict[str, str]) -
         current = saved_marketplace_sha(context)
         remote = marketplace_sha(context)
         if remote:
-            state.latest_version = remote[:7]
+            # 本地插件源的最新版本就是插件源自身的版本号；提交号只用于判断
+            # 源内容是否变化，不能当作版本号展示。
+            target = repository_plugin_version(context)
+            state.latest_version = target if target != "installed" else ""
             state.status = "up_to_date" if current and current == remote else "installed"
         else:
             state.status = "up_to_date"
