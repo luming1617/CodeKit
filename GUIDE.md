@@ -32,7 +32,7 @@ bash install.sh
 
 安装内容：rtk（节省 token 60-90%）、GitNexus（代码智能）、Graphify（知识图谱）、gh（GitHub CLI）、glab（GitLab CLI）、钉钉 CLI（`dws`）、飞书 CLI（`lark-cli`）、CodeKit 插件（Claude + OpenCode + Codex + Qoder + Qoder CN，插件分别包含对应平台的全局 subagent；Qoder 插件同时服务其 CLI 与桌面 IDE）。安装前脚本只**检测** git（存在即可）、Node.js ≥ 24、Python3 ≥ 3.10、npm 与 curl/wget，任一不满足即醒目列出并中止，不代装。编程智能体 CLI 不在此阶段强制准备：没有可用 CLI 时只提示，勾选平台插件后才自动安装对应 CLI。
 
-> CodeKit 的 7 个技能同时支持 **Claude**、**OpenCode**、**Codex**、**Qoder** 和 **Qoder CN**，可以同时安装，互不冲突。可选组件统一按 `npm → brew → apt → pipx/venv → 官方脚本/发布包` 的优先级探测：Claude、Codex、OpenCode 优先走 npm（统一 `registry.npmmirror.com` 镜像源），macOS 可回退 Homebrew/cask；Qoder 与 Qoder CN 使用官方安装脚本。Qoder 与 Qoder CN 的 CLI 和桌面 IDE 共用同一个用户级配置根，安装一次两端生效。
+> CodeKit 的 7 个技能同时支持 **Claude**、**OpenCode**、**Codex**、**Qoder** 和 **Qoder CN**，可以同时安装，互不冲突。可选组件统一按 `npm → brew → apt → pipx/venv → 发布包/官方脚本` 的优先级探测（rtk 在 brew 之外优先取 `rtk-<target triple>.tar.gz` 发布资产，而不是 `curl | bash`）：Claude、Codex、OpenCode 优先走 npm（统一 `registry.npmmirror.com` 镜像源），macOS 可回退 Homebrew/cask（Homebrew 统一走**中科大镜像**并关闭其自动更新）；Qoder 与 Qoder CN 使用官方安装脚本。脚本与 release 这类 GitHub 下载统一走 `gh-proxy`，GitHub 版本探测也只走该代理。Qoder 与 Qoder CN 的 CLI 和桌面 IDE 共用同一个用户级配置根，安装一次两端生效。
 >
 > 脚本以当前仓库作为插件市场源（相对定位）；组件注册表和交互选择器位于 `scripts/`，安装与卸载必须在完整仓库中执行。
 

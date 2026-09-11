@@ -42,6 +42,9 @@ REQUIREMENT = re.compile(r"^[a-z][a-z0-9_-]*(>=[0-9]+(\.[0-9]+)*)?$")
 
 # Global channel priority. Every platform probes this same order; a channel is
 # only used when it is both declared by the component and currently available.
+# ``release`` precedes ``script``: a release asset is resolved by an exact file
+# name and verified against a digest, while ``script`` pipes a remote script
+# into a shell. When a component offers both, the verifiable path goes first.
 CHANNEL_ORDER: tuple[str, ...] = (
     "npm",
     "brew",
@@ -49,8 +52,8 @@ CHANNEL_ORDER: tuple[str, ...] = (
     "apt",
     "pipx",
     "venv",
-    "script",
     "release",
+    "script",
 )
 
 # Only these npm package names may ever be installed. The allowlist exists
@@ -75,11 +78,15 @@ class ReleaseSpec:
     """Release-asset download plan for the ``release`` channel."""
 
     repo: str  # "github:owner/repo" or "gitlab:<project-id>"
-    asset: str  # template with {version} {os} {arch} {ext}
+    asset: str  # template with {version} {os} {arch} {ext} {target}
     binary: str  # executable name inside the archive
     os_tokens: Mapping[str, str] = field(default_factory=dict)
     arch_tokens: Mapping[str, str] = field(default_factory=dict)
     ext_tokens: Mapping[str, str] = field(default_factory=dict)
+    # Rust-style target triple, keyed by "<platform.system()>-<release_arch()>"
+    # (e.g. "Darwin-arm64"), for assets named after the triple instead of the
+    # separate os/arch tokens.
+    target_tokens: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -119,9 +126,23 @@ COMPONENTS: Sequence[Component] = (
         version_args=("--version",),
         channels={
             "brew": "rtk",
+            "release": "github:rtk-ai/rtk",
             "script": "https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh",
         },
         version_source="github:rtk-ai/rtk",
+        # 官方脚本下载的资产名就是 `rtk-<Rust target triple>.tar.gz`（版本只出现在
+        # 下载路径的 v{version} 里），这里按同一命名直接取发布资产，省掉 `curl|bash`。
+        release=ReleaseSpec(
+            repo="github:rtk-ai/rtk",
+            asset="rtk-{target}.tar.gz",
+            binary="rtk",
+            target_tokens={
+                "Darwin-arm64": "aarch64-apple-darwin",
+                "Darwin-x86_64": "x86_64-apple-darwin",
+                "Linux-x86_64": "x86_64-unknown-linux-musl",
+                "Linux-arm64": "aarch64-unknown-linux-musl",
+            },
+        ),
     ),
     Component("claude_plugin", "CodeKit Plugin (Claude)", "skills", plugin=True),
     Component("opencode_plugin", "CodeKit Plugin (OpenCode)", "skills", plugin=True),

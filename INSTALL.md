@@ -47,7 +47,12 @@
 | **交互式选择** | 提供可视化多选界面，用户可自由勾选要装的组件 |
 | **快速失败** | 前置依赖缺失时立即退出，避免半途失败 |
 
-> **npm 镜像源**：`set_npm` 切换到用户态前缀（`~/.npm-global`）时把 `npm_config_registry` 写入进程环境，本会话所有 npm / npx 子进程（Claude / Codex / OpenCode 的 CLI、`gitnexus`、钉钉 CLI、飞书 CLI，含飞书的 `npx skills add`）统一走 `https://registry.npmmirror.com`；`gitnexus`、钉钉 CLI、飞书 CLI 的**版本探测**也走该镜像的 `/<包名>/latest`。避免直连 `registry.npmjs.org` 超时。唯一来源是 `scripts/installer_config.py` 的 `NPM_REGISTRY`，失败时的手动安装指引仍显式附加 `--registry`。
+> **镜像与代理**（细节见 [INSTALL-STRATEGY.md §2.3](INSTALL-STRATEGY.md)）：
+> - **npm**：`set_npm` 切换到用户态前缀（`~/.npm-global`）时把 `npm_config_registry` 写入进程环境，本会话所有 npm / npx 子进程（Claude / Codex / OpenCode 的 CLI、`gitnexus`、钉钉 CLI、飞书 CLI，含飞书的 `npx skills add`）统一走 `https://registry.npmmirror.com`；`gitnexus`、钉钉 CLI、飞书 CLI 的**版本探测**也走该镜像的 `/<包名>/latest`。避免直连 `registry.npmjs.org` 超时。
+> - **Homebrew**：`Installer.brew` 每次调用前把 `HOMEBREW_MIRROR_ENV` 写入进程环境——`HOMEBREW_API_DOMAIN` / `HOMEBREW_BOTTLE_DOMAIN` / `HOMEBREW_{BREW,CORE,CASK}_GIT_REMOTE` 全部指向 `https://mirrors.ustc.edu.cn/`，并设置 `HOMEBREW_NO_AUTO_UPDATE=1` 关闭 brew 自身的自动更新（避免每次 `brew install/upgrade` 前先同步一遍 homebrew/brew、core 与 cask）。安装与卸载路径共用这一入口。
+> - **GitHub**：脚本安装源与 release 资产统一前缀 `https://gh-proxy.com/`，失败再回退直连（`download_urls`）；GitHub 的**版本探测**只走 gh-proxy（`probe_urls`），不再白等一次国内必然超时的直连。
+>
+> 唯一来源是 `scripts/installer_config.py` 的 `NPM_REGISTRY`、`HOMEBREW_MIRROR_ENV` 与 `GH_PROXY`；失败时的手动安装指引同样使用镜像/代理地址（npm 附加 `--registry`，GitHub 脚本走 gh-proxy）。
 
 ---
 
@@ -129,11 +134,11 @@ bash uninstall.sh [-y]
 
 ### 5.1 安装来源与方式
 
-> 下表是 `Component.channels` 的可读展开；权威定义在 `scripts/component-registry.py`，完整探测规则见 [INSTALL-STRATEGY.md](INSTALL-STRATEGY.md)。通道统一按 `npm → brew → brew_cask → apt → pipx → venv → script → release` 探测，取第一个「组件已声明且当前可用」的通道。
+> 下表是 `Component.channels` 的可读展开；权威定义在 `scripts/component-registry.py`，完整探测规则见 [INSTALL-STRATEGY.md](INSTALL-STRATEGY.md)。通道统一按 `npm → brew → brew_cask → apt → pipx → venv → release → script` 探测，取第一个「组件已声明且当前可用」的通道（`release` 在校验过摘要的发布资产与 `curl | bash` 之间优先取前者）。
 
 | 组件                | 安装来源                                                                | 安装方式（首选 → 回退）                                                                                                                                                                                    | 安装落点                                                                                     |
 |---------------------|-------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------|
-| `rtk`               | Homebrew formula `rtk`；回退源 `rtk-ai/rtk` 官方脚本                      | `brew install\|upgrade rtk` → 失败回退 `curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh \| sh` → 成功后按已安装智能体执行 `rtk init -g`，Codex 另执行 `rtk init -g --codex`                | brew 的 bin 目录；配置写入对应全局目录                                             |
+| `rtk`               | Homebrew formula `rtk`（中科大镜像）；`rtk-ai/rtk` 发布资产 `rtk-<target triple>.tar.gz`（gh-proxy）；回退源 `rtk-ai/rtk` 官方脚本 | `brew install\|upgrade rtk`（`HOMEBREW_NO_AUTO_UPDATE=1` + 中科大镜像）；命令存在但不在 brew 管理下时让位 → `release`：按 Rust target triple 解析 `rtk-<target>.tar.gz`（`x86_64-unknown-linux-musl` / `aarch64-apple-darwin` 等）→ gh-proxy 下载 → 摘要校验 → 装到 `~/.local/bin/rtk` → 解析不到资产才回退 `curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh \| sh` → 成功后按已安装智能体执行 `rtk init -g`，Codex 另执行 `rtk init -g --codex`                | brew 的 bin 目录，或 `~/.local/bin/rtk`；配置写入对应全局目录                                             |
 | `claude_plugin`     | 当前仓库根目录生成的兼容市场源（`CODEKIT_MARKET_DIR`，重建旧版 `plugins/codekit` 布局） | `claude plugin marketplace add <兼容市场源>` → `claude plugin marketplace update co-daming` 刷新索引 → 未装则 `claude plugin install codekit@co-daming --scope user`、已装则 `claude plugin update codekit@co-daming` → `record_marketplace_sha`；本地源为空即提示跳过，无回退 | `~/.claude/plugins/known_marketplaces.json`、`~/.claude/plugins/installed_plugins.json`、`~/.claude/settings.json` |
 | `opencode_plugin`   | 安装状态目录生成的兼容 npm 包源（`opencode-source`） | 首装：把条目 `codekit@file://<安装状态目录>/opencode-source` 写入 `~/.config/opencode/opencode.json` 的 `plugin` 数组（`installer_config.add_opencode_plugin` 原子写入）；已配置：强制刷新兼容包源（无该子命令时仅提示已配置） | `~/.config/opencode/opencode.json`                                                            |
 | `codex_plugin`      | 当前仓库根目录生成的兼容市场源（重建旧版 `plugins/codekit` 布局）       | 清理旧散装 `~/.agents/skills/keel-*` → `codex plugin marketplace add <兼容市场源>` →（已装且市场源为 Git 地址时 `codex plugin marketplace upgrade co-daming`）→ `codex plugin add codekit@co-daming` → `record_marketplace_sha`；本地源为空即提示跳过，无回退 | 插件缓存 `~/.codex/plugins/cache/`，启用状态写 `~/.codex/config.toml`                           |
@@ -143,8 +148,8 @@ bash uninstall.sh [-y]
 | `dingtalk_cli`      | npm 包 `dingtalk-workspace-cli`（官方 DingTalk Workspace CLI）              | 安装前检查 `unzip`，缺失时先通过当前平台包管理器安装 → `set_npm`（前缀指向 `~/.npm-global`，并注入 `npm_config_registry` 镜像源）→ `npm install -g dingtalk-workspace-cli@latest`；无自动认证配置                                                                                                                 | `~/.npm-global/bin/dws`                                                                       |
 | `feishu_cli`        | npm 包 `@larksuite/cli`（官方 Lark/Feishu CLI）                              | `set_npm`（前缀指向 `~/.npm-global`，并注入 `npm_config_registry` 镜像源）→ `npm install -g @larksuite/cli@latest` → `npx skills add larksuite/cli -y -g --agent <已安装的智能体>`；显式限定 Claude Code、Codex、OpenCode，避免 PromptScript 导致整批失败                                                                 | `~/.npm-global/bin/lark-cli`                                                                  |
 | `graphify`          | 官方 PyPI 渠道包 `graphifyy`（无 Homebrew formula）                          | `pipx install graphifyy`（已装则 `pipx upgrade graphifyy`）→ 失败回退独立 venv：`python3 -m venv` + `bin/pip install -U graphifyy` + 软链到 `~/.local/bin` → 按已检测智能体执行 `graphify install --platform <agent>` → `graphify hook install` | pipx 托管环境，或 `~/.local/share/CodeKit/venvs/graphify` + `~/.local/bin/graphify`             |
-| `gh`                | `brew`/`apt`/GitHub release（`cli/cli`）                                     | `brew_install_or_upgrade gh` → `apt install gh`（sudo，源中无包则跳过）→ GitHub release 二进制（SHA-256 校验，失败回退 gh-proxy）                                                                             | brew/apt 的 bin 目录，或 `~/.local/bin/gh`                                                    |
-| `glab`              | `brew`/`apt`/GitLab release（`34675721`）                                    | `brew_install_or_upgrade glab` → `apt install glab`（sudo，源中无包则跳过）→ GitLab release 二进制                                                                                                          | brew/apt 的 bin 目录，或 `~/.local/bin/glab`                                                  |
+| `gh`                | `brew`/`apt`/GitHub release（`cli/cli`）                                     | `brew_install_or_upgrade gh`（命中中科大镜像；非 brew 安装时让位） → `apt install gh`（sudo，源中无包则跳过）→ GitHub release 二进制（优先 gh-proxy、失败回退直连，SHA-256 校验）                                                                             | brew/apt 的 bin 目录，或 `~/.local/bin/gh`                                                    |
+| `glab`              | `brew`/`apt`/GitLab release（`34675721`）                                    | `brew_install_or_upgrade glab`（命中中科大镜像；非 brew 安装时让位） → `apt install glab`（sudo，源中无包则跳过）→ GitLab release 二进制                                                                                                          | brew/apt 的 bin 目录，或 `~/.local/bin/glab`                                                  |
 
 > 五个插件类组件的来源都是**当前仓库本地路径**（脚本相对自身位置探测根目录下的清单，并在安装时生成兼容源），不写死远端地址；若脚本目录保留 `scripts/` 但缺少根目录插件文件，这五项会各自告警并跳过（见 [8.1](#81-marketplace-本地源marketplace_local)）。
 > 更细的失败处理与升级路径见 [第 8 节](#8-各组件安装策略)。
@@ -156,7 +161,7 @@ bash uninstall.sh [-y]
 | 组件                | 已装版本探测                             | 最新版来源                                                    | 判定要点                                                                             |
 |---------------------|------------------------------------------|---------------------------------------------------------------|--------------------------------------------------------------------------------------|
 | `git_ai`            | `installer_state.git_ai_command` 解析路径后 `git-ai --version` | 上游无公开版本源，**不查询**                                   | 探测到即直接置 `up_to_date`（选择器标注"勾选可重装"，重装脚本即刷新到最新）           |
-| `rtk`               | `rtk --version`                           | GitHub API `repos/rtk-ai/rtk/releases/latest` 的 `tag_name`    | 查询失败（超时 5s）时置 `up_to_date`，不提示升级                                      |
+| `rtk`               | `rtk --version`                           | GitHub API `repos/rtk-ai/rtk/releases/latest` 的 `tag_name`（经 gh-proxy）    | 查询失败（超时 5s）时置 `up_to_date`，不提示升级                                      |
 | `claude_plugin`     | 状态文件 `marketplace_sha`（显示取前 7 位） | 本地仓库 `git rev-parse HEAD`（`installer_state.marketplace_sha`）  | 安装状态以 `claude plugin list` 含 `codekit@co-daming` 为准；SHA 相同→最新，不同→有更新 |
 | `opencode_plugin`   | 同上 `marketplace_sha`                    | 同上 `HEAD`                                                    | 安装状态以 `opencode.json` 含 `codekit@` 为准                                         |
 | `codex_plugin`      | 同上 `marketplace_sha`                    | 同上 `HEAD`                                                    | 安装状态以 `codex plugin list --marketplace co-daming` 首列匹配为准                    |
@@ -304,8 +309,8 @@ render_recap           # 打印卸载结果汇总
 
 | 组件 | 升级方式 |
 |------|----------|
-| `gh` / `glab` | 按通道：brew 已装则 `brew upgrade`；apt 安装不单独升级（锁定发行版版本）；release 每次解析并安装最新发布包 |
-| `rtk` | brew 可用则 `brew upgrade rtk`；否则重跑官方脚本（总是拉取最新） |
+| `gh` / `glab` | 按通道：brew 已装则 `brew upgrade`（中科大镜像 + 关闭 brew 自动更新）；非 brew 安装时 brew 通道让位；apt 安装不单独升级（锁定发行版版本）；release 每次解析并安装最新发布包（GitHub 优先 gh-proxy） |
+| `rtk` | 由 brew 管理则 `brew upgrade rtk`（中科大镜像 + 关闭 brew 自动更新）；否则 brew 通道让位 → 走 `release`：重新解析 `rtk-<target triple>.tar.gz` 并覆写 `~/.local/bin/rtk`（gh-proxy + 摘要校验）；解析失败才重跑官方脚本（经 gh-proxy） |
 | `gitnexus` | `npm install -g gitnexus@latest`（镜像由 `set_npm` 注入） |
 | `dingtalk_cli` / `feishu_cli` | 分别执行 `npm install -g dingtalk-workspace-cli@latest` / `npm install -g @larksuite/cli@latest`（镜像由 `set_npm` 注入） |
 | `graphify` | pipx 已托管 → `pipx upgrade graphifyy`；否则重建 venv 后 `pip install -U` |
@@ -337,14 +342,14 @@ render_recap           # 打印卸载结果汇总
 
 | 组件 | 首选方式 | 回退方式 | 备注 |
 |------|----------|----------|------|
-| `rtk` | `brew`（已安装 Homebrew 时） | 官方 `script` 安装脚本 | 装好后执行 `rtk init -g`，Codex 另执行 `rtk init -g --codex` |
+| `rtk` | `brew`（已安装 Homebrew 时，中科大镜像 + 关闭自动更新） | `release`：`rtk-<target triple>.tar.gz` 经 gh-proxy 下载 + 摘要校验 → 官方 `script` 安装脚本（同样经 gh-proxy） | 装好后执行 `rtk init -g`，Codex 另执行 `rtk init -g --codex`；命令已存在但不在 brew 管理下时 brew 通道让位 |
 | `claude_plugin` | `claude plugin marketplace add <安装状态目录>/marketplace-source/codekit`（兼容市场根） | — | 记录版本；本地源为空时提示并跳过；本地源不配置自动更新（打印手动刷新方式） |
 | `opencode_plugin` | 写入 `opencode.json` 的 plugin 数组 | — | 条目为 `codekit@file://<安装状态目录>/opencode-source`（兼容 npm 包入口）；用 node（优先）或 python3 编辑 JSON |
 | `codex_plugin` | `codex plugin marketplace add <安装状态目录>/marketplace-source/codekit`（兼容市场根） | — | 官方插件市场机制；`codex plugin add codekit@co-daming` |
 | `qoder_plugin` / `qodercn_plugin` | Qoder CLI `plugins install <源> --scope user --json` | 直写共享配置根（注册表 + 缓存 + `enabledPlugins`） | CLI 与桌面 IDE 共用同一个根，安装一次两端生效；只支持 `user` 作用域 |
 | `gitnexus` | npm 用户态安装（`npm install -g gitnexus@latest`，镜像由 `set_npm` 注入） | — | 无 Homebrew formula，走官方 npm 渠道；装好后执行 `gitnexus setup` |
 | `graphify` | pipx（`pipx install graphifyy`） | 独立 venv + 软链 | 无 Homebrew formula，走官方 PyPI 渠道（包名 `graphifyy`）；venv 位于 `~/.local/share/CodeKit/venvs/graphify`。不使用裸 `pip install`，因 brew python 受 PEP 668 保护会拒绝直接写入系统环境 |
-| `gh` | `brew` | `apt`（sudo，源中无包则跳过）→ GitHub release | release 资产经 SHA-256 校验，失败回退 gh-proxy |
+| `gh` | `brew`（中科大镜像 + 关闭自动更新） | `apt`（sudo，源中无包则跳过）→ GitHub release | release 资产优先 gh-proxy、失败回退直连，经 SHA-256 校验 |
 | `glab` | `brew` | `apt`（sudo，源中无包则跳过）→ GitLab release | |
 | `dingtalk_cli` | npm 用户态安装（`npm install -g dingtalk-workspace-cli@latest`，镜像由 `set_npm` 注入） | — | 命令为 `dws`；卸载时同时清理用户态和默认 npm 前缀 |
 | `feishu_cli` | npm 用户态安装（`npm install -g @larksuite/cli@latest`，镜像由 `set_npm` 注入） | — | 命令为 `lark-cli`；卸载时同时清理用户态和默认 npm 前缀 |

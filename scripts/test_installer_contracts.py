@@ -153,8 +153,51 @@ class StrategyTableTests(unittest.TestCase):
     def test_channel_order_is_the_declared_priority(self) -> None:
         self.assertEqual(
             detector.registry.CHANNEL_ORDER,
-            ("npm", "brew", "brew_cask", "apt", "pipx", "venv", "script", "release"),
+            ("npm", "brew", "brew_cask", "apt", "pipx", "venv", "release", "script"),
         )
+
+    def test_release_is_probed_before_the_remote_script(self) -> None:
+        # 校验过摘要的发布资产必须排在 `curl | bash` 之前，否则 rtk 这类同时声明
+        # 两个通道的组件会一直走远程脚本。
+        order = detector.registry.CHANNEL_ORDER
+        self.assertLess(order.index("release"), order.index("script"))
+
+    def test_rtk_release_asset_names_follow_the_rust_target_triple(self) -> None:
+        component = detector.registry.component_by_id("rtk")
+        spec = component.release
+        self.assertIsNotNone(spec)
+        # 脚本通道保留为发布资产解析失败时的回退。
+        self.assertEqual(component.channels["release"], spec.repo)
+        self.assertIn("script", component.channels)
+        cases = {
+            ("Linux", "x86_64"): "rtk-x86_64-unknown-linux-musl.tar.gz",
+            ("Linux", "arm64"): "rtk-aarch64-unknown-linux-musl.tar.gz",
+            ("Darwin", "arm64"): "rtk-aarch64-apple-darwin.tar.gz",
+            ("Darwin", "x86_64"): "rtk-x86_64-apple-darwin.tar.gz",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            for (os_name, arch), expected in cases.items():
+                with self.subTest(platform=f"{os_name}-{arch}"):
+                    installer.os_name = os_name
+                    with patch.object(installer, "release_arch", return_value=arch):
+                        self.assertEqual(
+                            installer.release_asset_name(spec, "0.48.0"), expected
+                        )
+
+    def test_rtk_prefers_the_verified_release_asset_over_the_script(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            calls: list[str] = []
+            with patch.object(installer, "requirements_met", return_value=(True, "")), patch.object(
+                installer, "channel_available", return_value=True
+            ), patch.object(
+                installer,
+                "install_channel",
+                side_effect=lambda _component, kind: calls.append(kind) or kind == "release",
+            ):
+                self.assertTrue(installer.install_via_channels("rtk"))
+        self.assertEqual(calls, ["brew", "release"])
 
     def test_every_npm_target_is_on_the_official_allowlist(self) -> None:
         # 防止裸名（gh/rtk/glab 等李鬼包）被误装。
@@ -549,6 +592,189 @@ class GlobalAgentCleanupTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout)
             backups = home / ".local" / "state" / "CodeKit" / "agent-backups" / "claude"
             self.assertTrue(list(backups.glob(f"{source_agent.name}*")))
+
+
+class _FakeUrlResponse:
+    """最小可用的 urlopen 返回值，供镜像与代理回退用例替换网络调用。"""
+
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+    def read(self) -> bytes:
+        return self.payload
+
+    def __enter__(self) -> "_FakeUrlResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+class HomebrewMirrorTests(unittest.TestCase):
+    def test_mirror_environment_targets_ustc_and_disables_auto_update(self) -> None:
+        env = config.HOMEBREW_MIRROR_ENV
+        self.assertEqual(env["HOMEBREW_NO_AUTO_UPDATE"], "1")
+        for key in (
+            "HOMEBREW_API_DOMAIN",
+            "HOMEBREW_BOTTLE_DOMAIN",
+            "HOMEBREW_BREW_GIT_REMOTE",
+            "HOMEBREW_CORE_GIT_REMOTE",
+            "HOMEBREW_CASK_GIT_REMOTE",
+        ):
+            with self.subTest(key):
+                self.assertTrue(env[key].startswith("https://mirrors.ustc.edu.cn/"))
+
+    def test_brew_overrides_preexisting_values_with_the_mirror(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            previous = {key: os.environ.get(key) for key in config.HOMEBREW_MIRROR_ENV}
+            try:
+                os.environ.update({key: "pre-existing" for key in config.HOMEBREW_MIRROR_ENV})
+                with patch.object(installer, "run_command", return_value=RunResult(0)) as run:
+                    installer.brew("install", "rtk")
+                self.assertEqual(run.call_args[0][0], ["brew", "install", "rtk"])
+                for key, value in config.HOMEBREW_MIRROR_ENV.items():
+                    self.assertEqual(os.environ.get(key), value)
+            finally:
+                for key, value in previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+
+class GithubProxyTests(unittest.TestCase):
+    GITHUB_URLS = (
+        "https://github.com/rtk-ai/rtk/releases/download/v1.2.3/rtk.tar.gz",
+        "https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh",
+        "https://api.github.com/repos/rtk-ai/rtk/releases/latest",
+        "https://objects.githubusercontent.com/codekit/asset",
+    )
+
+    def test_download_urls_put_the_proxy_first_and_keep_a_direct_fallback(self) -> None:
+        for url in self.GITHUB_URLS:
+            with self.subTest(url):
+                self.assertEqual(config.download_urls(url), (f"{config.GH_PROXY}/{url}", url))
+
+    def test_non_github_urls_are_never_proxied(self) -> None:
+        for url in (
+            "https://mirrors.ustc.edu.cn/homebrew-bottles/api/rtk.json",
+            "https://registry.npmmirror.com/gitnexus/latest",
+            "https://gitlab.com/api/v4/projects/34675721/releases/permalink/latest",
+            "https://qoder.com/install",
+        ):
+            with self.subTest(url):
+                self.assertEqual(config.download_urls(url), (url,))
+                self.assertEqual(config.probe_urls(url), (url,))
+
+    def test_version_probes_skip_the_direct_github_attempt(self) -> None:
+        # 探测失败只是退回“已是最新”，不值得再等一次国内必然超时的直连。
+        url = "https://api.github.com/repos/rtk-ai/rtk/releases/latest"
+        self.assertEqual(config.probe_urls(url), (f"{config.GH_PROXY}/{url}",))
+
+    def test_fetch_text_falls_back_to_the_direct_url(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            attempts: list[str] = []
+
+            def fake_urlopen(request, timeout=None):
+                attempts.append(request.full_url)
+                if len(attempts) == 1:
+                    raise OSError("proxy unreachable")
+                return _FakeUrlResponse(b"install rtk\n")
+
+            url = "https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh"
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                text = installer.fetch_text(url)
+        self.assertEqual(text, "install rtk\n")
+        self.assertEqual(attempts, [f"{config.GH_PROXY}/{url}", url])
+
+    def test_download_release_tries_the_proxy_first(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            requested: list[str] = []
+
+            def fake_run_command(args, **kwargs):
+                requested.append(args[-1])
+                Path(args[args.index("-o") + 1]).write_bytes(b"payload")
+                return RunResult(0)
+
+            url = "https://github.com/cli/cli/releases/download/v2.0.0/gh.tar.gz"
+            with patch.object(installer, "run_command", side_effect=fake_run_command):
+                archive = installer.download_release(url, "")
+                try:
+                    self.assertIsNotNone(archive)
+                    self.assertEqual(requested, [f"{config.GH_PROXY}/{url}"])
+                finally:
+                    if archive is not None:
+                        archive.unlink(missing_ok=True)
+
+    def test_version_probe_sends_the_github_api_through_the_proxy(self) -> None:
+        attempts: list[str] = []
+
+        def fake_urlopen(request, timeout=None):
+            attempts.append(request.full_url)
+            return _FakeUrlResponse(json.dumps({"tag_name": "v0.9.0"}).encode("utf-8"))
+
+        url = "https://api.github.com/repos/rtk-ai/rtk/releases/latest"
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            document = detector.fetch_json(url)
+        self.assertEqual(document, {"tag_name": "v0.9.0"})
+        self.assertEqual(attempts, [f"{config.GH_PROXY}/{url}"])
+
+
+class BrewChannelFallbackTests(unittest.TestCase):
+    def test_command_installed_outside_brew_lets_the_next_channel_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            with patch.object(installer, "command_exists", return_value=True), patch.object(
+                installer, "brew_manages", return_value=False
+            ), patch.object(installer, "brew") as brew:
+                self.assertFalse(installer.brew_install_or_upgrade("rtk", "rtk"))
+            brew.assert_not_called()
+
+    def test_missing_formula_fails_the_channel_after_a_single_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            with patch.object(installer, "command_exists", return_value=False), patch.object(
+                installer, "brew_manages", return_value=False
+            ), patch.object(installer, "brew", return_value=RunResult(1)) as brew:
+                self.assertFalse(installer.brew_install_or_upgrade("rtk", "rtk"))
+            brew.assert_called_once_with("install", "rtk")
+
+    def test_failed_upgrade_keeps_a_brew_managed_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            with patch.object(installer, "command_exists", return_value=True), patch.object(
+                installer, "brew_manages", return_value=True
+            ), patch.object(installer, "brew", return_value=RunResult(1)) as brew:
+                self.assertTrue(installer.brew_install_or_upgrade("rtk", "rtk"))
+            brew.assert_called_once_with("upgrade", "rtk")
+
+    def test_cask_installed_outside_brew_lets_the_next_channel_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            with patch.object(installer, "command_exists", return_value=True), patch.object(
+                installer, "brew_manages", return_value=False
+            ), patch.object(installer, "brew") as brew:
+                self.assertFalse(installer.install_brew_cask("claude-code", "claude"))
+            brew.assert_not_called()
+
+    def test_rtk_upgrade_falls_through_to_the_script_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            with patch.object(installer, "requirements_met", return_value=(True, "")), patch.object(
+                installer, "channel_available", side_effect=lambda kind: kind in {"brew", "script"}
+            ), patch.object(
+                installer, "brew_install_or_upgrade", return_value=False
+            ), patch.object(installer, "run_remote_script", return_value=True) as script, patch.object(
+                installer, "command_exists", return_value=True
+            ):
+                self.assertTrue(installer.install_via_channels("rtk"))
+            self.assertEqual(
+                script.call_args[0][0],
+                detector.registry.component_by_id("rtk").channels["script"],
+            )
 
 
 if __name__ == "__main__":
