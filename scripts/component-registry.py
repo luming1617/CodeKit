@@ -1,5 +1,29 @@
 #!/usr/bin/env python3
-"""Canonical component registry for the CodeKit installer."""
+"""Canonical component registry and install-strategy table for CodeKit.
+
+This module is the single source of truth for:
+
+* which optional components the installer offers (``COMPONENTS``);
+* which acquisition channels each one may use (``Component.channels``);
+* the global channel priority the installer probes (``CHANNEL_ORDER``);
+* the channel table for coding-agent CLIs (``AGENT_CLI_CHANNELS``).
+
+Installer, uninstaller, state detection and the coding-agent helpers all read
+these definitions instead of carrying their own copies, so a channel change is
+made in exactly one place.  The human-readable mirror of this table lives in
+``INSTALL-STRATEGY.md``.
+
+Channels are expressed as ``kind -> target``:
+
+* ``npm``        target is an official npm package name (whitelisted below);
+* ``brew``       target is a Homebrew formula;
+* ``brew_cask``  target is a Homebrew cask;
+* ``apt``        target is a Debian/Ubuntu package name;
+* ``pipx``       target is a PyPI distribution installed with pipx;
+* ``venv``       target is a PyPI distribution installed into a private venv;
+* ``script``     target is an official installer-script URL;
+* ``release``    target is resolved from ``Component.release`` (release assets).
+"""
 
 from __future__ import annotations
 
@@ -7,11 +31,55 @@ import argparse
 import json
 import re
 import sys
-from dataclasses import asdict, dataclass
-from typing import Dict, List, Sequence
+from dataclasses import asdict, dataclass, field
+from typing import Dict, List, Mapping, Optional, Sequence
 
 
 COMPONENT_ID = re.compile(r"^[a-z][a-z0-9_]*$")
+# A requirement is either a bare command that must exist ("unzip") or a
+# command with a minimum version ("node>=24.11.0").
+REQUIREMENT = re.compile(r"^[a-z][a-z0-9_-]*(>=[0-9]+(\.[0-9]+)*)?$")
+
+# Global channel priority. Every platform probes this same order; a channel is
+# only used when it is both declared by the component and currently available.
+CHANNEL_ORDER: tuple[str, ...] = (
+    "npm",
+    "brew",
+    "brew_cask",
+    "apt",
+    "pipx",
+    "venv",
+    "script",
+    "release",
+)
+
+# Only these npm package names may ever be installed. The allowlist exists
+# because several well-known CLI names are squatted or owned by unrelated
+# projects on npm (`gh`, `rtk`, `glab`, `@git-ai/cli`); installing a bare name
+# would silently pull the wrong package. Adding a component to the npm channel
+# requires adding its exact official package name here first.
+OFFICIAL_NPM_PACKAGES: frozenset[str] = frozenset(
+    {
+        "@anthropic-ai/claude-code",
+        "@openai/codex",
+        "@larksuite/cli",
+        "dingtalk-workspace-cli",
+        "gitnexus",
+        "opencode-ai",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ReleaseSpec:
+    """Release-asset download plan for the ``release`` channel."""
+
+    repo: str  # "github:owner/repo" or "gitlab:<project-id>"
+    asset: str  # template with {version} {os} {arch} {ext}
+    binary: str  # executable name inside the archive
+    os_tokens: Mapping[str, str] = field(default_factory=dict)
+    arch_tokens: Mapping[str, str] = field(default_factory=dict)
+    ext_tokens: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -19,6 +87,18 @@ class Component:
     component_id: str
     description: str
     group: str
+    # ``command`` is the executable used for presence/version checks; plugin
+    # components ship no command of their own and set ``plugin`` instead.
+    command: str = ""
+    version_args: tuple[str, ...] = ()
+    channels: Mapping[str, str] = field(default_factory=dict)
+    # Hard prerequisites enforced per component, e.g. ("node>=24.11.0",).
+    requires: tuple[str, ...] = ()
+    # Version source for upgrade checks: "github:owner/repo", "gitlab:<id>",
+    # "npm:<package>" or "pypi:<package>". Empty means "derive from channels".
+    version_source: str = ""
+    release: Optional[ReleaseSpec] = None
+    plugin: bool = False
 
 
 GROUPS: Dict[str, str] = {
@@ -29,26 +109,121 @@ GROUPS: Dict[str, str] = {
 }
 
 
+# Marker executable that proves an npm install produced a usable CLI.
 COMPONENTS: Sequence[Component] = (
-    Component("git_ai", "git-ai (代码追踪·推荐)", "ai"),
-    Component("rtk", "Rust Token Killer (节省token·推荐)", "ai"),
-    Component("claude_plugin", "CodeKit Plugin (Claude)", "skills"),
-    Component("opencode_plugin", "CodeKit Plugin (OpenCode)", "skills"),
-    Component("codex_plugin", "CodeKit Plugin (Codex)", "skills"),
-    Component("qoder_plugin", "CodeKit Plugin (Qoder)", "skills"),
-    Component("qodercn_plugin", "CodeKit Plugin (Qoder CN)", "skills"),
-    Component("gitnexus", "GitNexus (代码结构分析·推荐)", "intel"),
-    Component("graphify", "Graphify (代码知识图谱·推荐)", "intel"),
-    Component("gh", "GitHub CLI (推荐)", "third"),
-    Component("glab", "GitLab CLI (推荐)", "third"),
-    Component("dingtalk_cli", "钉钉 CLI", "third"),
-    Component("feishu_cli", "飞书 CLI", "third"),
+    Component(
+        "rtk",
+        "Rust Token Killer (节省token·推荐)",
+        "ai",
+        command="rtk",
+        version_args=("--version",),
+        channels={
+            "brew": "rtk",
+            "script": "https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh",
+        },
+        version_source="github:rtk-ai/rtk",
+    ),
+    Component("claude_plugin", "CodeKit Plugin (Claude)", "skills", plugin=True),
+    Component("opencode_plugin", "CodeKit Plugin (OpenCode)", "skills", plugin=True),
+    Component("codex_plugin", "CodeKit Plugin (Codex)", "skills", plugin=True),
+    Component("qoder_plugin", "CodeKit Plugin (Qoder)", "skills", plugin=True),
+    Component("qodercn_plugin", "CodeKit Plugin (Qoder CN)", "skills", plugin=True),
+    Component(
+        "gitnexus",
+        "GitNexus (代码结构分析·推荐)",
+        "intel",
+        command="gitnexus",
+        version_args=("--version",),
+        channels={"npm": "gitnexus"},
+        requires=("node>=24.11.0",),
+    ),
+    Component(
+        "graphify",
+        "Graphify (代码知识图谱·推荐)",
+        "intel",
+        command="graphify",
+        version_args=("--version",),
+        channels={"pipx": "graphifyy", "venv": "graphifyy"},
+        requires=("python>=3.10",),
+        version_source="pypi:graphifyy",
+    ),
+    Component(
+        "gh",
+        "GitHub CLI (推荐)",
+        "third",
+        command="gh",
+        version_args=("--version",),
+        channels={"brew": "gh", "apt": "gh", "release": "github:cli/cli"},
+        version_source="github:cli/cli",
+        release=ReleaseSpec(
+            repo="github:cli/cli",
+            asset="gh_{version}_{os}_{arch}.{ext}",
+            binary="gh",
+            os_tokens={"Darwin": "macOS", "Linux": "linux"},
+            arch_tokens={"x86_64": "amd64", "arm64": "arm64"},
+            ext_tokens={"Darwin": "zip", "Linux": "tar.gz"},
+        ),
+    ),
+    Component(
+        "glab",
+        "GitLab CLI (推荐)",
+        "third",
+        command="glab",
+        version_args=("version",),
+        channels={"brew": "glab", "apt": "glab", "release": "gitlab:34675721"},
+        version_source="gitlab:34675721",
+        release=ReleaseSpec(
+            repo="gitlab:34675721",
+            asset="glab_{version}_{os}_{arch}.{ext}",
+            binary="glab",
+            os_tokens={"Darwin": "darwin", "Linux": "linux"},
+            arch_tokens={"x86_64": "amd64", "arm64": "arm64"},
+            ext_tokens={"Darwin": "tar.gz", "Linux": "tar.gz"},
+        ),
+    ),
+    Component(
+        "dingtalk_cli",
+        "钉钉 CLI",
+        "third",
+        command="dws",
+        version_args=("version",),
+        channels={"npm": "dingtalk-workspace-cli"},
+        requires=("unzip",),
+    ),
+    Component(
+        "feishu_cli",
+        "飞书 CLI",
+        "third",
+        command="lark-cli",
+        version_args=("--version",),
+        channels={"npm": "@larksuite/cli"},
+    ),
 )
+
+
+# Coding-agent CLIs are installed on demand as plugin prerequisites. They share
+# the same channel priority and table shape as the optional components.
+AGENT_CLI_CHANNELS: Dict[str, Mapping[str, str]] = {
+    "claude": {"npm": "@anthropic-ai/claude-code", "brew_cask": "claude-code"},
+    "codex": {"npm": "@openai/codex", "brew_cask": "codex"},
+    "opencode": {"npm": "opencode-ai", "brew": "opencode"},
+    "qoder": {"script": "https://qoder.com/install"},
+    "qodercn": {"script": "https://static.qoder.com.cn/qoder-cli-cn/install.sh"},
+}
+
+
+COMPONENTS_BY_ID = {component.component_id: component for component in COMPONENTS}
+
+
+def component_by_id(component_id: str) -> Optional[Component]:
+    """Return a component definition by id, or None when unknown."""
+    return COMPONENTS_BY_ID.get(component_id)
 
 
 def validate_registry(
     components: Sequence[Component] = COMPONENTS,
     groups: Dict[str, str] = GROUPS,
+    agent_channels: Mapping[str, Mapping[str, str]] = AGENT_CLI_CHANNELS,
 ) -> None:
     if not components:
         raise ValueError("component registry is empty")
@@ -80,6 +255,45 @@ def validate_registry(
                 raise ValueError(
                     f"invalid {field_name} for component {component.component_id}"
                 )
+        _validate_channels(component.component_id, component.channels)
+        _validate_requirements(component.component_id, component.requires)
+        if component.plugin and component.channels:
+            raise ValueError(
+                f"plugin component must not declare channels: {component.component_id}"
+            )
+        if not component.plugin and not component.channels:
+            raise ValueError(
+                f"non-plugin component must declare channels: {component.component_id}"
+            )
+        if "release" in component.channels and component.release is None:
+            raise ValueError(
+                f"release channel without a release spec: {component.component_id}"
+            )
+        if component.release is not None and component.channels.get("release") != component.release.repo:
+            raise ValueError(
+                f"release spec/repo mismatch: {component.component_id}"
+            )
+
+    for key, channels in agent_channels.items():
+        _validate_channels(f"agent:{key}", channels)
+
+
+def _validate_channels(owner: str, channels: Mapping[str, str]) -> None:
+    for kind, target in channels.items():
+        if kind not in CHANNEL_ORDER:
+            raise ValueError(f"unknown channel {kind!r} for {owner}")
+        if not target or any(character in target for character in "\t\r\n"):
+            raise ValueError(f"invalid {kind} target for {owner}")
+        if kind == "npm" and target not in OFFICIAL_NPM_PACKAGES:
+            raise ValueError(
+                f"npm package is not on the official allowlist: {target} ({owner})"
+            )
+
+
+def _validate_requirements(owner: str, requires: Sequence[str]) -> None:
+    for requirement in requires:
+        if not REQUIREMENT.fullmatch(requirement):
+            raise ValueError(f"invalid requirement {requirement!r} for {owner}")
 
 
 def export_tsv(components: Sequence[Component] = COMPONENTS) -> None:
@@ -102,7 +316,17 @@ def export_json(components: Sequence[Component] = COMPONENTS) -> None:
         item = asdict(component)
         item["group_title"] = GROUPS[component.group]
         payload.append(item)
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "channel_order": list(CHANNEL_ORDER),
+                "components": payload,
+                "agent_clis": {key: dict(value) for key, value in AGENT_CLI_CHANNELS.items()},
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def parse_args() -> argparse.Namespace:

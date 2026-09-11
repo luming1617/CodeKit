@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import os
 import platform
 import shutil
 import subprocess
@@ -113,25 +112,16 @@ LINUX_AGENT_PATHS = {
 }
 
 
-# npm 包名、可执行命令和版本参数的唯一映射，供状态检测、安装路径和
-# 安装/卸载流程共同复用。
+# npm 包名、可执行命令和版本参数从策略表派生，供状态检测、安装路径和
+# 安装/卸载流程共同复用，避免出现第二份 npm 包名定义。
 NPM_COMPONENTS = {
-    "gitnexus": {
-        "package": "gitnexus",
-        "command": "gitnexus",
-        "version_args": ["--version"],
-    },
-    "dingtalk_cli": {
-        "package": "dingtalk-workspace-cli",
-        # The npm package exposes `dws` as its executable entry point.
-        "command": "dws",
-        "version_args": ["version"],
-    },
-    "feishu_cli": {
-        "package": "@larksuite/cli",
-        "command": "lark-cli",
-        "version_args": ["--version"],
-    },
+    component.component_id: {
+        "package": component.channels["npm"],
+        "command": component.command,
+        "version_args": list(component.version_args),
+    }
+    for component in registry.COMPONENTS
+    if "npm" in component.channels
 }
 
 
@@ -259,21 +249,6 @@ def agent_cli_state(component_id: str, context: Context) -> tuple[bool, str]:
     return True, agents.cli_version(entry.key, context.home)
 
 
-def git_ai_command(home: Path) -> Optional[str]:
-    """查找 PATH 中或 CodeKit 用户目录中的 git-ai 可执行文件。"""
-    found = shutil.which("git-ai")
-    if found:
-        return found
-    candidate = home / ".git-ai" / "bin" / "git-ai"
-    return str(candidate) if candidate.is_file() and os.access(candidate, os.X_OK) else None
-
-
-def git_ai_version(home: Path) -> str:
-    """读取 git-ai 版本；未找到可执行文件时返回空字符串。"""
-    command = git_ai_command(home)
-    return run_command([command, "--version"]) if command else ""
-
-
 def plugin_listing(command: str, args: list[str]) -> str:
     """读取 Claude/Codex 插件列表，隐藏 CLI 错误以便状态探测安全降级。"""
     if shutil.which(command) is None:
@@ -316,28 +291,35 @@ def fetch_json(url: str) -> Any:
         return None
 
 
-def latest_versions(components: Iterable[str]) -> dict[str, str]:
-    """从各组件的发布源读取最新版本，供安装选择器判断是否可升级。"""
-    sources = {
-        "glab": ("https://gitlab.com/api/v4/projects/34675721/releases/permalink/latest", "tag_name"),
-        "rtk": ("https://api.github.com/repos/rtk-ai/rtk/releases/latest", "tag_name"),
-        "gh": ("https://api.github.com/repos/cli/cli/releases/latest", "tag_name"),
+def version_source_url(component: str) -> tuple[str, str]:
+    """返回组件版本来源的 (URL, 字段)，全部由策略表声明；无来源时返回空对。"""
+    definition = registry.component_by_id(component)
+    if definition is None:
+        return "", ""
+    source = definition.version_source
+    if not source and "npm" in definition.channels:
+        source = f"npm:{definition.channels['npm']}"
+    kind, _, target = source.partition(":")
+    if kind == "npm":
         # npm 元数据同样走镜像源：直连 registry.npmjs.org 探测会拖慢甚至超时。
-        "gitnexus": (f"{config.NPM_REGISTRY}/gitnexus/latest", "version"),
-        "dingtalk_cli": (
-            f"{config.NPM_REGISTRY}/dingtalk-workspace-cli/latest",
-            "version",
-        ),
-        "feishu_cli": (f"{config.NPM_REGISTRY}/@larksuite/cli/latest", "version"),
-        "graphify": ("https://pypi.org/pypi/graphifyy/json", "version"),
-    }
+        return f"{config.NPM_REGISTRY}/{target}/latest", "version"
+    if kind == "pypi":
+        return f"https://pypi.org/pypi/{target}/json", "version"
+    if kind == "github":
+        return f"https://api.github.com/repos/{target}/releases/latest", "tag_name"
+    if kind == "gitlab":
+        return f"https://gitlab.com/api/v4/projects/{target}/releases/permalink/latest", "tag_name"
+    return "", ""
+
+
+def latest_versions(components: Iterable[str]) -> dict[str, str]:
+    """从各组件的版本源读取最新版本，供安装选择器判断是否可升级。"""
     result: dict[str, str] = {}
     for component in components:
-        if component not in sources:
+        url, field = version_source_url(component)
+        if not url:
             continue
-        url, field = sources[component]
-        document = fetch_json(url)
-        value = config.json_field(document, field)
+        value = config.json_field(fetch_json(url), field)
         version = config.extract_version(value)
         if version:
             result[component] = f"v{version}" if component == "glab" else version
@@ -398,27 +380,13 @@ def qoder_present(descriptor: Any, context: Context) -> bool:
 
 
 def component_version(component: str, context: Context) -> str:
-    """按组件类型选择版本来源，包括 CLI、git-ai 和插件配置版本。"""
-    commands = {
-        "glab": ("glab", ["version"]),
-        "gh": ("gh", ["--version"]),
-        "rtk": ("rtk", ["--version"]),
-        "graphify": ("graphify", ["--version"]),
-    }
-    commands.update(
-        {
-            component_id: (definition["command"], definition["version_args"])
-            for component_id, definition in NPM_COMPONENTS.items()
-        }
-    )
-    if component in commands:
-        command, args = commands[component]
-        value = command_version(command, args)
+    """按组件类型选择版本来源：CLI 命令来自策略表，插件来自自身配置。"""
+    definition = registry.component_by_id(component)
+    if definition is not None and definition.command:
+        value = command_version(definition.command, list(definition.version_args))
         # `gh --version` includes the build date and platform after the
         # semantic version.  Result pages only need the three-part version.
         return config.extract_version(value) if component == "gh" else value
-    if component == "git_ai":
-        return git_ai_version(context.home)
     if component in {"claude_plugin", "opencode_plugin", "codex_plugin"}:
         return repository_plugin_version(context)
     qoder_platform = qoder.platform_for_component(component)
@@ -445,12 +413,9 @@ def present(component: str, context: Context) -> bool:
     这里只看文件层面的落盘结果，卸载复核与 `--present` 子命令依赖它；
     安装状态是否成立另由 plugin_ready 追加 CLI 前置判断。
     """
-    if component == "git_ai":
-        return git_ai_command(context.home) is not None
-    if component in {"rtk", "graphify", "gh", "glab"}:
-        return shutil.which(component) is not None
-    if component in NPM_COMPONENTS:
-        return shutil.which(NPM_COMPONENTS[component]["command"]) is not None
+    definition = registry.component_by_id(component)
+    if definition is not None and definition.command:
+        return shutil.which(definition.command) is not None
     if component == "claude_plugin":
         listing = plugin_listing("claude", ["plugin", "list"])
         registered = bool(listing) and has_line(
@@ -492,9 +457,6 @@ def detect_component(component: str, context: Context, latest: dict[str, str]) -
         return state
     state.installed_version = component_version(component, context)
 
-    if component == "git_ai":
-        state.status = "up_to_date"
-        return state
     qoder_platform = qoder.platform_for_component(component)
     if qoder_platform is not None:
         if platform_subagents_state(context, qoder_platform.key) != "up_to_date":
@@ -545,10 +507,7 @@ def all_states(context: Context) -> list[ComponentState]:
     latest = latest_versions(
         component.component_id
         for component in registry.COMPONENTS
-        if (
-            component.component_id in {"glab", "rtk", "gh", "graphify"}
-            or component.component_id in NPM_COMPONENTS
-        )
+        if version_source_url(component.component_id)[0]
         and present(component.component_id, context)
     )
     return [
@@ -674,20 +633,9 @@ def display_path(path: Path, home: Path) -> str:
 
 def component_install_path(component: str, context: Context) -> str:
     """返回组件的实际安装路径或用户态安装的稳定回退路径。"""
-    executable_names = {
-        "rtk": "rtk",
-        "gitnexus": "gitnexus",
-        "dingtalk_cli": "dws",
-        "feishu_cli": "lark-cli",
-        "graphify": "graphify",
-        "gh": "gh",
-        "glab": "glab",
-    }
-    if component == "git_ai":
-        path = git_ai_command(context.home)
-        return display_path(Path(path), context.home) if path else display_path(context.home / ".git-ai", context.home)
-    if component in executable_names:
-        path = shutil.which(executable_names[component])
+    definition = registry.component_by_id(component)
+    if definition is not None and definition.command:
+        path = shutil.which(definition.command)
         if path:
             return display_path(Path(path), context.home)
         fallback = {

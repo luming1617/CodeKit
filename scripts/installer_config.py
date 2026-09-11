@@ -10,6 +10,7 @@ configuration file behind.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -26,7 +27,9 @@ SEMVER_PATTERN = re.compile(
 )
 MCP_SECTION_PATTERN = re.compile(r"^\[mcp_servers\.([^\]]+)\]\s*$")
 
-# 直连 registry.npmjs.org 在国内网络下常超时，所有 npm 安装统一走镜像源。
+# 直连 registry.npmjs.org 在国内网络下常超时。NPM_REGISTRY 既由 set_npm 写入
+# npm_config_registry（本会话所有 npm/npx 子进程生效），也用作版本探测 URL；
+# NPM_REGISTRY_ARGS 仅用于面向用户的手动安装指引，因为那些命令在用户 shell 执行、无法继承本进程环境。
 NPM_REGISTRY = "https://registry.npmmirror.com"
 NPM_REGISTRY_ARGS = ("--registry", NPM_REGISTRY)
 
@@ -58,6 +61,17 @@ def require_helper_files(directory: Optional[Path] = None) -> None:
     ]
     if missing:
         raise ValueError(f"installer helper missing: {', '.join(missing)}")
+
+
+def load_module(path: Path, name: str) -> Any:
+    """按文件路径加载辅助模块，供需要读取策略表的模块共用同一实例。"""
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load helper module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def linux_application_dirs(

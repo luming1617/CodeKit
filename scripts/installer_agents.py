@@ -10,7 +10,6 @@ plugin is selected and its CLI is missing, the CLI is installed first.
 from __future__ import annotations
 
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -26,26 +25,30 @@ import installer_config as config  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 
 
+# The channel table lives in component-registry.py (single source of truth for
+# both optional components and coding-agent CLIs).
+registry = config.load_module(SCRIPT_DIR / "component-registry.py", "codekit_component_registry")
+
+
 @dataclass(frozen=True)
 class AgentCLI:
-    """One agent platform plus every channel the installer can install it from."""
+    """One agent platform plus the channel table the installer probes."""
 
     key: str
     display_name: str
     component_id: str
     commands: tuple[str, ...]
-    brew_cask: str = ""
-    brew_formula: str = ""
-    npm_package: str = ""
-    script_url: str = ""
+    channels: Mapping[str, str]
 
+    @property
+    def npm_package(self) -> str:
+        """Official npm package name for this CLI, or an empty string."""
+        return self.channels.get("npm", "")
 
-# Official Qoder CLI channels; both distributions publish one script for macOS
-# and Linux, so no per-OS branch is needed for them.
-QODER_CLI_SCRIPTS = {
-    "qoder": "https://qoder.com/install",
-    "qodercn": "https://static.qoder.com.cn/qoder-cli-cn/install.sh",
-}
+    @property
+    def script_url(self) -> str:
+        """Official installer-script URL for this CLI, or an empty string."""
+        return self.channels.get("script", "")
 
 
 def _qoder_entry(platform_key: str, display_name: str) -> AgentCLI:
@@ -56,35 +59,21 @@ def _qoder_entry(platform_key: str, display_name: str) -> AgentCLI:
         display_name=display_name,
         component_id=descriptor.component_id,
         commands=descriptor.cli_commands,
-        script_url=QODER_CLI_SCRIPTS[platform_key],
+        channels=registry.AGENT_CLI_CHANNELS[platform_key],
     )
 
 
-AGENT_CLIS: tuple[AgentCLI, ...] = (
-    AgentCLI(
-        key="claude",
-        display_name="Claude Code",
-        component_id="claude_plugin",
-        commands=("claude",),
-        brew_cask="claude-code",
-        npm_package="@anthropic-ai/claude-code",
-    ),
-    AgentCLI(
-        key="codex",
-        display_name="Codex",
-        component_id="codex_plugin",
-        commands=("codex",),
-        brew_cask="codex",
-        npm_package="@openai/codex",
-    ),
-    AgentCLI(
-        key="opencode",
-        display_name="OpenCode",
-        component_id="opencode_plugin",
-        commands=("opencode",),
-        brew_formula="opencode",
-        npm_package="opencode-ai",
-    ),
+# Key, display name, plugin component and PATH commands for the npm/brew agents.
+_AGENT_META: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
+    ("claude", "Claude Code", "claude_plugin", ("claude",)),
+    ("codex", "Codex", "codex_plugin", ("codex",)),
+    ("opencode", "OpenCode", "opencode_plugin", ("opencode",)),
+)
+
+AGENT_CLIS: tuple[AgentCLI, ...] = tuple(
+    AgentCLI(key, display_name, component_id, commands, registry.AGENT_CLI_CHANNELS[key])
+    for key, display_name, component_id, commands in _AGENT_META
+) + (
     _qoder_entry("qoder", "Qoder"),
     _qoder_entry("qodercn", "Qoder CN"),
 )
@@ -196,25 +185,31 @@ def cli_version(
     return config.extract_version(first_line) or first_line
 
 
-def install_plan(entry: AgentCLI, os_name: str) -> list[Sequence[str]]:
-    """Return the install channels to try, in order, for the current platform."""
+def channel_plan(entry: AgentCLI) -> list[tuple[str, str]]:
+    """Return the CLI's declared channels in global priority order."""
+    return [
+        (kind, entry.channels[kind])
+        for kind in registry.CHANNEL_ORDER
+        if kind in entry.channels
+    ]
+
+
+def install_plan(entry: AgentCLI, os_name: Optional[str] = None) -> list[Sequence[str]]:
+    """Return install commands for an agent CLI, ordered by the channel table."""
     plan: list[Sequence[str]] = []
-    if os_name == "Darwin":
-        if entry.brew_cask:
-            plan.append(("brew", "install", "--cask", entry.brew_cask))
-        if entry.brew_formula:
-            plan.append(("brew", "install", entry.brew_formula))
-    if entry.npm_package:
-        plan.append(
-            ("npm", "install", "-g", f"{entry.npm_package}@latest", *config.NPM_REGISTRY_ARGS)
-        )
+    for kind, target in channel_plan(entry):
+        if kind == "npm":
+            plan.append(("npm", "install", "-g", f"{target}@latest"))
+        elif kind == "brew":
+            plan.append(("brew", "install", target))
+        elif kind == "brew_cask":
+            plan.append(("brew", "install", "--cask", target))
     return plan
 
 
 def supports_install(entry: AgentCLI, os_name: Optional[str] = None) -> bool:
     """Report whether any install channel exists for this platform."""
-    os_name = os_name or platform.system()
-    return bool(install_plan(entry, os_name) or entry.script_url)
+    return bool(entry.channels)
 
 
 def cli_extra_paths(entry: AgentCLI, home: Path) -> tuple[Path, ...]:
@@ -230,6 +225,10 @@ def fallback_note(entry: AgentCLI) -> str:
     if entry.script_url:
         return f"curl -fsSL {entry.script_url} | bash"
     if entry.npm_package:
-        registry = " ".join(config.NPM_REGISTRY_ARGS)
-        return f"npm install -g {entry.npm_package} {registry}"
+        registry_args = " ".join(config.NPM_REGISTRY_ARGS)
+        return f"npm install -g {entry.npm_package} {registry_args}"
+    brew_target = entry.channels.get("brew") or entry.channels.get("brew_cask")
+    if brew_target:
+        action = "brew install --cask" if "brew_cask" in entry.channels else "brew install"
+        return f"{action} {brew_target}"
     return ""

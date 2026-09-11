@@ -54,37 +54,58 @@ class AgentCliInstallTests(unittest.TestCase):
                 self.assertTrue(agents.supports_install(entry, "Linux"))
                 self.assertTrue(agents.supports_install(entry, "Darwin"))
 
-    def test_macos_prefers_homebrew_and_linux_uses_npm(self) -> None:
+    def test_install_plan_follows_the_global_channel_order(self) -> None:
+        # npm 是全局第一优先通道，brew/cask 只在其后；install_plan 只按
+        # CHANNEL_ORDER 列出已声明通道，可用性由调用方探测，因此与平台无关。
+        # 镜像源由 set_npm 注入环境变量，命令本身不再附加 --registry。
         claude = agents.agent_cli("claude")
-        self.assertEqual(agents.install_plan(claude, "Darwin")[0][:3], ("brew", "install", "--cask"))
-        self.assertEqual(
-            agents.install_plan(claude, "Linux"),
-            [
-                (
-                    "npm",
-                    "install",
-                    "-g",
-                    "@anthropic-ai/claude-code@latest",
-                    *config.NPM_REGISTRY_ARGS,
+        expected = [
+            ("npm", "install", "-g", "@anthropic-ai/claude-code@latest"),
+            ("brew", "install", "--cask", "claude-code"),
+        ]
+        self.assertEqual(agents.install_plan(claude, "Darwin"), expected)
+        self.assertEqual(agents.install_plan(claude, "Linux"), expected)
+
+    def test_set_npm_injects_the_user_prefix_and_mirror(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            installer = build_installer(home)
+            with patch.dict(os.environ, {}, clear=False):
+                installer.set_npm()
+                self.assertEqual(os.environ["npm_config_prefix"], str(home / ".npm-global"))
+                self.assertEqual(os.environ["npm_config_registry"], config.NPM_REGISTRY)
+                self.assertTrue(
+                    os.environ["PATH"].startswith(str(home / ".npm-global" / "bin"))
                 )
-            ],
-        )
+
+    def test_npm_install_relies_on_the_injected_mirror(self) -> None:
+        # 镜像源统一由 set_npm 注入的环境变量提供，执行命令不再逐处附加 --registry。
+        with tempfile.TemporaryDirectory() as directory:
+            installer = build_installer(Path(directory))
+            with patch.object(Installer, "command_exists", return_value=True):
+                with patch.object(Installer, "run_command", return_value=RunResult(0)) as run:
+                    with patch.dict(os.environ, {}, clear=False):
+                        self.assertTrue(installer.install_npm_package("gitnexus", "gitnexus"))
+                        self.assertEqual(os.environ["npm_config_registry"], config.NPM_REGISTRY)
+        self.assertEqual(run.call_args[0][0], ["npm", "install", "-g", "gitnexus@latest"])
 
     def test_missing_cli_is_installed_before_the_plugin(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             installer = build_installer(Path(directory))
-            with patch.object(detector, "agent_cli_presence", side_effect=presence_after_install()):
-                with patch.object(Installer, "run_command", return_value=RunResult(0)) as run:
-                    self.assertTrue(installer.ensure_agent_cli("claude"))
+            with patch.object(Installer, "channel_available", return_value=True):
+                with patch.object(detector, "agent_cli_presence", side_effect=presence_after_install()):
+                    with patch.object(Installer, "run_command", return_value=RunResult(0)) as run:
+                        self.assertTrue(installer.ensure_agent_cli("claude"))
         self.assertEqual(run.call_args[0][0][:3], ["npm", "install", "-g"])
 
     def test_unavailable_cli_channel_fails_without_touching_the_plugin(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             installer = build_installer(Path(directory))
-            with patch.object(detector, "agent_cli_presence", return_value=""):
-                with patch.object(Installer, "run_command", return_value=RunResult(1)):
-                    with patch.object(Installer, "run_remote_script", return_value=False):
-                        self.assertFalse(installer.ensure_agent_cli("claude"))
+            with patch.object(Installer, "channel_available", return_value=True):
+                with patch.object(detector, "agent_cli_presence", return_value=""):
+                    with patch.object(Installer, "run_command", return_value=RunResult(1)):
+                        with patch.object(Installer, "run_remote_script", return_value=False):
+                            self.assertFalse(installer.ensure_agent_cli("claude"))
 
     def test_default_selection_skips_plugins_whose_cli_is_missing(self) -> None:
         # 未安装的组件默认勾选；但缺 CLI 的插件要用户显式勾选，避免静默装上 CLI。
@@ -112,9 +133,10 @@ class AgentCliInstallTests(unittest.TestCase):
             home = Path(directory)
             installer = build_installer(home)
             with patch.dict(os.environ, {"PATH": "/usr/bin"}, clear=False):
-                with patch.object(detector, "agent_cli_presence", side_effect=presence_after_install()):
-                    with patch.object(Installer, "run_remote_script", return_value=True) as script:
-                        self.assertTrue(installer.ensure_agent_cli("qodercn"))
+                with patch.object(Installer, "channel_available", return_value=True):
+                    with patch.object(detector, "agent_cli_presence", side_effect=presence_after_install()):
+                        with patch.object(Installer, "run_remote_script", return_value=True) as script:
+                            self.assertTrue(installer.ensure_agent_cli("qodercn"))
                 self.assertTrue(os.environ["PATH"].startswith(str(home / ".qoder-cn" / "entry")))
         script.assert_called_once_with(agents.agent_cli("qodercn").script_url)
 

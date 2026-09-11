@@ -18,8 +18,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Union
@@ -220,8 +222,9 @@ class Installer:
         self.prepend_path(self.npm_prefix / "bin")
 
     def set_npm(self) -> None:
-        """将 npm 全局安装前缀切换到用户目录，避免使用 sudo 写系统目录。"""
+        """切换到用户态 npm 前缀并统一下发镜像源，避免 sudo 写系统目录和直连 registry.npmjs.org。"""
         os.environ["npm_config_prefix"] = str(self.npm_prefix)
+        os.environ["npm_config_registry"] = config.NPM_REGISTRY
         self.prepend_path(self.npm_prefix / "bin")
 
     def run_command(
@@ -491,8 +494,6 @@ class Installer:
             return " (组件未安装，勾选后安装)"
         if item.status == "installed":
             return f" (组件有更新，勾选后升级 {installed_version} → {item.latest_version})"
-        if component_id == "git_ai":
-            return f" (组件已最新 {installed_version} · 无公开版本源，勾选后重装)"
         return f" (组件已最新 {installed_version}，勾选后重装)"
 
     def plugin_component_tag(self, item, entry) -> str:
@@ -597,64 +598,304 @@ class Installer:
             config.set_key_value(self.version_file, "marketplace_sha", sha)
             self.logger.success(f"Marketplace version recorded: {sha[:7]}")
 
-    def git_ai_command(self) -> Optional[str]:
-        """返回 git-ai 可执行文件路径；未安装时返回 None。"""
-        return detector.git_ai_command(self.home)
+    def component(self, component_id: str):
+        """按 ID 读取策略表中的组件定义；未知组件返回 None。"""
+        return detector.registry.component_by_id(component_id)
 
-    def git_ai_asset(self) -> Optional[str]:
-        """根据当前操作系统和 CPU 架构计算 git-ai 发布包名称。"""
-        os_name = {"Darwin": "macos", "Linux": "linux"}.get(self.os_name)
-        arch = {"x86_64": "x64", "amd64": "x64", "arm64": "arm64", "aarch64": "arm64"}.get(platform.machine().lower())
-        return f"git-ai-{os_name}-{arch}" if os_name and arch else None
+    def requirements_met(self, component) -> tuple[bool, str]:
+        """校验组件的硬前置（如 node>=24.11.0），返回 (是否满足, 原因)。"""
+        for requirement in component.requires:
+            name, separator, minimum = requirement.partition(">=")
+            if name == "node":
+                current = self.command_version("node", ["-v"])
+                if not separator or not current or not config.version_greater_or_equal(current, minimum):
+                    return False, f"需要 Node.js >= {minimum}，当前 {current or '未安装'}"
+                continue
+            if name == "python":
+                current = f"{sys.version_info.major}.{sys.version_info.minor}"
+                if not separator or not config.version_greater_or_equal(current, minimum):
+                    return False, f"需要 Python >= {minimum}，当前 {current}"
+                continue
+            if not self.command_exists(name):
+                return False, f"需要命令 {name}"
+        return True, ""
 
-    def fetch_git_ai_binary(self) -> Optional[Path]:
-        """下载并校验匹配平台的 git-ai 二进制；校验失败时删除临时文件。"""
-        asset = self.git_ai_asset()
-        if not asset:
-            return None
+    def channel_available(self, kind: str) -> bool:
+        """判断通道在当前平台是否可用；只做探测，不触发安装。"""
+        if kind == "npm":
+            return self.command_exists("npm")
+        if kind in {"brew", "brew_cask"}:
+            return self.command_exists("brew")
+        if kind == "apt":
+            # apt 通道的 target 是 Debian/Ubuntu 包名，只在该包管理器下可用。
+            return self.linux_package_manager() == "apt-get"
+        if kind == "pipx":
+            return (
+                self.command_exists("pipx")
+                or self.command_exists("brew")
+                or self.linux_package_manager() is not None
+            )
+        if kind == "venv":
+            return self.run_capture(
+                [sys.executable, "-c", "import venv, ensurepip"]
+            ).returncode == 0
+        if kind in {"script", "release"}:
+            return self.command_exists("curl") or self.command_exists("wget")
+        return False
+
+    def manual_note(self, component) -> str:
+        """生成组件的手动安装指引，供所有通道都失败时提示。"""
+        if "script" in component.channels:
+            return f"curl -fsSL {component.channels['script']} | bash"
+        if "npm" in component.channels:
+            registry = " ".join(config.NPM_REGISTRY_ARGS)
+            return f"npm install -g {component.channels['npm']} {registry}"
+        if "brew" in component.channels:
+            return f"brew install {component.channels['brew']}"
+        if "apt" in component.channels:
+            return f"sudo apt-get install -y {component.channels['apt']}"
+        return "请参考官方文档"
+
+    def install_via_channels(self, component_id: str) -> bool:
+        """按全局通道优先级，选用第一个可用通道安装组件。"""
+        component = self.component(component_id)
+        if component is None:
+            return False
+        met, reason = self.requirements_met(component)
+        if not met:
+            self.logger.error(f"{component.description} 已跳过：{reason}")
+            return False
+        for kind in detector.registry.CHANNEL_ORDER:
+            if kind == "release":
+                if component.release is None:
+                    continue
+                label = component.release.repo
+            else:
+                label = component.channels.get(kind, "")
+                if not label:
+                    continue
+            if not self.channel_available(kind):
+                continue
+            self.logger.info(f"使用 {kind} 通道安装 {component.description}（{label}）")
+            if self.install_channel(component, kind):
+                return True
+            self.logger.warn(f"{kind} 通道未成功，尝试下一通道。")
+        self.logger.error(
+            f"{component.description} 安装失败；请手动安装：{self.manual_note(component)}"
+        )
+        return False
+
+    def install_channel(self, component, kind: str) -> bool:
+        """执行单个通道的安装动作，并以组件命令校验最终可用性。"""
+        target = component.channels.get(kind, "")
+        if kind == "npm":
+            return self.install_npm_package(target, component.command)
+        if kind == "brew":
+            return self.brew_install_or_upgrade(target, component.command)
+        if kind == "brew_cask":
+            return self.install_brew_cask(target, component.command)
+        if kind == "apt":
+            return self.install_apt_package(target, component.command)
+        if kind == "pipx":
+            return self.install_pipx_package(target, component.command)
+        if kind == "venv":
+            return self.install_venv_package(target, component.command)
+        if kind == "script":
+            return self.run_remote_script(target) and self.command_exists(component.command)
+        if kind == "release":
+            return self.install_release(component)
+        return False
+
+    def install_npm_package(self, package: str, command: str) -> bool:
+        """使用用户态 npm 前缀安装或升级一个全局 CLI，镜像源由 set_npm 注入的环境变量提供。"""
+        self.set_npm()
+        result = self.run_command(["npm", "install", "-g", f"{package}@latest"])
+        return result.returncode == 0 and self.command_exists(command)
+
+    def install_brew_cask(self, cask: str, command: str) -> bool:
+        """安装或升级一个 Homebrew cask，并在首次失败后重试安装。"""
+        if self.command_exists(command):
+            result = self.brew("upgrade", "--cask", cask)
+        else:
+            result = self.brew("install", "--cask", cask)
+        if result.returncode != 0:
+            self.brew("install", "--cask", cask)
+        return self.command_exists(command)
+
+    def install_apt_package(self, package: str, command: str) -> bool:
+        """经 sudo 安装 Debian/Ubuntu 包；包不在源中时返回 False 以便降级。"""
+        if self.run_capture(["apt-cache", "show", package]).returncode != 0:
+            self.logger.warn(f"apt 源中不存在 {package}，跳过 apt 通道。")
+            return False
+        if self.run_linux_package("install", package).returncode != 0:
+            return False
+        return self.command_exists(command)
+
+    def ensure_pipx(self) -> bool:
+        """确保 pipx 可用；缺失时按发行版包管理器 → Homebrew 补装。"""
+        if self.command_exists("pipx"):
+            return True
+        if self.linux_package_manager() and self.run_linux_package(
+            "install", "pipx"
+        ).returncode == 0 and self.command_exists("pipx"):
+            return True
+        if self.command_exists("brew") and self.brew_install_or_upgrade("pipx"):
+            return True
+        return self.command_exists("pipx")
+
+    def install_pipx_package(self, package: str, command: str) -> bool:
+        """通过 pipx 安装或升级一个 PyPI 发行包。"""
+        if not self.ensure_pipx():
+            return False
+        action = "upgrade" if self.command_exists(command) else "install"
+        result = self.run_command(["pipx", action, package])
+        return result.returncode == 0 and self.command_exists(command)
+
+    def install_venv_package(self, package: str, command: str) -> bool:
+        """把 PyPI 包装进独立 venv，并用用户级软链接暴露其命令。"""
+        venv = self.home / ".local" / "share" / "CodeKit" / "venvs" / command
+        if venv.exists():
+            shutil.rmtree(venv)
+        pip = venv / "bin" / "pip"
+        if self.run_command([sys.executable, "-m", "venv", str(venv)]).returncode != 0:
+            return False
+        if not pip.exists() or self.run_command([str(pip), "install", "-U", package]).returncode != 0:
+            return False
+        target = self.bin_dir / command
+        target.unlink(missing_ok=True)
+        target.symlink_to(venv / "bin" / command)
+        return self.command_exists(command)
+
+    def release_arch(self) -> str:
+        """把平台机器名归一化为发布资产的架构标记。"""
+        return {
+            "x86_64": "x86_64",
+            "amd64": "x86_64",
+            "aarch64": "arm64",
+            "arm64": "arm64",
+        }.get(platform.machine().lower(), "")
+
+    def release_asset_name(self, spec, version: str) -> str:
+        """按 release 模板展开当前平台的资产文件名。"""
+        return spec.asset.format(
+            version=version,
+            os=spec.os_tokens.get(self.os_name, ""),
+            arch=spec.arch_tokens.get(self.release_arch(), ""),
+            ext=spec.ext_tokens.get(self.os_name, ""),
+        )
+
+    def fetch_json_url(self, url: str):
+        """获取发布接口 JSON；网络或格式错误时返回 None。"""
         try:
-            request = urllib.request.Request("https://api.github.com/repos/git-ai-project/git-ai/releases/latest", headers={"Accept": "application/json", "User-Agent": "CodeKit-installer"})
+            request = urllib.request.Request(
+                url,
+                headers={"Accept": "application/json", "User-Agent": "CodeKit-installer"},
+            )
             with urllib.request.urlopen(request, timeout=30) as response:
-                document = json.load(response)
-            digest = next((item.get("digest", "").split(":", 1)[-1] for item in document.get("assets", []) if item.get("name") == asset), "")
+                return json.load(response)
         except (OSError, ValueError, json.JSONDecodeError):
-            digest = ""
-        if not digest:
             return None
-        fd, name = tempfile.mkstemp(prefix="git-ai-", dir=os.environ.get("TMPDIR", "/tmp"))
+
+    def resolve_release(self, spec) -> Optional[tuple[str, str, str]]:
+        """解析最新发布版本，返回 (版本, 下载地址, sha256)；失败返回 None。"""
+        kind, _, ident = spec.repo.partition(":")
+        if kind == "github":
+            document = self.fetch_json_url(
+                f"https://api.github.com/repos/{ident}/releases/latest"
+            )
+            if not document:
+                return None
+            version = str(document.get("tag_name", "")).lstrip("v")
+            asset_name = self.release_asset_name(spec, version)
+            for asset in document.get("assets", []):
+                if asset.get("name") == asset_name:
+                    digest = str(asset.get("digest", "")).split(":", 1)[-1]
+                    return version, str(asset.get("browser_download_url", "")), digest
+            return None
+        if kind == "gitlab":
+            document = self.fetch_json_url(
+                f"https://gitlab.com/api/v4/projects/{ident}/releases/permalink/latest"
+            )
+            if not document:
+                return None
+            version = str(document.get("tag_name", "")).lstrip("v")
+            asset_name = self.release_asset_name(spec, version)
+            links = (document.get("assets") or {}).get("links", [])
+            for link in links:
+                if link.get("name") == asset_name:
+                    return version, str(link.get("direct_asset_url", "")), ""
+            return None
+        return None
+
+    def download_release(self, url: str, digest: str) -> Optional[Path]:
+        """下载发布资产并校验摘要；GitHub 失败时回退镜像地址。"""
+        options = [
+            "--fail", "--location", "--connect-timeout", "10", "--speed-limit", "51200",
+            "--speed-time", "20", "--retry", "2", "--retry-max-time", "180",
+            "--continue-at", "-", "--progress-bar",
+        ]
+        fd, name = tempfile.mkstemp(prefix="codekit-release-", dir=os.environ.get("TMPDIR", "/tmp"))
         os.close(fd)
         temporary = Path(name)
-        url = f"https://github.com/git-ai-project/git-ai/releases/latest/download/{asset}"
-        options = ["--fail", "--location", "--connect-timeout", "10", "--speed-limit", "51200", "--speed-time", "20", "--retry", "2", "--retry-max-time", "180", "--continue-at", "-", "--progress-bar"]
         result = self.run_command(["curl", *options, "-o", str(temporary), url])
-        if result.returncode != 0:
+        if result.returncode != 0 and "github.com" in url:
             temporary.write_bytes(b"")
             self.run_command(["curl", *options, "-o", str(temporary), f"https://gh-proxy.com/{url}"])
-        if hashlib.sha256(temporary.read_bytes()).hexdigest() != digest:
+        if digest and hashlib.sha256(temporary.read_bytes()).hexdigest() != digest:
             temporary.unlink(missing_ok=True)
+            self.logger.error("发布包摘要校验失败，已删除下载文件。")
             return None
         return temporary
+
+    def extract_release_binary(self, archive: Path, binary: str) -> Optional[Path]:
+        """从 tar.gz/zip 发布包中定位目标可执行文件。"""
+        directory = Path(tempfile.mkdtemp(prefix="codekit-extract-"))
+        try:
+            if zipfile.is_zipfile(archive):
+                with zipfile.ZipFile(archive) as package:
+                    package.extractall(directory)
+            else:
+                with tarfile.open(archive) as package:
+                    try:
+                        package.extractall(directory, filter="data")
+                    except TypeError:
+                        # Python < 3.12 has no extraction filter.
+                        package.extractall(directory)
+        except (OSError, tarfile.TarError, zipfile.BadZipFile, ValueError):
+            return None
+        for candidate in directory.rglob(binary):
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def install_release(self, component) -> bool:
+        """按 release 通道解析、下载并安装组件的最新发布包。"""
+        resolved = self.resolve_release(component.release)
+        if not resolved or not resolved[1]:
+            self.logger.warn(f"未能解析 {component.description} 的发布包地址。")
+            return False
+        version, url, digest = resolved
+        self.logger.info(f"下载 {component.description} {version}：{url}")
+        archive = self.download_release(url, digest)
+        if archive is None:
+            return False
+        try:
+            binary = self.extract_release_binary(archive, component.release.binary)
+        finally:
+            archive.unlink(missing_ok=True)
+        if binary is None:
+            return False
+        target = self.bin_dir / component.release.binary
+        target.unlink(missing_ok=True)
+        shutil.move(str(binary), str(target))
+        target.chmod(0o755)
+        self.track(target)
+        return self.command_exists(component.command)
 
     def run_remote_script(self, url: str, shell: str = "bash", env: Optional[dict[str, str]] = None) -> bool:
         """下载远程安装脚本后交给指定 shell 执行，并返回脚本是否成功。"""
         script = self.fetch_text(url)
         return bool(script) and self.run_with_input([shell], script, env).returncode == 0
-
-    def install_git_ai(self) -> bool:
-        """优先使用带 SHA-256 校验的 git-ai 二进制安装，失败后回退官方脚本。"""
-        self.logger.info("Installing git-ai...")
-        self.prepend_path(self.home / ".git-ai" / "bin")
-        binary = self.fetch_git_ai_binary()
-        installed = False
-        if binary:
-            installed = self.run_remote_script("https://usegitai.com/install.sh", env={"GIT_AI_LOCAL_BINARY": str(binary)})
-            binary.unlink(missing_ok=True)
-        if not installed:
-            installed = self.run_remote_script("https://usegitai.com/install.sh")
-        if not detector.git_ai_command(self.home):
-            self.logger.warn(f"git-ai install failed — check log: {self.logger.log_path}")
-            return False
-        return True
 
     def configure_rtk(self) -> bool:
         """为已存在的 AI 编程工具注册 rtk 的全局 token 优化配置。"""
@@ -670,35 +911,17 @@ class Installer:
         return all(result.returncode == 0 for result in results)
 
     def install_rtk(self) -> bool:
-        """优先通过 Homebrew 安装/升级 rtk，失败后回退到官方安装脚本。"""
+        """按策略表安装 rtk（brew → 官方脚本），再写入各智能体配置。"""
         self.logger.info("Installing rtk (Rust Token Killer)...")
-        if self.command_exists("brew") and self.brew_install_or_upgrade("rtk") and self.command_exists("rtk"):
-            return self.configure_rtk()
-        installed = self.run_remote_script("https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh", "sh") and self.command_exists("rtk")
-        if installed:
-            # Homebrew 和官方脚本两条安装路径都必须执行相同的初始化，
-            # 否则无 brew 的 Linux 环境只安装二进制、不安装任何 agent 配置。
-            installed = self.configure_rtk()
-        return installed
+        if not self.install_via_channels("rtk"):
+            return False
+        return self.configure_rtk()
 
     def install_gitnexus(self) -> bool:
-        """使用用户态 npm 前缀安装最新版 gitnexus，并执行其初始化命令。"""
-        if not self.install_npm_component("gitnexus"):
+        """按策略表安装 gitnexus（npm），并执行其初始化命令。"""
+        if not self.install_via_channels("gitnexus"):
             return False
         return self.run_command(["gitnexus", "setup"]).returncode == 0
-
-    def install_npm_component(self, component_id: str) -> bool:
-        """使用用户态 npm 前缀安装或升级一个全局 npm CLI 组件。"""
-        definition = detector.NPM_COMPONENTS.get(component_id)
-        if not definition:
-            return False
-        self.set_npm()
-        package = definition["package"]
-        command = definition["command"]
-        result = self.run_command(
-            ["npm", "install", "-g", f"{package}@latest", *config.NPM_REGISTRY_ARGS]
-        )
-        return result.returncode == 0 and self.command_exists(command)
 
     def ensure_unzip(self) -> bool:
         """确保钉钉 CLI 的安装脚本可以调用 unzip。"""
@@ -723,28 +946,14 @@ class Installer:
         return installed
 
     def install_dingtalk_cli(self) -> bool:
-        """安装钉钉 CLI，并在安装前准备其所需的 unzip 命令。"""
+        """按策略表安装钉钉 CLI，并在安装前准备其所需的 unzip 命令。"""
         if not self.ensure_unzip():
             return False
-        return self.install_npm_component("dingtalk_cli")
+        return self.install_via_channels("dingtalk_cli")
 
     def install_graphify(self) -> bool:
-        """优先用 pipx 安装 graphifyy，失败时使用独立 venv 和用户级软链接回退。"""
-        installed = False
-        if self.command_exists("pipx"):
-            result = self.run_command(["pipx", "install", "graphifyy"]) if not self.command_exists("graphify") else self.run_command(["pipx", "upgrade", "graphifyy"])
-            installed = result.returncode == 0 and self.command_exists("graphify")
-        if not installed:
-            venv = self.home / ".local" / "share" / "CodeKit" / "venvs" / "graphify"
-            if venv.exists():
-                shutil.rmtree(venv)
-            pip = venv / "bin" / "pip"
-            if self.run_command([sys.executable, "-m", "venv", str(venv)]).returncode == 0 and pip.exists() and self.run_command([str(pip), "install", "-U", "graphifyy"]).returncode == 0:
-                target = self.bin_dir / "graphify"
-                target.unlink(missing_ok=True)
-                target.symlink_to(venv / "bin" / "graphify")
-                installed = self.command_exists("graphify")
-        if not installed:
+        """按策略表安装 graphify（pipx → 独立 venv），再为已装智能体注册。"""
+        if not self.install_via_channels("graphify"):
             return False
         platforms = [
             platform
@@ -765,8 +974,8 @@ class Installer:
         return all(result.returncode == 0 for result in results)
 
     def install_feishu_cli(self) -> bool:
-        """安装飞书 CLI，并只向支持全局安装的 CodeKit 智能体同步 skills。"""
-        if not self.install_npm_component("feishu_cli"):
+        """按策略表安装飞书 CLI，并只向支持全局安装的 CodeKit 智能体同步 skills。"""
+        if not self.install_via_channels("feishu_cli"):
             return False
 
         # `skills add -g` 会自动探测当前目录中的所有 Agent。若探测到
@@ -787,7 +996,6 @@ class Installer:
         result = self.run_command(
             [
                 "npx",
-                f"--registry={config.NPM_REGISTRY}",
                 "skills",
                 "add",
                 "larksuite/cli",
@@ -857,18 +1065,21 @@ class Installer:
         for directory in reversed(agents.cli_extra_paths(entry, self.home)):
             self.prepend_path(directory)
         installed = False
-        for command in agents.install_plan(entry, self.os_name):
-            if command[0] == "npm":
+        for kind, target in agents.channel_plan(entry):
+            if not self.channel_available(kind):
+                continue
+            if kind == "npm":
                 self.set_npm()
-            self.run_command(list(command))
+                self.run_command(["npm", "install", "-g", f"{target}@latest"])
+            elif kind == "brew":
+                self.brew_install_or_upgrade(target, entry.commands[0])
+            elif kind == "brew_cask":
+                self.install_brew_cask(target, entry.commands[0])
+            elif kind == "script":
+                self.run_remote_script(target)
             if detector.agent_cli_presence(platform_key, self.home):
                 installed = True
                 break
-        if not installed and entry.script_url:
-            installed = self.run_remote_script(entry.script_url) or self.run_command(
-                ["bash", "-c", f"curl -fsSL {entry.script_url} | bash"]
-            ).returncode == 0
-            installed = installed and bool(detector.agent_cli_presence(platform_key, self.home))
         if not installed:
             note = agents.fallback_note(entry)
             self.logger.error(
@@ -1001,22 +1212,9 @@ class Installer:
         )
         return True
 
-    def install_brew_component(self, formula: str) -> bool:
-        """按平台安装或升级 gh/glab：macOS 用 brew，Linux 用发行版包管理器。"""
-        if self.os_name == "Darwin" or self.command_exists("brew"):
-            return self.brew_install_or_upgrade(formula, formula)
-        if self.os_name == "Linux":
-            if not self.linux_package_manager():
-                return False
-            if self.command_exists(formula) and not self.linux_package_installed(formula):
-                return True
-            return self.run_linux_package("install", formula).returncode == 0 and self.command_exists(formula)
-        return False
-
     def install_component(self, component_id: str) -> bool:
         """按组件注册 ID 分发安装处理器，并隔离单个组件的失败。"""
         handlers = {
-            "git_ai": self.install_git_ai,
             "rtk": self.install_rtk,
             "claude_plugin": self.install_claude_plugin,
             "opencode_plugin": self.install_opencode_plugin,
@@ -1027,8 +1225,8 @@ class Installer:
             "dingtalk_cli": self.install_dingtalk_cli,
             "feishu_cli": self.install_feishu_cli,
             "graphify": self.install_graphify,
-            "gh": lambda: self.install_brew_component("gh"),
-            "glab": lambda: self.install_brew_component("glab"),
+            "gh": lambda: self.install_via_channels("gh"),
+            "glab": lambda: self.install_via_channels("glab"),
         }
         handler = handlers.get(component_id)
         if not handler:
@@ -1067,7 +1265,6 @@ class Installer:
             for component_id in (
                 "glab",
                 "gh",
-                "git_ai",
                 "rtk",
                 "gitnexus",
                 "dingtalk_cli",

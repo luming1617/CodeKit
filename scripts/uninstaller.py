@@ -161,16 +161,6 @@ class Uninstaller(Installer):
         except ValueError:
             return False
 
-    def uninstall_git_ai(self) -> bool:
-        """移除 git-ai hooks、程序目录、用户 bin 链接以及 shell PATH 残留。"""
-        if self.git_ai_command():
-            self.run_command(["git", "ai", "uninstall-hooks"])
-        shutil.rmtree(self.home / ".git-ai", ignore_errors=True)
-        (self.bin_dir / "git-ai").unlink(missing_ok=True)
-        for path in self.shell_rcs():
-            self.remove_matching_lines(path, "git-ai/bin")
-        return True
-
     def uninstall_rtk(self) -> bool:
         """撤销 rtk 的全局配置，并卸载残留。"""
         if self.command_exists("rtk"):
@@ -254,7 +244,6 @@ class Uninstaller(Installer):
     def uninstall_component(self, component_id: str) -> bool:
         """按组件注册 ID 分发卸载处理器，并把单项异常转换为失败结果。"""
         handlers = {
-            "git_ai": self.uninstall_git_ai,
             "rtk": self.uninstall_rtk,
             "claude_plugin": self.uninstall_claude_plugin,
             "opencode_plugin": self.uninstall_opencode_plugin,
@@ -306,8 +295,19 @@ class Uninstaller(Installer):
         if new != old:
             config.atomic_write(path, new)
 
+    def cleanup_legacy_git_ai(self) -> None:
+        """清理历史版本安装过的 git-ai 全局 hook 与残留；该组件已下线。"""
+        candidate = shutil.which("git-ai") or str(self.home / ".git-ai" / "bin" / "git-ai")
+        if Path(candidate).is_file():
+            self.run_command(["git", "ai", "uninstall-hooks"])
+        shutil.rmtree(self.home / ".git-ai", ignore_errors=True)
+        (self.bin_dir / "git-ai").unlink(missing_ok=True)
+        for path in self.shell_rcs():
+            self.remove_matching_lines(path, "git-ai/bin")
+
     def cleanup_global_config(self) -> None:
         """清理 Git 全局配置、CodeKit PATH 块和版本状态文件。"""
+        self.cleanup_legacy_git_ai()
         self.run_command(["git", "config", "--global", "--unset", "advice.addIgnoredFile"])
         self.run_command(["git", "config", "--global", "--unset", "push.autoSetupRemote"])
         for path in self.shell_rcs():

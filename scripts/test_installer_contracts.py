@@ -148,6 +148,72 @@ class DispatchParityTests(unittest.TestCase):
         self.assertEqual(version_record_ids(SCRIPT_DIR / "installer.py"), registry_ids)
 
 
+class StrategyTableTests(unittest.TestCase):
+    def test_channel_order_is_the_declared_priority(self) -> None:
+        self.assertEqual(
+            detector.registry.CHANNEL_ORDER,
+            ("npm", "brew", "brew_cask", "apt", "pipx", "venv", "script", "release"),
+        )
+
+    def test_every_npm_target_is_on_the_official_allowlist(self) -> None:
+        # 防止裸名（gh/rtk/glab 等李鬼包）被误装。
+        for component in detector.registry.COMPONENTS:
+            target = component.channels.get("npm")
+            if target:
+                self.assertIn(target, detector.registry.OFFICIAL_NPM_PACKAGES)
+
+    def test_non_whitelisted_npm_name_is_rejected(self) -> None:
+        bad = detector.registry.Component(
+            "bad", "Bad", "ai", command="bad", channels={"npm": "gh"}
+        )
+        with self.assertRaises(ValueError):
+            detector.registry.validate_registry(
+                [bad], detector.registry.GROUPS, {}
+            )
+
+    def test_git_ai_is_no_longer_offered(self) -> None:
+        self.assertIsNone(detector.registry.component_by_id("git_ai"))
+        self.assertNotIn(
+            "git_ai", {item.component_id for item in detector.registry.COMPONENTS}
+        )
+
+    def test_install_via_channels_picks_the_first_available_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            installer.bin_dir = Path(directory) / ".local" / "bin"
+            calls: list[str] = []
+            with patch.object(Installer, "requirements_met", return_value=(True, "")):
+                with patch.object(
+                    Installer, "channel_available", side_effect=lambda kind: kind == "brew"
+                ):
+                    with patch.object(
+                        Installer,
+                        "install_channel",
+                        side_effect=lambda _component, kind: calls.append(kind) or True,
+                    ):
+                        self.assertTrue(installer.install_via_channels("rtk"))
+        self.assertEqual(calls, ["brew"])
+
+    def test_component_requirement_blocks_gitnexus_on_node_24_4(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            with patch.object(detector, "command_version", return_value="v24.4.0"):
+                met, reason = installer.requirements_met(
+                    detector.registry.component_by_id("gitnexus")
+                )
+        self.assertFalse(met)
+        self.assertIn("24.11.0", reason)
+
+    def test_component_requirement_passes_gitnexus_on_node_24_11(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            with patch.object(detector, "command_version", return_value="v24.11.0"):
+                met, _reason = installer.requirements_met(
+                    detector.registry.component_by_id("gitnexus")
+                )
+        self.assertTrue(met)
+
+
 class CliPresenceContractTests(unittest.TestCase):
     def test_presence_formatting_is_shared_between_platform_layers(self) -> None:
         # installer_agents 与 installer_qoder 必须渲染出同一种 `命令 (路径)` 形式。
