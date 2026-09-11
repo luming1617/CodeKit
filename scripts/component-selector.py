@@ -141,6 +141,8 @@ def render(
                 "",
                 f"  {CYAN}状态{RESET}  组件未安装→默认勾选安装    组件有更新→默认勾选升级    "
                 "组件已最新→默认不勾选（勾选后重装）",
+                f"  {CYAN}提示{RESET}  插件条目区分「插件状态+版本」和「CLI 本体状态+版本」；"
+                "CLI 未安装的平台插件默认不勾选，勾选后会先自动安装该平台 CLI，再安装插件。",
                 f"  {BOLD}↑/↓{RESET} 定位  {BOLD}Space{RESET} 勾选/取消  "
                 f"{BOLD}a{RESET} 全选  {BOLD}n{RESET} 全不选  {BOLD}p{RESET} 切换 PATH  "
                 f"{BOLD}Enter{RESET} 确认  {BOLD}q{RESET} 退出",

@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import os
 import platform
 import shutil
 import subprocess
@@ -27,6 +26,12 @@ from typing import Any, Iterable, Optional
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "installer_config.py"
 REGISTRY_PATH = SCRIPT_DIR / "component-registry.py"
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+
+import installer_agents as agents  # noqa: E402
+import installer_qoder as qoder  # noqa: E402
 
 
 def load_module(path: Path, name: str) -> Any:
@@ -52,25 +57,71 @@ ANSI_RED = "\033[0;31m"
 ANSI_RESET = "\033[0m"
 
 
-# npm 包名、可执行命令和版本参数的唯一映射，供状态检测、安装路径和
-# 安装/卸载流程共同复用。
+# Desktop applications expose the same coding-agent capability as their CLI
+# counterparts, but they do not consistently install a command on PATH. Keep
+# these probes explicit and conservative: a config/data directory alone is not
+# proof that the application is installed. Qoder is the exception documented in
+# installer_qoder.py: its shared configuration root *is* the plugin storage both
+# surfaces read, so an existing root does count as availability.
+AGENT_COMMANDS = {
+    "claude": ("claude", "claude-desktop"),
+    "codex": ("codex",),
+    "opencode": ("opencode", "opencode-desktop"),
+}
+
+MACOS_AGENT_APPS = {
+    "claude": ("Claude.app",),
+    # The Codex app was merged into the new ChatGPT desktop app. Keep the old
+    # Codex bundle name as a compatibility probe for installations not yet
+    # migrated.
+    "codex": ("ChatGPT.app", "Codex.app"),
+    "opencode": ("OpenCode.app", "OpenCode Beta.app"),
+}
+
+LINUX_DESKTOP_FILES = {
+    "claude": ("claude.desktop", "claude-desktop.desktop"),
+    "codex": (
+        "chatgpt.desktop",
+        "codex.desktop",
+        "com.openai.chatgpt.desktop",
+        "com.openai.codex.desktop",
+    ),
+    "opencode": (
+        "opencode.desktop",
+        "opencode-desktop.desktop",
+        "ai.opencode.desktop.desktop",
+        "com.anomalyco.opencode.desktop",
+    ),
+}
+
+LINUX_AGENT_PATHS = {
+    "claude": (
+        Path("/opt/Claude"),
+        Path("/opt/claude-desktop"),
+        Path("/usr/lib/claude-desktop"),
+    ),
+    "codex": (
+        Path("/opt/ChatGPT"),
+        Path("/opt/Codex"),
+    ),
+    "opencode": (
+        Path("/opt/OpenCode"),
+        Path("/opt/opencode-desktop"),
+        Path("/usr/lib/opencode-desktop"),
+    ),
+}
+
+
+# npm 包名、可执行命令和版本参数从策略表派生，供状态检测、安装路径和
+# 安装/卸载流程共同复用，避免出现第二份 npm 包名定义。
 NPM_COMPONENTS = {
-    "gitnexus": {
-        "package": "gitnexus",
-        "command": "gitnexus",
-        "version_args": ["--version"],
-    },
-    "dingtalk_cli": {
-        "package": "dingtalk-workspace-cli",
-        # The npm package exposes `dws` as its executable entry point.
-        "command": "dws",
-        "version_args": ["version"],
-    },
-    "feishu_cli": {
-        "package": "@larksuite/cli",
-        "command": "lark-cli",
-        "version_args": ["--version"],
-    },
+    component.component_id: {
+        "package": component.channels["npm"],
+        "command": component.command,
+        "version_args": list(component.version_args),
+    }
+    for component in registry.COMPONENTS
+    if "npm" in component.channels
 }
 
 
@@ -98,20 +149,26 @@ class Context:
     version_file: Path
 
 
-def run_command(args: list[str], timeout: float = 15.0) -> str:
-    """静默执行探测命令；命令失败、异常或超时均返回空字符串。"""
+def run_command_capture(args: list[str], timeout: float = 15.0) -> tuple[int, str, str]:
+    """静默执行探测命令，返回 (退出码, stdout, stderr)；异常与超时按失败处理。"""
     try:
         completed = subprocess.run(
             args,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return completed.stdout.strip() if completed.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, "", str(exc)
+    return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
+
+
+def run_command(args: list[str], timeout: float = 15.0) -> str:
+    """静默执行探测命令；命令失败、异常或超时均返回空字符串。"""
+    returncode, output, _error = run_command_capture(args, timeout)
+    return output if returncode == 0 else ""
 
 
 def command_version(command: str, args: list[str]) -> str:
@@ -122,19 +179,74 @@ def command_version(command: str, args: list[str]) -> str:
     return output.splitlines()[0] if output else ""
 
 
-def git_ai_command(home: Path) -> Optional[str]:
-    """查找 PATH 中或 CodeKit 用户目录中的 git-ai 可执行文件。"""
-    found = shutil.which("git-ai")
-    if found:
-        return found
-    candidate = home / ".git-ai" / "bin" / "git-ai"
-    return str(candidate) if candidate.is_file() and os.access(candidate, os.X_OK) else None
+def agent_presence(name: str, home: Path, os_name: Optional[str] = None) -> str:
+    """返回 agent 的发现来源；CLI 和 Desktop 均视为已安装。"""
+    if name in qoder.PLATFORMS:
+        # Qoder 的 CLI 与 Desktop 地位一致，任一方可用的共享配置根即视为可用。
+        return qoder.agent_presence(name, home, os_name)
+    if name not in AGENT_COMMANDS:
+        return ""
+    for command in AGENT_COMMANDS[name]:
+        found = shutil.which(command)
+        if found:
+            return f"{command} ({found})"
+
+    os_name = os_name or platform.system()
+    if os_name == "Darwin":
+        for app_name in MACOS_AGENT_APPS[name]:
+            for app_dir in (Path("/Applications"), home / "Applications"):
+                candidate = app_dir / app_name
+                if candidate.is_dir():
+                    return str(candidate)
+        return ""
+
+    if os_name == "Linux":
+        for application_dir in config.linux_application_dirs(home):
+            for desktop_file in LINUX_DESKTOP_FILES[name]:
+                candidate = application_dir / "applications" / desktop_file
+                if candidate.is_file():
+                    return str(candidate)
+        for candidate in LINUX_AGENT_PATHS[name]:
+            if candidate.exists():
+                return str(candidate)
+        # User-local unpacked desktop bundles are common for AppImage-style
+        # installs and do not necessarily create a desktop entry.
+        for relative in (
+            Path(".local") / "share" / "applications" / f"{name}-desktop",
+            Path(".local") / "opt" / name,
+        ):
+            candidate = home / relative
+            if candidate.exists():
+                return str(candidate)
+    return ""
 
 
-def git_ai_version(home: Path) -> str:
-    """读取 git-ai 版本；未找到可执行文件时返回空字符串。"""
-    command = git_ai_command(home)
-    return run_command([command, "--version"]) if command else ""
+def agent_present(name: str, home: Path, os_name: Optional[str] = None) -> bool:
+    """判断 Claude、Codex 或 OpenCode 的 CLI/Desktop 是否可用。"""
+    return bool(agent_presence(name, home, os_name))
+
+
+def agent_cli_presence(
+    platform_key: str,
+    home: Path,
+    environ: Optional[dict[str, str]] = None,
+) -> str:
+    """只探测 agent 平台的 CLI 本体。
+
+    Desktop 应用、Linux 启动器和共享配置根都不算可用：插件安装以 CLI 为前置，
+    缺少 CLI 时安装器会先自动安装 CLI 再装插件。
+    """
+    return agents.cli_presence(platform_key, home, environ)
+
+
+def agent_cli_state(component_id: str, context: Context) -> tuple[bool, str]:
+    """返回插件对应平台 CLI 的存在性与版本，供安装选择器和结果汇总展示。"""
+    entry = agents.component_agent(component_id)
+    if entry is None:
+        return False, ""
+    if not agents.cli_presence(entry.key, context.home):
+        return False, ""
+    return True, agents.cli_version(entry.key, context.home)
 
 
 def plugin_listing(command: str, args: list[str]) -> str:
@@ -179,27 +291,35 @@ def fetch_json(url: str) -> Any:
         return None
 
 
+def version_source_url(component: str) -> tuple[str, str]:
+    """返回组件版本来源的 (URL, 字段)，全部由策略表声明；无来源时返回空对。"""
+    definition = registry.component_by_id(component)
+    if definition is None:
+        return "", ""
+    source = definition.version_source
+    if not source and "npm" in definition.channels:
+        source = f"npm:{definition.channels['npm']}"
+    kind, _, target = source.partition(":")
+    if kind == "npm":
+        # npm 元数据同样走镜像源：直连 registry.npmjs.org 探测会拖慢甚至超时。
+        return f"{config.NPM_REGISTRY}/{target}/latest", "version"
+    if kind == "pypi":
+        return f"https://pypi.org/pypi/{target}/json", "version"
+    if kind == "github":
+        return f"https://api.github.com/repos/{target}/releases/latest", "tag_name"
+    if kind == "gitlab":
+        return f"https://gitlab.com/api/v4/projects/{target}/releases/permalink/latest", "tag_name"
+    return "", ""
+
+
 def latest_versions(components: Iterable[str]) -> dict[str, str]:
-    """从各组件的官方源读取最新版本，供安装选择器判断是否可升级。"""
-    sources = {
-        "glab": ("https://gitlab.com/api/v4/projects/34675721/releases/permalink/latest", "tag_name"),
-        "rtk": ("https://api.github.com/repos/rtk-ai/rtk/releases/latest", "tag_name"),
-        "gh": ("https://api.github.com/repos/cli/cli/releases/latest", "tag_name"),
-        "gitnexus": ("https://registry.npmjs.org/gitnexus/latest", "version"),
-        "dingtalk_cli": (
-            "https://registry.npmjs.org/dingtalk-workspace-cli/latest",
-            "version",
-        ),
-        "feishu_cli": ("https://registry.npmjs.org/@larksuite%2fcli/latest", "version"),
-        "graphify": ("https://pypi.org/pypi/graphifyy/json", "version"),
-    }
+    """从各组件的版本源读取最新版本，供安装选择器判断是否可升级。"""
     result: dict[str, str] = {}
     for component in components:
-        if component not in sources:
+        url, field = version_source_url(component)
+        if not url:
             continue
-        url, field = sources[component]
-        document = fetch_json(url)
-        value = config.json_field(document, field)
+        value = config.json_field(fetch_json(url), field)
         version = config.extract_version(value)
         if version:
             result[component] = f"v{version}" if component == "glab" else version
@@ -212,59 +332,142 @@ def platform_subagents_state(context: Context, tool: str) -> str:
     if not helper.exists():
         return ""
     args = [sys.executable, str(helper), "status", "--home", str(context.home), "--tool", tool]
+    try:
+        # 与安装/卸载共用同一份目录解析：避免 Qoder 共享根在探测与落盘之间漂移。
+        flags, _agents_dir = agents.global_agent_plan(tool, context.home)
+    except ValueError:
+        return ""
+    args.extend(flags)
     if context.marketplace_local:
         source = context.marketplace_local / "skills"
         if source.is_dir():
             args.extend(["--source", str(source)])
-    return run_command(args)
-
-
-def component_version(component: str, context: Context) -> str:
-    """按组件类型选择版本来源，包括 CLI、git-ai 和插件配置版本。"""
-    commands = {
-        "glab": ("glab", ["version"]),
-        "gh": ("gh", ["--version"]),
-        "rtk": ("rtk", ["--version"]),
-        "graphify": ("graphify", ["--version"]),
-    }
-    commands.update(
-        {
-            component_id: (definition["command"], definition["version_args"])
-            for component_id, definition in NPM_COMPONENTS.items()
-        }
-    )
-    if component in commands:
-        command, args = commands[component]
-        value = command_version(command, args)
-        # `gh --version` includes the build date and platform after the
-        # semantic version.  Result pages only need the three-part version.
-        return config.extract_version(value) if component == "gh" else value
-    if component == "git_ai":
-        return git_ai_version(context.home)
-    if component in {"claude_plugin", "opencode_plugin", "codex_plugin"}:
-        version_file = (
-            context.marketplace_local / "plugin-version.json"
-            if context.marketplace_local
-            else SCRIPT_DIR.parent / "plugin-version.json"
+    returncode, output, error = run_command_capture(args)
+    if returncode != 0 or not output:
+        # 区分“确实未安装”和“探测失败”：失败必须留下可见线索，
+        # 否则组件状态会被静默降级为未安装并反复提示重装。
+        detail = error.splitlines()[0] if error else f"exit code {returncode}"
+        print(
+            f"installer state: agent 状态探测失败（tool={tool}）：{detail}",
+            file=sys.stderr,
         )
-        try:
-            return config.validate_plugin_version(version_file)
-        except (OSError, ValueError):
-            return "installed"
+        return ""
+    return output
+
+
+def repository_plugin_version(context: Context) -> str:
+    """读取插件源中的版本，作为无法从安装状态取版本时的回退。"""
+    version_file = (
+        context.marketplace_local / "plugin-version.json"
+        if context.marketplace_local
+        else SCRIPT_DIR.parent / "plugin-version.json"
+    )
+    try:
+        return config.validate_plugin_version(version_file)
+    except (OSError, ValueError):
+        return "installed"
+
+
+def claude_installed_version(home: Path) -> str:
+    """读取 Claude 插件注册表中记录的实际安装版本。"""
+    document = config.read_json(home / ".claude" / "plugins" / "installed_plugins.json")
+    entries = config.json_path(document, f"plugins.{CLAUDE_PLUGIN}@{CLAUDE_MARKETPLACE}")
+    if not isinstance(entries, list):
+        return ""
+    for entry in entries:
+        version = config.json_field(entry, "version")
+        if version:
+            return version
     return ""
 
 
+def codex_installed_version(home: Path) -> str:
+    """读取 Codex 插件缓存中以版本号命名的目录，取其中最新的一版。"""
+    root = home / ".codex" / "plugins" / "cache" / CODEX_MARKETPLACE / CODEX_PLUGIN
+    try:
+        versions = [item.name for item in root.iterdir() if item.is_dir()]
+    except OSError:
+        return ""
+    return max(versions, key=config.version_tuple) if versions else ""
+
+
+def installed_plugin_version(component: str, context: Context) -> str:
+    """读取平台实际落盘的插件版本；平台未记录版本时回退到插件源版本。
+
+    OpenCode 直接从本地插件源目录加载，不写版本记录，因此始终走回退分支。
+    """
+    readers = {
+        "claude_plugin": claude_installed_version,
+        "codex_plugin": codex_installed_version,
+    }
+    reader = readers.get(component)
+    if reader is not None:
+        try:
+            version = reader(context.home)
+        except (OSError, ValueError):
+            version = ""
+        if version:
+            return version
+    return repository_plugin_version(context)
+
+
+def qoder_present(descriptor: Any, context: Context) -> bool:
+    """按共享配置根判断 Qoder 插件文件状态，不要求 CLI 或 Desktop 正在运行。"""
+    try:
+        state = qoder.inspect(descriptor, context.home)
+    except ValueError:
+        return False
+    if not state.installed or not state.enabled:
+        return False
+    return platform_subagents_state(context, descriptor.key) in {"installed", "up_to_date"}
+
+
+def component_version(component: str, context: Context) -> str:
+    """按组件类型选择版本来源：CLI 命令来自策略表，插件来自自身配置。"""
+    definition = registry.component_by_id(component)
+    if definition is not None and definition.command:
+        value = command_version(definition.command, list(definition.version_args))
+        # `gh --version` includes the build date and platform after the
+        # semantic version.  Result pages only need the three-part version.
+        return config.extract_version(value) if component == "gh" else value
+    if component in {"claude_plugin", "opencode_plugin", "codex_plugin"}:
+        return installed_plugin_version(component, context)
+    qoder_platform = qoder.platform_for_component(component)
+    if qoder_platform is not None:
+        # 共享注册表里的版本就是 CLI 与 Desktop 两端共同看到的结果。
+        try:
+            state = qoder.inspect(qoder_platform, context.home)
+        except ValueError:
+            state = None
+        if state is not None and state.version:
+            return state.version
+        return repository_plugin_version(context)
+    return ""
+
+
+def claude_cache_present(home: Path) -> bool:
+    """判断 Claude 插件缓存是否已由 CLI 或 Desktop 写入共享目录。"""
+    return (home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE / CLAUDE_PLUGIN).is_dir()
+
+
 def present(component: str, context: Context) -> bool:
-    """判断组件是否存在；插件同时要求对应平台的 agent 已同步。"""
-    if component == "git_ai":
-        return git_ai_command(context.home) is not None
-    if component in {"rtk", "graphify", "gh", "glab"}:
-        return shutil.which(component) is not None
-    if component in NPM_COMPONENTS:
-        return shutil.which(NPM_COMPONENTS[component]["command"]) is not None
+    """判断组件文件是否存在；插件同时要求对应平台的 agent 已同步。
+
+    这里只看文件层面的落盘结果，卸载复核与 `--present` 子命令依赖它；
+    安装状态是否成立另由 plugin_ready 追加 CLI 前置判断。
+    """
+    definition = registry.component_by_id(component)
+    if definition is not None and definition.command:
+        return shutil.which(definition.command) is not None
     if component == "claude_plugin":
         listing = plugin_listing("claude", ["plugin", "list"])
-        return bool(listing) and has_line(listing, f"{CLAUDE_PLUGIN}@{CLAUDE_MARKETPLACE}", False) and platform_subagents_state(context, "claude") in {"installed", "up_to_date"}
+        registered = bool(listing) and has_line(
+            listing, f"{CLAUDE_PLUGIN}@{CLAUDE_MARKETPLACE}", False
+        )
+        if not registered:
+            # 只装 Desktop 的机器没有 CLI 命令，但插件缓存由两端共享写入。
+            registered = claude_cache_present(context.home)
+        return registered and platform_subagents_state(context, "claude") in {"installed", "up_to_date"}
     if component == "codex_plugin":
         listing = plugin_listing("codex", ["plugin", "list", "--marketplace", CODEX_MARKETPLACE])
         return bool(listing) and has_line(listing, f"{CODEX_PLUGIN}@{CODEX_MARKETPLACE}") and platform_subagents_state(context, "codex") in {"installed", "up_to_date"}
@@ -272,17 +475,45 @@ def present(component: str, context: Context) -> bool:
         return config.opencode_has_plugin(
             context.home / ".config" / "opencode" / "opencode.json"
         ) and platform_subagents_state(context, "opencode") in {"installed", "up_to_date"}
+    qoder_platform = qoder.platform_for_component(component)
+    if qoder_platform is not None:
+        return qoder_present(qoder_platform, context)
     return False
+
+
+def plugin_ready(component: str, context: Context) -> bool:
+    """判断插件是否已安装且其平台 CLI 可用。
+
+    安装状态以 CLI 为准：只有桌面端时插件视为未安装，安装器会默认勾选，
+    并先自动安装 CLI 再安装插件。
+    """
+    entry = agents.component_agent(component)
+    if entry is not None and not agent_cli_presence(entry.key, context.home):
+        return False
+    return present(component, context)
 
 
 def detect_component(component: str, context: Context, latest: dict[str, str]) -> ComponentState:
     """计算组件当前状态，并在可取得最新版本时区分已安装和可升级。"""
     state = ComponentState(component)
-    if not present(component, context):
+    if not plugin_ready(component, context):
         return state
     state.installed_version = component_version(component, context)
 
-    if component == "git_ai":
+    qoder_platform = qoder.platform_for_component(component)
+    if qoder_platform is not None:
+        if platform_subagents_state(context, qoder_platform.key) != "up_to_date":
+            state.status = "installed"
+            return state
+        target = repository_plugin_version(context)
+        if target and target != "installed":
+            state.latest_version = target
+            # Qoder 走本地目录安装，重装即升级，因此版本较旧就标记可升级。
+            if not state.installed_version or not config.version_greater_or_equal(
+                state.installed_version, target
+            ):
+                state.status = "installed"
+                return state
         state.status = "up_to_date"
         return state
     if component in {"claude_plugin", "opencode_plugin", "codex_plugin"}:
@@ -294,7 +525,10 @@ def detect_component(component: str, context: Context, latest: dict[str, str]) -
         current = saved_marketplace_sha(context)
         remote = marketplace_sha(context)
         if remote:
-            state.latest_version = remote[:7]
+            # 本地插件源的最新版本就是插件源自身的版本号；提交号只用于判断
+            # 源内容是否变化，不能当作版本号展示。
+            target = repository_plugin_version(context)
+            state.latest_version = target if target != "installed" else ""
             state.status = "up_to_date" if current and current == remote else "installed"
         else:
             state.status = "up_to_date"
@@ -319,10 +553,7 @@ def all_states(context: Context) -> list[ComponentState]:
     latest = latest_versions(
         component.component_id
         for component in registry.COMPONENTS
-        if (
-            component.component_id in {"glab", "rtk", "gh", "graphify"}
-            or component.component_id in NPM_COMPONENTS
-        )
+        if version_source_url(component.component_id)[0]
         and present(component.component_id, context)
     )
     return [
@@ -362,6 +593,17 @@ def recap_presence_version(component: str, context: Context) -> tuple[bool, str]
     """同时读取组件存在性和版本，供安装/卸载结果汇总复核。"""
     is_present = present(component, context)
     return is_present, component_version(component, context) if is_present else ""
+
+
+def component_cli_note(component: str, context: Context) -> str:
+    """返回插件对应平台 CLI 本体的状态与版本；非插件组件返回空字符串。"""
+    entry = agents.component_agent(component)
+    if entry is None:
+        return ""
+    is_present, version = agent_cli_state(component, context)
+    if not is_present:
+        return f"CLI {entry.display_name} 未安装"
+    return f"CLI {version or 'unknown'}"
 
 
 def terminal_width(value: str) -> int:
@@ -437,20 +679,9 @@ def display_path(path: Path, home: Path) -> str:
 
 def component_install_path(component: str, context: Context) -> str:
     """返回组件的实际安装路径或用户态安装的稳定回退路径。"""
-    executable_names = {
-        "rtk": "rtk",
-        "gitnexus": "gitnexus",
-        "dingtalk_cli": "dws",
-        "feishu_cli": "lark-cli",
-        "graphify": "graphify",
-        "gh": "gh",
-        "glab": "glab",
-    }
-    if component == "git_ai":
-        path = git_ai_command(context.home)
-        return display_path(Path(path), context.home) if path else display_path(context.home / ".git-ai", context.home)
-    if component in executable_names:
-        path = shutil.which(executable_names[component])
+    definition = registry.component_by_id(component)
+    if definition is not None and definition.command:
+        path = shutil.which(definition.command)
         if path:
             return display_path(Path(path), context.home)
         fallback = {
@@ -461,6 +692,13 @@ def component_install_path(component: str, context: Context) -> str:
             "graphify": context.home / ".local" / "bin" / "graphify",
         }.get(component)
         return display_path(fallback, context.home) if fallback else "—"
+    qoder_platform = qoder.platform_for_component(component)
+    if qoder_platform is not None:
+        try:
+            root = qoder.resolve_config_root(qoder_platform, context.home)
+        except ValueError:
+            return "—"
+        return display_path(qoder.plugin_cache_root(root), context.home)
     plugin_paths = {
         "claude_plugin": context.home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE,
         "opencode_plugin": context.home / ".config" / "opencode" / "node_modules" / "codekit",
@@ -472,9 +710,9 @@ def component_install_path(component: str, context: Context) -> str:
 
 def render_install_table(rows: list[tuple[str, str, str, str]]) -> None:
     """按内容计算列宽并输出紧凑的安装结果表。"""
-    headers = ("组件", "安装结果", "安装路径", "安装版本")
+    headers = ("组件", "安装结果", "安装路径", "版本（插件 · CLI）")
     max_path_width = 48
-    max_version_width = 40
+    max_version_width = 56
     normalized_rows = [
         (
             component,
@@ -526,12 +764,17 @@ def render_recap(mode: str, records: Iterable[str], context: Context) -> None:
                 ok_count += 1
             else:
                 fail_count += 1
+            # 插件组件同时给出插件本体与对应平台 CLI 的状态/版本。
+            cli_note = component_cli_note(component, context)
+            version_cell = version or "---"
+            if cli_note:
+                version_cell = f"{version_cell} · {cli_note}"
             install_rows.append(
                 (
                     component_description(component),
                     "成功" if succeeded else "失败",
                     component_install_path(component, context) if succeeded else "---",
-                    version or "---",
+                    version_cell,
                 )
             )
         render_install_table(install_rows)

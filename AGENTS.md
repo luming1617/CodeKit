@@ -4,7 +4,7 @@
 
 ### Overview
 
-CodeKit 是一个面向 Claude、OpenCode 和 Codex 的 AI 开发插件包，仓库包含七个工作流技能、安装与卸载工具、平台插件元数据以及初始化索引与上下文脚本。
+CodeKit 是一个面向 Claude、OpenCode、Codex、Qoder 和 Qoder CN 的 AI 开发插件包，仓库包含七个工作流技能、安装与卸载工具、平台插件元数据以及初始化索引与上下文脚本。
 
 ### Structure
 
@@ -16,6 +16,7 @@ CodeKit 是一个面向 Claude、OpenCode 和 Codex 的 AI 开发插件包，仓
 - `.claude-plugin/`: Claude 插件及 marketplace 的 JSON 元数据。
 - `.codex-plugin/`: Codex 插件及 marketplace 的 JSON 元数据。
 - `.opencode/`: OpenCode npm 包元数据及动态注册 skills 命令的插件实现。
+- `.qoder-plugin/`: Qoder / Qoder CN 插件 manifest；两个发行版共用同一个用户级配置根，安装一次即对 CLI 与桌面 IDE 同时生效。
 - `.standard/`: 当前仓库已存在的全局规范和 Python 技术栈规范索引及正文。
 - `install.sh`: macOS/Linux 安装或升级入口，调用 scripts 下的安装编排逻辑。
 - `uninstall.sh`: macOS/Linux 卸载入口，调用独立卸载编排逻辑。
@@ -23,7 +24,7 @@ CodeKit 是一个面向 Claude、OpenCode 和 Codex 的 AI 开发插件包，仓
 ### Commands and Verification
 
 - 校验每个技能的 SKILL.md、根级 openai.yaml、agent 元数据和资源引用。: `python3 scripts/validate-skill-layout.py` (evidence: `scripts/validate-skill-layout.py`, `skills/README.md`, `lefthook.yml`)
-- 校验 Claude、Codex、OpenCode 插件 manifest 的 JSON、名称、版本、marketplace 源和入口文件。: `python3 scripts/validate-plugin-manifests.py` (evidence: `scripts/validate-plugin-manifests.py`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `.opencode/package.json`)
+- 校验 Claude、Codex、OpenCode、Qoder 插件 manifest 的 JSON、名称、版本、marketplace 源和入口文件。: `python3 scripts/validate-plugin-manifests.py` (evidence: `scripts/validate-plugin-manifests.py`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `.opencode/package.json`, `.qoder-plugin/plugin.json`)
 - 校验安装器组件注册表的 ID、分组顺序和描述字段。: `python3 scripts/component-registry.py --check` (evidence: `scripts/component-registry.py`, `INSTALL.md`)
 - 运行初始化控制器、结果契约、路径边界和端到端状态流转测试。: `python3 skills/initialize/tests/test_initialize_scripts.py` (evidence: `skills/initialize/tests/test_initialize_scripts.py`, `skills/initialize/scripts/controller.py`)
 - 运行 bugfix 技能脚本和提案契约测试。: `python3 skills/bugfix/tests/test_bugfix_skill_scripts.py` (evidence: `skills/bugfix/tests/test_bugfix_skill_scripts.py`, `skills/bugfix/scripts/validate_bugfix_proposal.py`)
@@ -32,7 +33,8 @@ CodeKit 是一个面向 Claude、OpenCode 和 Codex 的 AI 开发插件包，仓
 - 运行 technical-doc 模板契约测试。: `python3 skills/technical-doc/tests/test_template_contract.py` (evidence: `skills/technical-doc/tests/test_template_contract.py`, `skills/technical-doc/references/technical-doc-template.md`)
 - 从本地仓库安装或升级选定的 CodeKit 组件。: `bash install.sh install -y` (evidence: `install.sh`, `README.md`, `INSTALL.md`)
 - 卸载选定的 CodeKit 组件。: `bash uninstall.sh -y` (evidence: `uninstall.sh`, `README.md`, `INSTALL.md`)
-- 把 plugin-version.json 的版本同步到三个平台 manifest。: `python3 scripts/sync-plugin-version.py` (evidence: `scripts/sync-plugin-version.py`, `plugin-version.json`, `lefthook.yml`)
+- 把 plugin-version.json 的版本同步到各平台 manifest。: `python3 scripts/sync-plugin-version.py` (evidence: `scripts/sync-plugin-version.py`, `plugin-version.json`, `lefthook.yml`)
+- 运行安装器、共享存储适配层和 agent 同步的回归测试（pre-push 门禁）。: `python3 -m unittest discover -s scripts -p 'test_*.py'` (evidence: `scripts/test_installer_qoder.py`, `scripts/test_installer_sources.py`, `scripts/test_installer_agents.py`, `lefthook.yml`)
 - 构建 GitNexus 仓库分析和技能索引。: `gitnexus analyze --skills --verbose` (evidence: `GUIDE.md`, `skills/initialize/SKILL.md`)
 - 使用代码模式提取 Graphify 知识图谱到仓库输出目录。: `graphify extract . --out . --code-only` (evidence: `skills/initialize/SKILL.md`, `skills/initialize/agents/initialize-graphify.md`)
 <!-- codekit:initialize:project-context:end -->

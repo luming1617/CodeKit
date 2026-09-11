@@ -10,6 +10,7 @@ configuration file behind.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -25,6 +26,70 @@ SEMVER_PATTERN = re.compile(
     r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$"
 )
 MCP_SECTION_PATTERN = re.compile(r"^\[mcp_servers\.([^\]]+)\]\s*$")
+
+# 直连 registry.npmjs.org 在国内网络下常超时。NPM_REGISTRY 既由 set_npm 写入
+# npm_config_registry（本会话所有 npm/npx 子进程生效），也用作版本探测 URL；
+# NPM_REGISTRY_ARGS 仅用于面向用户的手动安装指引，因为那些命令在用户 shell 执行、无法继承本进程环境。
+NPM_REGISTRY = "https://registry.npmmirror.com"
+NPM_REGISTRY_ARGS = ("--registry", NPM_REGISTRY)
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# 安装器运行期依赖的辅助模块清单（含 installer.py，供卸载器复用）。
+# installer.py / uninstaller.py 在导入这些模块之前先调用 require_helper_files()：
+# 否则残缺检出会在模块加载期抛出原始 ModuleNotFoundError，而不是受控的单行错误。
+REQUIRED_HELPER_FILES = (
+    "component-registry.py",
+    "component-selector.py",
+    "installer.py",
+    "installer_agents.py",
+    "installer_config.py",
+    "installer_qoder.py",
+    "installer_sources.py",
+    "installer_state.py",
+    "manage-global-agents.py",
+)
+
+
+def require_helper_files(directory: Optional[Path] = None) -> None:
+    """校验辅助模块是否齐全，缺失时抛出带绝对路径的 ValueError。"""
+    target = Path(directory) if directory is not None else SCRIPT_DIR
+    missing = [
+        str(target / name)
+        for name in REQUIRED_HELPER_FILES
+        if not (target / name).is_file()
+    ]
+    if missing:
+        raise ValueError(f"installer helper missing: {', '.join(missing)}")
+
+
+def load_module(path: Path, name: str) -> Any:
+    """按文件路径加载辅助模块，供需要读取策略表的模块共用同一实例。"""
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load helper module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def linux_application_dirs(
+    home: Path, environ: Optional[Mapping[str, str]] = None
+) -> tuple[Path, ...]:
+    """返回 XDG 应用目录，覆盖用户级和常见系统级安装位置。"""
+    environ = os.environ if environ is None else environ
+    configured_home = environ.get("XDG_DATA_HOME")
+    bases = (
+        [Path(configured_home).expanduser()]
+        if configured_home
+        else [Path(home) / ".local" / "share"]
+    )
+    configured_dirs = environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
+    bases.extend(
+        Path(value).expanduser() for value in configured_dirs.split(os.pathsep) if value
+    )
+    return tuple(dict.fromkeys(bases))
 
 
 def extract_version(value: str) -> str:

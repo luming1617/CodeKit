@@ -7,14 +7,53 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import installer_agents as agents  # noqa: E402
+import installer_qoder as qoder  # noqa: E402
 
 
 MANAGED_MARKER = "managed-by: codekit"
-TOOLS = ("claude", "opencode", "codex")
+# 平台键与全局 agent 目录的唯一来源：installer_agents 负责目录布局，
+# installer_qoder 负责两个 Qoder 发行版的共享配置根。
+TOOLS = ("claude", "opencode", "codex", *qoder.PLATFORMS)
+
+# canonical agent 使用 Claude 风格的工具名，OpenCode 的 agent frontmatter 要求
+# `tools` 是“工具 id → 布尔值”的映射；未声明的内建工具一律显式关闭，
+# 否则只读角色会在 OpenCode 上悄悄获得 Bash/Write 能力。
+OPENCODE_TOOL_IDS = {
+    "Read": "read",
+    "Grep": "grep",
+    "Glob": "glob",
+    "Bash": "bash",
+    "Write": "write",
+    "Edit": "edit",
+}
+OPENCODE_TOOLS = (
+    "read",
+    "edit",
+    "write",
+    "glob",
+    "grep",
+    "list",
+    "bash",
+    "task",
+    "todowrite",
+    "question",
+    "webfetch",
+    "websearch",
+    "lsp",
+    "skill",
+)
 
 
 def agent_files(source: Path) -> list[Path]:
@@ -112,31 +151,82 @@ def codex_toml(name: str, description: str, body: str) -> str:
     )
 
 
-def destinations(home: Path) -> dict[str, Path]:
-    """返回三种工具的全局 agent 目录。"""
+def opencode_markdown(markdown: str) -> str:
+    """把 canonical Markdown agent 转换成 OpenCode 可校验的 frontmatter。"""
+    lines = markdown.splitlines()
+    if len(lines) < 3 or lines[0].strip() != "---":
+        raise ValueError("missing frontmatter")
+    try:
+        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    except StopIteration as exc:
+        raise ValueError("unterminated frontmatter") from exc
+
+    front: list[str] = []
+    declared: list[str] = []
+    for line in lines[1:end]:
+        key, _, value = line.partition(":")
+        if key.strip() == "tools":
+            declared = [item.strip() for item in value.split(",") if item.strip()]
+            continue
+        front.append(line)
+
+    unknown = [name for name in declared if name not in OPENCODE_TOOL_IDS]
+    if unknown:
+        raise ValueError(
+            f"agent declares tools OpenCode cannot map: {', '.join(unknown)}"
+        )
+    allowed = {OPENCODE_TOOL_IDS[name] for name in declared}
+    front.append("tools:")
+    front.extend(
+        f"  {tool}: {'true' if tool in allowed else 'false'}" for tool in OPENCODE_TOOLS
+    )
+    return "\n".join(["---", *front, "---", *lines[end + 1 :]]).rstrip("\n") + "\n"
+
+
+def destinations(
+    home: Path,
+    tools: tuple[str, ...] = TOOLS,
+    config_root: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> dict[str, Path]:
+    """返回各工具的全局 agent 目录，Qoder 使用共享配置根。"""
+    environ = os.environ if environ is None else environ
+    qoder_tools = tuple(tool for tool in tools if tool in qoder.PLATFORMS)
+    if config_root is not None and len(qoder_tools) > 1:
+        raise SystemExit(
+            "--config-root selects one Qoder configuration root; pass --tool once"
+        )
     return {
-        "claude": home / ".claude" / "agents",
-        "opencode": home / ".config" / "opencode" / "agents",
-        "codex": home / ".codex" / "agents",
+        tool: agents.global_agent_plan(tool, home, config_root, environ)[1]
+        for tool in tools
     }
 
 
-def install(source: Path, home: Path, tools: tuple[str, ...] = TOOLS) -> int:
+def install(
+    source: Path,
+    home: Path,
+    tools: tuple[str, ...] = TOOLS,
+    config_root: Optional[Path] = None,
+) -> int:
     """将 canonical agent 原子同步到指定工具的全局目录。"""
     parsed = collect_agents(source)
     if not parsed:
         raise ValueError(f"no agent Markdown files found in {source}")
 
-    target_dirs = destinations(home)
+    target_dirs = destinations(home, tools, config_root)
     backup_root = home / ".local" / "state" / "CodeKit" / "agent-backups"
     changed = 0
-    # 同一份 Markdown 是事实源，两个工具保留 Markdown，Codex 使用等价 TOML。
+    # 同一份 Markdown 是事实源：Codex 转成等价 TOML，OpenCode 转成
+    # 布尔工具映射，其余工具直接沿用 canonical Markdown。
     for source_file, name, description, body in parsed:
         markdown = source_file.read_text(encoding="utf-8")
         for tool in tools:
             if tool == "codex":
                 destination = target_dirs[tool] / f"{name}.toml"
                 content = codex_toml(name, description, body)
+            elif tool == "opencode":
+                destination = target_dirs[tool] / f"{name}.md"
+                content = opencode_markdown(markdown)
             else:
                 destination = target_dirs[tool] / f"{name}.md"
                 content = markdown
@@ -162,9 +252,13 @@ def _is_managed(path: Path) -> bool:
     return MANAGED_MARKER in text or "# Managed by CodeKit" in text
 
 
-def _managed_files(home: Path, tools: tuple[str, ...] = TOOLS) -> list[Path]:
+def _managed_files(
+    home: Path,
+    tools: tuple[str, ...] = TOOLS,
+    config_root: Optional[Path] = None,
+) -> list[Path]:
     """收集指定工具布局中所有由 CodeKit 管理的 agent 文件。"""
-    target_dirs = destinations(home)
+    target_dirs = destinations(home, tools, config_root)
     layouts = tuple(
         (target_dirs[tool], "*.toml" if tool == "codex" else "*.md")
         for tool in tools
@@ -177,14 +271,19 @@ def _managed_files(home: Path, tools: tuple[str, ...] = TOOLS) -> list[Path]:
     )
 
 
-def status(source: Optional[Path], home: Path, tools: tuple[str, ...] = TOOLS) -> int:
+def status(
+    source: Optional[Path],
+    home: Path,
+    tools: tuple[str, ...] = TOOLS,
+    config_root: Optional[Path] = None,
+) -> int:
     """Print a stable state for shell callers: up_to_date, installed, or not_installed."""
     if source is not None and source.is_dir():
         parsed = collect_agents(source)
         if parsed:
             expected = 0
             present = 0
-            target_dirs = destinations(home)
+            target_dirs = destinations(home, tools, config_root)
             for _, name, _, _ in parsed:
                 for tool in tools:
                     expected += 1
@@ -193,14 +292,18 @@ def status(source: Optional[Path], home: Path, tools: tuple[str, ...] = TOOLS) -
             print("up_to_date" if present == expected else "installed" if present else "not_installed")
             return 0
 
-    print("installed" if _managed_files(home, tools) else "not_installed")
+    print("installed" if _managed_files(home, tools, config_root) else "not_installed")
     return 0
 
 
-def uninstall(home: Path, tools: tuple[str, ...] = TOOLS) -> int:
+def uninstall(
+    home: Path,
+    tools: tuple[str, ...] = TOOLS,
+    config_root: Optional[Path] = None,
+) -> int:
     """删除指定工具中带 CodeKit 标记的 agent 文件，并保留用户文件和备份。"""
     removed = 0
-    for path in _managed_files(home, tools):
+    for path in _managed_files(home, tools, config_root):
         try:
             path.unlink()
         except OSError as exc:
@@ -218,15 +321,20 @@ def main() -> int:
     parser.add_argument("--source", type=Path)
     parser.add_argument("--home", default=Path.home(), type=Path)
     parser.add_argument("--tool", choices=TOOLS, action="append", dest="tools")
+    parser.add_argument(
+        "--config-root",
+        type=Path,
+        help="explicit Qoder configuration root shared by its CLI and desktop IDE",
+    )
     args = parser.parse_args()
     tools = tuple(args.tools) if args.tools else TOOLS
     if args.command == "install":
         if args.source is None or not args.source.is_dir():
             raise SystemExit(f"agent source directory not found: {args.source}")
-        return install(args.source, args.home, tools)
+        return install(args.source, args.home, tools, args.config_root)
     if args.command == "status":
-        return status(args.source, args.home, tools)
-    return uninstall(args.home, tools)
+        return status(args.source, args.home, tools, args.config_root)
+    return uninstall(args.home, tools, args.config_root)
 
 
 if __name__ == "__main__":

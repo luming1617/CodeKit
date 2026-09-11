@@ -21,6 +21,15 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_config as config  # noqa: E402
+
+# 导入期门禁：与 installer.py 共用同一份 helper 清单，缺失时给出单行受控错误。
+try:
+    config.require_helper_files(SCRIPT_DIR)
+except ValueError as exc:
+    print(f"  ✗  {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+import installer_qoder as qoder  # noqa: E402
 import installer_state as detector  # noqa: E402
 from installer import (  # noqa: E402
     CLAUDE_MARKETPLACE,
@@ -121,15 +130,10 @@ class Uninstaller(Installer):
 
     def uninstall_platform_agents(self, tool: str) -> bool:
         """随对应插件移除该平台的全局 subagent。"""
-        helper = SCRIPT_DIR / "manage-global-agents.py"
-        if not helper.is_file():
-            return True
-        args = [sys.executable, str(helper), "uninstall"]
-        args.extend(["--home", str(self.home), "--tool", tool])
-        return self.run_command(args).returncode == 0
+        return self.run_platform_agents("uninstall", tool)
 
     def uninstall_claude_plugin(self) -> bool:
-        """卸载 Claude 插件及其 marketplace 注册，并校验注册信息是否已移除。"""
+        """卸载 Claude 插件及其 marketplace 注册；CLI 缺失时也清理共享缓存。"""
         plugin_ok = True
         if self.command_exists("claude"):
             package = f"{CLAUDE_PLUGIN}@{CLAUDE_MARKETPLACE}"
@@ -140,7 +144,9 @@ class Uninstaller(Installer):
             marketplace = self.run_capture(["claude", "plugin", "marketplace", "list", "--json"]).stdout
             # CLI 只负责标记/登记的内容也要检查，避免界面显示卸载成功但仍可被加载。
             plugin_ok = package not in remaining and f'"{CLAUDE_MARKETPLACE}"' not in marketplace
-            shutil.rmtree(self.home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE, ignore_errors=True)
+        # The plugin cache is shared with the desktop app, so it is always
+        # removed; a missing CLI must not leave a loadable plugin behind.
+        shutil.rmtree(self.home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE, ignore_errors=True)
         return plugin_ok and self.uninstall_platform_agents("claude")
 
     def uninstall_opencode_plugin(self) -> bool:
@@ -154,16 +160,6 @@ class Uninstaller(Installer):
             return plugin_ok and self.uninstall_platform_agents("opencode")
         except ValueError:
             return False
-
-    def uninstall_git_ai(self) -> bool:
-        """移除 git-ai hooks、程序目录、用户 bin 链接以及 shell PATH 残留。"""
-        if self.git_ai_command():
-            self.run_command(["git", "ai", "uninstall-hooks"])
-        shutil.rmtree(self.home / ".git-ai", ignore_errors=True)
-        (self.bin_dir / "git-ai").unlink(missing_ok=True)
-        for path in self.shell_rcs():
-            self.remove_matching_lines(path, "git-ai/bin")
-        return True
 
     def uninstall_rtk(self) -> bool:
         """撤销 rtk 的全局配置，并卸载残留。"""
@@ -233,14 +229,27 @@ class Uninstaller(Installer):
                 shutil.rmtree(path)
         return self.uninstall_platform_agents("codex")
 
+    def uninstall_qoder_plugin(self, platform_key: str) -> bool:
+        """移除 Qoder 共享配置根中的插件与全局 subagent；CLI 可用时先走 CLI 登记。"""
+        descriptor = qoder.PLATFORMS[platform_key]
+        try:
+            plugin_ok = qoder.uninstall(
+                descriptor, self.home, runner=self.qoder_run
+            )
+        except ValueError as exc:
+            self.logger.error(str(exc))
+            plugin_ok = False
+        return plugin_ok and self.uninstall_platform_agents(platform_key)
+
     def uninstall_component(self, component_id: str) -> bool:
         """按组件注册 ID 分发卸载处理器，并把单项异常转换为失败结果。"""
         handlers = {
-            "git_ai": self.uninstall_git_ai,
             "rtk": self.uninstall_rtk,
             "claude_plugin": self.uninstall_claude_plugin,
             "opencode_plugin": self.uninstall_opencode_plugin,
             "codex_plugin": self.uninstall_codex_plugin,
+            "qoder_plugin": lambda: self.uninstall_qoder_plugin("qoder"),
+            "qodercn_plugin": lambda: self.uninstall_qoder_plugin("qodercn"),
             "gitnexus": self.uninstall_gitnexus,
             "dingtalk_cli": self.uninstall_dingtalk_cli,
             "feishu_cli": self.uninstall_feishu_cli,
@@ -286,8 +295,19 @@ class Uninstaller(Installer):
         if new != old:
             config.atomic_write(path, new)
 
+    def cleanup_legacy_git_ai(self) -> None:
+        """清理历史版本安装过的 git-ai 全局 hook 与残留；该组件已下线。"""
+        candidate = shutil.which("git-ai") or str(self.home / ".git-ai" / "bin" / "git-ai")
+        if Path(candidate).is_file():
+            self.run_command(["git", "ai", "uninstall-hooks"])
+        shutil.rmtree(self.home / ".git-ai", ignore_errors=True)
+        (self.bin_dir / "git-ai").unlink(missing_ok=True)
+        for path in self.shell_rcs():
+            self.remove_matching_lines(path, "git-ai/bin")
+
     def cleanup_global_config(self) -> None:
         """清理 Git 全局配置、CodeKit PATH 块和版本状态文件。"""
+        self.cleanup_legacy_git_ai()
         self.run_command(["git", "config", "--global", "--unset", "advice.addIgnoredFile"])
         self.run_command(["git", "config", "--global", "--unset", "push.autoSetupRemote"])
         for path in self.shell_rcs():
@@ -313,17 +333,6 @@ class Uninstaller(Installer):
         self.logger.info(f"=== CodeKit Plugin Uninstall v{self.plugin_version} ===")
         if self.os_name not in {"Darwin", "Linux"}:
             raise InstallerError(f"Unsupported OS: {self.os_name}. Only macOS/Linux.")
-        required_helpers = (
-            SCRIPT_DIR / "component-registry.py",
-            SCRIPT_DIR / "installer.py",
-            SCRIPT_DIR / "installer_config.py",
-            SCRIPT_DIR / "installer_state.py",
-            SCRIPT_DIR / "installer_sources.py",
-            SCRIPT_DIR / "component-selector.py",
-        )
-        missing = [str(path) for path in required_helpers if not path.is_file()]
-        if missing:
-            raise InstallerError(f"Uninstaller helper missing: {', '.join(missing)}")
         detector.registry.validate_registry()
         # npm 全局包默认落在用户前缀；卸载前挂载用户 bin，确保未 source shell
         # 配置时也能检测到并清理 GitNexus、钉钉 CLI、飞书 CLI。

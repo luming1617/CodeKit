@@ -1,6 +1,6 @@
 # CodeKit AI 开发套件使用指南
 
-CodeKit 是一套基于 Claude / OpenCode / Codex 的 AI 开发套件，通过"规范 + 技能 + 工具链"，让 AI 能按团队标准独立完成研发闭环——从读 PRD、写方案、发布准备、编码到 CR，全程 AI 主导，人类定目标、审结果。
+CodeKit 是一套基于 Claude / OpenCode / Codex / Qoder 的 AI 开发套件，通过"规范 + 技能 + 工具链"，让 AI 能按团队标准独立完成研发闭环——从读 PRD、写方案、发布准备、编码到 CR，全程 AI 主导，人类定目标、审结果。
 
 ---
 
@@ -8,16 +8,17 @@ CodeKit 是一套基于 Claude / OpenCode / Codex 的 AI 开发套件，通过"�
 
 ### 前置要求
 
-| 条件 | 检查方式 |
+| 条件 | 说明 |
 |------|---------|
-| Node.js >= 20 | macOS 用 Homebrew，Linux 用发行版包管理器安装/升级 |
-| Python3 | macOS 用 Homebrew，Linux 用发行版包管理器安装 |
-| npm | macOS 用 Homebrew，Linux 用发行版包管理器安装 |
-| curl | macOS 用 Homebrew，Linux 用发行版包管理器安装 |
-| Homebrew | 仅 macOS 自动安装（安装失败退出；已装则自动更新，更新失败仅警告并继续） |
-| Git >= 2.50.0 | macOS 用 Homebrew，Linux 用发行版包管理器安装/升级 |
-| 编程智能体（Claude / Codex / OpenCode） | macOS 优先用 Homebrew/cask，Linux 使用 npm；三者都未安装时脚本提示选择 |
+| Node.js >= 24 | 只检测，不自动安装；不满足时提示手动安装方式并中止 |
+| Python3 >= 3.10 | 同上（graphify 要求 Python >= 3.10） |
+| npm | 随 Node.js 提供 |
+| curl 或 wget | 任一存在即可，用于官方脚本与发布包下载 |
+| git | 存在即可（安装器读取 marketplace 提交号并写入全局 git 配置，不再校验版本） |
+| 编程智能体（Claude / Codex / OpenCode / Qoder / Qoder CN） | 勾选对应插件时才自动安装 CLI（npm 优先，可回退 brew/cask；Qoder 与 Qoder CN 用官方脚本）；五者都未安装时仅提示并继续 |
 | SSH Key（访问 GitLab） | `ssh -T git@<your-git-host>` |
+
+> 安装器**不会**代装任何系统级工具（包括 Homebrew）；Homebrew 仅在已安装时作为可选安装通道使用。
 
 > `<your-git-host>` 指本仓库所在的 Git 主机。在本仓库内运行 `bash install.sh` 时，安装后的配置指引会自动打印实际主机名。
 
@@ -29,9 +30,9 @@ CodeKit 是一套基于 Claude / OpenCode / Codex 的 AI 开发套件，通过"�
 bash install.sh
 ```
 
-安装内容：git-ai（AI code tracking）、rtk（节省 token 60-90%）、GitNexus（代码智能）、Graphify（知识图谱）、gh（GitHub CLI）、glab（GitLab CLI）、钉钉 CLI（`dws`）、飞书 CLI（`lark-cli`）、CodeKit 插件（Claude + OpenCode + Codex 三平台，插件分别包含对应平台的全局 subagent）。安装前脚本会按平台自动保障 git ≥ 2.50.0、Node.js ≥ 20、Python3、npm、curl 与至少一个编程智能体；macOS 使用 Homebrew，Linux 使用发行版包管理器，失败即退出；安装后会打印包含安装路径、安装版本和未选择项的结果汇总，以及带作用说明的后续操作提示。
+安装内容：rtk（节省 token 60-90%）、GitNexus（代码智能）、Graphify（知识图谱）、gh（GitHub CLI）、glab（GitLab CLI）、钉钉 CLI（`dws`）、飞书 CLI（`lark-cli`）、CodeKit 插件（Claude + OpenCode + Codex + Qoder + Qoder CN，插件分别包含对应平台的全局 subagent；Qoder 插件同时服务其 CLI 与桌面 IDE）。安装前脚本只**检测** git（存在即可）、Node.js ≥ 24、Python3 ≥ 3.10、npm 与 curl/wget，任一不满足即醒目列出并中止，不代装。编程智能体 CLI 不在此阶段强制准备：没有可用 CLI 时只提示，勾选平台插件后才自动安装对应 CLI。
 
-> CodeKit 的 7 个技能同时支持 **Claude**、**OpenCode** 和 **Codex**，三者可以同时安装，互不冲突。Linux 上 Claude、Codex 和 OpenCode 使用 npm 安装；macOS 优先使用官方 Homebrew/cask。
+> CodeKit 的 7 个技能同时支持 **Claude**、**OpenCode**、**Codex**、**Qoder** 和 **Qoder CN**，可以同时安装，互不冲突。可选组件统一按 `npm → brew → apt → pipx/venv → 官方脚本/发布包` 的优先级探测：Claude、Codex、OpenCode 优先走 npm（统一 `registry.npmmirror.com` 镜像源），macOS 可回退 Homebrew/cask；Qoder 与 Qoder CN 使用官方安装脚本。Qoder 与 Qoder CN 的 CLI 和桌面 IDE 共用同一个用户级配置根，安装一次两端生效。
 >
 > 脚本以当前仓库作为插件市场源（相对定位）；组件注册表和交互选择器位于 `scripts/`，安装与卸载必须在完整仓库中执行。
 
@@ -64,6 +65,22 @@ bash uninstall.sh
 重启 OpenCode 后，技能以裸命令提供（如 `/initialize`），OpenCode 下不带插件前缀。
 
 手动配置直接使用仓库的 `.opencode/` 目录；如果需要与一键安装完全一致的旧版 npm 包目录结构，请运行 `bash install.sh install`，由安装器生成兼容包源。
+
+### 手动安装 Qoder 插件
+
+Qoder（国际版）与 Qoder CN 的 CLI、桌面 IDE 共用同一个用户级配置根，因此一条命令即可让两端同时拿到插件：
+
+```bash
+# Qoder CN：把本仓库作为本地插件源安装到共享配置根
+qodercn plugins install /path/to/CodeKit --scope user --json
+
+# 国际版把命令换成 qoder，配置根为 ~/.qoder
+qoder plugins install /path/to/CodeKit --scope user --json
+```
+
+安装结果写在 `<配置根>/plugins/installed_plugins_v2.json`，启用状态写在 `<配置根>/settings.json` 的 `enabledPlugins`；技能实体缓存在 `<配置根>/plugins/cache/local/codekit/<版本>/`。重启 Qoder CLI 与 Qoder IDE 后，用 `/codekit:<skill>` 调用。
+
+> 配置根可通过 `QODER_CONFIG_DIR` / `QODERCN_CONFIG_DIR` 覆盖，安装器会沿用同一个根；WSL 内安装只影响 WSL 侧的 Linux 根，Windows 侧的 `C:\Users\<name>\.qoder-cn` 需要单独安装。
 
 ### 手动安装 Codex 插件
 
@@ -118,7 +135,7 @@ touch .graphifyignore   # 按 .gitignore 语法配置 Graphify 忽略规则
 然后按所使用的智能体输入对应命令，初始化当前仓库知识图谱：
 
 ```text
-# Claude / OpenCode
+# Claude / OpenCode / Qoder
 /graphify .
 
 # Codex
@@ -127,7 +144,7 @@ $graphify .
 
 ### 4. 钉钉 CLI / 飞书 CLI
 
-两项 CLI 都由安装器通过 npm 用户态安装。安装后按需登录：
+两项 CLI 都由安装器通过 npm 用户态安装（`set_npm` 注入的 `npm_config_registry` 指向 `https://registry.npmmirror.com`）。安装后按需登录：
 
 ```bash
 dws auth login
@@ -181,6 +198,8 @@ rtk gain          # 查看节省统计
 | 排查 | `/codekit:bugfix` | 基于 PRD/TDD/RPD 系统化排查并修复问题 |
 
 > **Codex 调用方式：** Codex 中使用 `$<skill-name>` 调用对应技能，如 `$initialize`（旧版为 `$keel-initialize`，已去掉前缀）。Codex 也会根据 skill 描述自动匹配任务（隐式调用）。
+>
+> **Qoder 调用方式：** Qoder 与 Qoder CN 沿用 `/codekit:<skill>` 前缀，如 `/codekit:initialize`、`/codekit:technical-doc`；CLI 与桌面 IDE 读取同一份插件注册表，安装一次即可在两端调用。
 
 ---
 
@@ -238,6 +257,8 @@ AI 会跨越业务日志、进程状态、中间件指标、源代码等多个�
 | 命令找不到（OpenCode） | 检查 `~/.config/opencode/opencode.json` 中 `plugin` 数组是否包含 CodeKit |
 | OpenCode 插件未生效 | 修改 opencode.json 后需重启 OpenCode |
 | 命令找不到（Codex） | `codex plugin list --marketplace co-daming` 确认插件已安装；新会话生效 |
-| Codex 插件更新不生效 | `codex plugin marketplace upgrade co-daming` 后重新 `codex plugin add codekit@co-daming`，并开新会话 |
+| 命令找不到（Qoder / Qoder CN） | `qodercn plugins list --json` 确认存在 `codekit@local`；子命令为 `qoder` 时同理 |
+| Qoder 插件未生效 | 插件与全局 subagent 写入共享配置根，需重启 Qoder CLI 与 Qoder IDE 后生效 |
+| Qoder 只装到一端 | 无需重复安装：CLI 与 IDE 共用 `~/.qoder`（CN 为 `~/.qoder-cn`），一次安装两端可见 |
 | PATH 未生效 | `source ~/.zshrc` 或重启终端 |
 | 安装日志 | `cat ~/.local/state/CodeKit/install.log` |
