@@ -27,6 +27,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_config as config  # noqa: E402
+from installer_platform import rmtree  # noqa: E402
 
 
 PLUGIN_NAME = "codekit"
@@ -302,7 +303,8 @@ def remove_stale_versions(cache_root: Path, version: str) -> None:
         if candidate.name == version:
             continue
         if candidate.is_dir() and not candidate.is_symlink():
-            shutil.rmtree(candidate, ignore_errors=True)
+            # 缓存里的只读文件会让 shutil.rmtree 在 Windows 上抛 PermissionError。
+            rmtree(candidate, ignore_errors=True)
         else:
             candidate.unlink(missing_ok=True)
 
@@ -327,12 +329,14 @@ def install_direct(root: Path, stage: Path, version: str) -> Path:
             have_backup = True
         os.replace(staging, target)
     except (OSError, ValueError) as exc:
-        shutil.rmtree(staging, ignore_errors=True)
+        rmtree(staging, ignore_errors=True)
         if have_backup:
+            # Windows 上 os.replace 不能覆盖已存在的目录，回滚前先清掉半成品。
+            rmtree(target, ignore_errors=True)
             os.replace(backup, target)
         raise QoderError(f"could not write the Qoder plugin cache: {exc}") from exc
     if have_backup:
-        shutil.rmtree(backup, ignore_errors=True)
+        rmtree(backup, ignore_errors=True)
     remove_stale_versions(cache_root, version)
     register_plugin(root, target, version)
     set_plugin_enabled(root, True)
@@ -385,6 +389,26 @@ def looks_like_desktop_launcher(path: str) -> bool:
     return "/contents/" in normalized or "/.app/" in normalized
 
 
+def _entry_candidates(directory: Path, command: str) -> tuple[Path, ...]:
+    """列出入口目录中该命令可能出现的文件名。
+
+    Windows 上官方安装器落地的是 ``qoder.cmd``（再转发给
+    ``qoder-dispatcher.ps1``），没有无扩展名的入口文件；只按裸命令名查找会漏检。
+    """
+    if platform.system() != "Windows":
+        return (Path(directory) / command,)
+    return tuple(
+        Path(directory) / f"{command}{suffix}" for suffix in ("", ".cmd", ".bat", ".exe")
+    )
+
+
+def _usable_entry(path: Path) -> bool:
+    """判断入口文件是否可以被直接调用。"""
+    if not path.is_file():
+        return False
+    return platform.system() == "Windows" or os.access(path, os.X_OK)
+
+
 def cli_path(
     platform_key: str,
     home: Path,
@@ -407,9 +431,9 @@ def cli_path(
         return ""
     for directory in (root / "entry", root / "bin"):
         for command in descriptor.cli_commands:
-            candidate = directory / command
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                return str(candidate)
+            for candidate in _entry_candidates(directory, command):
+                if _usable_entry(candidate):
+                    return str(candidate)
     return ""
 
 
@@ -528,7 +552,7 @@ def remove_install_path(root: Path, entry: Mapping[str, Any]) -> None:
     if target is None:
         return
     if target.is_dir() and not target.is_symlink():
-        shutil.rmtree(target, ignore_errors=True)
+        rmtree(target, ignore_errors=True)
     elif target.exists():
         target.unlink(missing_ok=True)
 

@@ -50,6 +50,11 @@ class AgentCLI:
         """Official installer-script URL for this CLI, or an empty string."""
         return self.channels.get("script", "")
 
+    @property
+    def powershell_url(self) -> str:
+        """Windows-only PowerShell installer-script URL, or an empty string."""
+        return self.channels.get("powershell", "")
+
 
 def _qoder_entry(platform_key: str, display_name: str) -> AgentCLI:
     """Build a Qoder entry from the platform descriptor that owns its names."""
@@ -220,8 +225,25 @@ def cli_extra_paths(entry: AgentCLI, home: Path) -> tuple[Path, ...]:
     return (root / "entry", root / "bin")
 
 
-def fallback_note(entry: AgentCLI) -> str:
-    """Describe the manual install command to show when automation fails."""
+def fallback_note(entry: AgentCLI, *, windows: bool = False) -> str:
+    """Describe the manual install command to show when automation fails.
+
+    ``windows=True`` 时只给出 Windows 上真实可用的命令：Qoder 系在 Windows 只发布
+    ``install.ps1``，``curl | bash`` 那条提示会把用户引到并不存在的 bash 上。
+    """
+    if windows:
+        if entry.npm_package:
+            registry_args = " ".join(config.NPM_REGISTRY_ARGS)
+            return f"npm install -g {entry.npm_package} {registry_args}"
+        winget_id = entry.channels.get("winget", "")
+        if winget_id:
+            return f"winget install --id {winget_id} --exact"
+        if entry.powershell_url:
+            return (
+                "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+                f"\"irm {entry.powershell_url} | iex\""
+            )
+        return ""
     if entry.script_url:
         return f"curl -fsSL {entry.script_url} | bash"
     if entry.npm_package:

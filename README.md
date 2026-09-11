@@ -15,12 +15,23 @@
 在**本仓库根目录**执行：
 
 ```bash
+# macOS / Linux
 bash install.sh
 ```
 
+```bat
+:: Windows（CMD；也可直接用 install.ps1）
+install.cmd
+```
+
+卸载：macOS/Linux 用 `bash uninstall.sh`，Windows 用 `uninstall.cmd`。
+
 安装内容：编程智能体 CLI（Claude / Codex / OpenCode / Qoder / Qoder CN，勾选对应插件时自动补装；插件安装以 CLI 为前置，仅有 Desktop 不能替代） · CodeKit 插件（Claude / OpenCode / Codex / Qoder / Qoder CN，分别包含对应平台的 subagent） · GitNexus · Graphify · gh · glab · 钉钉 CLI · 飞书 CLI · rtk(节省token)
 
-> 安装前脚本只**检测**系统依赖，不会替你安装：git（存在即可）、Node.js ≥ 24、Python3 ≥ 3.10、npm、curl/wget 任一。任一不满足会醒目列出全部缺失项、当前版本与手动安装方式并中止。可选组件按统一优先级 `npm → brew → apt → pipx/venv → 发布包/官方脚本` 探测安装（校验过摘要的发布资产优先于 `curl | bash`），详见 [INSTALL-STRATEGY.md](INSTALL-STRATEGY.md)。
+> 安装前脚本只**检测**系统依赖，不会替你安装：git（存在即可）、Node.js ≥ 24、Python3 ≥ 3.10、npm、curl/wget 任一。任一不满足会醒目列出全部缺失项、当前版本与手动安装方式并中止。可选组件按统一优先级 `npm → brew → apt → winget → pipx/venv → 发布包/官方脚本` 探测安装（校验过摘要的发布资产优先于 `curl | bash`），详见 [INSTALL-STRATEGY.md](INSTALL-STRATEGY.md)。
+
+> Windows 上入口脚本用 `py -3`（不是 `python3`，该名字在干净系统上是微软商店别名桩），并强制 `-X utf8`。交互式选择器在 Windows 上同样可用（后端走 `CONOUT$` + `msvcrt`，并开启 ANSI 转义）；只有在拿不到终端时才会**显式打印默认选择清单**后继续，而不是静默采用默认值。
+
 
 > 安装前会检查 Claude、Codex、OpenCode、Qoder、Qoder CN 的 **CLI 本体**；五者 CLI 均不存在时只给出醒目提示并继续流程（不会阻断，退出码 0），也不会自动安装任何 CLI——只有在用户勾选了某个平台插件时，安装器才会先自动安装该平台 CLI 再安装插件。Desktop 应用、启动器与 Qoder 共享配置根不计入 CLI 前置，仅用于 Qoder 平台可用性判断与后续提示。
 

@@ -29,6 +29,7 @@ except ValueError as exc:
     print(f"  ✗  {exc}", file=sys.stderr)
     raise SystemExit(1)
 
+import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 import installer_state as detector  # noqa: E402
 from installer import (  # noqa: E402
@@ -62,15 +63,17 @@ class Uninstaller(Installer):
             for item in self.components
             if self.states[item.component_id].status != "not_installed"
         ]
-        if not self.auto_yes and Path("/dev/tty").exists():
+        if not self.auto_yes and self.platform.can_interact():
             answer = input("确认要卸载 CodeKit Plugin 及相关组件？[y/N]: ").strip().lower()
             if answer not in {"y", "yes"}:
                 self.logger.info("Cancelled.")
                 raise SystemExit(0)
 
         # 非交互执行必须可用于 CI：采用默认选择，并跳过终端选择器。
-        if self.auto_yes or not Path("/dev/tty").exists():
+        if self.auto_yes or not self.platform.can_interact():
             self.selected = default
+            if not self.auto_yes:
+                self.announce_default_selection(default)
             return default
 
         # 选择器只消费临时 TSV；finally 保证异常、取消和正常返回都会清理它。
@@ -94,6 +97,7 @@ class Uninstaller(Installer):
                 )
                 manifest.write("\t".join(value.replace("\t", " ") for value in fields) + "\n")
             manifest.close()
+            configured = self.shell_config()
             result = subprocess.run(
                 [
                     sys.executable,
@@ -105,15 +109,20 @@ class Uninstaller(Installer):
                     "--path-selected",
                     "0",
                     "--shell-config",
-                    str(self.shell_config()[0]),
+                    str(configured[0]) if configured else "",
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
                 check=False,
+                **platform_layer.text_kwargs(),
             )
         finally:
             manifest_path.unlink(missing_ok=True)
+        if result.returncode == 2:
+            # 选择器拿不到可用终端：显式降级为默认选择，不当作失败。
+            self.selected = default
+            self.announce_default_selection(default)
+            return default
         if result.returncode == 10:
             raise SystemExit(0)
         if result.returncode == 130:
@@ -146,12 +155,14 @@ class Uninstaller(Installer):
             plugin_ok = package not in remaining and f'"{CLAUDE_MARKETPLACE}"' not in marketplace
         # The plugin cache is shared with the desktop app, so it is always
         # removed; a missing CLI must not leave a loadable plugin behind.
-        shutil.rmtree(self.home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE, ignore_errors=True)
+        platform_layer.rmtree(
+            self.home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE, ignore_errors=True
+        )
         return plugin_ok and self.uninstall_platform_agents("claude")
 
     def uninstall_opencode_plugin(self) -> bool:
         """从 OpenCode 配置中删除 CodeKit 插件，并再次读取配置确认删除结果。"""
-        path = self.home / ".config" / "opencode" / "opencode.json"
+        path = config.opencode_config_file(self.home / ".config" / "opencode")
         try:
             plugin_ok = True
             if config.opencode_has_plugin(path):
@@ -168,17 +179,36 @@ class Uninstaller(Installer):
             self.run_command(["rtk", "init", "-g", "--codex", "--uninstall"])
         if self.command_exists("brew") and self.run_capture(["brew", "list", "rtk"]).returncode == 0:
             self.brew("uninstall", "rtk")
-        for path in (self.bin_dir / "rtk", self.home / ".local" / "bin" / "rtk"):
-            path.unlink(missing_ok=True)
+        # 发布包解出的是 rtk / rtk.exe；npm 风格入口在 Windows 上是 rtk.cmd。
+        for name in dict.fromkeys(
+            (self.platform.binary_filename("rtk"), self.platform.shim_name("rtk"))
+        ):
+            (self.bin_dir / name).unlink(missing_ok=True)
         return True
 
-    def uninstall_brew_component(self, formula: str) -> bool:
-        """按平台卸载 gh/glab，并删除 CodeKit 用户 bin 残留。"""
-        (self.bin_dir / formula).unlink(missing_ok=True)
-        if self.command_exists("brew") and self.run_capture(["brew", "list", formula]).returncode == 0:
-            return self.brew("uninstall", formula).returncode == 0
-        if self.os_name == "Linux" and self.linux_package_installed(formula):
-            return self.run_linux_package("remove", formula).returncode == 0
+    def uninstall_package_component(self, component_id: str) -> bool:
+        """按平台卸载由包管理器接管的 gh/glab，并清理 CodeKit 用户 bin 残留。"""
+        for name in dict.fromkeys(
+            (self.platform.shim_name(component_id), self.platform.binary_filename(component_id))
+        ):
+            (self.bin_dir / name).unlink(missing_ok=True)
+        if self.command_exists("brew") and self.run_capture(["brew", "list", component_id]).returncode == 0:
+            return self.brew("uninstall", component_id).returncode == 0
+        if self.os_name == "Linux" and self.linux_package_installed(component_id):
+            return self.run_linux_package("remove", component_id).returncode == 0
+        # Windows 上 gh/glab 由 winget 接管，必须走 winget uninstall，否则会留下
+        # 一份仍在 PATH 上的安装。
+        definition = self.component(component_id)
+        winget_id = definition.channels.get("winget", "") if definition else ""
+        if winget_id and self.channel_available("winget"):
+            result = self.run_command(
+                [
+                    "winget", "uninstall", "--id", winget_id, "--exact", "--silent",
+                    "--accept-source-agreements", "--disable-interactivity",
+                ],
+                timeout=600,
+            )
+            return result.returncode == 0
         return True
 
     def uninstall_gitnexus(self) -> bool:
@@ -215,8 +245,11 @@ class Uninstaller(Installer):
             self.run_command(["pipx", "uninstall", "graphifyy"])
         if self.command_exists("pip3"):
             self.run_command(["pip3", "uninstall", "-y", "graphifyy"])
-        shutil.rmtree(self.home / ".local" / "share" / "CodeKit" / "venvs" / "graphify", ignore_errors=True)
-        (self.bin_dir / "graphify").unlink(missing_ok=True)
+        platform_layer.rmtree(self.platform.venv_dir(self.home, "graphify"), ignore_errors=True)
+        for name in dict.fromkeys(
+            (self.platform.shim_name("graphify"), self.platform.binary_filename("graphify"))
+        ):
+            (self.bin_dir / name).unlink(missing_ok=True)
         return True
 
     def uninstall_codex_plugin(self) -> bool:
@@ -226,7 +259,7 @@ class Uninstaller(Installer):
             self.run_command(["codex", "plugin", "marketplace", "remove", CODEX_MARKETPLACE])
         for path in (self.home / ".agents" / "skills").glob("keel-*"):
             if path.is_dir():
-                shutil.rmtree(path)
+                platform_layer.rmtree(path, ignore_errors=True)
         return self.uninstall_platform_agents("codex")
 
     def uninstall_qoder_plugin(self, platform_key: str) -> bool:
@@ -254,8 +287,8 @@ class Uninstaller(Installer):
             "dingtalk_cli": self.uninstall_dingtalk_cli,
             "feishu_cli": self.uninstall_feishu_cli,
             "graphify": self.uninstall_graphify,
-            "gh": lambda: self.uninstall_brew_component("gh"),
-            "glab": lambda: self.uninstall_brew_component("glab"),
+            "gh": lambda: self.uninstall_package_component("gh"),
+            "glab": lambda: self.uninstall_package_component("glab"),
         }
         handler = handlers.get(component_id)
         if not handler:
@@ -277,14 +310,8 @@ class Uninstaller(Installer):
         self.cleanup_global_config()
 
     def shell_rcs(self) -> Iterable[Path]:
-        """返回卸载时需要检查的 Bash、Zsh 和 Fish 配置文件集合。"""
-        return (
-            self.home / ".bashrc",
-            self.home / ".bash_profile",
-            self.home / ".zshrc",
-            self.home / ".zprofile",
-            self.home / ".config" / "fish" / "config.fish",
-        )
+        """返回卸载时需要检查的 shell 配置文件集合；Windows 上没有。"""
+        return self.platform.shell_rc_files(self.home)
 
     def remove_matching_lines(self, path: Path, fragment: str) -> None:
         """从 shell 配置中删除包含指定片段的行，并在有变化时原子保存。"""
@@ -300,7 +327,7 @@ class Uninstaller(Installer):
         candidate = shutil.which("git-ai") or str(self.home / ".git-ai" / "bin" / "git-ai")
         if Path(candidate).is_file():
             self.run_command(["git", "ai", "uninstall-hooks"])
-        shutil.rmtree(self.home / ".git-ai", ignore_errors=True)
+        platform_layer.rmtree(self.home / ".git-ai", ignore_errors=True)
         (self.bin_dir / "git-ai").unlink(missing_ok=True)
         for path in self.shell_rcs():
             self.remove_matching_lines(path, "git-ai/bin")
@@ -331,8 +358,8 @@ class Uninstaller(Installer):
     def run(self) -> int:
         """执行完整卸载生命周期：状态检测、组件卸载和全局配置清理。"""
         self.logger.info(f"=== CodeKit Plugin Uninstall v{self.plugin_version} ===")
-        if self.os_name not in {"Darwin", "Linux"}:
-            raise InstallerError(f"Unsupported OS: {self.os_name}. Only macOS/Linux.")
+        if self.os_name not in {"Darwin", "Linux", "Windows"}:
+            raise InstallerError(f"Unsupported OS: {self.os_name}. Only macOS/Linux/Windows.")
         detector.registry.validate_registry()
         # npm 全局包默认落在用户前缀；卸载前挂载用户 bin，确保未 source shell
         # 配置时也能检测到并清理 GitNexus、钉钉 CLI、飞书 CLI。

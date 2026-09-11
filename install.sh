@@ -127,9 +127,13 @@ case " ${*:-} " in
   *" -h "*|*" --help "*) usage; exit 0 ;;
 esac
 
-# bootstrap 只支持 macOS/Linux；其余平台直接返回，避免执行不兼容命令。
+# bootstrap 只支持 macOS/Linux；Windows 走 install.ps1 / install.cmd。
 case "${OS_NAME}" in
   Darwin|Linux) ;;
+  MINGW*|MSYS*|CYGWIN*)
+    error "Windows 请使用 install.cmd（或 install.ps1），不要用 Git Bash 运行 install.sh。"
+    exit 1
+    ;;
   *) error "Unsupported OS: ${OS_NAME}"; exit 1 ;;
 esac
 

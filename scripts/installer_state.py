@@ -31,6 +31,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 
 import installer_agents as agents  # noqa: E402
+import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 
 
@@ -475,7 +476,7 @@ def present(component: str, context: Context) -> bool:
         return bool(listing) and has_line(listing, f"{CODEX_PLUGIN}@{CODEX_MARKETPLACE}") and platform_subagents_state(context, "codex") in {"installed", "up_to_date"}
     if component == "opencode_plugin":
         return config.opencode_has_plugin(
-            context.home / ".config" / "opencode" / "opencode.json"
+            config.opencode_config_file(context.home / ".config" / "opencode")
         ) and platform_subagents_state(context, "opencode") in {"installed", "up_to_date"}
     qoder_platform = qoder.platform_for_component(component)
     if qoder_platform is not None:
@@ -686,12 +687,17 @@ def component_install_path(component: str, context: Context) -> str:
         path = shutil.which(definition.command)
         if path:
             return display_path(Path(path), context.home)
+        # 回退路径同样按平台解析：Windows 的 npm 全局目录是 %APPDATA%\npm，
+        # 而且入口文件带 .cmd / .exe 后缀，不能沿用 POSIX 的两段式路径。
+        platform = platform_layer.platform_for()
+        npm_dir = platform.npm_bin_dir(platform.npm_prefix(context.home))
+        codekit_dir = platform.bin_dir(context.home, npm_dir)
         fallback = {
-            "rtk": context.home / ".local" / "bin" / "rtk",
-            "gitnexus": context.home / ".npm-global" / "bin" / "gitnexus",
-            "dingtalk_cli": context.home / ".npm-global" / "bin" / "dws",
-            "feishu_cli": context.home / ".npm-global" / "bin" / "lark-cli",
-            "graphify": context.home / ".local" / "bin" / "graphify",
+            "rtk": codekit_dir / platform.binary_filename("rtk"),
+            "gitnexus": npm_dir / platform.shim_name("gitnexus"),
+            "dingtalk_cli": npm_dir / platform.shim_name("dws"),
+            "feishu_cli": npm_dir / platform.shim_name("lark-cli"),
+            "graphify": codekit_dir / platform.shim_name("graphify"),
         }.get(component)
         return display_path(fallback, context.home) if fallback else "—"
     qoder_platform = qoder.platform_for_component(component)
@@ -839,7 +845,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         home=args.home,
         marketplace_local=args.marketplace_local,
         version_file=args.version_file
-        or args.home / ".local" / "state" / "CodeKit" / "installed_versions",
+        or platform_layer.platform_for().state_dir(args.home) / "installed_versions",
     )
     try:
         if args.command == "detect":

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Sequence
 
 from installer_config import read_json, validate_plugin_version, write_json
+from installer_platform import rmtree
 
 
 def copy_contents(source: Path, target: Path) -> None:
@@ -66,9 +67,11 @@ def update_json_fields(path: Path, fields: dict[str, str]) -> None:
 def remove_path(path: Path) -> None:
     """删除文件、软链接或目录；目标不存在时保持幂等。"""
     if path.is_symlink() or path.is_file():
-        path.unlink()
+        path.unlink(missing_ok=True)
     elif path.is_dir():
-        shutil.rmtree(path)
+        # 只读文件在 Windows 上会让 shutil.rmtree 抛 PermissionError，适配层的
+        # rmtree 会先清掉只读位再删。
+        rmtree(path, ignore_errors=True)
 
 
 def replace_stages(replacements: Sequence[tuple[Path, Path]]) -> None:
@@ -92,6 +95,9 @@ def replace_stages(replacements: Sequence[tuple[Path, Path]]) -> None:
             remove_path(destination)
         for destination, backup in reversed(backups):
             if backup.exists() or backup.is_symlink():
+                # Windows 上 os.replace 不能覆盖已存在的目录（POSIX 允许替换空目录），
+                # 因此回滚前必须先清掉半成品目标，否则回滚本身会再失败一次。
+                remove_path(destination)
                 os.replace(backup, destination)
         raise ValueError(f"could not replace staged plugin sources: {exc}") from exc
     else:
@@ -104,6 +110,7 @@ def prepare(source: Path, state_dir: Path) -> tuple[Path, Path, Path]:
     source = source.resolve()
     state_dir = state_dir.resolve()
     required = (
+        source / ".agents" / "plugins" / "marketplace.json",
         source / ".claude-plugin",
         source / ".codex-plugin",
         source / ".opencode",
@@ -133,6 +140,7 @@ def prepare(source: Path, state_dir: Path) -> tuple[Path, Path, Path]:
     qoder_tmp = Path(tempfile.mkdtemp(prefix=".qoder-source.tmp.", dir=qoder_parent))
     try:
         for directory in (
+            market_tmp / ".agents" / "plugins",
             market_tmp / ".claude-plugin",
             market_tmp / ".codex-plugin",
             market_tmp / ".opencode" / "plugins",
@@ -144,6 +152,9 @@ def prepare(source: Path, state_dir: Path) -> tuple[Path, Path, Path]:
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
+        # Codex 只认 `<root>/.agents/plugins/marketplace.json`；`.codex-plugin/`
+        # 提供的是插件自身的元数据，两者都需要。
+        copy_contents(source / ".agents", market_tmp / ".agents")
         copy_contents(source / ".claude-plugin", market_tmp / ".claude-plugin")
         copy_contents(source / ".codex-plugin", market_tmp / ".codex-plugin")
         copy_contents(source / ".opencode" / "plugins", market_tmp / ".opencode" / "plugins")

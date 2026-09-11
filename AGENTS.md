@@ -20,6 +20,10 @@ CodeKit 是一个面向 Claude、OpenCode、Codex、Qoder 和 Qoder CN 的 AI �
 - `.standard/`: 当前仓库已存在的全局规范和 Python 技术栈规范索引及正文。
 - `install.sh`: macOS/Linux 安装或升级入口，调用 scripts 下的安装编排逻辑。
 - `uninstall.sh`: macOS/Linux 卸载入口，调用独立卸载编排逻辑。
+- `install.ps1` / `install.cmd`: Windows 安装或升级入口（`install.cmd` 是 PowerShell 的 CMD 包装），只做 preflight 检测后转交同一套 Python 编排逻辑。
+- `uninstall.ps1` / `uninstall.cmd`: Windows 卸载入口。
+- `scripts/installer_platform.py`: 唯一的平台差异来源（npm 前缀、venv 布局、状态目录、临时目录、命令入口、特权与交互判定），安装、卸载、状态检测都读它。
+- `.agents/plugins/marketplace.json`: Codex 实际读取的 marketplace 清单（`.codex-plugin/` 只提供插件自身元数据，两者都必需）。
 
 ### Commands and Verification
 
@@ -31,8 +35,8 @@ CodeKit 是一个面向 Claude、OpenCode、Codex、Qoder 和 Qoder CN 的 AI �
 - 运行 product-doc 技能脚本测试。: `python3 skills/product-doc/tests/test_product_doc_skill_scripts.py` (evidence: `skills/product-doc/tests/test_product_doc_skill_scripts.py`, `skills/product-doc/scripts/validate_prd.py`)
 - 运行 technical-doc 控制器测试。: `python3 skills/technical-doc/tests/test_tech_doc_controller.py` (evidence: `skills/technical-doc/tests/test_tech_doc_controller.py`, `skills/technical-doc/scripts/tech_doc_controller.py`)
 - 运行 technical-doc 模板契约测试。: `python3 skills/technical-doc/tests/test_template_contract.py` (evidence: `skills/technical-doc/tests/test_template_contract.py`, `skills/technical-doc/references/technical-doc-template.md`)
-- 从本地仓库安装或升级选定的 CodeKit 组件。: `bash install.sh install -y` (evidence: `install.sh`, `README.md`, `INSTALL.md`)
-- 卸载选定的 CodeKit 组件。: `bash uninstall.sh -y` (evidence: `uninstall.sh`, `README.md`, `INSTALL.md`)
+- 从本地仓库安装或升级选定的 CodeKit 组件。: `bash install.sh install -y`（Windows: `install.cmd install -y`） (evidence: `install.sh`, `install.cmd`, `install.ps1`, `README.md`, `INSTALL.md`)
+- 卸载选定的 CodeKit 组件。: `bash uninstall.sh -y`（Windows: `uninstall.cmd -y`） (evidence: `uninstall.sh`, `uninstall.cmd`, `uninstall.ps1`, `README.md`, `INSTALL.md`)
 - 把 plugin-version.json 的版本同步到各平台 manifest。: `python3 scripts/sync-plugin-version.py` (evidence: `scripts/sync-plugin-version.py`, `plugin-version.json`, `lefthook.yml`)
 - 运行安装器、共享存储适配层和 agent 同步的回归测试（pre-push 门禁）。: `python3 -m unittest discover -s scripts -p 'test_*.py'` (evidence: `scripts/test_installer_qoder.py`, `scripts/test_installer_sources.py`, `scripts/test_installer_agents.py`, `lefthook.yml`)
 - 构建 GitNexus 仓库分析和技能索引。: `gitnexus analyze --skills --verbose` (evidence: `GUIDE.md`, `skills/initialize/SKILL.md`)

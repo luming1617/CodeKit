@@ -63,11 +63,38 @@
 在**本仓库根目录**执行（脚本以当前仓库作为插件市场源）：
 
 ```bash
+# macOS / Linux
 bash install.sh install [-y]
 bash uninstall.sh [-y]
 ```
 
+```bat
+:: Windows（CMD；也可直接调用 install.ps1 / uninstall.ps1）
+install.cmd install [-y]
+uninstall.cmd [-y]
+```
+
 `install.sh` 和 `uninstall.sh` 都依赖同仓库的 Python 安装/卸载编排器及组件辅助脚本，不再支持只传输单个脚本的 `curl ... | bash` 模式；需要远程安装或卸载时，请先克隆或下载完整仓库再执行。
+
+### Windows 入口说明
+
+四个 Windows 入口与 `install.sh` / `uninstall.sh` 职责完全对称：`install.ps1` / `uninstall.ps1`
+只做 preflight 检测，然后转交 `scripts/installer.py` / `scripts/uninstaller.py`；`.cmd` 只是
+PowerShell 的 CMD 包装（供 CMD 与双击使用）。
+
+| 事项 | 说明 |
+|------|------|
+| Python 启动方式 | `py -3`（其次 `python`）。**不使用 `python3`**：干净 Windows 上该名字是微软商店别名桩，执行后无输出 |
+| 编码 | 入口脚本传 `-X utf8`；安装器内部再 `sys.stdout.reconfigure(encoding="utf-8")` 兜底。GBK 无法编码 `▶` / `╔`，不处理会直接抛 `UnicodeEncodeError` |
+| 文件编码 | `.ps1` 必须 UTF-8 **with BOM**（PowerShell 5.1 对无 BOM 文件按 ANSI 解析，中文会乱码）；`.ps1` / `.cmd` 保持 CRLF |
+| 依赖探测 | `curl` 按「真实可执行文件」解析：PowerShell 5.1 内置 `curl` 别名指向 `Invoke-WebRequest`，按别名调用会绕过安装器需要的 `curl.exe` |
+| Git Bash | 在 Git Bash 里执行 `install.sh` 会被显式拒绝并提示改用 `install.cmd`；Windows 不走 MSYS/MINGW 的 POSIX 入口 |
+| 交互选择器 | 可用。后端按平台切换：POSIX 用 `/dev/tty` + `termios`，Windows 用 `CONOUT$` + `msvcrt` 并开启 ANSI 转义。拿不到终端时选择器返回退出码 2，安装器显式降级为默认选择并打印清单，**不会静默采用默认值** |
+
+> Windows 的路径与命令入口差异（npm 前缀、`Scripts\`、`.cmd` 转发、状态目录、文件语义）
+> 统一由 `scripts/installer_platform.py` 承担，完整对照表见
+> [INSTALL-STRATEGY.md §8](INSTALL-STRATEGY.md)。
+
 
 ---
 
@@ -93,22 +120,24 @@ bash uninstall.sh [-y]
 
 | 检查项 | 要求 | 失败处理 |
 |--------|------|----------|
-| Node.js | >= 24.0.0 | 未安装或版本不足即**汇总后退出（非 0）**，提示 brew / nvm / fnm / NodeSource 等安装方式 |
+| Node.js | >= 24.0.0 | 未安装或版本不足即**汇总后退出（非 0）**，提示 brew / nvm / fnm / NodeSource 等安装方式（Windows 提示 `winget install OpenJS.NodeJS.LTS` 与 nvm-windows） |
 | npm | 存在即可 | 同上 |
-| Python3 | >= 3.10 | 同上（graphify 要求 Python >= 3.10） |
-| git | 存在即可（**不校验版本**） | 同上 |
-| curl / wget | 任一存在 | 同上 |
+| Python3 | >= 3.10 | 同上（graphify 要求 Python >= 3.10）。**Windows 用 `py -3` 探测，不用 `python3`**（后者是微软商店别名桩） |
+| git | 存在即可（**不校验版本**） | 同上（Windows 提示 `winget install Git.Git`） |
+| curl / wget | 任一存在 | 同上。**Windows 由 `install.ps1` 检查 `curl.exe`**；PowerShell 的 `curl` 别名不算 |
 | 编程智能体 | `preflight_agents` 只探测 Claude / Codex / OpenCode / Qoder / Qoder CN 的 **CLI 本体** | 五者 CLI 均不存在时只提示并**继续流程**（退出码 0）；勾选某个平台插件时先安装该平台 CLI |
 
 > 安装器不再自动安装 Homebrew / git / Node.js / Python3 / curl；Homebrew 仅在已安装时作为可选安装通道使用。
 > git 的历史门槛 `>= 2.50.1` 随 git-ai 组件下线一并取消。
+> macOS/Linux 的 preflight 由 `install.sh` 承担（bash），Windows 由 `install.ps1` 承担（PowerShell），
+> 两者检查同一组门槛，只是探测命令与手动安装指引按平台给出。
 
 
 ---
 
 ## 5. 安装组件清单
 
-组件的唯一注册源是 `scripts/component-registry.py` 中的 `COMPONENTS` 和 `GROUPS`。每个 `Component` 同时声明 `command` / `version_args` / `channels` / `requires`：`channels` 就是该组件的安装策略（`npm`/`brew`/`brew_cask`/`apt`/`pipx`/`venv`/`script`/`release`），全平台按 `CHANNEL_ORDER` 统一探测。详细规则见 [INSTALL-STRATEGY.md](INSTALL-STRATEGY.md)。`installer_state.py` 在启动时校验组件 ID、重复项、分组引用、分组顺序、通道合法性（npm 目标必须在官方白名单内）及 TSV 安全性；`installer.py` 的 `install_component` 与 `uninstaller.py` 的 `uninstall_component` 各用一张分发表把组件 ID 映射到对应的 `install_*` / `uninstall_*` 处理器，覆盖性由 `scripts/test_installer_contracts.py` 断言（注册表、安装分发、卸载分发、版本记录四方必须一致）。
+组件的唯一注册源是 `scripts/component-registry.py` 中的 `COMPONENTS` 和 `GROUPS`。每个 `Component` 同时声明 `command` / `version_args` / `channels` / `requires`：`channels` 就是该组件的安装策略（`npm`/`brew`/`brew_cask`/`apt`/`winget`/`pipx`/`venv`/`release`/`script`/`powershell`），全平台按 `CHANNEL_ORDER` 统一探测；其中 `winget` 与 `powershell` 是 Windows 专用通道，在其他平台可用性恒为假。详细规则见 [INSTALL-STRATEGY.md](INSTALL-STRATEGY.md)。`installer_state.py` 在启动时校验组件 ID、重复项、分组引用、分组顺序、通道合法性（npm 目标必须在官方白名单内）及 TSV 安全性；`installer.py` 的 `install_component` 与 `uninstaller.py` 的 `uninstall_component` 各用一张分发表把组件 ID 映射到对应的 `install_*` / `uninstall_*` 处理器，覆盖性由 `scripts/test_installer_contracts.py` 断言（注册表、安装分发、卸载分发、版本记录四方必须一致）。
 
 | # | 组件 ID           | 展示名称                          | 分组     |
 |---|-------------------|-----------------------------------|----------|

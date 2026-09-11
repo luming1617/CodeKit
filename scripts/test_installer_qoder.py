@@ -20,6 +20,28 @@ import installer_state as detector  # noqa: E402
 from installer import Installer, InstallerError  # noqa: E402
 
 
+# 宿主若导出了 QODER*_CONFIG_DIR，共享配置根会被覆盖，断言就会指向真实用户目录
+# 而不是临时目录。整模块运行期间先移除它们，tearDown 时再恢复。
+_AMBIENT_ENV_PATCH = None
+
+
+def setUpModule() -> None:
+    """隔离宿主导出的 Qoder 根目录覆盖。"""
+    global _AMBIENT_ENV_PATCH
+    _AMBIENT_ENV_PATCH = patch.dict(os.environ, {}, clear=False)
+    _AMBIENT_ENV_PATCH.start()
+    for key in ("QODER_CONFIG_DIR", "QODERCN_CONFIG_DIR"):
+        os.environ.pop(key, None)
+
+
+def tearDownModule() -> None:
+    """恢复本模块运行前的环境。"""
+    global _AMBIENT_ENV_PATCH
+    if _AMBIENT_ENV_PATCH is not None:
+        _AMBIENT_ENV_PATCH.stop()
+        _AMBIENT_ENV_PATCH = None
+
+
 # A registry entry shaped the way the desktop IDE writes it: an install path with
 # no version subdirectory, a nine-digit timestamp, and keys CodeKit never owns.
 DESKTOP_FOREIGN_ENTRY = {
@@ -86,7 +108,8 @@ class ConfigRootTests(unittest.TestCase):
     def test_home_relative_override_is_expanded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / "cfg").mkdir()
-            with patch.dict(os.environ, {"HOME": directory}, clear=False):
+            # Windows 的 expanduser("~") 读 USERPROFILE 而不是 HOME，两个都要给。
+            with patch.dict(os.environ, {"HOME": directory, "USERPROFILE": directory}, clear=False):
                 root = qoder.resolve_config_root(
                     self.descriptor, Path(directory), {self.descriptor.config_env: "~/cfg"}
                 )
@@ -469,12 +492,17 @@ class PresenceTests(unittest.TestCase):
     def test_cli_wins_over_the_shared_root(self) -> None:
         root = self.home / ".qoder"
         root.mkdir()
+        # Windows 的 shutil.which 依赖 PATHEXT，裸文件不会被当作命令；解析结果还会
+        # 把后缀规范成大写（qoder.CMD），因此按文件身份比较而不是字符串。
+        windows = os.name == "nt"
+        executable = self.home / ("qoder.cmd" if windows else "qoder")
+        executable.write_text("@echo off\r\n" if windows else "#!/bin/sh\n", encoding="utf-8")
+        executable.chmod(0o755)
         environ = dict(self.environ, PATH=str(self.home))
-        (self.home / "qoder").write_text("#!/bin/sh\n", encoding="utf-8")
-        os.chmod(self.home / "qoder", 0o755)
-        self.assertEqual(
-            qoder.agent_presence("qoder", self.home, "Linux", environ),
-            f"qoder ({self.home / 'qoder'})",
+        source = qoder.agent_presence("qoder", self.home, "Linux", environ)
+        self.assertTrue(source.startswith("qoder ("), source)
+        self.assertTrue(
+            os.path.samefile(source.removeprefix("qoder (").removesuffix(")"), executable)
         )
 
     def test_agent_location_exposes_the_shared_agents_directory(self) -> None:
@@ -569,7 +597,10 @@ class SharedStateTests(unittest.TestCase):
         with patch.dict(os.environ, self.no_cli_env, clear=False):
             os.environ.pop(self.descriptor.config_env, None)
             path = detector.component_install_path("qodercn_plugin", self.context)
-        self.assertTrue(path.endswith(".qoder-cn/plugins/cache/local/codekit"))
+        # 展示路径按宿主分隔符渲染，Windows 上是反斜杠。
+        self.assertTrue(
+            path.replace("\\", "/").endswith(".qoder-cn/plugins/cache/local/codekit")
+        )
 
     def test_broken_shared_root_never_raises_out_of_detection(self) -> None:
         with patch.dict(os.environ, {self.descriptor.config_env: str(self.home / "gone")}, clear=False):

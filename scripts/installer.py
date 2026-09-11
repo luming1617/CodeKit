@@ -41,6 +41,7 @@ except ValueError as exc:
     raise SystemExit(1)
 
 import installer_agents as agents  # noqa: E402
+import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 import installer_sources as source_builder  # noqa: E402
 import installer_state as detector  # noqa: E402
@@ -64,6 +65,7 @@ class RunResult:
 class Logger:
     def __init__(self, state_dir: Path) -> None:
         """初始化安装日志器，并确保状态目录已经存在。"""
+        platform_layer.configure_stdout_encoding()
         self.state_dir = state_dir
         self.log_path = state_dir / "install.log"
         self.use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
@@ -152,17 +154,21 @@ class Installer:
         """创建一次安装会话，并初始化路径、状态和结果记录。"""
         self.auto_yes = auto_yes
         self.home = Path.home()
-        xdg_state = Path(os.environ.get("XDG_STATE_HOME", str(self.home / ".local" / "state"))).expanduser()
-        self.state_dir = xdg_state / "CodeKit"
-        self.bin_dir = self.home / ".local" / "bin"
-        self.npm_prefix = self.home / ".npm-global"
+        # 平台差异（npm 前缀、venv 布局、状态目录、临时目录、交互能力）全部由
+        # 适配层给出，安装/卸载/状态检测三处不再各自硬编码 POSIX 假设。
+        self.platform = platform_layer.platform_for()
+        self.os_name = self.platform.os_name
+        probed_prefix = platform_layer.probe_npm_prefix() if self.platform.is_windows else ""
+        self.npm_prefix = self.platform.npm_prefix(self.home, probed_prefix)
+        self.npm_bin_dir = self.platform.npm_bin_dir(self.npm_prefix)
+        self.bin_dir = self.platform.bin_dir(self.home, self.npm_bin_dir)
+        self.state_dir = self.platform.state_dir(self.home)
         self.version_file = self.state_dir / "installed_versions"
         self.logger = Logger(self.state_dir)
         self.changed_paths: list[str] = []
         self.states: dict[str, detector.ComponentState] = {}
         self.selected: list[str] = []
         self.install_records: list[tuple[str, str, str]] = []
-        self.os_name = platform.system()
         self.marketplace_local = self._detect_marketplace()
         self.market_dir: Optional[Path] = None
         self.opencode_source_dir: Optional[Path] = None
@@ -189,6 +195,9 @@ class Installer:
     def _detect_marketplace(self) -> Optional[Path]:
         """检查当前仓库是否具备生成兼容插件源所需的完整文件。"""
         required = (
+            # Codex 只认 <root>/.agents/plugins/marketplace.json；`.codex-plugin/`
+            # 提供的是插件自身元数据，两者都必须存在。
+            REPO_DIR / ".agents" / "plugins" / "marketplace.json",
             REPO_DIR / ".claude-plugin" / "marketplace.json",
             REPO_DIR / ".codex-plugin" / "marketplace.json",
             REPO_DIR / ".claude-plugin" / "plugin.json",
@@ -217,15 +226,36 @@ class Installer:
     def ensure_user_bin(self) -> None:
         """创建用户级 bin 目录，并让 npm 全局 bin 与本地 bin 立即生效。"""
         self.bin_dir.mkdir(parents=True, exist_ok=True)
-        (self.npm_prefix / "bin").mkdir(parents=True, exist_ok=True)
+        self.npm_bin_dir.mkdir(parents=True, exist_ok=True)
         self.prepend_path(self.bin_dir)
-        self.prepend_path(self.npm_prefix / "bin")
+        self.prepend_path(self.npm_bin_dir)
 
     def set_npm(self) -> None:
-        """切换到用户态 npm 前缀并统一下发镜像源，避免 sudo 写系统目录和直连 registry.npmjs.org。"""
-        os.environ["npm_config_prefix"] = str(self.npm_prefix)
+        """统一下发 npm 镜像源，并在需要时切换到用户态前缀。
+
+        macOS/Linux 把前缀指到用户目录（`~/.npm-global`），避免 sudo 写系统目录；
+        Windows 沿用 npm 自己的前缀，它已经被 Node 安装包写进 PATH，覆写反而要
+        额外维护一份 PATH 配置。
+        """
+        if not self.platform.is_windows:
+            os.environ["npm_config_prefix"] = str(self.npm_prefix)
         os.environ["npm_config_registry"] = config.NPM_REGISTRY
-        self.prepend_path(self.npm_prefix / "bin")
+        self.prepend_path(self.npm_bin_dir)
+
+    @staticmethod
+    def _resolve_command(command: Sequence[str]) -> list[str]:
+        """把 argv[0] 解析成可执行文件的全路径。
+
+        Windows 的 CreateProcess 不按 PATHEXT 展开裸命令名，`["npm", ...]` 会直接抛
+        WinError 2（npm 实际是 npm.CMD）；换成全路径后可以直接启动，既不必动用
+        `shell=True`（避免引号与注入风险），也不用关心具体是 .exe 还是 .cmd。
+        """
+        resolved = [str(item) for item in command]
+        if resolved and not any(separator in resolved[0] for separator in (os.sep, "/", "\\")):
+            found = platform_layer.resolve_exe(resolved[0])
+            if found:
+                resolved[0] = found
+        return resolved
 
     def run_command(
         self,
@@ -239,7 +269,7 @@ class Installer:
 
         timeout 到期后终止子进程并返回 124，避免挂起的 CLI 让安装/卸载无限阻塞。
         """
-        command = [str(item) for item in args]
+        command = self._resolve_command(args)
         self.logger.command_start(command)
         try:
             process = subprocess.Popen(
@@ -249,8 +279,8 @@ class Installer:
                 stdin=None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
                 bufsize=1,
+                **platform_layer.text_kwargs(),
             )
         except OSError as exc:
             self.logger.command_finished(command, 127, str(exc))
@@ -281,13 +311,13 @@ class Installer:
         """静默执行探测命令并返回结果，失败或超时统一返回失败结果。"""
         try:
             result = subprocess.run(
-                [str(item) for item in args],
+                self._resolve_command(args),
                 env=os.environ.copy(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                text=True,
                 timeout=timeout,
                 check=False,
+                **platform_layer.text_kwargs(),
             )
         except (OSError, subprocess.TimeoutExpired):
             return RunResult(1)
@@ -295,20 +325,20 @@ class Installer:
 
     def run_with_input(self, args: Sequence[str], content: str, env: Optional[dict[str, str]] = None) -> RunResult:
         """向外部命令写入文本输入并显示摘要；完整输出写入安装日志。"""
-        command = [str(item) for item in args]
+        command = self._resolve_command(args)
         self.logger.command_start(command)
         merged_env = os.environ.copy()
         if env:
             merged_env.update(env)
         try:
             result = subprocess.run(
-                [str(item) for item in args],
+                command,
                 input=content,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
                 env=merged_env,
                 check=False,
+                **platform_layer.text_kwargs(),
             )
         except OSError:
             self.logger.command_finished(command, 127)
@@ -401,7 +431,7 @@ class Installer:
         command = self.linux_package_command(action, package)
         if not command:
             return RunResult(127)
-        if os.geteuid() != 0:
+        if not platform_layer.is_admin():
             if not self.command_exists("sudo"):
                 self.logger.error("Linux package operation requires root privileges or sudo.")
                 return RunResult(127)
@@ -543,22 +573,32 @@ class Installer:
             return f" (插件有更新 {plugin_version} · {cli_text}，勾选后升级)"
         return f" (插件已最新 {plugin_version} · {cli_text}，勾选后重装)"
 
-    def shell_config(self) -> tuple[Path, str]:
-        """根据用户 shell 返回配置文件路径及需要写入的 PATH 配置行。"""
-        shell = Path(os.environ.get("SHELL", "/bin/bash")).name
-        if shell == "fish":
-            return self.home / ".config" / "fish" / "config.fish", 'fish_add_path -g "${HOME}/.local/bin" "${HOME}/.npm-global/bin"'
-        if shell == "zsh":
-            return self.home / ".zshrc", 'export PATH="${HOME}/.local/bin:${HOME}/.npm-global/bin:${PATH}"'
-        return self.home / ".bashrc", 'export PATH="${HOME}/.local/bin:${HOME}/.npm-global/bin:${PATH}"'
+    def shell_config(self) -> Optional[tuple[Path, str]]:
+        """返回需要写入 PATH 的 shell 配置；Windows 上没有这样的文件。"""
+        return self.platform.shell_config(self.home)
 
     def path_configured(self) -> bool:
-        """检查当前 shell 配置是否已经包含 CodeKit 用户工具目录。"""
-        path, line = self.shell_config()
+        """检查当前 shell 配置是否已经包含 CodeKit 用户工具目录。
+
+        Windows 没有可写的 shell 配置，改为检查 npm 全局目录是否已在 PATH 上
+        （Node 安装包通常会写入），避免把「配置缺失」误报成需要处理。
+        """
+        configured = self.shell_config()
+        if configured is None:
+            return self.tool_dir_on_path()
+        path, line = configured
         try:
             return line in path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             return False
+
+    def tool_dir_on_path(self) -> bool:
+        """判断本平台需要的用户工具目录是否已经出现在 PATH 中。"""
+        entries = {os.path.normcase(os.path.normpath(value)) for value in os.environ.get("PATH", "").split(os.pathsep) if value}
+        for directory in (self.bin_dir, self.npm_bin_dir):
+            if os.path.normcase(os.path.normpath(str(directory))) not in entries:
+                return False
+        return True
 
     def cli_available_for(self, component_id: str) -> bool:
         """判断组件是否没有 CLI 前置要求，或该前置已经满足。"""
@@ -566,6 +606,30 @@ class Installer:
         if entry is None:
             return True
         return bool(self.agent_cli_status(entry.key)[0])
+
+    def announce_default_selection(self, default: Sequence[str]) -> None:
+        """显式播报默认选择，替代不可用的交互选择器。
+
+        静默采用默认值比报错更糟：用户会以为自己在交互，实际已经被决定。这里把
+        与选择器等价的清单（分组、状态标签、勾选标记）直接打印出来。
+        """
+        self.logger.warn(
+            "交互式选择器暂不可用（需要 termios 与 /dev/tty），本次使用默认选择。"
+        )
+        previous_group = ""
+        lines = ["\n  本次安装选择（● = 勾选，○ = 跳过）："]
+        for index, item in enumerate(self.components, 1):
+            title = detector.registry.GROUPS[item.group]
+            if item.group != previous_group:
+                if previous_group:
+                    lines.append("")
+                lines.append(f"  {title}")
+                previous_group = item.group
+            mark = "●" if item.component_id in default else "○"
+            lines.append(
+                f"   {mark} {index:>2}. {item.description}{self.component_tag(item.component_id)}"
+            )
+        self.logger.info("\n".join(lines))
 
     def select_components(self) -> list[str]:
         """按安装状态生成默认选择，并在交互模式下调用选择器回填用户选择。"""
@@ -578,9 +642,11 @@ class Installer:
         ]
         path_selected = not self.path_configured()
         # 非交互执行必须可用于 CI：采用默认选择，并跳过终端选择器。
-        if self.auto_yes or not Path("/dev/tty").exists():
+        if self.auto_yes or not self.platform.can_interact():
             self.setup_path_selected = path_selected
             self.selected = default
+            if not self.auto_yes:
+                self.announce_default_selection(default)
             return default
 
         # 选择器只消费临时 TSV；finally 保证异常、取消和正常返回都会清理它。
@@ -596,13 +662,21 @@ class Installer:
                 )
                 manifest.write("\t".join(value.replace("\t", " ") for value in fields) + "\n")
             manifest.close()
-            path, _ = self.shell_config()
+            configured = self.shell_config()
             result = subprocess.run(
-                [sys.executable, str(SCRIPT_DIR / "component-selector.py"), "--mode", "install", "--manifest", str(manifest_path), "--path-selected", "1" if path_selected else "0", "--shell-config", str(path)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+                [sys.executable, str(SCRIPT_DIR / "component-selector.py"), "--mode", "install", "--manifest", str(manifest_path), "--path-selected", "1" if path_selected else "0", "--shell-config", str(configured[0]) if configured else ""],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                **platform_layer.text_kwargs(),
             )
         finally:
             manifest_path.unlink(missing_ok=True)
+        if result.returncode == 2:
+            # 选择器拿不到可用终端（例如没有控制台的 Windows 会话）：显式降级，
+            # 不把缺少终端当成失败。
+            self.setup_path_selected = path_selected
+            self.selected = default
+            self.announce_default_selection(default)
+            return default
         if result.returncode == 10:
             raise SystemExit(0)
         if result.returncode == 130:
@@ -660,6 +734,9 @@ class Installer:
         if kind == "apt":
             # apt 通道的 target 是 Debian/Ubuntu 包名，只在该包管理器下可用。
             return self.linux_package_manager() == "apt-get"
+        if kind == "winget":
+            # winget 只在 Windows 上存在；其他平台的同名命令即使有也不应使用。
+            return self.platform.is_windows and self.command_exists("winget")
         if kind == "pipx":
             return (
                 self.command_exists("pipx")
@@ -670,21 +747,61 @@ class Installer:
             return self.run_capture(
                 [sys.executable, "-c", "import venv, ensurepip"]
             ).returncode == 0
-        if kind in {"script", "release"}:
+        if kind == "script":
+            # 官方 .sh 安装脚本只在类 Unix 环境里跑。Git for Windows 也会把 bash 放进
+            # PATH，所以不能只判断"有没有 shell"：否则 Windows 上会退化成用 Git Bash
+            # 执行 Unix 安装脚本，把文件装进 MSYS 目录树而不是 Windows 的 npm 目录。
+            return not self.platform.is_windows and bool(
+                platform_layer.remote_script_command("bash")
+            )
+        if kind == "powershell":
+            # 严格限定 Windows：pwsh 在 macOS/Linux 上也可能存在，但那些 .ps1
+            # 是 Windows 专用的安装脚本，不能跨平台执行。
+            return self.platform.is_windows and bool(
+                platform_layer.remote_script_command("powershell")
+            )
+        if kind == "release":
             return self.command_exists("curl") or self.command_exists("wget")
         return False
 
     def manual_note(self, component) -> str:
         """生成组件的手动安装指引，供所有通道都失败时提示。"""
-        if "script" in component.channels:
-            return f"curl -fsSL {config.github_proxy_url(component.channels['script'])} | bash"
-        if "npm" in component.channels:
+        channels = component.channels
+        # Windows 上没有可用的 Unix shell，`curl … | bash` 这条提示会把人引到不存在的
+        # 解释器上；按 Windows 真正可用的通道给指引。
+        if self.platform.is_windows:
+            if "winget" in channels:
+                return f"winget install --id {channels['winget']} --exact"
+            if "npm" in channels:
+                registry = " ".join(config.NPM_REGISTRY_ARGS)
+                return f"npm install -g {channels['npm']} {registry}"
+            if "powershell" in channels:
+                return (
+                    "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+                    f"\"irm {channels['powershell']} | iex\""
+                )
+            if component.release is not None:
+                return (
+                    f"从 {component.release.repo} 的 Releases 下载对应的 Windows 资产"
+                    f"（{component.release.binary}）手工安装并加入 PATH"
+                )
+            return "请参考官方文档"
+        if "script" in channels:
+            return f"curl -fsSL {config.github_proxy_url(channels['script'])} | bash"
+        if "powershell" in channels:
+            return (
+                "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+                f"\"irm {channels['powershell']} | iex\""
+            )
+        if "npm" in channels:
             registry = " ".join(config.NPM_REGISTRY_ARGS)
-            return f"npm install -g {component.channels['npm']} {registry}"
-        if "brew" in component.channels:
-            return f"brew install {component.channels['brew']}（建议先按 INSTALL.md 配置中科大镜像）"
-        if "apt" in component.channels:
-            return f"sudo apt-get install -y {component.channels['apt']}"
+            return f"npm install -g {channels['npm']} {registry}"
+        if "winget" in channels:
+            return f"winget install --id {channels['winget']} --exact"
+        if "brew" in channels:
+            return f"brew install {channels['brew']}（建议先按 INSTALL.md 配置中科大镜像）"
+        if "apt" in channels:
+            return f"sudo apt-get install -y {channels['apt']}"
         return "请参考官方文档"
 
     def install_via_channels(self, component_id: str) -> bool:
@@ -727,12 +844,16 @@ class Installer:
             return self.install_brew_cask(target, component.command)
         if kind == "apt":
             return self.install_apt_package(target, component.command)
+        if kind == "winget":
+            return self.install_winget_package(target, component.command)
         if kind == "pipx":
             return self.install_pipx_package(target, component.command)
         if kind == "venv":
             return self.install_venv_package(target, component.command)
         if kind == "script":
             return self.run_remote_script(target) and self.command_exists(component.command)
+        if kind == "powershell":
+            return self.run_remote_script(target, shell="powershell") and self.command_exists(component.command)
         if kind == "release":
             return self.install_release(component)
         return False
@@ -765,6 +886,22 @@ class Installer:
             return False
         return self.command_exists(command)
 
+    def install_winget_package(self, package: str, command: str) -> bool:
+        """经 winget 安装或升级一个组件。
+
+        非交互场景必须显式接受包协议与源协议，否则 winget 会挂起等待输入；
+        `--disable-interactivity` 同时关掉可能弹出的进度交互。
+        """
+        common = (
+            "--id", package, "--exact", "--silent",
+            "--accept-package-agreements", "--accept-source-agreements",
+            "--disable-interactivity",
+        )
+        action = "upgrade" if self.command_exists(command) else "install"
+        if self.run_command(["winget", action, *common], timeout=1200).returncode != 0:
+            return False
+        return self.command_exists(command)
+
     def ensure_pipx(self) -> bool:
         """确保 pipx 可用；缺失时按发行版包管理器 → Homebrew 补装。"""
         if self.command_exists("pipx"):
@@ -786,18 +923,20 @@ class Installer:
         return result.returncode == 0 and self.command_exists(command)
 
     def install_venv_package(self, package: str, command: str) -> bool:
-        """把 PyPI 包装进独立 venv，并用用户级软链接暴露其命令。"""
-        venv = self.home / ".local" / "share" / "CodeKit" / "venvs" / command
+        """把 PyPI 包装进独立 venv，并把它的命令暴露到用户 bin 目录。"""
+        venv = self.platform.venv_dir(self.home, command)
         if venv.exists():
-            shutil.rmtree(venv)
-        pip = venv / "bin" / "pip"
+            platform_layer.rmtree(venv, ignore_errors=True)
+        pip = self.platform.venv_pip(venv)
         if self.run_command([sys.executable, "-m", "venv", str(venv)]).returncode != 0:
             return False
         if not pip.exists() or self.run_command([str(pip), "install", "-U", package]).returncode != 0:
             return False
-        target = self.bin_dir / command
-        target.unlink(missing_ok=True)
-        target.symlink_to(venv / "bin" / command)
+        executable = self.platform.venv_exe(venv, command)
+        if not executable.exists():
+            return False
+        # Windows 上不能靠符号链接暴露 venv 命令，适配层会改写成 .cmd 转发脚本。
+        self.platform.expose_command(self.bin_dir, command, executable)
         return self.command_exists(command)
 
     def release_arch(self) -> str:
@@ -872,7 +1011,7 @@ class Installer:
             "--speed-time", "20", "--retry", "2", "--retry-max-time", "180",
             "--continue-at", "-", "--progress-bar",
         ]
-        fd, name = tempfile.mkstemp(prefix="codekit-release-", dir=os.environ.get("TMPDIR", "/tmp"))
+        fd, name = tempfile.mkstemp(prefix="codekit-release-", dir=self.platform.temp_dir())
         os.close(fd)
         temporary = Path(name)
         result = RunResult(1)
@@ -892,7 +1031,11 @@ class Installer:
         return temporary
 
     def extract_release_binary(self, archive: Path, binary: str) -> Optional[Path]:
-        """从 tar.gz/zip 发布包中定位目标可执行文件。"""
+        """从 tar.gz/zip 发布包中定位目标可执行文件。
+
+        Windows 构建的可执行文件带 ``.exe``，因此按平台文件名与裸名各找一次，
+        这样同一个发布说明在 macOS/Linux 与 Windows 上都能命中。
+        """
         directory = Path(tempfile.mkdtemp(prefix="codekit-extract-"))
         try:
             if zipfile.is_zipfile(archive):
@@ -907,9 +1050,10 @@ class Installer:
                         package.extractall(directory)
         except (OSError, tarfile.TarError, zipfile.BadZipFile, ValueError):
             return None
-        for candidate in directory.rglob(binary):
-            if candidate.is_file():
-                return candidate
+        for name in dict.fromkeys((self.platform.binary_filename(binary), binary)):
+            for candidate in directory.rglob(name):
+                if candidate.is_file():
+                    return candidate
         return None
 
     def install_release(self, component) -> bool:
@@ -929,17 +1073,27 @@ class Installer:
             archive.unlink(missing_ok=True)
         if binary is None:
             return False
-        target = self.bin_dir / component.release.binary
+        target = self.platform.release_target(self.bin_dir, component.release.binary)
         target.unlink(missing_ok=True)
         shutil.move(str(binary), str(target))
-        target.chmod(0o755)
+        if not self.platform.is_windows:
+            target.chmod(0o755)
         self.track(target)
         return self.command_exists(component.command)
 
     def run_remote_script(self, url: str, shell: str = "bash", env: Optional[dict[str, str]] = None) -> bool:
-        """下载远程安装脚本后交给指定 shell 执行，并返回脚本是否成功。"""
+        """下载远程安装脚本后交给平台原生的 shell 执行。
+
+        shell="powershell" 用于 Windows 专用的 .ps1 安装器（Qoder 等官方只提供
+        .ps1），脚本同样经 stdin 喂入，避免落盘与执行策略的额外处理。
+        """
         script = self.fetch_text(url)
-        return bool(script) and self.run_with_input([shell], script, env).returncode == 0
+        if not script:
+            return False
+        command = platform_layer.remote_script_command(shell)
+        if not command:
+            return False
+        return self.run_with_input(list(command), script, env).returncode == 0
 
     def configure_rtk(self) -> bool:
         """为已存在的 AI 编程工具注册 rtk 的全局 token 优化配置。"""
@@ -968,8 +1122,12 @@ class Installer:
         return self.run_command(["gitnexus", "setup"]).returncode == 0
 
     def ensure_unzip(self) -> bool:
-        """确保钉钉 CLI 的安装脚本可以调用 unzip。"""
-        if self.command_exists("unzip"):
+        """确保钉钉 CLI 的安装脚本可以调用解压工具。
+
+        Windows 上不需要：钉钉的 install.js 在 win32 分支改用 PowerShell 的
+        Expand-Archive 解压 zip，Windows 也没有默认的 unzip 命令。
+        """
+        if self.platform.is_windows or self.command_exists("unzip"):
             return True
 
         self.logger.info("unzip not found; installing it before DingTalk CLI...")
@@ -1119,13 +1277,17 @@ class Installer:
                 self.brew_install_or_upgrade(target, entry.commands[0])
             elif kind == "brew_cask":
                 self.install_brew_cask(target, entry.commands[0])
+            elif kind == "winget":
+                self.install_winget_package(target, entry.commands[0])
             elif kind == "script":
                 self.run_remote_script(target)
+            elif kind == "powershell":
+                self.run_remote_script(target, shell="powershell")
             if detector.agent_cli_presence(platform_key, self.home):
                 installed = True
                 break
         if not installed:
-            note = agents.fallback_note(entry)
+            note = agents.fallback_note(entry, windows=self.platform.is_windows)
             self.logger.error(
                 f"{entry.display_name} CLI 安装失败；请手动执行：{note}，然后重新运行安装。"
             )
@@ -1176,8 +1338,12 @@ class Installer:
             return False
         if not self.install_platform_agents("opencode"):
             return False
-        path = self.home / ".config" / "opencode" / "opencode.json"
-        plugin = f"codekit@file://{self.opencode_source_dir}"
+        # 写 opencode 自己解析到的那份配置：它按 opencode.json → opencode.jsonc
+        # 的顺序取第一个存在的文件，写错文件会让同一个插件出现在两份配置里。
+        path = config.opencode_config_file(self.home / ".config" / "opencode")
+        # 必须用 file URI 而不是直接拼路径：Windows 盘符路径含冒号与反斜杠，
+        # `file://C:\...` 会被解析成主机名为盘符的 UNC 路径。
+        plugin = f"codekit@{self.opencode_source_dir.as_uri()}"
         try:
             if config.opencode_has_plugin(path):
                 result = self.run_command(["opencode", "plugin", plugin, "-g", "-f"]) if self.run_capture(["opencode", "plugin", "--help"]).returncode == 0 else RunResult(0)
@@ -1337,8 +1503,17 @@ class Installer:
         self.track(self.version_file)
 
     def setup_shell_path(self) -> None:
-        """向当前 shell 配置追加一次性 PATH 配置，已存在时保持文件不变。"""
-        path, line = self.shell_config()
+        """向当前 shell 配置追加一次性 PATH 配置，已存在时保持文件不变。
+
+        Windows 没有可写的 shell 配置（PowerShell profile 路径本地化且可能被
+        OneDrive 重定向），改为校验 PATH 并在缺失时打印手动指引。
+        """
+        configured = self.shell_config()
+        if configured is None:
+            if not self.tool_dir_on_path():
+                self.logger.warn(self.platform.path_hint(self.home, self.npm_bin_dir))
+            return
+        path, line = configured
         old = path.read_text(encoding="utf-8") if path.exists() else ""
         if line in old:
             return
@@ -1347,15 +1522,19 @@ class Installer:
 
     def print_next_steps(self) -> None:
         """用醒目的表格打印后续操作及其作用。"""
-        shell_path, _ = self.shell_config()
-        try:
-            shell_path_text = f"~/{shell_path.relative_to(self.home)}"
-        except ValueError:
-            shell_path_text = str(shell_path)
-        rows = [
-            ("重启智能体应用", "让本次安装的插件、技能和配置立即生效"),
-            (f"source {shell_path_text}", "让本次安装的用户级命令立即在当前终端生效"),
-        ]
+        rows = [("重启智能体应用", "让本次安装的插件、技能和配置立即生效")]
+        configured = self.shell_config()
+        if configured is None:
+            rows.append(("新开一个终端", "让本次安装的用户级命令立即生效"))
+        else:
+            shell_path = configured[0]
+            try:
+                shell_path_text = f"~/{shell_path.relative_to(self.home)}"
+            except ValueError:
+                shell_path_text = str(shell_path)
+            rows.append(
+                (f"source {shell_path_text}", "让本次安装的用户级命令立即在当前终端生效")
+            )
         if self.command_exists("gitnexus"):
             rows.append(("仓库根目录执行：gitnexus analyze --embeddings --skills --verbose", "对当前仓库建立gitnexus索引"))
         if self.command_exists("claude"):
@@ -1416,8 +1595,8 @@ class Installer:
     def run(self) -> int:
         """执行完整安装生命周期：前置检查、安装、配置和结果收尾。"""
         self.logger.info(f"\n \n === CodeKit Plugin Install v{self.plugin_version} ===")
-        if platform.system() not in {"Darwin", "Linux"}:
-            raise InstallerError(f"Unsupported OS: {platform.system()}. Only macOS/Linux.")
+        if self.os_name not in {"Darwin", "Linux", "Windows"}:
+            raise InstallerError(f"Unsupported OS: {self.os_name}. Only macOS/Linux/Windows.")
         detector.registry.validate_registry()
         self.ensure_user_bin()
         if not self.marketplace_local:

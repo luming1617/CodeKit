@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_agents as agents  # noqa: E402
 import installer_config as config  # noqa: E402
+import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 import installer_state as detector  # noqa: E402
 from installer import Installer, InstallerError, RunResult  # noqa: E402
@@ -36,9 +38,13 @@ def bare_installer(home: Path) -> Installer:
     """装配仅含命令执行与平台探测所需字段的安装会话。"""
     installer = Installer.__new__(Installer)
     installer.home = home
-    installer.os_name = "Linux"
+    # 固定为 Linux 适配对象：用例不应随宿主平台改变行为。
+    installer.platform = platform_layer.platform_for("Linux")
+    installer.os_name = installer.platform.os_name
     installer.state_dir = home / ".local" / "state" / "CodeKit"
     installer.state_dir.mkdir(parents=True, exist_ok=True)
+    installer.bin_dir = home / ".local" / "bin"
+    installer.npm_bin_dir = home / ".npm-global" / "bin"
     installer.logger = Mock()
     installer.marketplace_local = None
     installer.changed_paths = []
@@ -102,6 +108,7 @@ class HelperContractTests(unittest.TestCase):
                 "installer.py",
                 "installer_agents.py",
                 "installer_config.py",
+                "installer_platform.py",
                 "installer_qoder.py",
                 "installer_sources.py",
                 "installer_state.py",
@@ -153,8 +160,26 @@ class StrategyTableTests(unittest.TestCase):
     def test_channel_order_is_the_declared_priority(self) -> None:
         self.assertEqual(
             detector.registry.CHANNEL_ORDER,
-            ("npm", "brew", "brew_cask", "apt", "pipx", "venv", "release", "script"),
+            (
+                "npm",
+                "brew",
+                "brew_cask",
+                "apt",
+                "winget",
+                "pipx",
+                "venv",
+                "release",
+                "script",
+                "powershell",
+            ),
         )
+
+    def test_windows_only_channels_never_leak_into_other_platforms(self) -> None:
+        # winget/powershell 的存在不得影响 macOS/Linux 的通道选择。
+        order = detector.registry.CHANNEL_ORDER
+        self.assertGreater(order.index("winget"), order.index("apt"))
+        self.assertLess(order.index("release"), order.index("script"))
+        self.assertLess(order.index("release"), order.index("powershell"))
 
     def test_release_is_probed_before_the_remote_script(self) -> None:
         # 校验过摘要的发布资产必须排在 `curl | bash` 之前，否则 rtk 这类同时声明
@@ -174,6 +199,8 @@ class StrategyTableTests(unittest.TestCase):
             ("Linux", "arm64"): "rtk-aarch64-unknown-linux-musl.tar.gz",
             ("Darwin", "arm64"): "rtk-aarch64-apple-darwin.tar.gz",
             ("Darwin", "x86_64"): "rtk-x86_64-apple-darwin.tar.gz",
+            # Windows 资产是 msvc 三元组 + zip，与 Unix 的 tar.gz 不同。
+            ("Windows", "x86_64"): "rtk-x86_64-pc-windows-msvc.zip",
         }
         with tempfile.TemporaryDirectory() as directory:
             installer = bare_installer(Path(directory))
@@ -184,6 +211,40 @@ class StrategyTableTests(unittest.TestCase):
                         self.assertEqual(
                             installer.release_asset_name(spec, "0.48.0"), expected
                         )
+
+    def test_windows_release_assets_use_the_native_os_token_and_zip(self) -> None:
+        cases = {
+            "gh": "gh_2.100.0_Windows_amd64.zip",
+            "glab": "glab_1.117.0_windows_amd64.zip",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            installer.os_name = "Windows"
+            for component_id, expected in cases.items():
+                with self.subTest(component=component_id):
+                    spec = detector.registry.component_by_id(component_id).release
+                    with patch.object(installer, "release_arch", return_value="x86_64"):
+                        self.assertEqual(
+                            installer.release_asset_name(spec, expected.split("_")[1]),
+                            expected,
+                        )
+
+    def test_windows_only_channels_are_declared_where_windows_needs_them(self) -> None:
+        # gh/glab 在 Windows 上没有 brew/apt，必须有一条可用的原生通道。
+        for component_id in ("gh", "glab"):
+            with self.subTest(component=component_id):
+                channels = detector.registry.component_by_id(component_id).channels
+                self.assertIn("winget", channels)
+                self.assertIn("Windows", detector.registry.component_by_id(component_id).release.os_tokens)
+        qoder = detector.registry.AGENT_CLI_CHANNELS["qoder"]
+        self.assertTrue(qoder["powershell"].startswith("https://"))
+        self.assertTrue(qoder["script"].startswith("https://"))
+        self.assertIn("winget", detector.registry.AGENT_CLI_CHANNELS["claude"])
+
+    def test_dingtalk_has_no_static_unzip_requirement(self) -> None:
+        # Windows 用 Expand-Archive，静态 requires 会让该组件在 Windows 上被误判。
+        component = detector.registry.component_by_id("dingtalk_cli")
+        self.assertNotIn("unzip", component.requires)
 
     def test_rtk_prefers_the_verified_release_asset_over_the_script(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -370,6 +431,8 @@ class SelectorProtocolTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -395,6 +458,8 @@ class SelectorProtocolTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -418,6 +483,8 @@ class SelectorProtocolTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
         self.assertEqual(result.returncode, 2)
@@ -437,9 +504,9 @@ class SelectComponentsProtocolTests(unittest.TestCase):
 
     def drive(self, installer: Installer, returncode: int, stdout: str):
         completed = subprocess.CompletedProcess([], returncode, stdout=stdout, stderr="")
-        # 选择器分支要求存在 /dev/tty；CI 无控制终端，这里显式放行。
+        # 选择器分支要求可交互终端；CI 无控制终端，这里显式放行。
         with patch.object(detector, "agent_cli_presence", return_value=""):
-            with patch("installer.Path.exists", return_value=True):
+            with patch.object(platform_layer.Platform, "can_interact", return_value=True):
                 with patch("subprocess.run", return_value=completed) as run:
                     installer.select_components()
         return run
@@ -580,18 +647,24 @@ class GlobalAgentCleanupTests(unittest.TestCase):
             target.mkdir(parents=True)
             foreign = target / source_agent.name
             foreign.write_text("# user-authored, not managed by CodeKit\n", encoding="utf-8")
-            result = self.run_helper(
-                "install",
-                "--home",
-                str(home),
-                "--tool",
-                "claude",
-                "--source",
-                str(REPO_DIR / "skills"),
-            )
-            self.assertEqual(result.returncode, 0, result.stdout)
-            backups = home / ".local" / "state" / "CodeKit" / "agent-backups" / "claude"
-            self.assertTrue(list(backups.glob(f"{source_agent.name}*")))
+            # 备份根跟随平台状态目录：Windows 上是 %LOCALAPPDATA%，测试里指到临时
+            # 目录，避免写进真实用户目录；父进程改了 os.environ，子进程会继承。
+            local_appdata = str(home / "AppData" / "Local")
+            with patch.dict(os.environ, {"LOCALAPPDATA": local_appdata}, clear=False):
+                result = self.run_helper(
+                    "install",
+                    "--home",
+                    str(home),
+                    "--tool",
+                    "claude",
+                    "--source",
+                    str(REPO_DIR / "skills"),
+                )
+                self.assertEqual(result.returncode, 0, result.stdout)
+                backups = (
+                    platform_layer.platform_for().state_dir(home) / "agent-backups" / "claude"
+                )
+                self.assertTrue(list(backups.glob(f"{source_agent.name}*")))
 
 
 class _FakeUrlResponse:
@@ -775,6 +848,360 @@ class BrewChannelFallbackTests(unittest.TestCase):
                 script.call_args[0][0],
                 detector.registry.component_by_id("rtk").channels["script"],
             )
+
+
+class WindowsPlatformAdapterTests(unittest.TestCase):
+    """Windows 分支的离线用例：靠假 Platform 覆盖，不要求宿主是 Windows。"""
+
+    def test_windows_paths_never_reuse_posix_locations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            environ = {
+                "LOCALAPPDATA": str(home / "LocalAppData"),
+                "APPDATA": str(home / "Roaming"),
+            }
+            with patch.dict(os.environ, environ, clear=False):
+                windows = platform_layer.platform_for("Windows")
+                self.assertTrue(windows.is_windows)
+                self.assertTrue(windows.os_name == "Windows")
+                self.assertEqual(windows.state_dir(home), home / "LocalAppData" / "CodeKit")
+                prefix = windows.npm_prefix(home)
+                self.assertEqual(prefix, home / "Roaming" / "npm")
+                # npm 的 shim 直接落在前缀根目录，Windows 上没有 bin/ 子目录。
+                self.assertEqual(windows.npm_bin_dir(prefix), prefix)
+                self.assertEqual(windows.bin_dir(home, prefix), prefix)
+                # 没有可写的 shell 配置，也没有 SIGHUP。
+                self.assertIsNone(windows.shell_config(home))
+                self.assertEqual(windows.shell_rc_files(home), ())
+                self.assertEqual(windows.signal_names(), ("SIGTERM",))
+
+    def test_windows_probed_npm_prefix_wins_over_the_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            windows = platform_layer.platform_for("Windows")
+            probed = home / "custom" / "npm"
+            self.assertEqual(windows.npm_prefix(home, str(probed)), probed)
+            # 探测为空时回落到 %APPDATA%\npm，而不是 POSIX 的 ~/.npm-global。
+            with patch.dict(os.environ, {"APPDATA": str(home / "Roaming")}, clear=False):
+                self.assertEqual(windows.npm_prefix(home, "  "), home / "Roaming" / "npm")
+
+    def test_windows_venv_layout_and_entry_names(self) -> None:
+        windows = platform_layer.platform_for("Windows")
+        venv = Path("C:/CodeKit/venvs/graphify")
+        self.assertEqual(windows.venv_pip(venv).name, "pip.exe")
+        self.assertEqual(windows.venv_exe(venv, "graphify").name, "graphify.exe")
+        self.assertEqual(windows.shim_name("graphify"), "graphify.cmd")
+        self.assertEqual(windows.binary_filename("rtk"), "rtk.exe")
+        self.assertEqual(windows.binary_filename("gh.exe"), "gh.exe")
+        self.assertEqual(
+            windows.release_target(Path("C:/npm"), "rtk"), Path("C:/npm/rtk.exe")
+        )
+
+    def test_windows_command_shim_is_a_cmd_forwarder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            windows = platform_layer.platform_for("Windows")
+            target = Path(directory) / "venvs" / "Scripts" / "graphify.exe"
+            target.parent.mkdir(parents=True)
+            target.write_text("", encoding="utf-8")
+            shim = windows.expose_command(Path(directory) / "npm", "graphify", target)
+            self.assertEqual(shim.name, "graphify.cmd")
+            self.assertIn(str(target), shim.read_text(encoding="utf-8"))
+
+    @unittest.skipIf(
+        platform_layer.is_windows(), "Windows 用 .cmd 转发脚本，而不是符号链接"
+    )
+    def test_posix_command_exposure_stays_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            linux = platform_layer.platform_for("Linux")
+            target = Path(directory) / "real"
+            target.write_text("", encoding="utf-8")
+            link = linux.expose_command(Path(directory) / "bin", "graphify", target)
+            self.assertTrue(link.is_symlink())
+
+    def test_rmtree_clears_the_read_only_bit(self) -> None:
+        # Windows 上删除只读文件会抛 PermissionError，适配层必须先清只读位。
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory) / "tree"
+            tree.mkdir()
+            locked = tree / "locked.txt"
+            locked.write_text("x", encoding="utf-8")
+            os.chmod(locked, stat.S_IREAD)
+            platform_layer.rmtree(tree)
+            self.assertFalse(tree.exists())
+
+    def test_windows_only_channels_are_unavailable_off_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            with patch.object(installer, "command_exists", return_value=True), patch.object(
+                platform_layer, "remote_script_command", return_value=("/usr/bin/pwsh",)
+            ):
+                self.assertFalse(installer.channel_available("winget"))
+                self.assertFalse(installer.channel_available("powershell"))
+
+    def test_resolve_command_expands_a_bare_name_to_a_full_path(self) -> None:
+        # Windows 的 CreateProcess 不展开 PATHEXT，必须先把 argv[0] 换成全路径。
+        self.assertEqual(
+            Installer._resolve_command([sys.executable, "-c", "pass"])[0], sys.executable
+        )
+        resolved = platform_layer.resolve_exe("python3")
+        if resolved:
+            self.assertEqual(Installer._resolve_command(["python3", "-V"])[0], resolved)
+
+    def test_resolve_command_leaves_paths_alone(self) -> None:
+        self.assertEqual(Installer._resolve_command(["./tool", "-v"])[0], "./tool")
+        self.assertEqual(Installer._resolve_command(["C:/tools/x.exe"])[0], "C:/tools/x.exe")
+
+
+    def windows_installer(self, home: Path) -> Installer:
+        installer = bare_installer(home)
+        installer.platform = platform_layer.platform_for("Windows")
+        installer.os_name = installer.platform.os_name
+        return installer
+
+    def test_script_channel_is_disabled_on_windows_even_with_git_bash(self) -> None:
+        # Git for Windows 也会把 bash 放进 PATH；只看"有没有 shell"的话，Windows 上会
+        # 用 Git Bash 执行 Unix 安装脚本，把文件装进 MSYS 目录树而不是 npm 目录。
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(platform_layer, "remote_script_command", return_value=("/usr/bin/bash",)):
+                self.assertFalse(
+                    self.windows_installer(Path(directory)).channel_available("script")
+                )
+                self.assertTrue(bare_installer(Path(directory)).channel_available("script"))
+
+    def test_windows_manual_note_never_suggests_a_bash_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self.windows_installer(Path(directory))
+            rtk_note = installer.manual_note(detector.registry.component_by_id("rtk"))
+            gh_note = installer.manual_note(detector.registry.component_by_id("gh"))
+            graphify_note = installer.manual_note(
+                detector.registry.component_by_id("graphify")
+            )
+        self.assertNotIn("| bash", rtk_note)
+        self.assertIn("rtk-ai/rtk", rtk_note)
+        self.assertIn("winget install --id GitHub.cli", gh_note)
+        self.assertNotIn("| bash", graphify_note)
+
+
+class QoderEntryDetectionTests(unittest.TestCase):
+    def test_windows_entry_detects_a_cmd_shim(self) -> None:
+        # 官方安装器在 Windows 落地的是 qoder.cmd，没有无扩展名的入口文件。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "entry"
+            entry.mkdir()
+            shim = entry / "qoder.cmd"
+            shim.write_text("@echo off\n", encoding="utf-8")
+            with patch.dict(os.environ, {"QODER_CONFIG_DIR": str(root)}, clear=False):
+                with patch.object(qoder, "find_cli", return_value=("", "")):
+                    with patch.object(qoder.platform, "system", return_value="Windows"):
+                        found = qoder.cli_path("qoder", root)
+        self.assertEqual(Path(found), shim)
+
+    def test_windows_entry_ignores_a_non_executable_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "entry").mkdir()
+            with patch.dict(os.environ, {"QODER_CONFIG_DIR": str(root)}, clear=False):
+                with patch.object(qoder, "find_cli", return_value=("", "")):
+                    with patch.object(qoder.platform, "system", return_value="Windows"):
+                        self.assertEqual(qoder.cli_path("qoder", root), "")
+
+
+class FakeTerminalBackend:
+    """脚本化后端：把预设按键序列喂给状态机，完全不碰真实终端。"""
+
+    def __init__(self, keys: list[str]) -> None:
+        self._keys = list(keys)
+        self.writes: list[str] = []
+
+    def open(self) -> None:  # pragma: no cover - nothing to open
+        pass
+
+    def close(self) -> None:  # pragma: no cover - nothing to close
+        pass
+
+    def write(self, text: str) -> None:
+        self.writes.append(text)
+
+    def read_key(self) -> str:
+        if not self._keys:
+            raise EOFError
+        return self._keys.pop(0)
+
+    def size(self) -> tuple[int, int]:
+        return 80, 40
+
+    def signals(self) -> tuple[int, ...]:
+        return ()
+
+
+class SelectorBackendTests(unittest.TestCase):
+    """选择器终端后端：两个平台归一化到同一组逻辑事件，状态机共用。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.selector = config.load_module(SELECTOR_SCRIPT, "codekit_component_selector")
+
+    def components(self, count: int = 3):
+        return [
+            self.selector.Component(
+                index=index,
+                name=f"item-{index}",
+                group="ai",
+                group_title="AI",
+                tag="",
+                selected=False,
+            )
+            for index in range(1, count + 1)
+        ]
+
+    def windows_console(self, chars: list[str]):
+        console = self.selector.WindowsConsole()
+
+        class FakeMsvcrt:
+            def __init__(self, values: list[str]) -> None:
+                self._values = list(values)
+
+            def getwch(self) -> str:
+                return self._values.pop(0)
+
+        console._msvcrt = FakeMsvcrt(chars)
+        return console
+
+    def test_windows_key_mapping_covers_arrows_and_control_keys(self) -> None:
+        # Windows 的方向键是「前导字节 + 扫描码」两字节，与 POSIX 的 ANSI 序列不同，
+        # 但必须归一化成同一组逻辑事件。
+        cases = {
+            ("\xe0", "P"): "down",
+            ("\x00", "H"): "up",
+            ("\xe0", "K"): "other",
+            ("\r",): "confirm",
+            (" ",): "toggle",
+            ("a",): "all",
+            ("n",): "none",
+            ("p",): "path",
+            ("q",): "quit",
+            ("z",): "other",
+        }
+        for chars, expected in cases.items():
+            with self.subTest(chars=chars):
+                self.assertEqual(self.windows_console(list(chars)).read_key(), expected)
+
+    def test_windows_ctrl_c_becomes_keyboard_interrupt(self) -> None:
+        with self.assertRaises(KeyboardInterrupt):
+            self.windows_console(["\x03"]).read_key()
+
+    def test_state_machine_toggles_moves_and_confirms(self) -> None:
+        backend = FakeTerminalBackend(["toggle", "down", "toggle", "confirm"])
+        result = self.selector.interactive_select(
+            self.components(), "install", False, "", backend
+        )
+        self.assertEqual(result, ([1, 2], False))
+        # 画面必须显式回车换行：raw 模式与备用屏幕下没有 ONLCR 转换。
+        self.assertTrue(backend.writes)
+        self.assertTrue(all("\r\n" in frame for frame in backend.writes))
+        self.assertTrue(backend.writes[0].startswith("\x1b[2J\x1b[H"))
+
+    def test_state_machine_path_toggle_is_install_only(self) -> None:
+        backend = FakeTerminalBackend(["path", "confirm"])
+        self.assertEqual(
+            self.selector.interactive_select(self.components(), "install", False, "", backend),
+            ([], True),
+        )
+        backend = FakeTerminalBackend(["path", "confirm"])
+        self.assertEqual(
+            self.selector.interactive_select(self.components(), "uninstall", False, "", backend),
+            ([], False),
+        )
+
+    def test_state_machine_quit_returns_none(self) -> None:
+        backend = FakeTerminalBackend(["quit"])
+        self.assertIsNone(
+            self.selector.interactive_select(self.components(), "install", False, "", backend)
+        )
+
+    def test_open_backend_without_a_terminal_returns_none(self) -> None:
+        # 无 /dev/tty 且非 Windows 时必须返回 None，让调用方显式降级。
+        with patch.object(self.selector.platform_layer, "is_windows", return_value=False), patch.object(
+            self.selector.os.path, "exists", return_value=False
+        ):
+            self.assertIsNone(self.selector.open_backend())
+
+
+class SelectorDegradationTests(unittest.TestCase):
+    def build(self, home: Path) -> Installer:
+        installer = bare_installer(home)
+        installer.auto_yes = False
+        installer.setup_path_selected = False
+        installer.states = {
+            component.component_id: detector.ComponentState(component.component_id)
+            for component in detector.registry.COMPONENTS
+        }
+        return installer
+
+    def test_selector_without_a_terminal_degrades_to_defaults(self) -> None:
+        # 选择器返回 2 表示拿不到终端；这必须显式降级而不是报错。
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self.build(Path(directory))
+            completed = subprocess.CompletedProcess([], 2, stdout="", stderr="no terminal")
+            with patch.object(detector, "agent_cli_presence", return_value=""):
+                with patch.object(platform_layer.Platform, "can_interact", return_value=True):
+                    with patch("subprocess.run", return_value=completed):
+                        installer.select_components()
+        self.assertTrue(installer.setup_path_selected)
+        self.assertIn("rtk", installer.selected)
+        # 缺 CLI 的插件不默认勾选：自动安装 CLI 必须来自显式勾选。
+        self.assertNotIn("claude_plugin", installer.selected)
+
+
+class OpencodeConfigFileTests(unittest.TestCase):
+    """安装器必须写 OpenCode 自己解析到的那份配置，否则同一插件会出现在两份文件里。"""
+
+    def test_config_file_follows_the_opencode_resolution_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(config.opencode_config_file(root), root / "opencode.json")
+            (root / "opencode.jsonc").write_text("{}", encoding="utf-8")
+            self.assertEqual(config.opencode_config_file(root), root / "opencode.jsonc")
+            (root / "opencode.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(config.opencode_config_file(root), root / "opencode.json")
+            (root / "opencode.json").unlink()
+            (root / "opencode.jsonc").unlink()
+            (root / ".opencode").mkdir()
+            (root / ".opencode" / "opencode.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(
+                config.opencode_config_file(root), root / ".opencode" / "opencode.json"
+            )
+
+    def test_jsonc_comments_and_trailing_commas_are_tolerated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "opencode.jsonc"
+            path.write_text(
+                '{\n'
+                "  // 用户注释不能被当成语法错误\n"
+                '  "$schema": "https://opencode.ai/config.json",\n'
+                '  "plugin": [\n'
+                '    "codekit@file:///C:/x", // 行尾注释\n'
+                "  ],\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(config.opencode_plugins(path), ["codekit@file:///C:/x"])
+
+    def test_stripper_never_touches_comment_markers_inside_strings(self) -> None:
+        text = '{"url": "http://example.com", "note": "/* not a comment */"}'
+        self.assertEqual(json.loads(config.strip_jsonc(text)), json.loads(text))
+
+    def test_add_and_remove_round_trip_on_a_jsonc_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "opencode.jsonc"
+            path.write_text('{\n  // keep the schema\n  "$schema": "x"\n}\n', encoding="utf-8")
+            config.add_opencode_plugin(path, "codekit@file:///C:/y")
+            self.assertTrue(config.opencode_has_plugin(path))
+            config.remove_opencode_plugins(path)
+            self.assertFalse(config.opencode_has_plugin(path))
+            # 与 opencode 自身 `plugin -g` 的行为一致：重写时按标准 JSON 落盘。
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"$schema": "x"})
 
 
 if __name__ == "__main__":

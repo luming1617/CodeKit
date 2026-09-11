@@ -19,6 +19,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_agents as agents  # noqa: E402
+import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 
 
@@ -214,7 +215,9 @@ def install(
         raise ValueError(f"no agent Markdown files found in {source}")
 
     target_dirs = destinations(home, tools, config_root)
-    backup_root = home / ".local" / "state" / "CodeKit" / "agent-backups"
+    # 备份根与安装器的状态目录保持一致：Windows 是 %LOCALAPPDATA%\CodeKit，
+    # 不能沿用 POSIX 的 ~/.local/state。
+    backup_root = platform_layer.platform_for().state_dir(home) / "agent-backups"
     changed = 0
     # 同一份 Markdown 是事实源：Codex 转成等价 TOML，OpenCode 转成
     # 布尔工具映射，其余工具直接沿用 canonical Markdown。

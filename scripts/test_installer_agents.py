@@ -17,18 +17,44 @@ import subprocess  # noqa: E402,F401
 
 import installer_agents as agents  # noqa: E402
 import installer_config as config  # noqa: E402
+import installer_platform as platform_layer  # noqa: E402
 import installer_state as detector  # noqa: E402
 from installer import Installer, RunResult  # noqa: E402
 
 REPO_DIR = SCRIPT_DIR.parent
 
 
+# 宿主若导出了 QODER*_CONFIG_DIR，共享配置根会被覆盖，断言就会指向真实用户目录
+# 而不是临时目录。整模块运行期间先移除它们，tearDown 时再恢复。
+_AMBIENT_ENV_PATCH = None
+
+
+def setUpModule() -> None:
+    """隔离宿主导出的 Qoder 根目录覆盖。"""
+    global _AMBIENT_ENV_PATCH
+    _AMBIENT_ENV_PATCH = patch.dict(os.environ, {}, clear=False)
+    _AMBIENT_ENV_PATCH.start()
+    for key in ("QODER_CONFIG_DIR", "QODERCN_CONFIG_DIR"):
+        os.environ.pop(key, None)
+
+
+def tearDownModule() -> None:
+    """恢复本模块运行前的环境。"""
+    global _AMBIENT_ENV_PATCH
+    if _AMBIENT_ENV_PATCH is not None:
+        _AMBIENT_ENV_PATCH.stop()
+        _AMBIENT_ENV_PATCH = None
+
+
 def build_installer(home: Path) -> Installer:
     """装配一次只有 CLI 安装所需字段的安装会话。"""
     installer = Installer.__new__(Installer)
     installer.home = home
-    installer.os_name = "Linux"
+    # 固定为 Linux 适配对象：用例不应随宿主平台改变行为。
+    installer.platform = platform_layer.platform_for("Linux")
+    installer.os_name = installer.platform.os_name
     installer.npm_prefix = home / ".npm-global"
+    installer.npm_bin_dir = installer.npm_prefix / "bin"
     installer.bin_dir = home / ".local" / "bin"
     installer.logger = Mock()
     installer.changed_paths = []

@@ -31,6 +31,8 @@ def build_repo(root: Path, *, with_qoder: bool = True) -> Path:
     """Create the smallest repository layout the source builder accepts."""
     repo = root / "repo"
     write(repo / "plugin-version.json", json.dumps({"version": VERSION}))
+    # Codex 只读 `.agents/plugins/marketplace.json`；`.codex-plugin/` 只是插件元数据。
+    write(repo / ".agents" / "plugins" / "marketplace.json", json.dumps({"name": "co-daming"}))
     for directory in (".claude-plugin", ".codex-plugin"):
         write(repo / directory / "plugin.json", json.dumps({"name": "codekit", "version": "0.0.1"}))
         write(repo / directory / "marketplace.json", json.dumps({"name": "co-daming"}))
@@ -80,6 +82,14 @@ class QoderStageTests(unittest.TestCase):
         # That transcription only serves Codex/OpenCode skill discovery.
         self.assertFalse((self.qoder / "skills" / "demo" / "agents" / "openai.yaml").exists())
         self.assertTrue((self.market / "skills" / "demo" / "agents" / "openai.yaml").is_file())
+
+    def test_codex_marketplace_is_staged_at_the_path_codex_reads(self) -> None:
+        # Codex 0.154 只在 <root>/.agents/plugins/marketplace.json 找清单；放在
+        # `.codex-plugin/` 会被判为 "marketplace root does not contain a supported
+        # manifest"。
+        staged = self.market / ".agents" / "plugins" / "marketplace.json"
+        self.assertTrue(staged.is_file())
+        self.assertEqual(json.loads(staged.read_text(encoding="utf-8"))["name"], "co-daming")
 
     def test_rebuilding_replaces_the_stage_without_leftovers(self) -> None:
         write(self.qoder / "stale.txt", "left behind by an older build")

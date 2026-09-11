@@ -91,5 +91,9 @@ uninstall_linux() {
 case "${OS_NAME}" in
   Darwin) uninstall_macos "$@"; exit $? ;;
   Linux) uninstall_linux "$@"; exit $? ;;
-  *) error "Unsupported OS: ${OS_NAME}. Only macOS/Linux are supported."; exit 1 ;;
+  MINGW*|MSYS*|CYGWIN*)
+    error "Windows 请使用 uninstall.cmd（或 uninstall.ps1），不要用 Git Bash 运行 uninstall.sh。"
+    exit 1
+    ;;
+  *) error "Unsupported OS: ${OS_NAME}. Only macOS/Linux/Windows are supported."; exit 1 ;;
 esac
