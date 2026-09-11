@@ -2,17 +2,17 @@
 
 每一路写一个 JSON result。时间使用 UTC ISO-8601，路径使用相对仓库根的 POSIX 路径。
 
-## 固定角色映射
+## 固定任务映射
 
-以下三个任务必须由对应的独立全局 Subagent 执行，不能由主 Agent或其他角色代替：
+三个 task 必须产出同一 schema 的 result，但执行者不同：`gitnexus` 由确定性控制器执行，另外两个必须由对应的独立全局 Subagent 执行，不能由主 Agent或其他角色代替：
 
-| task | canonical agent | 结果责任 |
+| task | canonical 执行者 | 结果责任 |
 |---|---|---|
-| `gitnexus` | `initialize-gitnexus` | GitNexus 状态探测、索引/复用和 skills artifact |
-| `graphify` | `initialize-graphify` | Graphify 缓存校验、full/update 和 chunk 状态 |
-| `context-scanner` | `initialize-context-scanner` | 只读仓库事实、命令候选和证据路径 |
+| `gitnexus` | 控制器 `controller.py analyze` | GitNexus 状态探测、索引/复用和 skills artifact |
+| `graphify` | `initialize-graphify`（独立 Subagent） | Graphify 缓存校验、full/update 和 chunk 状态 |
+| `context-scanner` | `initialize-context-scanner`（独立 Subagent） | 只读仓库事实、命令候选和证据路径 |
 
-角色正文位于 `skills/initialize/agents/`，并由 `initialize/SKILL.md` 的强制调用规则指定跨平台启动方式。
+Subagent 角色正文位于 `skills/initialize/agents/`，由 `initialize/SKILL.md` 的派发规则指定跨平台启动方式。`gitnexus` 没有角色正文：它的 runner、索引模式与 embedding 策略全部来自 `run-manifest.json` 的 `tools.gitnexus` / `gitnexus_index` / `gitnexus_embedding_mode` / `gitnexus_skill_mode`，由 `scripts/gitnexus-step.py` 执行并落盘 result。
 
 ```yaml
 schema_version: 1
@@ -62,7 +62,9 @@ error:
 
 完整的 GitNexus 结果必须携带可解析的 `.gitnexus/meta.json`。完整的 Graphify 结果必须携带 `graphify-out/graph.json`、`graphify-out/manifest.json` 和 `graphify-out/.graphify_root`；`success` 及 `index-current`/`no-change` 复用都适用。必要 artifact 的校验类型由控制器内置策略决定，Worker 返回的 `validation` 只能作为说明，不能降低 JSON、非空节点或 root-match 校验。
 
-## 主 Agent独立复核
+## 门禁复核
+
+门禁的检查对象是 result 与证据，不依赖产出它的会话。`gitnexus` 一路的 result 由控制器自己执行得出，因此它不具备「独立会话产出」的性质，但下列基于证据的复核同样适用；不得把控制器自证当作独立验证来宣称。
 
 1. result schema、run-id、task 唯一性、状态/exit code 一致。
 2. `changed_files` 全部位于 `allowed_paths`。

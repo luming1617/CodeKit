@@ -177,7 +177,7 @@ rtk gain          # 查看节省统计
 /codekit:initialize
 ```
 
-`initialize` 自动识别技术栈，强制调用 GitNexus、Graphify、Context Scanner 三个独立 Subagent，挂载规范并生成或更新 `AGENTS.md`、`CLAUDE.md`，为后续开发建立完整上下文。
+`initialize` 自动识别技术栈，由确定性控制器执行 GitNexus、强制派发 Graphify 与 Context Scanner 两个独立 Subagent，挂载规范并生成或更新 `AGENTS.md`、`CLAUDE.md`，为后续开发建立完整上下文。
 
 ### 第二步：开始需求开发或问题排查
 

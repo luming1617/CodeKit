@@ -259,16 +259,150 @@ def probe_graphify_ast_process_pool(graphify_path: Path, root: Path) -> bool:
         return False
 
 
+def gitnexus_command() -> tuple[list[str], str]:
+    """解析 GitNexus runner，返回 ``(argv 前缀, 类型)``。
+
+    只接受真实安装（显式覆盖或 ``PATH`` 上的 ``gitnexus``）。仓库内的
+    ``.gitnexus/run.cjs`` 是兜底 shim，在没有真实安装时按 ``gitnexus@latest``
+    走 npx/bunx/pnpm dlx：每次解析到的版本、Node 版本和依赖树都可能不同，
+    GitNexus 因而判定分析器身份变化并强制**全量重建**；那也违反「不通过
+    npx/dlx 下载」的约束。需要 shim 时用 ``CODEKIT_GITNEXUS_RUNNER`` 显式指定。
+    """
+    override = os.environ.get("CODEKIT_GITNEXUS_RUNNER", "").strip()
+    if override:
+        parts = shlex.split(override)
+        if parts:
+            return parts, "override"
+    installed = shutil.which("gitnexus")
+    if installed:
+        return [installed], "global"
+    return [], "unresolved"
+
+
+def gitnexus_cli_path(command: list[str]) -> Path | None:
+    """定位 runner 真正的 CLI 入口，用于找安装根和探测可选依赖。"""
+    if not command:
+        return None
+    if len(command) == 1:
+        return Path(command[0]).resolve()
+    for item in reversed(command[1:]):
+        candidate = Path(item)
+        if candidate.suffix in {".js", ".cjs", ".mjs"} or candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def gitnexus_install_root(cli: Path | None) -> Path | None:
+    """从 CLI 入口向上找 ``name == "gitnexus"`` 的包根。"""
+    if cli is None:
+        return None
+    for candidate in (cli, *list(cli.parents)[:6]):
+        try:
+            data = json.loads((candidate / "package.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and data.get("name") == "gitnexus":
+            return candidate
+    return None
+
+
+def gitnexus_local_embeddings(cli: Path | None) -> bool:
+    """探测 runner 自带的本地 embedding 栈。
+
+    这是可选依赖，安装时可能因为 onnxruntime 的 CUDA 下载被墙而被跳过；缺少它
+    时任何全量重建都会在「重算已有向量」这一步直接失败。
+    """
+    root = gitnexus_install_root(cli)
+    if root is None:
+        return False
+    modules = root / "node_modules"
+    return (modules / "onnxruntime-node").is_dir() and (
+        modules / "@huggingface" / "transformers"
+    ).is_dir()
+
+
+def gitnexus_index_modes(root: Path) -> dict[str, object]:
+    """读取现有索引记录的分析模式；重建时必须镜像，否则触发全量重建。"""
+    try:
+        data = json.loads((root / ".gitnexus" / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"present": False, "pdg": None, "embeddings": 0, "branch": None}
+    stats = data.get("stats")
+    stats = stats if isinstance(stats, dict) else {}
+    try:
+        embeddings = int(stats.get("embeddings") or 0)
+    except (TypeError, ValueError):
+        embeddings = 0
+    return {
+        "present": True,
+        "pdg": "pdg" in data,
+        "embeddings": embeddings,
+        "branch": data.get("branch") if isinstance(data.get("branch"), str) else None,
+    }
+
+
+def gitnexus_embedding_plan(
+    index: dict[str, object], local_embeddings: bool, requested: bool, authorized: bool
+) -> tuple[str, list[str]]:
+    """决定本次运行的 embedding 策略，返回 ``(模式, warnings)``。
+
+    索引里已有向量而 runner 缺 embedding 栈时，一次全量重建必然 exit 1；此时
+    要么按用户授权先安装，要么显式 ``--drop-embeddings`` 降级，不能撞上才失败。
+
+    - ``preserve``：正常分析，保留既有向量（GitNexus 默认行为）。
+    - ``drop``：追加 ``--drop-embeddings``，放弃语义检索以换取可完成的重建。
+    - ``install-authorized``：先执行 ``gitnexus embeddings install``（全局写入，
+      需用户显式授权）。
+    """
+    present = bool(index.get("embeddings"))
+    if requested and not local_embeddings:
+        if authorized:
+            return "install-authorized", [
+                "GitNexus 需要本地 embedding 栈；已获授权，将先安装再分析。"
+            ]
+        raise PrepareError(
+            "--embeddings 需要本地 embedding 栈，但当前 runner 未安装它；"
+            "请授权全局写入（--allow-global-writes）后重试，或去掉 --embeddings"
+        )
+    if not present or local_embeddings:
+        return "preserve", []
+    if authorized:
+        return "install-authorized", [
+            "索引含 embedding 而 runner 缺少本地 embedding 栈：已获授权，将先安装再分析。"
+        ]
+    return "drop", [
+        f"索引含 {index.get('embeddings')} 条 embedding，但当前 GitNexus runner 没有本地 "
+        "embedding 栈；全量重建会失败，因此本次追加 --drop-embeddings 降级"
+        "（语义检索失效，补齐 embedding 栈后可重新构建）。",
+    ]
+
+
 def tool_capabilities(root: Path) -> dict[str, object]:
-    local = root / ".gitnexus" / "run.cjs"
-    if local.is_file() and shutil.which("node"):
-        gitnexus = probe(["node", str(local)], root)
-        gitnexus["runner"] = "local"
-    elif shutil.which("gitnexus"):
-        gitnexus = probe(["gitnexus"], root)
-        gitnexus["runner"] = "global"
+    command, runner = gitnexus_command()
+    cli = gitnexus_cli_path(command)
+    if command:
+        gitnexus = probe(command, root)
+        gitnexus["command"] = command
+        gitnexus["runner"] = runner
+        gitnexus["cli"] = str(cli) if cli else None
+        gitnexus["identity_stable"] = gitnexus_install_root(cli) is not None
+        gitnexus["local_embeddings"] = gitnexus_local_embeddings(cli)
     else:
-        gitnexus = {"available": False, "runner": None, "supports": {}}
+        gitnexus = {
+            "available": False,
+            "runner": runner,
+            "command": [],
+            "cli": None,
+            "identity_stable": False,
+            "local_embeddings": False,
+            "supports": {},
+            "resolution_hint": (
+                "未在 PATH 上找到 gitnexus，且不会回落到 .gitnexus/run.cjs "
+                "(它按 gitnexus@latest 走 npx，会让索引身份漂移并触发全量重建)。"
+                "请把 <npm 前缀>/bin 加入 PATH（安装器的 shell 配置步骤可自动完成），"
+                "或用 CODEKIT_GITNEXUS_RUNNER 显式指定 runner。"
+            ),
+        }
 
     graphify_path = shutil.which("graphify")
     if graphify_path:
@@ -401,6 +535,7 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--allow-partial", action="store_true")
     parser.add_argument("--commit", action="store_true")
+    parser.add_argument("--allow-global-writes", action="store_true")
     parser.add_argument("--run-id", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
@@ -440,6 +575,14 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
     }
     head_result = run(["git", "rev-parse", "--verify", "HEAD"], root, check=False)
     tools = tool_capabilities(root)
+    # 索引模式与 embedding 前提在任何写入之前判定：不满足时零业务写入地失败。
+    index_modes = gitnexus_index_modes(root)
+    embedding_mode, embedding_warnings = gitnexus_embedding_plan(
+        index_modes,
+        bool(tools.get("gitnexus", {}).get("local_embeddings")),
+        args.embeddings,
+        args.allow_global_writes,
+    )
     state_root, lock_path, run_dir, state_is_temporary, state_warnings, descriptor = acquire_state_lock(root, run_id)
     manifest_path = run_dir / "run-manifest.json"
     manifest: dict[str, object] = {
@@ -460,6 +603,7 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
             "force": args.force,
             "allow_partial": args.allow_partial,
             "commit": args.commit,
+            "allow_global_writes": args.allow_global_writes,
         },
         "baseline_status": baseline_status,
         "baseline_files": baseline_files,
@@ -468,7 +612,9 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
         "managed_paths": sorted(managed),
         "required_standard_paths": sorted(required_standard_paths),
         "tools": tools,
-        "warnings": state_warnings,
+        "gitnexus_index": index_modes,
+        "gitnexus_embedding_mode": embedding_mode,
+        "warnings": [*state_warnings, *embedding_warnings],
         "prepared_changed_files": [],
         "authorized_changed_paths": [],
         "phase": "preparing",

@@ -26,6 +26,7 @@ def load_module(filename: str):
 prepare = load_module("prepare.py")
 reconcile = load_module("reconcile.py")
 validator = load_module("validate-result.py")
+gitnexus_step = load_module("gitnexus-step.py")
 
 
 class RecoverableRunInputError(validator.ValidationError):
@@ -131,11 +132,17 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--force", action="store_true")
     start.add_argument("--allow-partial", action="store_true")
     start.add_argument("--commit", action="store_true")
+    start.add_argument("--allow-global-writes", action="store_true")
     start.add_argument("--run-id", help=argparse.SUPPRESS)
 
     gate = commands.add_parser("gate", help="validate and seal all worker results")
     gate.add_argument("--manifest", required=True, type=Path)
     gate.add_argument("--result", required=True, action="append", type=Path)
+
+    analyze = commands.add_parser(
+        "analyze", help="run the deterministic GitNexus step and write its worker result"
+    )
+    analyze.add_argument("--manifest", required=True, type=Path)
 
     context = commands.add_parser("reconcile", help="write context from a sealed worker gate")
     context.add_argument("--manifest", required=True, type=Path)
@@ -171,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
             ("--force", args.force),
             ("--allow-partial", args.allow_partial),
             ("--commit", args.commit),
+            ("--allow-global-writes", args.allow_global_writes),
         ):
             if enabled:
                 forwarded.append(flag)
@@ -200,6 +208,13 @@ def main(argv: list[str] | None = None) -> int:
             "lock": lock_status(manifest),
         }, ensure_ascii=False, indent=2))
         return result
+    if args.command == "analyze":
+        try:
+            validate_active_manifest(args.manifest)
+            return gitnexus_step.main(["--manifest", str(args.manifest)], emit=True)
+        except Exception:
+            abort_safely(args.manifest, "gitnexus step raised an exception")
+            raise
     if args.command == "reconcile":
         try:
             validate_active_manifest(args.manifest)

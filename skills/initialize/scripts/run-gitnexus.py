@@ -35,6 +35,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--run-dir", type=Path)
+    parser.add_argument(
+        "--use-global-registry",
+        action="store_true",
+        help="user authorized global writes: register in the real GITNEXUS_HOME",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -42,9 +47,18 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("a GitNexus command is required after --")
 
     original_dir = registry_dir()
-    if os.environ.get("CODEKIT_GITNEXUS_USE_GLOBAL_REGISTRY") == "1" and likely_writable(original_dir):
-        completed = subprocess.run(command, cwd=args.root, text=True)
-        return completed.returncode
+    authorized = args.use_global_registry or os.environ.get(
+        "CODEKIT_GITNEXUS_USE_GLOBAL_REGISTRY"
+    ) == "1"
+    if authorized:
+        if likely_writable(original_dir):
+            completed = subprocess.run(command, cwd=args.root, text=True)
+            return completed.returncode
+        print(
+            "initialize warning: --use-global-registry was requested but "
+            f"{original_dir} is not writable; falling back to a disposable registry",
+            file=sys.stderr,
+        )
 
     try:
         with tempfile.TemporaryDirectory(prefix="codekit-gitnexus-home-") as temporary:

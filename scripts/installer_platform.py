@@ -500,14 +500,56 @@ class Platform:
             return home / ".zshrc", 'export PATH="${HOME}/.local/bin:${HOME}/.npm-global/bin:${PATH}"'
         return home / ".bashrc", 'export PATH="${HOME}/.local/bin:${HOME}/.npm-global/bin:${PATH}"'
 
+    def shell_path_configs(
+        self, home: Path, environ: Optional[Mapping[str, str]] = None
+    ) -> Tuple[Tuple[Path, str], ...]:
+        """需要写入 PATH 的全部 shell 配置，而不只是当前登录 shell 的交互配置。
+
+        agent（Claude / Codex / OpenCode / Qoder）派生的 shell 多为 login 或
+        非交互 bash，只读 ``~/.profile``，不读 ``~/.bashrc``；安装时的
+        ``$SHELL`` 又可能指向 zsh。只写当前 shell 的交互配置会让 ``gitnexus``
+        这类用户态 CLI 在 agent 里不可见，命令因而回落到 ``npx @latest``，
+        导致已建索引的分析器身份漂移并触发全量重建。
+
+        已存在的 ``~/.bash_profile`` 只追加、不创建：一旦创建它会覆盖
+        ``~/.profile``（bash login shell 读前者就不再读后者），反而丢掉
+        ``.bashrc`` 的加载。
+        """
+        if self.is_windows:
+            return ()
+        env = os.environ if environ is None else environ
+        shell = Path(env.get("SHELL", "/bin/bash")).name
+        home = Path(home)
+        export = 'export PATH="${HOME}/.local/bin:${HOME}/.npm-global/bin:${PATH}"'
+        configs: list[tuple[Path, str]] = [
+            (home / ".bashrc", export),
+            (home / ".profile", export),
+        ]
+        if (home / ".bash_profile").exists():
+            configs.append((home / ".bash_profile", export))
+        if shell == "zsh" or (home / ".zshrc").exists():
+            configs.append((home / ".zshrc", export))
+        if shell == "zsh" or (home / ".zprofile").exists():
+            configs.append((home / ".zprofile", export))
+        fish = home / ".config" / "fish" / "config.fish"
+        if shell == "fish" or fish.exists():
+            configs.append(
+                (fish, 'fish_add_path -g "${HOME}/.local/bin" "${HOME}/.npm-global/bin"')
+            )
+        return tuple(configs)
+
     def shell_rc_files(self, home: Path) -> Tuple[Path, ...]:
-        """卸载时需要清理的 shell 配置文件；Windows 上没有。"""
+        """卸载时需要清理的 shell 配置文件；Windows 上没有。
+
+        含 ``~/.profile``：安装会往 login shell 配置里写 PATH，卸载必须对称清理。
+        """
         if self.is_windows:
             return ()
         home = Path(home)
         return (
             home / ".bashrc",
             home / ".bash_profile",
+            home / ".profile",
             home / ".zshrc",
             home / ".zprofile",
             home / ".config" / "fish" / "config.fish",

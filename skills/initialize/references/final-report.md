@@ -36,4 +36,4 @@
 
 ## 报告字段
 
-报告 run-id、root、languages、各阶段及 `initialize-gitnexus` / `initialize-graphify` / `initialize-context-scanner` 状态、partial 原因、artifact 验证、变更文件、validators（含来源、命令、退出码与输出尾部）、commit decision、锁释放结果。上下文截断或渲染告警（`context_warnings`，如 AGENTS.md 条目超行预算被裁剪）必须原样展示，不得静默丢弃。不要声称 skipped 的分析已完成，不隐藏 Graphify chunk/健康警告。
+报告 run-id、root、languages、各阶段及 gitnexus 步骤（控制器执行）/ `initialize-graphify` / `initialize-context-scanner` 状态、partial 原因、artifact 验证、变更文件、validators（含来源、命令、退出码与输出尾部）、commit decision、锁释放结果。上下文截断或渲染告警（`context_warnings`，如 AGENTS.md 条目超行预算被裁剪）必须原样展示，不得静默丢弃。不要声称 skipped 的分析已完成，不隐藏 Graphify chunk/健康警告。

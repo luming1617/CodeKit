@@ -270,7 +270,7 @@ render_recap           # 打印卸载结果汇总
 
 `preflight_agents` 只探测五平台 **CLI 本体**：Desktop 应用、Linux 启动器与 Qoder 共享配置根**不计入 CLI 前置**，而是在 Qoder 平台可用性判断与后续提示中使用。如果五者 CLI 均不存在，只打印醒目提示并继续流程，不再中断插件安装（缺少的 CLI 由用户勾选对应插件后自动补装）。强依赖（Node.js ≥ 24 / npm / Python3 ≥ 3.10 / git / curl-wget）已由 `install.sh` 在进入 Python 安装器前检测，不满足时根本不会进入本阶段。Qoder 与 Qoder CN 的 CLI 和桌面 IDE 共用同一个用户级配置根。全局 agent 在选择对应的 Claude、OpenCode、Codex 或 Qoder 插件时同步安装（先于插件写入注册表，避免半安装状态）；该阶段只在 install 执行，卸载不执行。
 
-全局 subagent 的统一源文件位于各 Skill 的 `skills/<skill>/agents/*.md`。Claude Code 原样安装到 `~/.claude/agents/`，OpenCode 原样安装到 `~/.config/opencode/agents/`，Codex 则生成同名的 `~/.codex/agents/*.toml`（正文映射到 `developer_instructions`），Qoder / Qoder CN 原样安装到与桌面 IDE 共享的 `<配置根>/agents/`（裸名，CLI 与 IDE 两端都能调度）。`initialize` 随插件安装 `initialize-gitnexus`、`initialize-graphify`、`initialize-context-scanner`，运行时由 `SKILL.md` 强制调用。安装器具备幂等性；同名非 CodeKit 文件会先备份到 `~/.local/state/CodeKit/agent-backups/`。
+全局 subagent 的统一源文件位于各 Skill 的 `skills/<skill>/agents/*.md`。Claude Code 原样安装到 `~/.claude/agents/`，OpenCode 原样安装到 `~/.config/opencode/agents/`，Codex 则生成同名的 `~/.codex/agents/*.toml`（正文映射到 `developer_instructions`），Qoder / Qoder CN 原样安装到与桌面 IDE 共享的 `<配置根>/agents/`（裸名，CLI 与 IDE 两端都能调度）。`initialize` 随插件安装 `initialize-graphify`、`initialize-context-scanner`，运行时由 `SKILL.md` 强制派发；它的 GitNexus 一路由确定性控制器 `controller.py analyze` 执行，不安装全局角色。安装器具备幂等性；同名非 CodeKit 文件会先备份到 `~/.local/state/CodeKit/agent-backups/`。
 
 > 各 Skill 与 `SKILL.md` 同级的 `openai.yaml` **不是** subagent 源，也不参与上述全局安装：它是 Codex 的技能界面元数据，随技能目录整体分发，路径换算见第 10 章。
 

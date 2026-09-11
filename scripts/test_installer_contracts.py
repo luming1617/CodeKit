@@ -1747,5 +1747,65 @@ class OpencodeConfigFileTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"$schema": "x"})
 
 
+class ShellPathConfigTests(unittest.TestCase):
+    """PATH 必须同时写进 login 配置：agent 的 shell 不读 ~/.bashrc。"""
+
+    def test_posix_writes_both_interactive_and_login_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            linux = platform_layer.platform_for("Linux")
+            targets = dict(linux.shell_path_configs(home, {"SHELL": "/bin/bash"}))
+            self.assertIn(home / ".bashrc", targets)
+            # login / 非交互 bash 只读 ~/.profile，漏掉它 gitnexus 就不可见。
+            self.assertIn(home / ".profile", targets)
+            self.assertIn(".npm-global/bin", targets[home / ".profile"])
+
+    def test_zsh_login_shell_gets_its_own_login_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            linux = platform_layer.platform_for("Linux")
+            targets = dict(linux.shell_path_configs(home, {"SHELL": "/usr/bin/zsh"}))
+            self.assertIn(home / ".zshrc", targets)
+            self.assertIn(home / ".zprofile", targets)
+
+    def test_bash_profile_is_only_appended_never_created(self) -> None:
+        # 创建 ~/.bash_profile 会让 bash login shell 不再读 ~/.profile，
+        # 反而丢掉 .bashrc 的加载，因此缺省时不能凭空创建。
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            linux = platform_layer.platform_for("Linux")
+            absent = dict(linux.shell_path_configs(home, {"SHELL": "/bin/bash"}))
+            self.assertNotIn(home / ".bash_profile", absent)
+            (home / ".bash_profile").write_text("# user\n", encoding="utf-8")
+            present = dict(linux.shell_path_configs(home, {"SHELL": "/bin/bash"}))
+            self.assertIn(home / ".bash_profile", present)
+
+    def test_uninstall_cleans_every_install_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            linux = platform_layer.platform_for("Linux")
+            installed = {path for path, _ in linux.shell_path_configs(home, {"SHELL": "/bin/zsh"})}
+            self.assertLessEqual(installed, set(linux.shell_rc_files(home)))
+
+    def test_setup_shell_path_writes_login_config_too_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            installer = bare_installer(home)
+            with patch.dict(os.environ, {"SHELL": "/bin/bash"}, clear=False):
+                installer.setup_shell_path()
+                installer.setup_shell_path()
+                self.assertTrue(installer.path_configured())
+
+            bashrc = (home / ".bashrc").read_text(encoding="utf-8")
+            profile = (home / ".profile").read_text(encoding="utf-8")
+            self.assertIn(".npm-global/bin", bashrc)
+            # agent 的 login shell 只读 ~/.profile，这一份缺了工具就不可见。
+            self.assertIn(".npm-global/bin", profile)
+            self.assertEqual(1, bashrc.count("# Added by CodeKit Plugin"))
+            self.assertEqual(1, profile.count("# Added by CodeKit Plugin"))
+            # 凭空创建 ~/.bash_profile 会让 bash login shell 不再读 ~/.profile。
+            self.assertFalse((home / ".bash_profile").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -614,20 +614,28 @@ class Installer:
         """返回需要写入 PATH 的 shell 配置；Windows 上没有这样的文件。"""
         return self.platform.shell_config(self.home)
 
-    def path_configured(self) -> bool:
-        """检查当前 shell 配置是否已经包含 CodeKit 用户工具目录。
+    def shell_path_configs(self) -> tuple[tuple[Path, str], ...]:
+        """返回全部需要写入 PATH 的 shell 配置；Windows 上没有。"""
+        return self.platform.shell_path_configs(self.home)
 
+    def path_configured(self) -> bool:
+        """检查所有 shell 配置是否都已包含 CodeKit 用户工具目录。
+
+        只检查当前 ``$SHELL`` 的交互配置会漏掉 agent 实际使用的 login shell
+        （``~/.profile``），于是工具在 agent 里不可见而回落到 ``npx @latest``。
         Windows 没有可写的 shell 配置，改为检查 npm 全局目录是否已在 PATH 上
         （Node 安装包通常会写入），避免把「配置缺失」误报成需要处理。
         """
-        configured = self.shell_config()
-        if configured is None:
+        configs = self.shell_path_configs()
+        if not configs:
             return self.tool_dir_on_path()
-        path, line = configured
-        try:
-            return line in path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            return False
+        for path, line in configs:
+            try:
+                if line not in path.read_text(encoding="utf-8"):
+                    return False
+            except (OSError, UnicodeDecodeError):
+                return False
+        return True
 
     def tool_dir_on_path(self) -> bool:
         """判断本平台需要的用户工具目录是否已经出现在 PATH 中。"""
@@ -1624,37 +1632,42 @@ class Installer:
         self.track(self.version_file)
 
     def setup_shell_path(self) -> None:
-        """向当前 shell 配置追加一次性 PATH 配置，已存在时保持文件不变。
+        """向所有 shell 配置追加一次性 PATH 配置，已存在时保持文件不变。
+
+        写的不只是当前 ``$SHELL`` 的交互配置：agent 派生的 login / 非交互 bash
+        只读 ``~/.profile``，漏掉它会让用户态 CLI 在 agent 会话里不可见。
 
         Windows 没有可写的 shell 配置（PowerShell profile 路径本地化且可能被
         OneDrive 重定向），改为校验 PATH 并在缺失时打印手动指引。
         """
-        configured = self.shell_config()
-        if configured is None:
+        configs = self.shell_path_configs()
+        if not configs:
             if not self.tool_dir_on_path():
                 self.logger.warn(self.platform.path_hint(self.home, self.npm_bin_dir))
             return
-        path, line = configured
-        old = path.read_text(encoding="utf-8") if path.exists() else ""
-        if line in old:
-            return
-        config.atomic_write(path, old.rstrip("\n") + f"\n\n# Added by CodeKit Plugin\n{line}\n")
-        self.track(path)
+        marker = "# Added by CodeKit Plugin"
+        for path, line in configs:
+            old = path.read_text(encoding="utf-8") if path.exists() else ""
+            if line in old:
+                continue
+            config.atomic_write(path, old.rstrip("\n") + f"\n\n{marker}\n{line}\n")
+            self.track(path)
 
     def print_next_steps(self) -> None:
         """用醒目的表格打印后续操作及其作用。"""
         rows = [("重启智能体应用", "让本次安装的插件、技能和配置立即生效")]
-        configured = self.shell_config()
-        if configured is None:
+        configs = self.shell_path_configs()
+        if not configs:
             rows.append(("新开一个终端", "让本次安装的用户级命令立即生效"))
         else:
-            shell_path = configured[0]
-            try:
-                shell_path_text = f"~/{shell_path.relative_to(self.home)}"
-            except ValueError:
-                shell_path_text = str(shell_path)
+            names = []
+            for path, _ in configs:
+                try:
+                    names.append(f"~/{path.relative_to(self.home)}")
+                except ValueError:
+                    names.append(str(path))
             rows.append(
-                (f"source {shell_path_text}", "让本次安装的用户级命令立即在当前终端生效")
+                (f"source {' '.join(names)}", "让本次安装的用户级命令立即在当前终端生效")
             )
         if self.command_exists("gitnexus"):
             rows.append(("仓库根目录执行：gitnexus analyze --embeddings --skills --verbose", "对当前仓库建立gitnexus索引"))
