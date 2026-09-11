@@ -1218,7 +1218,12 @@ class Installer:
         return all(result.returncode == 0 for result in results)
 
     def install_feishu_cli(self) -> bool:
-        """按策略表安装飞书 CLI，并只向支持全局安装的 CodeKit 智能体同步 skills。"""
+        """按策略表安装飞书 CLI，并向已装智能体同步 skills。
+
+        skills 由第三方提供（`npx skills add` 需要 clone GitHub 仓库），只是 CLI 之外
+        的附加项：同步失败不影响 CLI 本身可用，所以只告警、不判组件失败。技能全局库
+        （`-g` 的落盘位置）已有这些 skills 时直接跳过，升级路径不再依赖 GitHub 可达。
+        """
         if not self.install_via_channels("feishu_cli"):
             return False
 
@@ -1237,6 +1242,9 @@ class Installer:
         if not agents:
             self.logger.warn("No supported coding agent found; skipped Feishu skills.")
             return True
+        if self.feishu_skills_installed():
+            self.logger.info("飞书 skills 已安装，跳过同步。")
+            return True
         result = self.run_command(
             [
                 "npx",
@@ -1249,7 +1257,21 @@ class Installer:
                 *agents,
             ]
         )
-        return result.returncode == 0
+        if result.returncode != 0:
+            self.logger.warn(
+                "飞书 skills 未同步（飞书 CLI 本身已就绪）；可稍后手动重试："
+                "npx skills add larksuite/cli -y -g"
+            )
+        return True
+
+    def feishu_skills_installed(self) -> bool:
+        """判断 skills CLI 的全局技能库中是否已装飞书 skills。
+
+        `npx skills add larksuite/cli -g` 把技能写进 `~/.agents/skills`（配一个
+        `~/.agents/.skill-lock.json` 记录来源），与具体智能体无关，因此这一处就是
+        「已装」的权威依据。
+        """
+        return any((self.home / ".agents" / "skills").glob("lark-*"))
 
     def platform_agents_plan(self, action: str, tool: str) -> Optional[tuple[list[str], Path]]:
         """构造平台全局 subagent 的同步/清理命令与目标目录；无可执行动作时返回 None。"""

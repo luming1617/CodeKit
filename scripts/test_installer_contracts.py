@@ -865,6 +865,49 @@ class BrewChannelFallbackTests(unittest.TestCase):
             )
 
 
+class FeishuSkillsSyncTests(unittest.TestCase):
+    """飞书 skills 同步是附加项：失败不判组件失败，已装则不再 clone GitHub。"""
+
+    def _installer(self, home: Path, sync_result: int):
+        installer = bare_installer(home)
+        installer.install_via_channels = Mock(return_value=True)
+        installer.command_exists = Mock(return_value=True)
+        installer.run_command = Mock(return_value=RunResult(sync_result))
+        return installer
+
+    def test_failed_skills_sync_still_reports_the_component_as_done(self) -> None:
+        # 实测 `npx skills add` 会 clone github.com；国内网络失败时飞书 CLI 本身已装好，
+        # 不能因为这一步把整个组件判成「未完成」。
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(Path(directory), sync_result=1)
+            self.assertTrue(installer.install_feishu_cli())
+            installer.logger.error.assert_not_called()
+            self.assertTrue(installer.logger.warn.called)
+
+    def test_skills_sync_success_keeps_the_same_return_value(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(Path(directory), sync_result=0)
+            self.assertTrue(installer.install_feishu_cli())
+            self.assertTrue(installer.run_command.called)
+            installer.logger.warn.assert_not_called()
+
+    def test_installed_skills_skip_the_network_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".agents" / "skills" / "lark-base").mkdir(parents=True)
+            installer = self._installer(home, sync_result=0)
+            self.assertTrue(installer.install_feishu_cli())
+            installer.run_command.assert_not_called()
+
+    def test_missing_skills_library_still_runs_the_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".agents" / "skills" / "dingtalk-chat").mkdir(parents=True)
+            installer = self._installer(home, sync_result=0)
+            self.assertTrue(installer.install_feishu_cli())
+            self.assertTrue(installer.run_command.called)
+
+
 class WindowsPlatformAdapterTests(unittest.TestCase):
     """Windows 分支的离线用例：靠假 Platform 覆盖，不要求宿主是 Windows。"""
 
@@ -1187,6 +1230,79 @@ class QoderEntryDetectionTests(unittest.TestCase):
                 with patch.object(qoder, "find_cli", return_value=("", "")):
                     with patch.object(qoder.platform, "system", return_value="Windows"):
                         self.assertEqual(qoder.cli_path("qoder", root), "")
+
+    def test_dispatcher_wrapper_without_backend_is_not_installed(self) -> None:
+        # 卸载 npm 包不会删掉 entry 目录里的转发器，而它退出 127：不能算已安装。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "entry"
+            entry.mkdir()
+            (entry / "qoder.cmd").write_text(
+                '@echo off\npowershell.exe -File "%~dp0qoder-dispatcher.ps1" -- %*\n',
+                encoding="utf-8",
+            )
+            environ = {"QODER_CONFIG_DIR": str(root), "PATH": ""}
+            with patch.object(qoder, "find_cli", return_value=("", "")):
+                with patch.object(qoder.shutil, "which", return_value=None):
+                    with patch.object(qoder.platform, "system", return_value="Windows"):
+                        self.assertEqual(qoder.cli_path("qoder", root, environ), "")
+
+    def test_dispatcher_wrapper_reports_its_backend(self) -> None:
+        # 转发器后面的真实 CLI 在 bin/<命令>/ 下；报后端路径才能探到版本号。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "entry"
+            entry.mkdir()
+            (entry / "qoder.cmd").write_text(
+                '@echo off\npowershell.exe -File "%~dp0qoder-dispatcher.ps1" -- %*\n',
+                encoding="utf-8",
+            )
+            backend = root / "bin" / "qodercli" / "qodercli.exe"
+            backend.parent.mkdir(parents=True)
+            backend.write_bytes(b"")
+            environ = {"QODER_CONFIG_DIR": str(root), "PATH": ""}
+            with patch.object(qoder, "find_cli", return_value=("", "")):
+                with patch.object(qoder.shutil, "which", return_value=None):
+                    with patch.object(qoder.platform, "system", return_value="Windows"):
+                        self.assertEqual(qoder.cli_path("qoder", root, environ), str(backend))
+
+    def test_wrapper_backend_env_override_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "entry"
+            entry.mkdir()
+            (entry / "qodercn.cmd").write_text(
+                '@echo off\npowershell.exe -File "%~dp0qodercn-dispatcher.ps1" -- %*\n',
+                encoding="utf-8",
+            )
+            override = root / "custom-qoderclicn.exe"
+            override.write_bytes(b"")
+            environ = {
+                "QODERCN_CONFIG_DIR": str(root),
+                "QODERCN_CLI_BIN": str(override),
+                "PATH": "",
+            }
+            with patch.object(qoder, "find_cli", return_value=("", "")):
+                with patch.object(qoder.shutil, "which", return_value=None):
+                    with patch.object(qoder.platform, "system", return_value="Windows"):
+                        self.assertEqual(
+                            qoder.cli_path("qodercn", root, environ), str(override)
+                        )
+
+    def test_path_dispatcher_wrapper_without_backend_is_not_installed(self) -> None:
+        # entry 目录被写进 PATH 时，PATH 命中本身就是同一个转发器。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wrapper = root / "qoder.cmd"
+            wrapper.write_text(
+                '@echo off\npowershell.exe -File "%~dp0qoder-dispatcher.ps1" -- %*\n',
+                encoding="utf-8",
+            )
+            environ = {"QODER_CONFIG_DIR": str(root), "PATH": ""}
+            with patch.object(qoder, "find_cli", return_value=("qoder", str(wrapper))):
+                with patch.object(qoder.shutil, "which", return_value=None):
+                    with patch.object(qoder.platform, "system", return_value="Windows"):
+                        self.assertEqual(qoder.cli_path("qoder", root, environ), "")
 
 
 class FakeTerminalBackend:

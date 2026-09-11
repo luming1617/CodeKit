@@ -49,6 +49,7 @@ class Platform:
     component_id: str
     display_name: str
     cli_commands: tuple[str, ...]
+    cli_bin_env: str
     config_env: str
     config_dirname: str
     macos_apps: tuple[str, ...]
@@ -63,6 +64,7 @@ PLATFORMS: dict[str, Platform] = {
         component_id="qoder_plugin",
         display_name="CodeKit Plugin (Qoder)",
         cli_commands=("qoder", "qodercli"),
+        cli_bin_env="QODER_CLI_BIN",
         config_env="QODER_CONFIG_DIR",
         config_dirname=".qoder",
         macos_apps=("Qoder IDE.app", "Qoder.app"),
@@ -78,6 +80,7 @@ PLATFORMS: dict[str, Platform] = {
         component_id="qodercn_plugin",
         display_name="CodeKit Plugin (Qoder CN)",
         cli_commands=("qodercn", "qoderclicn"),
+        cli_bin_env="QODERCN_CLI_BIN",
         config_env="QODERCN_CONFIG_DIR",
         config_dirname=".qoder-cn",
         macos_apps=("Qoder CN IDE.app", "Qoder CN.app"),
@@ -409,6 +412,40 @@ def _usable_entry(path: Path) -> bool:
     return platform.system() == "Windows" or os.access(path, os.X_OK)
 
 
+# 入口目录里落地的这个文件只是转发器：真正的 CLI 在别处，后端不存在时它退出 127。
+_DISPATCHER_MARKER = "-dispatcher.ps1"
+
+
+def _is_dispatcher_wrapper(path: str) -> bool:
+    """判断入口文件是不是转发给后端 CLI 的 dispatcher。
+
+    官方安装器和 npm 包都只在 ``<root>/entry`` 落地一个转发脚本，卸载 CLI 不会
+    删除它，因此入口文件本身不能单独作为“已安装”的证据。
+    """
+    try:
+        head = Path(path).read_text(encoding="utf-8", errors="ignore")[:2000]
+    except OSError:
+        return False
+    return _DISPATCHER_MARKER in head
+
+
+def _wrapper_backend(
+    descriptor: Platform, root: Path, environ: Mapping[str, str]
+) -> str:
+    """返回 dispatcher 后端 CLI 的路径，解析顺序与 qoder-dispatcher.ps1 一致。"""
+    override = environ.get(descriptor.cli_bin_env, "")
+    if override and Path(override).is_file():
+        return str(override)
+    for command in descriptor.cli_commands[1:]:
+        found = shutil.which(command, path=environ.get("PATH"))
+        if found and not looks_like_desktop_launcher(found):
+            return str(found)
+        for candidate in _entry_candidates(root / "bin" / command, command):
+            if _usable_entry(candidate):
+                return str(candidate)
+    return ""
+
+
 def cli_path(
     platform_key: str,
     home: Path,
@@ -419,11 +456,18 @@ def cli_path(
     The official installer drops the CLI inside the shared configuration root
     (``<root>/entry``) and only then adds it to PATH from the shell profile, so
     a plain PATH lookup misses a CLI that was just installed in this process.
+    That entry file forwards to the real CLI, so it only counts while its
+    backend still exists; reporting the backend also keeps ``--version`` probes
+    working, which a ``.cmd`` forwarding script would break.
     """
     descriptor = PLATFORMS[platform_key]
     environ = os.environ if environ is None else environ
     _name, found = find_cli(descriptor, environ)
-    if found and not looks_like_desktop_launcher(found):
+    if (
+        found
+        and not looks_like_desktop_launcher(found)
+        and not _is_dispatcher_wrapper(found)
+    ):
         return found
     try:
         root = resolve_config_root(descriptor, home, environ)
@@ -432,8 +476,13 @@ def cli_path(
     for directory in (root / "entry", root / "bin"):
         for command in descriptor.cli_commands:
             for candidate in _entry_candidates(directory, command):
-                if _usable_entry(candidate):
+                if not _usable_entry(candidate):
+                    continue
+                if not _is_dispatcher_wrapper(candidate):
                     return str(candidate)
+                backend = _wrapper_backend(descriptor, root, environ)
+                if backend:
+                    return backend
     return ""
 
 
