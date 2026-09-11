@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import tempfile
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
@@ -32,6 +33,30 @@ MCP_SECTION_PATTERN = re.compile(r"^\[mcp_servers\.([^\]]+)\]\s*$")
 # NPM_REGISTRY_ARGS 仅用于面向用户的手动安装指引，因为那些命令在用户 shell 执行、无法继承本进程环境。
 NPM_REGISTRY = "https://registry.npmmirror.com"
 NPM_REGISTRY_ARGS = ("--registry", NPM_REGISTRY)
+
+# Homebrew 默认在 install/upgrade 前先跑一次 brew update：git 拉 homebrew/brew、
+# homebrew-core 与 homebrew-cask，再直连 ghcr.io 取 bottle，国内单次就是分钟级。
+# 这里统一切到中科大镜像，并关闭 brew 自身的自动更新（组件是否需要升级由安装器
+# 自行判断，不需要 brew 再同步一遍索引）。
+HOMEBREW_MIRROR_ENV = {
+    "HOMEBREW_NO_AUTO_UPDATE": "1",
+    "HOMEBREW_API_DOMAIN": "https://mirrors.ustc.edu.cn/homebrew-bottles/api",
+    "HOMEBREW_BOTTLE_DOMAIN": "https://mirrors.ustc.edu.cn/homebrew-bottles",
+    "HOMEBREW_BREW_GIT_REMOTE": "https://mirrors.ustc.edu.cn/brew.git",
+    "HOMEBREW_CORE_GIT_REMOTE": "https://mirrors.ustc.edu.cn/homebrew-core.git",
+    "HOMEBREW_CASK_GIT_REMOTE": "https://mirrors.ustc.edu.cn/homebrew-cask.git",
+}
+
+# GitHub 直连（github.com、raw.githubusercontent.com、api.github.com）在国内常
+# 不可达或极慢。所有 GitHub 下载与版本探测统一前置该代理，非 GitHub 地址不受影响。
+GH_PROXY = "https://gh-proxy.com"
+
+# 判定 GitHub 地址的根域名；子域（api./raw./objects./codeload.）一并覆盖。
+GITHUB_HOSTS = ("github.com", "githubusercontent.com")
+
+# 单次远程读取的超时（秒）。GitHub 地址会先试 gh-proxy 再回退直连，
+# 因此该值是「每一次尝试」的上限，不是整体预算。
+REMOTE_FETCH_TIMEOUT = 20
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -72,6 +97,32 @@ def load_module(path: Path, name: str) -> Any:
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def is_github_url(url: str) -> bool:
+    """判断 URL 是否指向 GitHub；只看主机名，避免被路径里的域名片段误判。"""
+    host = urllib.parse.urlsplit(url).hostname or ""
+    return any(host == root or host.endswith(f".{root}") for root in GITHUB_HOSTS)
+
+
+def github_proxy_url(url: str) -> str:
+    """把 GitHub URL 改写为 gh-proxy 前置形式；非 GitHub URL 原样返回。"""
+    return f"{GH_PROXY}/{url}" if is_github_url(url) else url
+
+
+def download_urls(url: str) -> tuple[str, ...]:
+    """下载地址的尝试顺序：GitHub 走 gh-proxy 优先，失败再回退直连。"""
+    proxied = github_proxy_url(url)
+    return (url,) if proxied == url else (proxied, url)
+
+
+def probe_urls(url: str) -> tuple[str, ...]:
+    """版本探测地址的尝试顺序：GitHub 只走 gh-proxy。
+
+    探测失败只会退回“已是最新”，代价是提示不准；与其再等一次必然超时的直连，
+    不如把预算留给可用地址，避免拖慢每次安装前的组件状态检查。
+    """
+    return (github_proxy_url(url),)
 
 
 def linux_application_dirs(

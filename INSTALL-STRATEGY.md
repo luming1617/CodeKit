@@ -40,19 +40,22 @@ Node.js  >= 24.0.0   当前: 未安装
 代码按下列顺序**探测**，取第一个「已声明且当前可用」的通道，不做逐层试错：
 
 ```
-npm  →  brew  →  brew_cask  →  apt  →  pipx  →  venv  →  script  →  release
+npm  →  brew  →  brew_cask  →  apt  →  pipx  →  venv  →  release  →  script
 ```
+
+`release` 排在 `script` 之前：发布资产按精确文件名解析并做摘要校验，而 `script` 是把远程
+脚本管道给 shell；同一组件同时声明两者时，先走可校验的那条路。
 
 | 通道 | target | 可用性判定 | 安装 / 升级语义 |
 |---|---|---|---|
 | `npm` | 官方 npm 包名（白名单） | `npm` 存在 | `npm install -g <pkg>@latest`（含升级） |
-| `brew` | formula | `brew` 存在 | 已装则 `brew upgrade`，否则 `brew install` |
-| `brew_cask` | cask | `brew` 存在 | `brew install --cask` / `brew upgrade --cask` |
+| `brew` | formula | `brew` 存在 | 已装且由 brew 管理则 `brew upgrade`，否则 `brew install`；命令已存在但不在 brew 管理下时**让位给下一通道**（避免装出第二份拷贝）；强制中科大镜像并关闭 brew 自动更新 |
+| `brew_cask` | cask | `brew` 存在 | 已装且由 brew 管理则 `brew upgrade --cask`，否则 `brew install --cask`；同样让位条件；镜像环境同 `brew` |
 | `apt` | 发行版包名 | Linux 且有包管理器 | `apt-get install -y`（需 sudo，见 §3）；包不存在则跳到下一通道 |
 | `pipx` | PyPI 发行名 | `pipx` 存在（缺失则先按 apt→brew 装 pipx） | `pipx install` / `pipx upgrade` |
 | `venv` | PyPI 发行名 | `python3 -m venv` 可用 | 独立 venv + 用户级软链接，始终可重装 |
-| `script` | 官方安装脚本 URL | `curl` 或 `wget` 存在 | 下载后交给 shell 执行 |
-| `release` | `Component.release` | `curl` 或 `wget` 存在 | 解析最新版 → 下载资产 → 校验（如可）→ 解包 → 安装到 `~/.local/bin` |
+| `release` | `Component.release` | `curl` 或 `wget` 存在 | 解析最新版 → 按模板展开资产名 → 下载 → 校验（如可）→ 解包 → 安装到 `~/.local/bin`；GitHub 地址优先走 gh-proxy。模板除 `{version}/{os}/{arch}/{ext}` 外还支持按 Rust target triple 命名的 `{target}` |
+| `script` | 官方安装脚本 URL | `curl` 或 `wget` 存在 | 下载后交给 shell 执行；GitHub 地址优先走 gh-proxy（见 §2.3） |
 
 ### 2.1 npm 白名单（防同名李鬼）
 
@@ -65,6 +68,29 @@ npm  →  brew  →  brew_cask  →  apt  →  pipx  →  venv  →  script  →
 | `rtk` | cliffano 的 release 工具 | Rust Token Killer（改用 brew/script） |
 | `glab` | npm 不存在 | 官方 GitLab CLI（改用 brew/apt/release） |
 | `@git-ai/cli` | code-ba 的提交信息生成器 | 已移除，不再安装 |
+
+### 2.2 同一通道的两种失败语义（brew 为例）
+
+brew 通道返回「是否已接管该组件」，而不是「命令是否存在」，避免把失败路径跑第二遍，
+也避免组件的升级永远卡在错误的通道上：
+
+1. 命令不存在 → 走 `brew install`；失败即返回失败，降级到下一通道。
+2. 命令存在且由 brew 管理 → 走 `brew upgrade`；失败时命令仍可用，**不降级**（否则会
+   在 script/release 再装一份把 brew 的拷贝遮住），只告警。
+3. 命令存在但不在 brew 管理下（例如官方脚本装的 rtk）→ **直接让位**给下一通道，
+   不执行 `brew install`/`brew upgrade`；真正能完成升级的是当初安装它的那个通道。
+
+### 2.3 镜像与代理（国内网络）
+
+| 目标 | 镜像 / 代理 | 注入位置 |
+|---|---|---|
+| npm / npx | `https://registry.npmmirror.com` | `installer_config.NPM_REGISTRY` → `set_npm` |
+| Homebrew | `https://mirrors.ustc.edu.cn/…`（`brew.git`、`homebrew-core.git`、`homebrew-cask.git`、`homebrew-bottles`、`homebrew-bottles/api`） | `installer_config.HOMEBREW_MIRROR_ENV` → `Installer.brew` 写入进程环境 |
+| GitHub 下载（脚本 / release 资产） | `https://gh-proxy.com/<原地址>`，失败回退直连 | `installer_config.download_urls` |
+| GitHub 版本探测 | 同上，只走 gh-proxy（不再等一次必然超时的直连） | `installer_config.probe_urls` |
+
+Homebrew 镜像同时把 `HOMEBREW_NO_AUTO_UPDATE=1` 写入环境：组件是否需要升级由安装器
+自行判断，不需要每次 `brew install/upgrade` 前再同步一遍 homebrew/brew、core 与 cask。
 
 ## 3. sudo 行为（apt 通道）
 
@@ -81,7 +107,7 @@ npm  →  brew  →  brew_cask  →  apt  →  pipx  →  venv  →  script  →
 
 | 组件 | 分组 | 命令 | npm | brew | apt | pipx/venv | script | release | requires |
 |---|---|---|---|---|---|---|---|---|---|
-| rtk | ai | `rtk` | — | `rtk` | — | — | 官方 install.sh | — | — |
+| rtk | ai | `rtk` | — | `rtk` | — | — | 官方 install.sh | GitHub `rtk-ai/rtk`（`rtk-{target}.tar.gz`） | — |
 | gitnexus | intel | `gitnexus` | `gitnexus` | — | — | — | — | — | **node >= 24.11.0** |
 | graphify | intel | `graphify` | — | — | — | `graphifyy` | — | — | python >= 3.10 |
 | gh | third | `gh` | — | `gh` | `gh` | — | — | GitHub `cli/cli` | — |
@@ -113,8 +139,11 @@ gitnexus 并提示升级到 24.11+，其余组件照常安装。
 
 1. 已安装且版本满足 → 结束，不重装。
 2. 否则按 `CHANNEL_ORDER` 取第一个「组件已声明 + 当前可用」的通道执行。
-3. 通道执行后校验命令是否可用；不可用则记录真实错误并继续下一通道。
-4. 单个组件失败不阻断其余组件；结果在收尾汇总表中呈现。
+3. 通道执行后校验命令是否可用；不可用则记录真实错误并继续下一通道。brew/cask 另有
+   「让位」判定（见 §2.2）：命令虽可用但不由 brew 管理时不算成功，继续下一通道，
+   让当初安装它的通道完成升级。
+4. 通道失败不重复执行同一动作（不会把失败路径再跑一遍），单个组件失败不阻断其余
+   组件；结果在收尾汇总表中呈现。
 
 ## 7. 卸载
 

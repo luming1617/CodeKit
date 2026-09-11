@@ -279,16 +279,18 @@ def saved_marketplace_sha(context: Context) -> str:
 
 
 def fetch_json(url: str) -> Any:
-    """获取版本接口 JSON；网络、格式或解析失败时返回 None。"""
-    request = urllib.request.Request(
-        url,
-        headers={"Accept": "application/json", "User-Agent": "CodeKit-installer"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=5) as response:
-            return json.load(response)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
+    """获取版本接口 JSON；GitHub 地址只走 gh-proxy，避免拖慢启动前的状态检查。"""
+    for candidate in config.probe_urls(url):
+        request = urllib.request.Request(
+            candidate,
+            headers={"Accept": "application/json", "User-Agent": "CodeKit-installer"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return json.load(response)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    return None
 
 
 def version_source_url(component: str) -> tuple[str, str]:

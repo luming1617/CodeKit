@@ -326,21 +326,48 @@ class Installer:
         """调用统一的状态检测逻辑读取命令版本；命令不存在时返回空字符串。"""
         return detector.command_version(command, list(args))
 
-    def brew(self, *args: str) -> RunResult:
-        """通过统一命令执行器调用 Homebrew。"""
-        return self.run_command(["brew", *args])
+    def set_brew_mirror(self) -> None:
+        """把 Homebrew 切到中科大镜像并关闭自动更新。
+
+        镜像写入进程环境：brew 及其所有子进程都会继承，因此这一步对安装与卸载
+        路径、以及 `brew list` 这类探测命令同样生效。
+        """
+        os.environ.update(config.HOMEBREW_MIRROR_ENV)
+
+    def brew(self, *args: str, capture: bool = False) -> RunResult:
+        """调用 Homebrew，并统一注入中科大镜像与关闭自动更新的环境。
+
+        capture=True 用于 `brew list` 这类只读本地状态的探测，不产生终端输出。
+        """
+        self.set_brew_mirror()
+        command = ["brew", *args]
+        return self.run_capture(command) if capture else self.run_command(command)
+
+    def brew_manages(self, name: str, *, cask: bool = False) -> bool:
+        """判断 name 是否由 Homebrew 自己管理；本地查询，不触发安装动作。"""
+        args = ["list", "--cask", name] if cask else ["list", name]
+        return self.brew(*args, capture=True).returncode == 0
 
     def brew_install_or_upgrade(self, formula: str, probe: Optional[str] = None) -> bool:
-        """安装或升级一个 Homebrew formula，并用 probe 命令确认最终可用性。"""
+        """经 Homebrew 安装或升级一个 formula，并返回该通道是否已接管该组件。
+
+        只有「命令缺失」或「命令由 brew 自己管理」时 brew 才是正确的通道：命令已存在
+        但不由 brew 管理（例如官方脚本装的 rtk）时直接让位，否则只会装出第二份拷贝，
+        而原来的 script/release 通道才是能真正完成升级的那个。
+        """
         probe = probe or formula
-        if self.command_exists(probe):
-            self.logger.info(f"{formula} already installed; upgrading via brew...")
-            self.brew("upgrade", formula)
-        else:
-            self.brew("install", formula)
         if not self.command_exists(probe):
-            self.brew("install", formula)
-        return self.command_exists(probe)
+            result = self.brew("install", formula)
+            return result.returncode == 0 and self.command_exists(probe)
+        if not self.brew_manages(formula):
+            self.logger.info(f"{formula} 不在 Homebrew 管理下，跳过 brew 通道交给原通道升级。")
+            return False
+        result = self.brew("upgrade", formula)
+        if result.returncode != 0:
+            # brew 管着这个命令、只是这次升级没成功：命令仍可用，不降级到其他通道，
+            # 否则会在 script/release 里再装一份把 brew 的拷贝遮住。
+            self.logger.warn(f"{formula} 升级未成功，保持现有 Homebrew 安装。")
+        return True
 
     def linux_package_manager(self) -> Optional[str]:
         """返回 Linux 包管理器；入口传入的环境变量优先。"""
@@ -400,13 +427,15 @@ class Installer:
         return result.returncode == 0
 
     def fetch_text(self, url: str) -> str:
-        """获取远程脚本文本；网络或编码错误时返回空字符串供调用方回退。"""
-        try:
-            request = urllib.request.Request(url, headers={"User-Agent": "CodeKit-installer"})
-            with urllib.request.urlopen(request, timeout=30) as response:
-                return response.read().decode("utf-8")
-        except (OSError, UnicodeError):
-            return ""
+        """获取远程脚本文本；GitHub 地址优先走 gh-proxy，失败再回退直连。"""
+        for candidate in config.download_urls(url):
+            try:
+                request = urllib.request.Request(candidate, headers={"User-Agent": "CodeKit-installer"})
+                with urllib.request.urlopen(request, timeout=config.REMOTE_FETCH_TIMEOUT) as response:
+                    return response.read().decode("utf-8")
+            except (OSError, UnicodeError):
+                continue
+        return ""
 
     def agent_notice_box(self, lines: Sequence[str]) -> str:
         """按终端显示宽度渲染提示边框，避免中英文混排时边框错位。"""
@@ -648,12 +677,12 @@ class Installer:
     def manual_note(self, component) -> str:
         """生成组件的手动安装指引，供所有通道都失败时提示。"""
         if "script" in component.channels:
-            return f"curl -fsSL {component.channels['script']} | bash"
+            return f"curl -fsSL {config.github_proxy_url(component.channels['script'])} | bash"
         if "npm" in component.channels:
             registry = " ".join(config.NPM_REGISTRY_ARGS)
             return f"npm install -g {component.channels['npm']} {registry}"
         if "brew" in component.channels:
-            return f"brew install {component.channels['brew']}"
+            return f"brew install {component.channels['brew']}（建议先按 INSTALL.md 配置中科大镜像）"
         if "apt" in component.channels:
             return f"sudo apt-get install -y {component.channels['apt']}"
         return "请参考官方文档"
@@ -715,14 +744,17 @@ class Installer:
         return result.returncode == 0 and self.command_exists(command)
 
     def install_brew_cask(self, cask: str, command: str) -> bool:
-        """安装或升级一个 Homebrew cask，并在首次失败后重试安装。"""
-        if self.command_exists(command):
-            result = self.brew("upgrade", "--cask", cask)
-        else:
+        """经 Homebrew cask 安装或升级；cask 不在 brew 管理下时让位给下一通道。"""
+        if not self.command_exists(command):
             result = self.brew("install", "--cask", cask)
+            return result.returncode == 0 and self.command_exists(command)
+        if not self.brew_manages(cask, cask=True):
+            self.logger.info(f"{cask} 不在 Homebrew cask 管理下，跳过该通道交给原通道升级。")
+            return False
+        result = self.brew("upgrade", "--cask", cask)
         if result.returncode != 0:
-            self.brew("install", "--cask", cask)
-        return self.command_exists(command)
+            self.logger.warn(f"{cask} 升级未成功，保持现有 Homebrew cask 安装。")
+        return True
 
     def install_apt_package(self, package: str, command: str) -> bool:
         """经 sudo 安装 Debian/Ubuntu 包；包不在源中时返回 False 以便降级。"""
@@ -779,24 +811,28 @@ class Installer:
 
     def release_asset_name(self, spec, version: str) -> str:
         """按 release 模板展开当前平台的资产文件名。"""
+        arch = self.release_arch()
         return spec.asset.format(
             version=version,
             os=spec.os_tokens.get(self.os_name, ""),
-            arch=spec.arch_tokens.get(self.release_arch(), ""),
+            arch=spec.arch_tokens.get(arch, ""),
             ext=spec.ext_tokens.get(self.os_name, ""),
+            target=spec.target_tokens.get(f"{self.os_name}-{arch}", ""),
         )
 
     def fetch_json_url(self, url: str):
-        """获取发布接口 JSON；网络或格式错误时返回 None。"""
-        try:
-            request = urllib.request.Request(
-                url,
-                headers={"Accept": "application/json", "User-Agent": "CodeKit-installer"},
-            )
-            with urllib.request.urlopen(request, timeout=30) as response:
-                return json.load(response)
-        except (OSError, ValueError, json.JSONDecodeError):
-            return None
+        """获取发布接口 JSON；GitHub 地址优先走 gh-proxy，失败再回退直连。"""
+        for candidate in config.download_urls(url):
+            try:
+                request = urllib.request.Request(
+                    candidate,
+                    headers={"Accept": "application/json", "User-Agent": "CodeKit-installer"},
+                )
+                with urllib.request.urlopen(request, timeout=config.REMOTE_FETCH_TIMEOUT) as response:
+                    return json.load(response)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+        return None
 
     def resolve_release(self, spec) -> Optional[tuple[str, str, str]]:
         """解析最新发布版本，返回 (版本, 下载地址, sha256)；失败返回 None。"""
@@ -830,7 +866,7 @@ class Installer:
         return None
 
     def download_release(self, url: str, digest: str) -> Optional[Path]:
-        """下载发布资产并校验摘要；GitHub 失败时回退镜像地址。"""
+        """下载发布资产并校验摘要；GitHub 地址优先走 gh-proxy，失败再回退直连。"""
         options = [
             "--fail", "--location", "--connect-timeout", "10", "--speed-limit", "51200",
             "--speed-time", "20", "--retry", "2", "--retry-max-time", "180",
@@ -839,10 +875,16 @@ class Installer:
         fd, name = tempfile.mkstemp(prefix="codekit-release-", dir=os.environ.get("TMPDIR", "/tmp"))
         os.close(fd)
         temporary = Path(name)
-        result = self.run_command(["curl", *options, "-o", str(temporary), url])
-        if result.returncode != 0 and "github.com" in url:
+        result = RunResult(1)
+        for candidate in config.download_urls(url):
+            # --continue-at - 会续传上一个地址留下的半成品，切换地址前必须清空。
             temporary.write_bytes(b"")
-            self.run_command(["curl", *options, "-o", str(temporary), f"https://gh-proxy.com/{url}"])
+            result = self.run_command(["curl", *options, "-o", str(temporary), candidate])
+            if result.returncode == 0:
+                break
+        if result.returncode != 0:
+            temporary.unlink(missing_ok=True)
+            return None
         if digest and hashlib.sha256(temporary.read_bytes()).hexdigest() != digest:
             temporary.unlink(missing_ok=True)
             self.logger.error("发布包摘要校验失败，已删除下载文件。")
