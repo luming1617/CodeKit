@@ -36,6 +36,24 @@ gitnexus_runner = load_script("run-gitnexus.py")
 gitnexus_step = load_script("gitnexus-step.py")
 common = sys.modules["_common"]
 
+# Windows reports every writable file as 0o666: os.chmod only maps the read-only
+# bit, so POSIX permission bits are not observable there.
+POSIX_MODES = os.name != "nt"
+POSIX_MODE_REASON = "os.chmod on Windows only maps the read-only bit"
+# A clean Windows `python3` is the Microsoft Store alias stub: shutil.which finds
+# it, but it exits non-zero, so fixtures name the interpreter that really runs.
+VALIDATION_PYTHON = "py -3" if os.name == "nt" else "python3"
+
+
+def validation_python_runs() -> bool:
+    try:
+        completed = subprocess.run(
+            [*VALIDATION_PYTHON.split(), "-c", "pass"], capture_output=True, check=False
+        )
+    except OSError:
+        return False
+    return completed.returncode == 0
+
 
 def worker_result(task: str, *, changed=None, allowed=None, artifacts=None, run_id: str = "test-run") -> dict:
     return {
@@ -353,9 +371,7 @@ class GraphifyCapabilityTests(unittest.TestCase):
     def test_graphify_capabilities_detect_flags_and_ast_process_pool(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            runner = root / "graphify"
-            runner.write_text(
-                f"#!{sys.executable}\n"
+            body = (
                 "import sys\n"
                 "if sys.argv[1:] == ['--version']:\n"
                 "    print('graphify 1.0')\n"
@@ -363,10 +379,19 @@ class GraphifyCapabilityTests(unittest.TestCase):
                 "    print('extract --max-workers N')\n"
                 "    print('hook install            install post-commit git hooks')\n"
                 "elif sys.argv[1:] == ['extract', '--help']:\n"
-                "    print('--code-only --max-workers')\n",
-                encoding="utf-8",
+                "    print('--code-only --max-workers')\n"
             )
-            runner.chmod(0o755)
+            if os.name == "nt":
+                # CreateProcess cannot exec an extension-less POSIX script.
+                (root / "graphify.py").write_text(body, encoding="utf-8")
+                runner = root / "graphify.cmd"
+                runner.write_text(
+                    f'@echo off\r\n"{sys.executable}" "%~dp0graphify.py" %*\r\n', encoding="utf-8"
+                )
+            else:
+                runner = root / "graphify"
+                runner.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
+                runner.chmod(0o755)
             with patch.object(
                 prepare.shutil,
                 "which",
@@ -379,6 +404,27 @@ class GraphifyCapabilityTests(unittest.TestCase):
             self.assertTrue(graphify["supports"]["code_only"])
             self.assertTrue(graphify["supports"]["ast_process_pool"])
             self.assertTrue(graphify["supports"]["git_hooks"])
+
+    def test_shebang_probe_resolves_the_venv_python_behind_a_cmd_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / "venvs" / "graphify" / "Scripts"
+            scripts.mkdir(parents=True)
+            (scripts / "python.exe").write_text("", encoding="utf-8")
+            launcher = root / "graphify.cmd"
+            launcher.write_text(
+                "@echo off\r\n"
+                f'"{scripts / "graphify.exe"}" %*\r\n'
+                "exit /b %ERRORLEVEL%\r\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([str(scripts / "python.exe")], prepare._shebang_python(launcher))
+
+    def test_shebang_probe_keeps_windows_backslashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = Path(directory) / "graphify"
+            runner.write_text(f"#!{sys.executable}\n", encoding="utf-8")
+            self.assertEqual([sys.executable], prepare._shebang_python(runner))
 
     def test_ast_process_pool_probe_uses_graphify_shebang_python(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1208,14 +1254,28 @@ class WorkerContractTests(unittest.TestCase):
     def test_old_gitnexus_help_is_detected_without_assuming_flags(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            runner = root / "gitnexus-old"
-            runner.write_text(
-                "#!/bin/sh\n"
-                "if [ \"$1\" = \"--version\" ]; then echo 'gitnexus 1.0'; exit 0; fi\n"
-                "echo 'usage: gitnexus analyze --skills'\n",
-                encoding="utf-8",
-            )
-            runner.chmod(0o755)
+            if os.name == "nt":
+                # CreateProcess cannot exec an extension-less POSIX script.
+                runner = root / "gitnexus-old.cmd"
+                runner.write_text(
+                    "@echo off\r\n"
+                    'if "%~1"=="--version" goto version\r\n'
+                    "echo usage: gitnexus analyze --skills\r\n"
+                    "exit /b 0\r\n"
+                    ":version\r\n"
+                    "echo gitnexus 1.0\r\n"
+                    "exit /b 0\r\n",
+                    encoding="utf-8",
+                )
+            else:
+                runner = root / "gitnexus-old"
+                runner.write_text(
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = \"--version\" ]; then echo 'gitnexus 1.0'; exit 0; fi\n"
+                    "echo 'usage: gitnexus analyze --skills'\n",
+                    encoding="utf-8",
+                )
+                runner.chmod(0o755)
             capability = prepare.probe([str(runner)], root)
             self.assertFalse(capability["supports"]["skip_agents_md"])
             self.assertFalse(capability["supports"]["index_only"])
@@ -1343,7 +1403,10 @@ class RepositoryBoundaryTests(unittest.TestCase):
             root.mkdir()
             outside.mkdir()
             subprocess.run(["git", "init", "-q", str(root)], check=True)
-            os.symlink(outside, root / ".standard", target_is_directory=True)
+            try:
+                os.symlink(outside, root / ".standard", target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
             with self.assertRaises(prepare.PrepareError):
                 prepare.main(["--root", str(root), "--language", "python", "--run-id", "escape"])
             self.assertEqual([], list(outside.rglob("*.md")))
@@ -1356,7 +1419,10 @@ class RepositoryBoundaryTests(unittest.TestCase):
             (root / ".standard/02-stack").mkdir(parents=True)
             outside.mkdir()
             (outside / "rule.md").write_text("external\n", encoding="utf-8")
-            os.symlink(outside, root / ".standard/02-stack/evil", target_is_directory=True)
+            try:
+                os.symlink(outside, root / ".standard/02-stack/evil", target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             with self.assertRaises(prepare.PrepareError):
                 prepare.main(["--root", str(root), "--language", "python", "--run-id", "escape"])
@@ -1422,7 +1488,8 @@ class EndToEndTests(unittest.TestCase):
                     "start", "--root", str(root), "--language", "python", "--run-id", "repairable"
                 ]))
             manifest_path = root / ".codekit/initialize/repairable/run-manifest.json"
-            self.assertEqual(0o600, stat.S_IMODE(manifest_path.stat().st_mode))
+            if POSIX_MODES:
+                self.assertEqual(0o600, stat.S_IMODE(manifest_path.stat().st_mode))
             outside_result = root.parent / "repairable-result.json"
             outside_result.write_text("{}", encoding="utf-8")
             with redirect_stderr(StringIO()) as error_output:
@@ -1519,7 +1586,7 @@ class EndToEndTests(unittest.TestCase):
                 "structure": [{"path": "README.md", "description": "Fixture documentation"}],
                 "commands": [{
                     "purpose": "Check",
-                    "command": "python3 -c pass",
+                    "command": f"{VALIDATION_PYTHON} -c pass",
                     "evidence": "missing.py",
                     "required_for_initialize": True,
                 }],
@@ -1636,7 +1703,7 @@ class EndToEndTests(unittest.TestCase):
                 "structure": [{"path": "README.md", "description": "Fixture documentation"}],
                 "commands": [{
                     "purpose": "Check",
-                    "command": "python3 -c pass",
+                    "command": f"{VALIDATION_PYTHON} -c pass",
                     "evidence": "README.md",
                     "required_for_initialize": True,
                 }],
@@ -1859,7 +1926,9 @@ class WorkerPathClaimTests(unittest.TestCase):
         self.assertTrue(any("unsafe repository-relative path" in message for message in errors))
 
 
-@unittest.skipIf(shutil.which("python3") is None, "python3 is an allowed validation program")
+@unittest.skipUnless(
+    validation_python_runs(), f"{VALIDATION_PYTHON} must run as an allowed validation program"
+)
 class ValidationExecutionTests(unittest.TestCase):
     """Commit evidence must come from commands the controller executed itself."""
 
@@ -1878,12 +1947,14 @@ class ValidationExecutionTests(unittest.TestCase):
         with git_scratch_directory() as directory:
             root = Path(directory)
             code, report = drive_initialize_flow(root, scan_context(root, [
-                {"purpose": "Check", "command": "python3 check_ok.py",
+                {"purpose": "Check", "command": f"{VALIDATION_PYTHON} check_ok.py",
                  "evidence": "check_ok.py", "required_for_initialize": True},
             ]))
             self.assertEqual(0, code, report["errors"])
             self.assertEqual("executed", report["validation_source"])
-            self.assertEqual("python3 check_ok.py", report["validations"][0]["command"])
+            self.assertEqual(
+                f"{VALIDATION_PYTHON} check_ok.py", report["validations"][0]["command"]
+            )
             self.assertEqual(0, report["validations"][0]["exit_code"])
             self.assertEqual(1, commit_count(root))
 
@@ -1891,7 +1962,7 @@ class ValidationExecutionTests(unittest.TestCase):
         with git_scratch_directory() as directory:
             root = Path(directory)
             code, report = drive_initialize_flow(root, scan_context(root, [
-                {"purpose": "Check", "command": "python3 check_ok.py",
+                {"purpose": "Check", "command": f"{VALIDATION_PYTHON} check_ok.py",
                  "evidence": "check_ok.py", "required_for_initialize": True},
             ]), commit=True)
             self.assertEqual(0, code, report["errors"])
@@ -1908,11 +1979,13 @@ class ValidationExecutionTests(unittest.TestCase):
         with git_scratch_directory() as directory:
             root = Path(directory)
             code, report = drive_initialize_flow(root, scan_context(root, [
-                {"purpose": "Check", "command": "python3 check_bad.py",
+                {"purpose": "Check", "command": f"{VALIDATION_PYTHON} check_bad.py",
                  "evidence": "check_bad.py", "required_for_initialize": True},
             ]), commit=True)
             self.assertEqual(1, code)
-            self.assertIn("repository validation failed: python3 check_bad.py", report["errors"])
+            self.assertIn(
+                f"repository validation failed: {VALIDATION_PYTHON} check_bad.py", report["errors"]
+            )
             self.assertFalse(report["commit_allowed"])
             self.assertEqual(1, commit_count(root))
             manifest = json.loads(
@@ -2045,7 +2118,7 @@ class ValidationExecutionTests(unittest.TestCase):
             self.assertEqual("gated", manifest["phase"])
             self.assertNotIn("validation_commands", manifest)
 
-            context["commands"][0]["command"] = "python3 check_ok.py"
+            context["commands"][0]["command"] = f"{VALIDATION_PYTHON} check_ok.py"
             context["commands"][0]["evidence"] = "check_ok.py"
             (run_dir / "context.json").write_text(json.dumps(context), encoding="utf-8")
             with redirect_stdout(StringIO()):
@@ -2067,6 +2140,7 @@ class ValidationExecutionTests(unittest.TestCase):
 class AtomicWriteModeTests(unittest.TestCase):
     """Managed files must not silently lose their permission bits."""
 
+    @unittest.skipUnless(POSIX_MODES, POSIX_MODE_REASON)
     def test_existing_mode_is_preserved_and_new_files_are_readable(self):
         for module in (prepare, reconcile, validator):
             with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as directory:

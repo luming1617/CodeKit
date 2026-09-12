@@ -9,7 +9,7 @@ allowed-tools: 'Bash, Read, Write, Agent, Grep, LSP, Skill'
 
 在用户授权范围内，把冻结的新建或变更后的 PRD、技术方案（TDD）与发布方案（RPD）转换为可验证的代码变更。主 Agent 是唯一 Orchestrator；代码由 Implementer Subagent 编写，验证由确定性的本地工具执行，失败由只读 Debugger 分析，最终 Diff 交给系统已注册的 `codekit:code-review` Skill 独立审查。
 
-**输出语言：**面向用户的计划、状态和报告使用简体中文；代码、命令、路径、标识符和原始日志保持原样。
+**输出语言：**面向用户的计划、状态和报告使用简体中文；专有名词、参数、代码、命令、路径、JSON 字段名与状态字面量（如 `BLOCKED`）和原始日志保持英文原文；Task Contract、状态文件与其他产物按 `references/` 契约的既有语言要求执行。规则原文见 `$SKILLS_ROOT/_shared/prompts/output-language.md`，派发子代理时必须把该规则带进任务正文。
 
 ## 路径解析约定
 

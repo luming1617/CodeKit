@@ -4,43 +4,47 @@
 
 ### Overview
 
-CodeKit 是一个面向 Claude、OpenCode、Codex、Qoder 和 Qoder CN 的 AI 开发插件包，仓库包含七个工作流技能、安装与卸载工具、平台插件元数据以及初始化索引与上下文脚本。
+CodeKit 是以插件形式分发给 Claude、Codex、OpenCode、Qoder 与 Qoder CN 的 AI 开发套件仓库：7 个 AI 工作流技能（skills/）、一套纯 Python 的安装/卸载/校验工具链（scripts/ 与 install.sh、install.ps1 入口）和四份平台插件元数据，仓库自身没有运行时服务、数据库或部署流水线，只有 lefthook.yml 定义的 git 钩子门禁。
 
 ### Structure
 
-- `skills/`: 包含 bugfix、code-impl、code-review、initialize、product-doc、release-doc、technical-doc 七个以 SKILL.md 和 openai.yaml 为核心的工作流技能。
-- `skills/initialize/`: 初始化工作流定义、Context Scanner/GitNexus/Graphify 角色、标准模板、控制器脚本和初始化测试。
-- `skills/initialize/scripts/`: 初始化状态机的准备、门禁验证、结果 reconcile、GitNexus 适配与公共辅助脚本。
-- `skills/initialize/tests/`: 覆盖初始化脚本、worker contract、路径边界、结果门禁和端到端状态流转的 Python 测试。
-- `scripts/`: 安装器、卸载器、组件注册与选择、插件 manifest/技能布局校验、全局 agent 管理和版本同步脚本。
-- `.claude-plugin/`: Claude 插件及 marketplace 的 JSON 元数据。
-- `.codex-plugin/`: Codex 插件及 marketplace 的 JSON 元数据。
-- `.opencode/`: OpenCode npm 包元数据及动态注册 skills 命令的插件实现。
-- `.qoder-plugin/`: Qoder / Qoder CN 插件 manifest；两个发行版共用同一个用户级配置根，安装一次即对 CLI 与桌面 IDE 同时生效。
-- `.standard/`: 当前仓库已存在的全局规范和 Python 技术栈规范索引及正文。
-- `install.sh`: macOS/Linux 安装或升级入口，调用 scripts 下的安装编排逻辑。
-- `uninstall.sh`: macOS/Linux 卸载入口，调用独立卸载编排逻辑。
-- `install.ps1` / `install.cmd`: Windows 安装或升级入口（`install.cmd` 是 PowerShell 的 CMD 包装），只做 preflight 检测后转交同一套 Python 编排逻辑。
-- `uninstall.ps1` / `uninstall.cmd`: Windows 卸载入口。
-- `scripts/installer_platform.py`: 唯一的平台差异来源（npm 前缀、venv 布局、状态目录、临时目录、命令入口、特权与交互判定），安装、卸载、状态检测都读它。
-- `.agents/plugins/marketplace.json`: Codex 实际读取的 marketplace 清单（`.codex-plugin/` 只提供插件自身元数据，两者都必需）。
+- `skills/`: 七个 AI 工作流技能目录（bugfix、code-impl、code-review、initialize、product-doc、release-doc、technical-doc）；实测 7 个 SKILL.md、7 个同级 openai.yaml 与 26 个 agents/*.md 角色定义，目录约定见 skills/README.md。
+- `skills/initialize/`: 初始化工作流本体：SKILL.md（Phase 0-4 流程与参数）、openai.yaml、agents/（initialize-context-scanner 与 initialize-graphify 两个 subagent 角色正文）、references/（context-files、worker-contract、orchestration、tool-adapters、final-report 五份契约）与 standard/（01-global、02-stack、03-project 规范模板）。
+- `skills/initialize/scripts/`: initialize 状态机的确定性实现：_common.py（仓库验证白名单 VALIDATION_PROGRAMS、禁用 shell 语法正则、错误码枚举、托管块标记、git 基线）、prepare.py（Phase 0 冻结基线与 GitNexus/Graphify 能力探测）、controller.py（start/analyze/gate/reconcile/finish CLI）、reconcile.py（上下文 contract 校验与 AGENTS.md/CLAUDE.md 渲染）、validate-result.py（Worker 结果与 artifact 门禁、自跑仓库验证）、run-gitnexus.py 与 gitnexus-step.py（GitNexus argv 拼装与全局 registry 复核）。
+- `skills/initialize/tests/`: 控制器、worker contract、路径边界、结果门禁与端到端状态流转测试；在系统临时目录中 git init 仓库并用隔离的 GITNEXUS_HOME 运行。
+- `skills/bugfix/`: Bug 诊断技能：bugfix-investigator/challenger/implementer 三个 agent、scripts/bugfix_state.py 与 scripts/validate_bugfix_proposal.py 提案门禁，以及 tests/test_bugfix_skill_scripts.py。
+- `skills/code-impl/`: 需求实现技能：impl-planner/implementer/debugger 三个 agent、scripts/code_impl_controller.py 任务 DAG 编排控制器，以及 tests/test_code_impl_controller.py。
+- `skills/code-review/`: 多维代码审查技能：review-context/review-evidence/review-failure/review-specialist/review-traceability 五个 agent、scripts/freeze_review_snapshot.py 快照与 scripts/validate_review_report.py 报告门禁，以及 tests/test_review_contracts.py。
+- `skills/product-doc/`: PRD 生成与审查技能：product-extractor/product-writer/product-reviewer 三个 agent、scripts/review_state.py 与 scripts/validate_prd.py 契约校验，以及 tests/test_product_doc_skill_scripts.py。
+- `skills/release-doc/`: 发布方案技能：release-critic/dependencies/refiner/reviewer/writer 五个 agent 与 references/（release-doc-template.md、release-review-contract.md、check-standard.md、release-reviewer-prompt.md）；本技能不含 scripts/ 与 tests/，没有本地可执行门禁。
+- `skills/technical-doc/`: 技术方案技能：tech-architect/tech-context/tech-critic/tech-refiner/tech-reviewer 五个 agent、scripts/tech_doc_controller.py 阶段控制器，以及 tests/test_tech_doc_controller.py 与 tests/test_template_contract.py（模板与校验器字段一致性）。
+- `skills/_shared/prompts/`: 跨技能共享提示片段：path-convention.md（SKILL_DIR/SKILLS_ROOT 绝对路径解析与派发清单）与 subagent-mandate.md，被各技能 SKILL.md 以 _shared/prompts/ 路径引用。
+- `scripts/`: 纯 Python 工程工具链：installer.py（约 1915 行的安装主入口）与 installer_config/platform/state/sources/agents/qoder.py 分层模块、uninstaller.py、component-registry.py（组件注册表与 --check 自校验）、component-selector.py、manage-global-agents.py、sync-plugin-version.py、validate-skill-layout.py、validate-plugin-manifests.py，以及 4 个 test_installer_*.py 回归测试。
+- `install.sh`: POSIX 安装入口：只做系统依赖检测，最后 exec python3 调用 scripts/installer.py；Windows 等价入口是 install.ps1（launcher 用 py -3 而非 python3，并强制 -X utf8）与 6 行的 install.cmd 包装；uninstall.sh、uninstall.ps1、uninstall.cmd 是对应卸载入口，调用 scripts/uninstaller.py。
+- `.claude-plugin/`: Claude 插件元数据：plugin.json 与 marketplace.json；同类的 .qoder-plugin/plugin.json 是 Qoder 与 Qoder CN 共用的 manifest（两个发行版共享同一用户级配置根）。
+- `.codex-plugin/`: Codex 插件自身元数据（plugin.json、marketplace.json）；Codex 实际解析的 marketplace 条目位于 .agents/plugins/marketplace.json，两处文件同时必需。
+- `.opencode/`: OpenCode 分发：package.json（name codekit、version 1.0.0、type module、main plugins/codekit.js）、opencode.json 与 plugins/codekit.js、plugins/graphify.js，用于动态注册 skills 命令。
+- `lefthook.yml`: git 钩子门禁定义：pre-commit 先同步 plugin-version.json 版本进各 manifest 再校验 manifest；pre-push 校验五个 marketplace/plugin 文件存在、技能布局、安装器 unittest 套件与 skills/*/tests 全部套件（钩子内部以 python3 调用脚本）。
+- `.standard/`: 本 run 的 Phase 0 刚写入的规范库：01-global/（00-instructions.md、api.md、git.md、security.md、unit-test.md）与 02-stack/python/（00-instructions.md、01-test.md）；模板来源是 skills/initialize/standard/，当前尚未被 git 跟踪。
+- `AGENTS.md`: 上下文文件（与 CLAUDE.md 成对）：由 CodeKit 托管块管理、主 Agent 是唯一写者；两者在本 run 的 Phase 0 基线中已存在，其中 AGENTS.md 处于 dirty 状态且尚未按本次扫描结果更新。
 
 ### Commands and Verification
 
-- 校验每个技能的 SKILL.md、根级 openai.yaml、agent 元数据和资源引用。: `python3 scripts/validate-skill-layout.py` (evidence: `scripts/validate-skill-layout.py`, `skills/README.md`, `lefthook.yml`)
-- 校验 Claude、Codex、OpenCode、Qoder 插件 manifest 的 JSON、名称、版本、marketplace 源和入口文件。: `python3 scripts/validate-plugin-manifests.py` (evidence: `scripts/validate-plugin-manifests.py`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `.opencode/package.json`, `.qoder-plugin/plugin.json`)
-- 校验安装器组件注册表的 ID、分组顺序和描述字段。: `python3 scripts/component-registry.py --check` (evidence: `scripts/component-registry.py`, `INSTALL.md`)
-- 运行初始化控制器、结果契约、路径边界和端到端状态流转测试。: `python3 skills/initialize/tests/test_initialize_scripts.py` (evidence: `skills/initialize/tests/test_initialize_scripts.py`, `skills/initialize/scripts/controller.py`)
-- 运行 bugfix 技能脚本和提案契约测试。: `python3 skills/bugfix/tests/test_bugfix_skill_scripts.py` (evidence: `skills/bugfix/tests/test_bugfix_skill_scripts.py`, `skills/bugfix/scripts/validate_bugfix_proposal.py`)
-- 运行 product-doc 技能脚本测试。: `python3 skills/product-doc/tests/test_product_doc_skill_scripts.py` (evidence: `skills/product-doc/tests/test_product_doc_skill_scripts.py`, `skills/product-doc/scripts/validate_prd.py`)
-- 运行 technical-doc 控制器测试。: `python3 skills/technical-doc/tests/test_tech_doc_controller.py` (evidence: `skills/technical-doc/tests/test_tech_doc_controller.py`, `skills/technical-doc/scripts/tech_doc_controller.py`)
-- 运行 technical-doc 模板契约测试。: `python3 skills/technical-doc/tests/test_template_contract.py` (evidence: `skills/technical-doc/tests/test_template_contract.py`, `skills/technical-doc/references/technical-doc-template.md`)
-- 从本地仓库安装或升级选定的 CodeKit 组件。: `bash install.sh install -y`（Windows: `install.cmd install -y`） (evidence: `install.sh`, `install.cmd`, `install.ps1`, `README.md`, `INSTALL.md`)
-- 卸载选定的 CodeKit 组件。: `bash uninstall.sh -y`（Windows: `uninstall.cmd -y`） (evidence: `uninstall.sh`, `uninstall.cmd`, `uninstall.ps1`, `README.md`, `INSTALL.md`)
-- 把 plugin-version.json 的版本同步到各平台 manifest。: `python3 scripts/sync-plugin-version.py` (evidence: `scripts/sync-plugin-version.py`, `plugin-version.json`, `lefthook.yml`)
-- 运行安装器、共享存储适配层和 agent 同步的回归测试（pre-push 门禁）。: `python3 -m unittest discover -s scripts -p 'test_*.py'` (evidence: `scripts/test_installer_qoder.py`, `scripts/test_installer_sources.py`, `scripts/test_installer_agents.py`, `lefthook.yml`)
-- 构建 GitNexus 仓库分析和技能索引。: `gitnexus analyze --skills --verbose` (evidence: `GUIDE.md`, `skills/initialize/SKILL.md`)
-- 使用代码模式提取 Graphify 知识图谱到仓库输出目录。: `graphify extract . --out . --code-only` (evidence: `skills/initialize/SKILL.md`, `skills/initialize/agents/initialize-graphify.md`)
+- 校验每个技能的 SKILL.md、openai.yaml、agent 元数据与资源引用完整性（脚本只读取 skills/ 并打印结果，实测入口为 225 行纯校验）: `py -3 scripts/validate-skill-layout.py` (evidence: `scripts/validate-skill-layout.py`, `lefthook.yml`, `skills/README.md`)
+- 校验 Claude、Codex、OpenCode、Qoder 插件 manifest 的 JSON 语法、插件名、版本一致性与被引用文件是否存在: `py -3 scripts/validate-plugin-manifests.py` (evidence: `scripts/validate-plugin-manifests.py`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `.opencode/package.json`, `.qoder-plugin/plugin.json`, `lefthook.yml`)
+- 校验安装器组件注册表的 ID、分组顺序与渠道字段（--check 在 validate_registry 后直接返回，不导出注册表）: `py -3 scripts/component-registry.py --check` (evidence: `scripts/component-registry.py`, `INSTALL-STRATEGY.md`, `INSTALL.md`)
+- 运行安装器、平台层、全局 agent 同步与 Qoder 安装的回归测试（pre-push 门禁等价；测试创建系统临时目录并 fork sys.executable 子进程）: `py -3 -m unittest discover -s scripts` (evidence: `scripts/test_installer_agents.py`, `scripts/test_installer_contracts.py`, `scripts/test_installer_qoder.py`, `scripts/test_installer_sources.py`, `lefthook.yml`)
+- 运行 initialize 控制器、worker contract、路径边界、结果门禁与端到端状态流转测试（会在临时目录 git init 仓库）: `py -3 -m unittest discover -s skills/initialize/tests` (evidence: `skills/initialize/tests/test_initialize_scripts.py`, `skills/initialize/scripts/controller.py`, `lefthook.yml`)
+- 运行 bugfix 技能脚本与提案契约测试: `py -3 -m unittest discover -s skills/bugfix/tests` (evidence: `skills/bugfix/tests/test_bugfix_skill_scripts.py`, `skills/bugfix/scripts/validate_bugfix_proposal.py`, `skills/bugfix/scripts/bugfix_state.py`)
+- 运行 code-impl 任务编排控制器测试: `py -3 -m unittest discover -s skills/code-impl/tests` (evidence: `skills/code-impl/tests/test_code_impl_controller.py`, `skills/code-impl/scripts/code_impl_controller.py`)
+- 运行 code-review 快照与报告契约测试: `py -3 -m unittest discover -s skills/code-review/tests` (evidence: `skills/code-review/tests/test_review_contracts.py`, `skills/code-review/scripts/freeze_review_snapshot.py`, `skills/code-review/scripts/validate_review_report.py`)
+- 运行 product-doc 技能脚本测试（PRD 校验与审查状态）: `py -3 -m unittest discover -s skills/product-doc/tests` (evidence: `skills/product-doc/tests/test_product_doc_skill_scripts.py`, `skills/product-doc/scripts/validate_prd.py`, `skills/product-doc/scripts/review_state.py`)
+- 运行 technical-doc 阶段控制器与模板契约测试: `py -3 -m unittest discover -s skills/technical-doc/tests` (evidence: `skills/technical-doc/tests/test_tech_doc_controller.py`, `skills/technical-doc/tests/test_template_contract.py`, `skills/technical-doc/references/technical-doc-template.md`)
+- 把 plugin-version.json 的版本同步进四个平台 manifest（会改写 .claude-plugin、.codex-plugin、.opencode、.qoder-plugin 下的文件，属于仓库内写入，故不作为无副作用验证）: `py -3 scripts/sync-plugin-version.py` (evidence: `scripts/sync-plugin-version.py`, `plugin-version.json`, `lefthook.yml`)
+- Windows 下从本地仓库安装或升级选中的 CodeKit 组件（写用户级配置目录、可能联网与安装 CLI，仅在人工明确要求时执行）: `install.cmd install -y` (evidence: `install.cmd`, `install.ps1`, `scripts/installer.py`, `INSTALL.md`)
+- 卸载选中的 CodeKit 组件（删除用户级配置与插件目录）: `uninstall.cmd -y` (evidence: `uninstall.cmd`, `uninstall.ps1`, `scripts/uninstaller.py`, `README.md`)
+- 构建 GitNexus 代码索引与 GitNexus skill 产物（参数来自 gitnexus-step.py 的 ANALYZE_BASE；写 .gitnexus/ 与全局 registry，gitnexus 不在仓库验证白名单内，本 run 由 controller.py analyze 派发）: `gitnexus analyze --skills --skip-agents-md --verbose` (evidence: `skills/initialize/scripts/gitnexus-step.py`, `skills/initialize/SKILL.md`, `GUIDE.md`)
+- 用 Graphify 以本地 AST 模式抽取代码知识图谱到 graphify-out/（外部工具，不在仓库验证白名单内，由 initialize-graphify subagent 执行）: `graphify extract . --out . --code-only` (evidence: `skills/initialize/references/tool-adapters.md`, `skills/initialize/agents/initialize-graphify.md`)
 <!-- codekit:initialize:project-context:end -->
 
 <!-- codekit:initialize:standards:start -->

@@ -17,4 +17,6 @@ __pycache__/
 .gitnexus/
 graphify-out/
 .graphifyignore
+.claude/skills/gitnexus*/
+.agents/skills/gitnexus*/
 # codekit:initialize:ignore:end

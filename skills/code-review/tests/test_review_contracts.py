@@ -392,7 +392,10 @@ class SnapshotScriptTests(unittest.TestCase):
             repo = Path(directory)
             subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
             (repo / "regular.py").write_text("print('x')\n", encoding="utf-8")
-            os.symlink("regular.py", repo / "link.py")
+            try:
+                os.symlink("regular.py", repo / "link.py")
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
             paths, digest = untracked_manifest(repo)
             self.assertEqual(paths, ["link.py", "regular.py"])
             self.assertEqual(len(digest), 64)

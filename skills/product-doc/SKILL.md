@@ -14,6 +14,8 @@ argument-hint: '<product-material-source> [--feature-directory <feature-director
 
 本 Skill 的协作原则与 `code-impl` 保持一致：主 Agent 是唯一 Orchestrator，负责输入冻结、权限边界、任务编排、结果合并、门禁和交付；Extractor、Writer、Reviewer 都是隔离的 Sub-agent，只能使用主 Agent 显式传入的资料和契约。Reviewer 只读，不得直接改写 PRD；所有修改由主 Agent 根据证据协调 Writer 或定向修订完成。
 
+**输出语言：**面向用户的说明、检查结论、审批请求和交付报告使用简体中文；专有名词、参数、代码、命令、路径、JSON 字段名与状态字面量（如 `BLOCKED`）和原始日志保持英文原文；PRD 及其他产物文件正文按 `product-doc-template.md` 与评审契约的既有语言要求执行。规则原文见 `$SKILLS_ROOT/_shared/prompts/output-language.md`，派发子代理时必须把该规则带进任务正文。
+
 ## Agent 架构图
 
 ```mermaid

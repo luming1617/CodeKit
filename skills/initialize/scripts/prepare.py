@@ -8,6 +8,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -197,14 +198,39 @@ def probe(command: list[str], root: Path) -> dict[str, object]:
     }
 
 
+def _batch_python_target(lines: list[str]) -> list[str]:
+    """Resolve the interpreter behind a Windows batch launcher (npm/venv shim).
+
+    ``graphify.CMD`` runs ``"<venv>\\Scripts\\graphify.exe" %*`` and carries no
+    shebang, so the entry-point exe names the venv that owns Graphify.
+    """
+    for line in lines:
+        for quoted, bare in re.findall(r'"([^"]+)"|([^\s"]+\.exe)', line, re.IGNORECASE):
+            target = (quoted or bare).strip()
+            if not target.lower().endswith(".exe") or not os.path.isabs(target):
+                continue
+            path = Path(target)
+            if path.name.lower().startswith("python"):
+                return [str(path)]
+            sibling_python = path.parent / "python.exe"
+            if path.parent.name.lower() == "scripts" and sibling_python.is_file():
+                return [str(sibling_python)]
+    return []
+
+
 def _shebang_python(graphify_path: Path) -> list[str] | None:
+    """Return the interpreter that actually runs Graphify, or None if undecidable."""
     try:
-        first_line = graphify_path.read_text(encoding="utf-8").splitlines()[0]
-        if not first_line.startswith("#!"):
-            return None
-        parts = shlex.split(first_line[2:].strip())
-    except (OSError, IndexError, ValueError):
+        lines = graphify_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
         return None
+    first_line = lines[0] if lines else ""
+    if first_line.startswith("#!"):
+        # posix=False so a Windows ``#!C:\...\python.exe`` keeps its backslashes;
+        # stripping quotes restores what POSIX mode would already have removed.
+        parts = [part.strip('"') for part in shlex.split(first_line[2:].strip(), posix=False)]
+    else:
+        parts = _batch_python_target(lines)
     if not parts:
         return None
 
@@ -272,7 +298,8 @@ def gitnexus_command() -> tuple[list[str], str]:
     """
     override = os.environ.get("CODEKIT_GITNEXUS_RUNNER", "").strip()
     if override:
-        parts = shlex.split(override)
+        # posix=False so a Windows ``C:\...\python.exe`` keeps its backslashes.
+        parts = [part.strip('"') for part in shlex.split(override, posix=False)]
         if parts:
             return parts, "override"
     installed = shutil.which("gitnexus")

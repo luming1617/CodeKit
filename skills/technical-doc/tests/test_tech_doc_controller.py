@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -473,7 +474,7 @@ class TechDocControllerTests(unittest.TestCase):
         state = self.repo / ".codekit" / "technical-doc" / "run-18" / "state.json"
         self.write_tdd()
         result = subprocess.run(
-            ["python3", str(MODULE_PATH), "gate", "--state", str(state),
+            [sys.executable, str(MODULE_PATH), "gate", "--state", str(state),
              "--tdd-file", str(self.feature / "technical-doc.md")],
             capture_output=True, text=True,
         )
@@ -483,7 +484,7 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertIn("independent-review-ran", payload["failures"])
 
         bad = subprocess.run(
-            ["python3", str(MODULE_PATH), "start-stage", "--state", str(state), "--to", "CONTEXT"],
+            [sys.executable, str(MODULE_PATH), "start-stage", "--state", str(state), "--to", "CONTEXT"],
             capture_output=True, text=True,
         )
         self.assertEqual(bad.returncode, 2)
