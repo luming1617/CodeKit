@@ -24,7 +24,9 @@ allowed-tools: 'Bash, Read, Write, Edit, Glob, Grep, Agent, Skill'
 - `--force`：显式重建 GitNexus/Graphify，不绕过验证或写入边界。
 - `--allow-partial`：允许工具缺失等可接受的 `skipped` 继续生成上下文；仍不得把整体标记为 success，也不得放行真实失败。协作不可用必须映射为 `skipped + collab-unavailable`，整体保持 `blocked`。
 - `--commit`：通过所有提交门禁后提交精确文件；默认不提交。
-- `--allow-global-writes`：授权 Phase 0/1 在仓库之外写入一次（`gitnexus embeddings install`、真实 `GITNEXUS_HOME` 注册）。仅在用户明确同意后传入；未传入时脚本按 `gitnexus_embedding_mode=drop` 显式降级而不是失败。Phase 0 检测到需要全局写入却未获授权时，主 Agent 必须显式询问用户，不得自行授权。
+- `--allow-global-writes`：授权 Phase 0/1 在仓库之外写入一次（`gitnexus embeddings install`、把仓库写进真实 `GITNEXUS_HOME/registry.json`）。仅在用户明确同意后传入；未传入时按下面的前提分别降级。Phase 0 检测到需要全局写入却未获授权时，主 Agent 必须显式询问用户，不得自行授权：
+  - **embedding 前提**：按 `gitnexus_embedding_mode=drop` 显式降级，不失败。
+  - **注册前提**：`list`/`query`/`context`/`impact`/`trace`/`cypher`/`check`/`detect-changes` 与 MCP 图查询只从该注册表解析仓库，缺注册时索引有效但一律报 `No indexed repositories found`。因此 `start` 在零业务写入前失败（`PrepareError`）：获准后带 `--allow-global-writes` 重跑；用户拒绝时带 `--allow-partial` 明确接受 gitnexus 阶段降级为 `partial/registry-missing`。
 
 未知参数、空/重复/不支持的语言必须在任何写入前报错。
 
@@ -43,7 +45,7 @@ allowed-tools: 'Bash, Read, Write, Edit, Glob, Grep, Agent, Skill'
 5. GitNexus 和 Graphify 不得写 `AGENTS.md`、`CLAUDE.md`；`initialize-context-scanner` 只返回事实和证据路径。
 6. `.gitignore`、`.graphifyignore`、规范索引和上下文文件只更新各自的 CodeKit managed block，保留用户内容及其他工具 block。
 7. Worker 只能写声明的路径；Git 可见的真实 diff 按路径申报，被 ignore 的分析产物目录按控制器授予的前缀判定。出现未授权或未申报路径时停止收敛与自动提交。
-8. 任一 required 阶段失败即失败；工具不存在是 `skipped`，整体为 partial，默认禁止提交。失败 manifest phase 统一为 `aborted`，final report status 仍为 `failed`。
+8. 任一 required 阶段失败即失败；工具不存在是 `skipped`，整体为 partial，默认禁止提交。`required_for_initialize` 验证命令的程序未安装同样记为 `skipped`（partial 且禁止提交）；程序不在控制器白名单则是可恢复的契约错误，在 reconcile 写入前报错，不是 finish 阶段的失败。失败 manifest phase 统一为 `aborted`，final report status 仍为 `failed`。
 9. 任一托管文件在运行前 dirty 时可更新其 managed block，但本次运行禁止自动提交。
 
 ## 执行架构与职责
@@ -98,7 +100,7 @@ python3 "<SKILL_DIR>/scripts/controller.py" start [initialize arguments]
 
 控制器创建 manifest、取得锁并进入 `prepared`。`prepare.py`、`reconcile.py`、`validate-result.py` 是控制器内部模块，不作为编排入口直接调用。
 
-Phase 0 同时在任何写入之前解析 GitNexus runner 并判定 embedding 前提，结果写进 manifest：`tools.gitnexus`（`command` / `runner` / `identity_stable` / `local_embeddings`）、`gitnexus_index`（`present` / `pdg` / `embeddings`）、`gitnexus_embedding_mode`、`options.allow_global_writes`。检测到需要全局写入（补齐本地 embedding 栈）而用户未授权时，主 Agent 必须显式询问用户后重新运行；脚本不会自行授权。
+Phase 0 同时在任何写入之前解析 GitNexus runner 并判定 embedding 与**全局注册**两个前提，结果写进 manifest：`tools.gitnexus`（`command` / `runner` / `identity_stable` / `local_embeddings`）、`gitnexus_index`（`present` / `pdg` / `embeddings`）、`gitnexus_embedding_mode`、`gitnexus_registry`（`dir` / `path` / `registered` / `writable`）、`options.allow_global_writes`。检测到需要全局写入而用户未授权时，主 Agent 必须显式询问用户后重新运行；脚本不会自行授权。补齐本地 embedding 栈属于可降级前提；**注册属于硬前提**——查询类命令与 MCP 图查询只从 `<GITNEXUS_HOME>/registry.json` 解析仓库，缺注册时 `status` 正常但查询全废，所以未授权且未传 `--allow-partial` 时 `start` 直接失败，不做任何写入。
 
 ### Phase 1：分析与只读扫描
 
@@ -114,6 +116,7 @@ python3 "<SKILL_DIR>/scripts/controller.py" analyze --manifest <run-manifest.jso
 控制器按冻结的 runner 与索引模式执行，并按 Worker contract 写出 `<run-id>/gitnexus-result.json`；它只写这一个 result，不推进 manifest 阶段（阶段由 gate 推进）。
 
 - GitNexus 以 `status` 为真相源：`status --json` 报 `current` 且 artifact 存在时直接复用索引，返回 `skipped + index-current`，不再执行 analyze。命令前缀只取 manifest 的 `tools.gitnexus.command`（`CODEKIT_GITNEXUS_RUNNER` 或 `PATH` 上的真实安装），**不得**回落到 `.gitnexus/run.cjs`（它按 `gitnexus@latest` 走 npx，会漂移分析器身份并触发全量重建），也不通过 `npx`/`dlx` 下载；解析失败按 tool missing 返回 `skipped`。基准参数为 `analyze --skills --skip-agents-md --verbose`，并镜像 `gitnexus_index.pdg`、按 `gitnexus_embedding_mode` 追加 `--drop-embeddings` 或先安装 embedding 栈；执行一律经过 `scripts/run-gitnexus.py`，默认隔离全局 registry，用户授权后才用 `--use-global-registry`。这些参数由控制器推导，主 Agent 不得自行覆盖。
+- **注册校验（不得省略）**：`status` 走仓库内 `.gitnexus/`，查询类命令与 MCP 图查询走全局 registry，两者可以不一致，所以 `status=current` 与 analyze 退出码 0 都**不能**证明查询路径可用。控制器在两条路径上都会实测 `gitnexus_registry_state`：未授权时不写注册表并返回 `partial + registry-missing`；已授权时先经 `gitnexus index <root>` 幂等补注册（复用路径尤其需要，那时 analyze 不会运行），仍未注册则 `failed`；成功后把实测到的 `registry` 写进 result。Gate 对 complete 的 gitnexus result 会自己重测一次注册，缺失即拒绝，绝不采信 result 的自述。
 - 当 GitNexus 支持 `--skills` 时，准备阶段会尝试创建 `.claude/skills` 与 `.agents/skills` 两个目标目录；若宿主目录只读且 help 支持 `--skip-skills`，manifest 标记 `community-only`，控制器追加该 flag 并保留社区 skills；不支持时明确失败。控制器必须申报每一处 Git 可见的变更路径；被 ignore 的分析产物目录只需申报实际写入的顶层条目，门禁按授权前缀核验。
 - Graphify Agent Skill 使用 `$graphify . --update --no-viz`（Codex）或 `/graphify . --update --no-viz`（Claude/OpenCode）；Shell CLI 必须使用其真实子命令 adapter，不能执行 `graphify .`。混合仓库或无明确语义后端时默认使用 `graphify extract . --out . --code-only`；Worker 按 `tools.graphify.supports.ast_process_pool` 与 `max_workers` 能力决定是否追加 `--max-workers 1`，未知能力按不支持处理且无 fallback flag 时明确失败。
 - `initialize-context-scanner` 只返回结构化事实、命令候选与证据路径；主 Agent不得用自己的扫描摘要代替该 result。
@@ -149,7 +152,7 @@ python3 "<SKILL_DIR>/scripts/controller.py" reconcile \
 python3 "<SKILL_DIR>/scripts/controller.py" finish --manifest <run-manifest.json>
 ```
 
-`finish` 由控制器自行执行 reconcile 记录的每条 `required_for_initialize` 仓库验证命令，真实退出码写入 `final_report.validations`：命令不经 shell 解析，禁止重定向、管道、命令替换与通配符，可执行程序必须在控制器白名单内或为仓库内的明确脚本路径，超时由 `--validation-timeout`（默认 900 秒）控制。主 Agent 不预先执行验证命令，也不得用自己的判断替代控制器结果；`--validation-result` 只在显式 `--allow-attested-validations` 的外部验证环境下接受，此时仍禁止自动提交。
+`finish` 由控制器自行执行 reconcile 记录的每条 `required_for_initialize` 仓库验证命令，真实退出码写入 `final_report.validations`：命令不经 shell 解析，禁止重定向、管道、命令替换与通配符，可执行程序必须在控制器白名单内或为仓库内的明确脚本路径（Python 命令按宿主：macOS/Linux `python3 …`，Windows `py -3 …`），超时由 `--validation-timeout`（默认 900 秒）控制。reconcile 已用同一白名单预检这些命令：程序不在白名单、含禁用 shell 语法或仓库脚本缺失时作为可恢复的契约错误在写入任何托管文件之前中止（修复 context 后重试同一个 run）；白名单内但本机未安装的程序在 finish 记为 `skipped` 并写入 `final_report.validation_warnings`，整体降级为 `partial` 且禁止提交（`commit_status` 为 `blocked-skipped-validations`）。主 Agent 不预先执行验证命令，也不得用自己的判断替代控制器结果；`--validation-result` 只在显式 `--allow-attested-validations` 的外部验证环境下接受，此时仍禁止自动提交。
 
 随后展示本次托管文件的 status、diff stat 和关键 diff。若启动时显式传入 `--commit`，`finish` 由控制器在持锁状态下执行提交门禁，仅精确提交本次已授权且未被 Git ignore 的路径；不得由主 Agent在控制器之外自行 stage 或提交。
 

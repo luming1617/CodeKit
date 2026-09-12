@@ -8,12 +8,11 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from _common import (
     COMPLETE_SKIP_CODES,
@@ -26,6 +25,7 @@ from _common import (
     IGNORE_START,
     INDEX_END,
     INDEX_START,
+    MANAGED_GITIGNORE_ENTRIES,
     PROJECT_END,
     PROJECT_START,
     RESERVED_MARKERS,
@@ -35,21 +35,18 @@ from _common import (
     TASK_REQUIRED_ARTIFACTS,
     WORKER_ERROR_CODES,
     InitializeError,
+    ValidationProgramMissing,
     atomic_json,
     git_status,
+    gitnexus_registry_state,
     load_json,
+    resolve_validation_command,
+    resolved_repository_path,
+    safe_relative,
     snapshot_trees,
 )
 
 VALID_STATUSES = {"success", "skipped", "failed", "partial"}
-# Repository validation commands come from the Scanner result, so they are
-# untrusted input: no shell, no shell syntax, and a bounded program list.
-VALIDATION_FORBIDDEN = re.compile(r"[;&|<>$`\n\r*?(){}\"'\\]")
-VALIDATION_PROGRAMS = {
-    "bash", "cargo", "cc", "cmake", "deno", "dtl", "gcc", "go", "gradle", "just",
-    "make", "mvn", "node", "nox", "npm", "pnpm", "pre-commit", "pytest", "python",
-    "python3", "sh", "tox", "yarn", "zig",
-}
 REQUIRED_FIELDS = {
     "schema_version", "run_id", "task", "status", "required", "runner", "command",
     "exit_code", "changed_files", "allowed_paths", "artifacts", "warnings", "started_at",
@@ -91,13 +88,6 @@ def cleanup_state(manifest: dict) -> dict[str, object]:
     return {"status": "removed", "path": str(run_dir)}
 
 
-def safe_relative(raw: str) -> PurePosixPath:
-    path = PurePosixPath(raw)
-    if path.is_absolute() or ".." in path.parts or not path.parts:
-        raise ValidationError(f"unsafe repository-relative path: {raw!r}")
-    return path
-
-
 def path_allowed(raw: str, allowed: list[str]) -> bool:
     path = safe_relative(raw)
     for prefix_raw in allowed:
@@ -131,21 +121,6 @@ def file_sha(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 
 
-def resolved_repository_path(root: Path, raw: str) -> Path:
-    relative = safe_relative(raw)
-    lexical = root.joinpath(*relative.parts)
-    try:
-        lexical.resolve().relative_to(root)
-    except ValueError as exc:
-        raise ValidationError(f"path escapes repository through symlink: {raw}") from exc
-    cursor = root
-    for part in relative.parts:
-        cursor /= part
-        if cursor.is_symlink():
-            raise ValidationError(f"path contains a symlink: {raw}")
-    return lexical
-
-
 snapshot_worker_scopes = snapshot_trees
 
 
@@ -168,14 +143,22 @@ def covered_by(raw: str, prefixes: list[str]) -> bool:
 def changed_since_baseline(manifest: dict, root: Path) -> set[str]:
     """Paths changed since Phase 0 that nobody can explain by prefix authority.
 
-    Git-visible changes are always reported per path.  Ignored analyzer areas
-    are compared at top-level entry granularity and skipped when the entry lies
-    inside an authorized write scope, so cache churn no longer masquerades as an
-    out-of-bounds write while a brand-new unexpected directory still trips.
+    Git-visible changes are always reported per path, minus the paths Phase 0
+    itself made visible by rewriting its own managed ignore file: those were
+    never written by anyone, the controller merely stopped ignoring them.
+    Ignored analyzer areas are compared at top-level entry granularity and
+    skipped when the entry lies inside an authorized write scope, so cache
+    churn no longer masquerades as an out-of-bounds write while a brand-new
+    unexpected directory still trips.
     """
     baseline_status = set(manifest.get("baseline_status", {}))
+    visibility_delta = manifest.get("controller_visibility_delta", [])
+    if not isinstance(visibility_delta, list):
+        visibility_delta = []
     current = set(git_status(root))
-    changed = current - baseline_status
+    changed = current - baseline_status - {
+        path for path in visibility_delta if isinstance(path, str)
+    }
     for path, state in manifest.get("baseline_files", {}).items():
         if state.get("dirty") and file_sha(root / path) != state.get("sha256"):
             changed.add(path)
@@ -187,6 +170,21 @@ def changed_since_baseline(manifest: dict, root: Path) -> set[str]:
             continue
         changed.add(path)
     return changed
+
+
+def uncovered_paths(paths: set[str], declared: set[str]) -> set[str]:
+    """Paths that no worker declaration accounts for.
+
+    Declarations come from model output and may name a directory
+    (``.agents/skills/gitnexus-cli``) where ``git status`` reports the files
+    beneath it, so a declared path also covers its descendants — the same
+    containment rule the scope checks use.  A plain string difference would
+    report every such file as an unreported write.
+    """
+    prefixes = [
+        raw for raw in declared if isinstance(raw, str) and raw.strip()
+    ]
+    return {path for path in paths if not covered_by(path, prefixes)}
 
 
 def within_or_error(
@@ -346,6 +344,22 @@ def validate_worker(result: dict, manifest: dict, root: Path) -> list[str]:
                 errors.append(f"{result['task']}: success requires artifact: {required}")
         if result["task"] == "context-scanner" and result.get("changed_files"):
             errors.append("context-scanner: read-only worker cannot report changed files")
+    if result["task"] == "gitnexus" and complete:
+        # 索引写在仓库内、仓库解析却在全局 registry：只校验 .gitnexus/meta.json 会让
+        # 「索引有效但 list/query/MCP 全部报 No indexed repositories」悄悄通过。这里由
+        # 门禁自己在宿主环境重测注册，不采信 result 的 self-report。
+        try:
+            registry = gitnexus_registry_state(root)
+        except OSError as exc:
+            errors.append(f"gitnexus: cannot read the GitNexus registry: {exc}")
+        else:
+            if not registry["registered"]:
+                errors.append(
+                    "gitnexus: index is not registered in "
+                    f"{registry['path']}; list/query/context/impact/trace/cypher/"
+                    "check/detect-changes and the MCP graph queries cannot resolve "
+                    "this repository"
+                )
     return errors
 
 
@@ -398,6 +412,7 @@ def workers_command(args: argparse.Namespace, *, emit: bool = True) -> int:
                 "artifacts": result.get("artifacts", []),
                 "version": result.get("version"),
                 "mode": result.get("mode", "default"),
+                "registry": result.get("registry"),
                 "error_code": (
                     result.get("error", {}).get("code")
                     if isinstance(result.get("error"), dict) else None
@@ -408,7 +423,7 @@ def workers_command(args: argparse.Namespace, *, emit: bool = True) -> int:
     if missing_tasks:
         errors.append("missing worker results: " + ", ".join(sorted(missing_tasks)))
 
-    unreported = changed_since_baseline(manifest, root) - declared
+    unreported = uncovered_paths(changed_since_baseline(manifest, root), declared)
     if unreported:
         errors.append("unreported paths changed since baseline: " + ", ".join(sorted(unreported)))
     if errors:
@@ -514,7 +529,7 @@ def validate_managed_gitignore(path: Path) -> list[str]:
     text = path.read_text(encoding="utf-8")
     body = text.split(IGNORE_START, 1)[1].split(IGNORE_END, 1)[0]
     present = {line.strip() for line in body.splitlines() if line.strip()}
-    required = {".codekit/", ".gitnexus/", "graphify-out/", ".graphifyignore"}
+    required = set(MANAGED_GITIGNORE_ENTRIES)
     for entry in sorted(required - present):
         errors.append(f"managed .gitignore is missing {entry}")
     return errors
@@ -598,49 +613,21 @@ def git_value(root: Path, command: list[str]) -> str | None:
     return completed.stdout.strip() if completed.returncode == 0 else None
 
 
-def resolve_validation_command(root: Path, command: str) -> list[str]:
-    """Turn a recorded repository command into a directly executable argv.
-
-    The Scanner invents these strings from repository content, so they are
-    treated as untrusted: shell syntax is rejected, the program must be on the
-    allow list (or a repository script path), and nothing is ever run through a
-    shell.  The working directory is always the frozen repository root.
-    """
-    if not isinstance(command, str) or not command.strip():
-        raise ValidationError("repository validation command is empty")
-    if VALIDATION_FORBIDDEN.search(command):
-        raise ValidationError(
-            f"repository validation command uses forbidden shell syntax: {command!r}"
-        )
-    argv = shlex.split(command)
-    if not argv:
-        raise ValidationError("repository validation command is empty")
-    program = argv[0]
-    if program.startswith(("./", "scripts/")):
-        candidate = resolved_repository_path(root, program)
-        if not candidate.is_file():
-            raise ValidationError(f"repository validation script is missing: {program}")
-        return [str(candidate), *argv[1:]]
-    if program not in VALIDATION_PROGRAMS:
-        raise ValidationError(f"repository validation program is not allowed: {program}")
-    executable = shutil.which(program)
-    if executable is None:
-        raise ValidationError(f"repository validation program is not installed: {program}")
-    return [executable, *argv[1:]]
-
-
 def run_repository_validations(
     root: Path, manifest: dict, timeout: int
-) -> tuple[list[dict[str, object]], list[str]]:
+) -> tuple[list[dict[str, object]], list[str], list[str]]:
     """Execute the required validations and record the real exit codes.
 
     Commit evidence must not be self-attested by the orchestrating agent, so the
     controller runs every ``required_for_initialize`` command itself.  Each
     command is echoed first so the executed action stays visible in the
-    transcript.
+    transcript.  A command whose allow-listed program is not installed on this
+    host is reported as ``skipped``: a missing toolchain must not fail a run that
+    already wrote its context files.
     """
     results: list[dict[str, object]] = []
     errors: list[str] = []
+    warnings: list[str] = []
     for item in manifest.get("validation_commands", []):
         command = item.get("command") if isinstance(item, dict) else None
         if not isinstance(command, str):
@@ -648,6 +635,16 @@ def run_repository_validations(
             continue
         try:
             argv = resolve_validation_command(root, command)
+        except ValidationProgramMissing as exc:
+            warnings.append(f"{exc}; recorded as skipped")
+            results.append({
+                "command": command,
+                "status": "skipped",
+                "exit_code": None,
+                "reason": ERROR_CODE_TOOL_MISSING,
+            })
+            print(f"initialize warning: {exc}; recorded as skipped", file=sys.stderr)
+            continue
         except (ValidationError, ValueError) as exc:
             errors.append(f"repository validation is not executable: {exc}")
             results.append({"command": command, "status": "blocked", "exit_code": None})
@@ -669,7 +666,7 @@ def run_repository_validations(
         })
         if completed.returncode:
             errors.append(f"repository validation failed: {command}")
-    return results, errors
+    return results, errors, warnings
 
 
 def commit_exact_paths(root: Path, paths: list[str]) -> str:
@@ -725,6 +722,7 @@ def final_command(args: argparse.Namespace, *, emit: bool = True) -> int:
         expected_validations = manifest.get("validation_commands", [])
         attested = bool(args.validation_result)
         validations: list[dict[str, object]] = []
+        validation_warnings: list[str] = []
         if attested and not args.allow_attested_validations:
             errors.append(
                 "--validation-result needs --allow-attested-validations: the controller "
@@ -752,7 +750,7 @@ def final_command(args: argparse.Namespace, *, emit: bool = True) -> int:
                     errors.append(f"repository validation failed: {command or '<unknown>'}")
             validations = validation_results
         elif expected_validations:
-            validations, execution_errors = run_repository_validations(
+            validations, execution_errors, validation_warnings = run_repository_validations(
                 root, manifest, args.validation_timeout
             )
             errors.extend(execution_errors)
@@ -764,7 +762,7 @@ def final_command(args: argparse.Namespace, *, emit: bool = True) -> int:
         errors.extend(validate_graphify_state(root, manifest))
         current_changes = changed_since_baseline(manifest, root)
         authorized = set(manifest.get("authorized_changed_paths", []))
-        outside = current_changes - authorized
+        outside = uncovered_paths(current_changes, authorized)
         if outside:
             errors.append("changes outside managed paths: " + ", ".join(sorted(outside)))
         commit_paths = sorted(path for path in current_changes if not ignored_by_git(root, path))
@@ -775,7 +773,12 @@ def final_command(args: argparse.Namespace, *, emit: bool = True) -> int:
         )
         dirty_managed = sorted(dirty_at_start & set(commit_paths))
         commit_requested = bool(manifest.get("options", {}).get("commit"))
-        overall = "failed" if errors else gate_status
+        # A required validation that could not run keeps the run out of success:
+        # the missing toolchain may hide a real regression.
+        skipped_validations = [
+            item for item in validations if item.get("status") == "skipped"
+        ]
+        overall = "failed" if errors else ("partial" if skipped_validations else gate_status)
         commit_allowed = (
             commit_requested and overall == "success" and not dirty_managed
             and bool(commit_paths) and not attested
@@ -784,6 +787,8 @@ def final_command(args: argparse.Namespace, *, emit: bool = True) -> int:
         commit_status = "not-requested"
         if commit_requested and attested:
             commit_status = "blocked-unverified-validations"
+        elif commit_requested and skipped_validations:
+            commit_status = "blocked-skipped-validations"
         elif commit_requested and not commit_paths:
             commit_status = "no-changes"
         elif commit_requested and not commit_allowed:
@@ -802,6 +807,7 @@ def final_command(args: argparse.Namespace, *, emit: bool = True) -> int:
             "errors": errors,
             "changed_files": sorted(current_changes),
             "validations": validations,
+            "validation_warnings": validation_warnings,
             "validation_source": "attested" if attested else "executed",
             "dirty_managed_at_baseline": dirty_managed,
             "commit_requested": commit_requested,

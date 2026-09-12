@@ -28,6 +28,9 @@ allowed_paths: [.gitnexus/]
 artifacts:
   - path: .gitnexus/meta.json
     validation: json-valid
+registry:
+  dir: /home/user/.gitnexus
+  registered: true
 warnings: []
 started_at: "2026-09-08T12:00:00Z"
 finished_at: "2026-09-08T12:00:01Z"
@@ -37,7 +40,12 @@ error:
   message: null
 ```
 
-`error.code` 使用控制器集中定义的枚举；未知或拼写错误的 code 必须拒绝。当前受支持的 code 包括 `tool-missing`、`index-current`、`no-change`、`collab-unavailable`、`chunk-failures`、`execution-failed`、`artifact-invalid`、`out-of-scope`、`internal-error`，成功结果的 code 必须为 `null`。
+`error.code` 使用控制器集中定义的枚举；未知或拼写错误的 code 必须拒绝。当前受支持的 code 包括 `tool-missing`、`index-current`、`no-change`、`collab-unavailable`、`chunk-failures`、`execution-failed`、`artifact-invalid`、`out-of-scope`、`internal-error`、`registry-missing`，成功结果的 code 必须为 `null`。
+
+`registry` 只有 gitnexus 一路携带，值是控制器在宿主环境实测到的
+`<GITNEXUS_HOME>/registry.json` 状态（`dir` / `registered`）。查询类命令与 MCP 图
+查询只从该注册表解析仓库，所以 `status` 与 `.gitnexus/meta.json` 都不能证明查询
+可用；gate 会自己重测一次，不采信该字段的自述。
 
 ## 状态一致性
 
@@ -60,7 +68,7 @@ error:
 路径必须先规范化；拒绝绝对路径、`..`、symlink 逃逸和仅靠字符串前缀伪装的 sibling 路径。这类畸形路径声明是契约违规：控制器把它作为 `errors` 返回并继续校验其余项，不会中断整个 run，也不会阅读声明外的文件。
 这些范围由控制器内置的 task policy 决定。Worker 返回的 `allowed_paths` 只是声明其实际使用的权限子集，不能授权新路径。
 
-完整的 GitNexus 结果必须携带可解析的 `.gitnexus/meta.json`。完整的 Graphify 结果必须携带 `graphify-out/graph.json`、`graphify-out/manifest.json` 和 `graphify-out/.graphify_root`；`success` 及 `index-current`/`no-change` 复用都适用。必要 artifact 的校验类型由控制器内置策略决定，Worker 返回的 `validation` 只能作为说明，不能降低 JSON、非空节点或 root-match 校验。
+完整的 GitNexus 结果必须携带可解析的 `.gitnexus/meta.json`，并且该仓库必须已注册在宿主的 GitNexus 全局 registry：`list`/`query`/`context`/`impact`/`trace`/`cypher`/`check`/`detect-changes` 与 MCP 图查询只从那里解析仓库，缺注册时索引虽有效但查询全废（`registry-missing`）。完整的 Graphify 结果必须携带 `graphify-out/graph.json`、`graphify-out/manifest.json` 和 `graphify-out/.graphify_root`；`success` 及 `index-current`/`no-change` 复用都适用。必要 artifact 的校验类型由控制器内置策略决定，Worker 返回的 `validation` 只能作为说明，不能降低 JSON、非空节点或 root-match 校验。
 
 ## 门禁复核
 
@@ -71,6 +79,7 @@ error:
 3. Phase 0 Git 基线与当前 `git status` 的差集没有未申报路径。被 ignore 的产物目录（`.gitnexus/`、`graphify-out/`、GitNexus skills 目录）按 Phase 0 的**顶层条目快照**与控制器授予的**前缀**比较：缓存文件的增减、计数或 mtime 变化不视为越界写入，未预期的新顶层条目仍然失败。
 4. artifact 存在、可读，`json-valid` 必须可解析；图/manifest 节点不得为空。
 5. 带 root 的 artifact/sidecar 必须解析到当前仓库根。
-6. `partial`、`failed` 保持原状态；不得按“失败 Worker 数量”聚合。`collab-unavailable` 是编排阻断，不是普通 partial，且不得由 `--allow-partial` 放行。
+6. `gitnexus` 的 complete 结论必须能在宿主环境重测到全局注册；缺失即拒绝（`registry-missing`），不得由 result 的 `registry` 字段自述代替。
+7. `partial`、`failed` 保持原状态；不得按“失败 Worker 数量”聚合。`collab-unavailable` 是编排阻断，不是普通 partial，且不得由 `--allow-partial` 放行。
 
 校验器输出 `success | partial | failed` 和每项证据。required failure、越界写入或 artifact root 不一致均为 failed。

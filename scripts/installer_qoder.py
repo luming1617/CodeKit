@@ -27,7 +27,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_config as config  # noqa: E402
-from installer_platform import rmtree  # noqa: E402
+from installer_platform import has_contents, rmtree  # noqa: E402
 
 
 PLUGIN_NAME = "codekit"
@@ -110,6 +110,7 @@ class InstallState:
     enabled: bool
     version: str
     install_path: str
+    leftover: bool = False
 
 
 def empty_registry() -> dict[str, Any]:
@@ -296,6 +297,39 @@ def set_plugin_enabled(
 def plugin_cache_root(root: Path) -> Path:
     """Return the cache directory holding locally installed Qoder plugins."""
     return Path(root) / "plugins" / "cache" / CACHE_MARKETPLACE / PLUGIN_NAME
+
+
+def cached_copies(root: Path) -> list[Path]:
+    """列出插件缓存中仍有内容的 CodeKit 副本目录。
+
+    插件按 ``cache/<marketplace>/<plugin>`` 落盘，卸载后目录本身通常还在：CLI
+    只在里面写一个 ``.orphaned_at`` 标记就当作删除了。残留判定因此以磁盘为准，
+    不走注册表——注册表恰恰是 CLI 第一个清掉的东西。
+    """
+    try:
+        marketplaces = sorted((Path(root) / "plugins" / "cache").iterdir())
+    except OSError:
+        return []
+    return [
+        candidate
+        for marketplace in marketplaces
+        if has_contents(candidate := marketplace / PLUGIN_NAME)
+    ]
+
+
+def remove_cached_copies(root: Path) -> None:
+    """物理删除插件缓存里的 CodeKit 副本。
+
+    ``plugins uninstall`` 是软删除：清掉注册表条目后在缓存目录写入
+    ``.orphaned_at``，目录留着等它自己回收（实测 ``plugins list`` 也不回收）。
+    卸载器必须自己删，否则用户会看到「卸载成功」但 skill 文件仍在，宿主还会把
+    它们逐条列成待确认的残留。
+    """
+    for target in cached_copies(root):
+        if target.is_dir() and not target.is_symlink():
+            rmtree(target, ignore_errors=True)
+        else:
+            target.unlink(missing_ok=True)
 
 
 def remove_stale_versions(cache_root: Path, version: str) -> None:
@@ -577,6 +611,7 @@ def inspect(
         enabled=plugin_enabled(root) if installed else False,
         version=version,
         install_path=install_path,
+        leftover=not installed and bool(cached_copies(root)),
     )
 
 
@@ -614,6 +649,9 @@ def uninstall(
 ) -> bool:
     """Remove the plugin from the shared root, with or without a CLI present."""
     root = resolve_config_root(descriptor, home, environ)
+    # CLI 的卸载是软删除，而且第一个动作就是清掉注册表条目；等它跑完再读注册表
+    # 已经找不到 installPath 了，物理删除会被整个跳过。因此先快照安装路径。
+    registered = plugin_entries(read_registry(root))
     command = capable_cli(descriptor, environ, runner)
     if command:
         runner(
@@ -621,15 +659,19 @@ def uninstall(
              PLUGIN_NAME, "--json"],
             timeout=120,
         )
+    # 先把登记状态清干净，再动文件：注册表写不进去时插件可能仍被宿主加载，
+    # 这时删掉缓存等于毁掉一份正在使用的安装。
     document = read_registry(root)
-    for entry in plugin_entries(document):
-        remove_install_path(root, entry)
     plugins = document.get("plugins")
     if isinstance(plugins, dict) and PLUGIN_ID in plugins:
         plugins.pop(PLUGIN_ID)
         _write_json(registry_path(root), document)
     set_plugin_enabled(root, None)
-    return not plugin_entries(read_registry(root))
+    # 注册表和 settings 都不再引用这个插件，缓存里的副本到此才是真正的垃圾。
+    for entry in registered + plugin_entries(read_registry(root)):
+        remove_install_path(root, entry)
+    remove_cached_copies(root)
+    return not plugin_entries(read_registry(root)) and not cached_copies(root)
 
 
 def desktop_presence(

@@ -22,10 +22,12 @@ from pathlib import Path, PurePosixPath
 from _common import (
     ERROR_CODE_EXECUTION_FAILED,
     ERROR_CODE_INDEX_CURRENT,
+    ERROR_CODE_REGISTRY_MISSING,
     ERROR_CODE_TOOL_MISSING,
     InitializeError,
     atomic_json,
     git_status,
+    gitnexus_registry_state,
     load_json,
     snapshot_trees,
     utc_now,
@@ -34,6 +36,14 @@ from _common import (
 STEP_TREES = (".gitnexus", ".claude/skills", ".agents/skills")
 ANALYZE_BASE = ("analyze", "--skills", "--skip-agents-md", "--verbose")
 WARNING_PREFIX = "initialize warning:"
+REGISTRY_WARNING = (
+    "GitNexus 索引未注册到全局 registry（{path}）：list/query/context/impact/trace/"
+    "cypher/check/detect-changes 与 MCP 图查询都会报 “No indexed repositories found”。"
+)
+
+
+def registry_warning(root: Path) -> str:
+    return REGISTRY_WARNING.format(path=gitnexus_registry_state(root)["path"])
 
 
 def tool_snapshot(manifest: dict) -> dict:
@@ -103,6 +113,26 @@ def invoke(skill_dir: Path, root: Path, command: list[str], *, authorized: bool)
         argv.append("--use-global-registry")
     argv += ["--", *command]
     return subprocess.run(argv, text=True, capture_output=True, check=False)
+
+
+def register_index(
+    skill_dir: Path, root: Path, command: list[str], *, authorized: bool
+) -> tuple[bool, list[str], int | None]:
+    """把已有索引登记到真实全局 registry，返回 ``(registered, warnings, exit)``。
+
+    ``status=current`` 时 analyze 不会运行，因此复用路径上没有任何一步会写注册表；
+    仓库因此可能长期处于「索引有效但查询解析不到」的状态。注册走 ``gitnexus index``：
+    它只登记既有 ``.gitnexus/``，不重新分析，幂等且开销小。
+    """
+    if not authorized:
+        return False, [], None
+    completed = invoke(skill_dir, root, [*command, "index", str(root)], authorized=True)
+    forward(completed)
+    return (
+        bool(gitnexus_registry_state(root)["registered"]),
+        adapter_warnings(completed),
+        completed.returncode,
+    )
 
 
 def adapter_warnings(completed: subprocess.CompletedProcess) -> list[str]:
@@ -221,6 +251,13 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
     result_path = run_dir / "gitnexus-result.json"
 
     def publish(**fields) -> int:
+        # 注册状态每次现测：它是查询路径能否解析到本仓库的唯一判据，不能缓存，
+        # 也不能由退出码代替。
+        registry = gitnexus_registry_state(root)
+        result["registry"] = {
+            "dir": registry["dir"],
+            "registered": registry["registered"],
+        }
         sealed(result, started_clock, **fields)
         atomic_json(result_path, result)
         if emit:
@@ -228,6 +265,7 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
                 "task": "gitnexus",
                 "status": result["status"],
                 "error_code": result["error"]["code"],
+                "registry": result["registry"],
                 "changed_files": result["changed_files"],
                 "warnings": result["warnings"],
                 "result": str(result_path),
@@ -259,14 +297,54 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
         and payload.get("status") == "current"
         and (root / ".gitnexus" / "meta.json").is_file()
     ):
+        # 复用路径是最容易漏掉注册的一支：analyze 不会运行，注册只能在这里补。
+        warnings = list(probe_warnings)
+        allowed = allowed_paths(root, tool)
+        if not gitnexus_registry_state(root)["registered"]:
+            if not authorized:
+                warnings.append(registry_warning(root))
+                return publish(
+                    status="partial",
+                    exit_code=0,
+                    command=[*command, "status", "--json"],
+                    allowed_paths=allowed,
+                    artifacts=meta_artifacts(root),
+                    error={
+                        "code": ERROR_CODE_REGISTRY_MISSING,
+                        "message": "GitNexus 索引未注册到全局 registry，查询路径不可用",
+                    },
+                    warnings=warnings,
+                )
+            registered, register_warnings, register_exit = register_index(
+                skill_dir, root, command, authorized=authorized
+            )
+            warnings.extend(register_warnings)
+            if not registered:
+                warnings.append(registry_warning(root))
+                return publish(
+                    status="failed",
+                    exit_code=register_exit if register_exit else 1,
+                    command=[*command, "index", str(root)],
+                    allowed_paths=allowed,
+                    changed_files=changed_paths(root, before_git, before_trees, allowed),
+                    error={
+                        "code": ERROR_CODE_EXECUTION_FAILED,
+                        "message": (
+                            "已授权全局写入，但 GitNexus 全局 registry 仍缺少本仓库；"
+                            "查询类命令与 MCP 图查询不可用"
+                        ),
+                    },
+                    warnings=warnings,
+                )
+            warnings.append("复用的索引已补注册到 GitNexus 全局 registry。")
         return publish(
             status="skipped",
             exit_code=None,
             command=[*command, "status", "--json"],
             error={"code": ERROR_CODE_INDEX_CURRENT, "message": None},
             artifacts=meta_artifacts(root),
-            allowed_paths=allowed_paths(root, tool),
-            warnings=probe_warnings,
+            allowed_paths=allowed,
+            warnings=warnings,
         )
 
     embedding_mode = manifest.get("gitnexus_embedding_mode")
@@ -339,6 +417,48 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
             },
             warnings=warnings,
         )
+
+    # analyze 在未授权时把注册写进一次性 registry 并随之删除，所以「退出码 0」并不
+    # 等于查询路径可用；这里实测注册状态，缺注册就补，补不上就不许记 success。
+    if not gitnexus_registry_state(root)["registered"]:
+        if not authorized:
+            warnings.append(registry_warning(root))
+            return publish(
+                status="partial",
+                exit_code=completed.returncode,
+                command=argv,
+                allowed_paths=allowed,
+                changed_files=changed,
+                artifacts=artifacts,
+                error={
+                    "code": ERROR_CODE_REGISTRY_MISSING,
+                    "message": "GitNexus 索引未注册到全局 registry，查询路径不可用",
+                },
+                warnings=warnings,
+            )
+        registered, register_warnings, register_exit = register_index(
+            skill_dir, root, command, authorized=authorized
+        )
+        warnings.extend(register_warnings)
+        if not registered:
+            warnings.append(registry_warning(root))
+            return publish(
+                status="failed",
+                exit_code=register_exit if register_exit else 1,
+                command=[*command, "index", str(root)],
+                allowed_paths=allowed,
+                changed_files=changed,
+                artifacts=artifacts,
+                error={
+                    "code": ERROR_CODE_EXECUTION_FAILED,
+                    "message": (
+                        "已授权全局写入，但 GitNexus 全局 registry 仍缺少本仓库；"
+                        "查询类命令与 MCP 图查询不可用"
+                    ),
+                },
+                warnings=warnings,
+            )
+        warnings.append("索引已注册到 GitNexus 全局 registry。")
 
     return publish(
         status="success",

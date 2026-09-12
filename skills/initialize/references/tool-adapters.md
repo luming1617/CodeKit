@@ -53,11 +53,35 @@ GitNexus 强制重建。因此参数必须镜像 manifest 里记录的既有索�
 
 基准参数是 `analyze --skills --skip-agents-md --verbose`，再按上面的模式镜像与
 embedding 策略追加 flag，并且必须通过 `<SKILL_DIR>/scripts/run-gitnexus.py` 执行。
-默认隔离 GitNexus 的全局 registry（一次性 `GITNEXUS_HOME`），因为它不属于本次
-仓库写入范围；此时 adapter 会输出 warning。用户显式传入 `--allow-global-writes`
-（manifest `options.allow_global_writes` 为 `true`）时，控制器改用
-`run-gitnexus.py --use-global-registry`，让注册落在真实 `GITNEXUS_HOME`；该目录
-不可写时 adapter 仍降级为临时 registry 并给出 warning，不视为失败。
+
+### 全局注册（查询路径的前提）
+
+GitNexus 把索引写在仓库内 `.gitnexus/`，却把仓库注册在
+`<GITNEXUS_HOME>/registry.json`（`GITNEXUS_HOME` 未设置时取 `~/.gitnexus`），
+并且**只用后者**解析仓库：
+
+- 走仓库内索引：`analyze`、`status`、`doctor`；
+- 走全局注册表：`list`、`query`、`context`、`impact`、`trace`、`cypher`、
+  `check`、`detect-changes`、`index`，以及全部 MCP 图查询。
+
+因此「索引有效」和「查询可用」是两件事：只跑 analyze 而不注册时，`status --json`
+报 up-to-date，查询却一律报 `No indexed repositories found`。而 adapter 默认隔离
+registry（一次性 `GITNEXUS_HOME`，进程退出即删除），恰好会造成这个状态，所以：
+
+| 情形 | 行为 |
+|---|---|
+| 已注册 | 无需任何全局写入，不询问用户 |
+| 未注册且用户授权（`--allow-global-writes`） | 经 `run-gitnexus.py --use-global-registry` 执行，注册落在真实 `GITNEXUS_HOME`；授权目录不可写时 adapter 降级为临时 registry 并 warning |
+| 未注册且未授权、未传 `--allow-partial` | `start` 在零业务写入前失败（`PrepareError`），主 Agent 必须询问用户后重跑 |
+| 未注册且未授权、已传 `--allow-partial` | 不写注册表，gitnexus 阶段记为 `partial/registry-missing`（整体 partial、禁止提交） |
+| 已授权但注册仍未落地 | `failed`，不得记 success |
+
+控制器在**复用路径**（`status=current`）也会补注册：那时 analyze 不运行，否则仓库会
+长期停在「索引有效但查询全废」。补注册走 `gitnexus index <root>`——它只登记既有
+`.gitnexus/`，不重新分析，幂等且开销小。注册状态由 `gitnexus_registry_state(root)`
+在宿主环境下实测，写入 result 的 `registry` 字段；gate 会独立重测一次，缺失即拒绝
+complete 结论。`--use-global-registry` 不可写时会降级为临时 registry 并输出 warning，
+这仍是失败信号而不是可接受的降级。
 
 若不支持 `--skip-agents-md`：
 

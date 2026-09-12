@@ -115,6 +115,44 @@ class QoderStageTests(unittest.TestCase):
             self.assertFalse((qoder / "agents").exists())
 
 
+class StagingHygieneTests(unittest.TestCase):
+    """开发机上的缓存不属于插件载荷，不能装进宿主。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+
+    def test_development_debris_is_not_staged(self) -> None:
+        repo = build_repo(self.base)
+        demo = repo / "skills" / "demo"
+        write(demo / "tests" / "__pycache__" / "test_demo.cpython-314.pyc", "x")
+        write(demo / "scripts" / "state.pyc", "x")
+        write(demo / ".pytest_cache" / "CACHEDIR.TAG", "x")
+        write(demo / ".DS_Store", "x")
+        write(repo / "skills" / ".DS_Store", "x")
+        write(repo / ".claude-plugin" / "__pycache__" / "gen.pyc", "x")
+        # skills 自带可运行的测试套件：测试文件是载荷的一部分，只排除缓存。
+        write(demo / "tests" / "test_demo.py", "# real test\n")
+
+        market, opencode, qoder = sources.prepare(repo, self.base / "state")
+
+        for stage in (market, opencode, qoder):
+            names = {path.name for path in stage.rglob("*")}
+            self.assertNotIn("__pycache__", names)
+            self.assertNotIn(".pytest_cache", names)
+            self.assertNotIn(".DS_Store", names)
+            self.assertEqual(
+                [path for path in stage.rglob("*") if path.suffix in {".pyc", ".pyo"}],
+                [],
+            )
+        self.assertTrue((qoder / "skills" / "demo" / "tests" / "test_demo.py").is_file())
+        self.assertTrue((market / "skills" / "demo" / "tests" / "test_demo.py").is_file())
+        self.assertTrue(
+            (opencode / "plugins" / "codekit" / "skills" / "demo" / "tests" / "test_demo.py").is_file()
+        )
+
+
 class SourceValidationTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()

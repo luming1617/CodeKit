@@ -59,6 +59,8 @@ class Uninstaller(Installer):
         """生成卸载组件选择器中的状态提示。"""
         item = self.states[component_id]
         if item.status == "not_installed":
+            if item.leftover:
+                return " (组件未安装，但发现卸载残留，勾选后清理)"
             return " (组件未安装)"
         return f" (组件已安装 {item.installed_version or 'unknown'}，勾选后卸载)"
 
@@ -68,6 +70,7 @@ class Uninstaller(Installer):
             item.component_id
             for item in self.components
             if self.states[item.component_id].status != "not_installed"
+            or self.states[item.component_id].leftover
         ]
         if not self.auto_yes and self.platform.can_interact():
             answer = input("确认要卸载 CodeKit Plugin 及相关组件？[y/N]: ").strip().lower()
@@ -434,6 +437,24 @@ class Uninstaller(Installer):
             plugin_ok = False
         return plugin_ok and self.uninstall_platform_agents(platform_key)
 
+    def clear_leftovers(self, component_id: str) -> bool:
+        """物理删除组件仍留在磁盘上的插件缓存，返回是否已清空。
+
+        插件 CLI 的卸载普遍是软删除：清掉注册表条目后在缓存目录里写一个
+        ``.orphaned_at`` 标记，目录本身留着。handler 报成功只说明登记状态干净
+        了，用户看到的文件还在。这里以文件为准再收一次尾，否则「成功」是假的，
+        宿主还会把那些文件逐条列成待确认的残留。
+        """
+        for path in detector.component_leftovers(component_id, self.context):
+            if path.is_dir() and not path.is_symlink():
+                platform_layer.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+        remaining = detector.component_leftovers(component_id, self.context)
+        for path in remaining:
+            self.logger.warn(f"{component_id} 的残留目录未能删除：{path}")
+        return not remaining
+
     def uninstall_component(self, component_id: str) -> bool:
         """按组件注册 ID 分发卸载处理器，并把单项异常转换为失败结果。"""
         handlers = {
@@ -454,17 +475,26 @@ class Uninstaller(Installer):
         if not handler:
             return False
         try:
-            return bool(handler())
+            ok = bool(handler())
         except (OSError, ValueError, InstallerError) as exc:
             self.logger.error(f"{component_id} failed: {exc}")
             return False
+        # 只有在登记状态确实清理成功后才动文件：注册表或配置删不掉时，插件可能
+        # 仍被宿主加载，此时删缓存等于毁掉一份正在使用的安装。
+        return self.clear_leftovers(component_id) if ok else False
 
     def run_uninstalls(self) -> None:
         """按用户选择逐项卸载；未安装项视为幂等成功，最后清理全局配置。"""
         for component_id in self.selected:
-            prior = "absent" if self.states[component_id].status == "not_installed" else "installed"
+            item = self.states[component_id]
+            # 卸载是幂等操作：组件确实不存在时才跳过破坏性处理器。只剩残留时仍
+            # 要走处理器，否则重跑卸载永远清不掉上一轮遗留的文件。
+            prior = (
+                "absent"
+                if item.status == "not_installed" and not item.leftover
+                else "installed"
+            )
             self.logger.info(f"\n--- 卸载: {component_id} ---")
-            # 卸载是幂等操作：检测到组件不存在时不调用破坏性处理器。
             ok = True if prior == "absent" else self.uninstall_component(component_id)
             self.uninstall_records.append((component_id, prior, "1" if ok else "0"))
         self.cleanup_global_config()

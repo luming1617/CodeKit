@@ -15,15 +15,46 @@ from installer_config import read_json, validate_plugin_version, write_json
 from installer_platform import rmtree
 
 
+# 开发机上跑过测试、被 IDE 打开过就会留下这些缓存：它们不属于插件载荷，装进
+# 宿主后没有任何东西会认领它们，宿主却会把插件缓存里的每个文件都当成待确认的
+# 「卸载残留」列给用户。清单与仓库 .gitignore 一致，再加上跨平台的系统垃圾。
+# 注意 skills 自带可运行的测试（tests/、*.py 都是载荷的一部分），只排除缓存。
+STAGING_IGNORES = (
+    "__pycache__",
+    "*.py[cod]",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".venv",
+    ".venv-wsl",
+    "venv",
+    ".idea",
+    "*.iml",
+    "*.ipr",
+    "*.iws",
+    ".git",
+    ".DS_Store",
+    "Thumbs.db",
+    "desktop.ini",
+)
+
+_ignore_debris = shutil.ignore_patterns(*STAGING_IGNORES)
+
+
 def copy_contents(source: Path, target: Path) -> None:
-    """递归复制源目录内容到目标目录，保留普通文件和目录结构。"""
+    """递归复制源目录内容到目标目录，跳过开发环境的缓存与垃圾文件。"""
     if not source.is_dir():
         raise ValueError(f"source directory not found: {source}")
     target.mkdir(parents=True, exist_ok=True)
-    for item in source.iterdir():
-        destination = target / item.name
+    names = sorted(child.name for child in source.iterdir())
+    ignored = _ignore_debris(str(source), names)
+    for name in names:
+        if name in ignored:
+            continue
+        item = source / name
+        destination = target / name
         if item.is_dir() and not item.is_symlink():
-            shutil.copytree(item, destination, dirs_exist_ok=True)
+            shutil.copytree(item, destination, dirs_exist_ok=True, ignore=_ignore_debris)
         else:
             shutil.copy2(item, destination)
 

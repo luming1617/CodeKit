@@ -23,9 +23,11 @@ from _common import (
     IGNORE_START,
     INDEX_END,
     INDEX_START,
+    MANAGED_GITIGNORE_ENTRIES,
     InitializeError,
     atomic_write,
     git_status,
+    gitnexus_registry_state,
     replace_managed_block,
     snapshot_trees,
     utc_now,
@@ -377,6 +379,35 @@ def gitnexus_embedding_plan(
     ]
 
 
+def gitnexus_registration_plan(
+    registry: dict[str, object], runner: object, authorized: bool, allow_partial: bool
+) -> list[str]:
+    """判定 GitNexus 全局注册前提，返回 warnings；未授权且未接受降级时报错。
+
+    查询类命令（``list``/``query``/``context``/``impact``/``trace``/``cypher``/
+    ``check``/``detect-changes``）与 MCP 图查询只从 ``<GITNEXUS_HOME>/registry.json``
+    解析仓库，所以注册不是可选优化：只写仓库内索引而不注册时，``status`` 一切正常，
+    查询却全部报 “No indexed repositories found”。与 embedding 前提一样，该判定在
+    任何写入之前完成：未获用户授权时零业务写入地失败，由主 Agent 询问后重跑。
+    """
+    if registry.get("registered") or runner in {None, "unresolved"} or authorized:
+        return []
+    if allow_partial:
+        return [
+            "已按 --allow-partial 接受 GitNexus 注册缺失：本次不写全局注册表 "
+            f"{registry.get('path')}，gitnexus 阶段记为 partial/registry-missing，"
+            "查询类命令与 MCP 图查询在注册前不可用。",
+        ]
+    raise PrepareError(
+        f"GitNexus 全局注册表 {registry.get('path')} 中没有本仓库："
+        "list/query/context/impact/trace/cypher/check/detect-changes 与 MCP 图查询"
+        "只能从该注册表解析仓库，缺少注册时索引虽然 status 正常但一律报 "
+        "“No indexed repositories found”。请询问用户是否允许在仓库之外写入注册表："
+        "允许则带 --allow-global-writes 重新运行；不允许则带 --allow-partial "
+        "明确接受 gitnexus 阶段降级为 partial/registry-missing。"
+    )
+
+
 def tool_capabilities(root: Path) -> dict[str, object]:
     command, runner = gitnexus_command()
     cli = gitnexus_cli_path(command)
@@ -583,6 +614,15 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
         args.embeddings,
         args.allow_global_writes,
     )
+    # 注册前提与 embedding 前提同样在任何写入之前判定：查询类命令与 MCP 图查询只
+    # 从全局 registry 解析仓库，缺注册时索引可用但查不到，必须由用户明确取舍。
+    registry = gitnexus_registry_state(root)
+    registry_warnings = gitnexus_registration_plan(
+        registry,
+        tools.get("gitnexus", {}).get("runner"),
+        args.allow_global_writes,
+        args.allow_partial,
+    )
     state_root, lock_path, run_dir, state_is_temporary, state_warnings, descriptor = acquire_state_lock(root, run_id)
     manifest_path = run_dir / "run-manifest.json"
     manifest: dict[str, object] = {
@@ -607,6 +647,7 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
         },
         "baseline_status": baseline_status,
         "baseline_files": baseline_files,
+        "controller_visibility_delta": [],
         "worker_tree_roots": WORKER_TREE_ROOTS,
         "worker_scope_baseline": snapshot_worker_scopes(root, WORKER_TREE_ROOTS),
         "managed_paths": sorted(managed),
@@ -614,7 +655,8 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
         "tools": tools,
         "gitnexus_index": index_modes,
         "gitnexus_embedding_mode": embedding_mode,
-        "warnings": [*state_warnings, *embedding_warnings],
+        "gitnexus_registry": registry,
+        "warnings": [*state_warnings, *embedding_warnings, *registry_warnings],
         "prepared_changed_files": [],
         "authorized_changed_paths": [],
         "phase": "preparing",
@@ -642,13 +684,24 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
         manifest["gitnexus_skill_mode"] = gitnexus_mode
         gitignore = root / ".gitignore"
         require_repository_target(root, gitignore)
-        if atomic_write(gitignore, replace_managed_block(gitignore.read_text(encoding="utf-8") if gitignore.exists() else "", IGNORE_START, IGNORE_END, [".codekit/", ".gitnexus/", "graphify-out/", ".graphifyignore"])):
+        if atomic_write(gitignore, replace_managed_block(gitignore.read_text(encoding="utf-8") if gitignore.exists() else "", IGNORE_START, IGNORE_END, list(MANAGED_GITIGNORE_ENTRIES))):
             changed.append(".gitignore")
         graphifyignore = root / ".graphifyignore"
         require_repository_target(root, graphifyignore)
         graphify_rules = [".codekit/", ".standard/", "AGENTS.md", "CLAUDE.md", ".gitnexus/", ".claude/", ".agents/", "graphify-out/"]
         if atomic_write(graphifyignore, replace_managed_block(graphifyignore.read_text(encoding="utf-8") if graphifyignore.exists() else "", GRAPHIFY_START, GRAPHIFY_END, graphify_rules)):
             changed.append(".graphifyignore")
+        # Rewriting the managed block can un-ignore paths an earlier run had
+        # ignored, which flips their git visibility without anyone writing them.
+        # Only untracked paths can be affected: ignore rules never apply to a
+        # tracked file, so a tracked path that appears here was genuinely
+        # written and stays a declared change.  Recorded so the barrier does not
+        # report the un-ignored files as unreported changes.
+        visibility_delta = sorted(
+            path
+            for path, status in status_entries(root).items()
+            if status == "??" and path not in baseline_status
+        )
 
         for source, target in mappings:
             require_repository_target(root, target)
@@ -663,6 +716,7 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
         manifest["prepared_changed_files"] = sorted(changed)
         manifest["managed_paths"] = sorted(managed | set(changed))
         manifest["authorized_changed_paths"] = sorted(changed)
+        manifest["controller_visibility_delta"] = visibility_delta
         manifest["phase"] = "prepared"
         atomic_write(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", mode=0o600)
     except Exception:

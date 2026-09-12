@@ -12,17 +12,17 @@ from pathlib import Path, PurePosixPath
 
 from _common import (
     EXPECTED_TASKS,
-    IGNORE_END,
-    IGNORE_START,
     PROJECT_END,
     PROJECT_START,
     RESERVED_MARKERS,
     STANDARDS_END,
     STANDARDS_START,
     InitializeError,
+    ValidationProgramMissing,
     atomic_write,
     load_json,
     replace_managed_block,
+    resolve_validation_command,
 )
 
 # AGENTS.md stays a short routing document; overflow is trimmed with a warning
@@ -77,7 +77,10 @@ def validate_context(context: dict, root: Path) -> None:
 
     The Scanner is a model, so entries are checked field by field here: a missing
     key must fail with a readable contract error instead of raising ``KeyError``
-    from the renderer in the middle of Phase 3.
+    from the renderer in the middle of Phase 3.  Required validations are also
+    resolved here, so a command the controller could never execute fails while
+    the run is still recoverable instead of at ``finish`` after the context
+    files were written.
     """
     if context.get("schema_version") != 1:
         raise ContextContractError("unsupported context schema_version")
@@ -109,31 +112,21 @@ def validate_context(context: dict, root: Path) -> None:
             )
         for name in names:
             require_repository_path(root, name, "context command evidence")
+        if item.get("required_for_initialize") is True:
+            try:
+                resolve_validation_command(root, item["command"])
+            except ValidationProgramMissing:
+                # Allow-listed but absent on this host: finish records it as skipped.
+                pass
+            except InitializeError as exc:
+                raise ContextContractError(
+                    "required_for_initialize command cannot be run by the controller "
+                    f"({exc}); replace it with an allow-listed program or a repository "
+                    "script path, then retry this run"
+                ) from exc
 
 
 replace_block = replace_managed_block
-
-
-def update_gitignore_for_skills(root: Path, result: dict) -> bool:
-    """Ignore only concrete GitNexus skill directories from validated output."""
-    if result.get("task") != "gitnexus" or result.get("status") != "success":
-        return False
-    paths: set[str] = set()
-    for raw in result.get("changed_files", []):
-        parts = PurePosixPath(raw).parts
-        for prefix in ((".claude", "skills"), (".agents", "skills")):
-            if len(parts) >= 3 and parts[:2] == prefix and parts[2].startswith("gitnexus"):
-                paths.add("/".join(parts[:3]) + "/")
-    if not paths:
-        return False
-    path = root / ".gitignore"
-    text = path.read_text(encoding="utf-8") if path.exists() else ""
-    if text.count(IGNORE_START) != 1 or text.count(IGNORE_END) != 1:
-        raise ReconcileError("invalid managed .gitignore block")
-    body = text.split(IGNORE_START, 1)[1].split(IGNORE_END, 1)[0]
-    entries = {line.strip() for line in body.splitlines() if line.strip()}
-    updated = replace_managed_block(text, IGNORE_START, IGNORE_END, sorted(entries | paths))
-    return atomic_write(path, updated)
 
 
 def index_directories(root: Path) -> list[Path]:
@@ -304,9 +297,6 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
         raise ReconcileError("supplied worker results do not match the validated task set")
 
     changed: list[str] = []
-    for result in supplied_results:
-        if update_gitignore_for_skills(root, result):
-            changed.append(".gitignore")
     indexes = standard_indexes(root)
     agents = root / "AGENTS.md"
     agents_text = agents.read_text(encoding="utf-8") if agents.exists() else ""

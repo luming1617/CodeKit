@@ -152,6 +152,21 @@ def rmtree(path: Path, *, ignore_errors: bool = False) -> None:
     shutil.rmtree(path, onerror=onerror)
 
 
+def has_contents(path: Path) -> bool:
+    """判断路径是否还留着内容，供「卸载残留」判定使用。
+
+    空目录不算残留：它不会出现在宿主的待清理文件列表里，也没必要为它报失败。
+    符号链接按存在处理，因为链接本身就是要清掉的东西。
+    """
+    if path.is_symlink() or path.is_file():
+        return True
+    try:
+        next(path.iterdir())
+    except (OSError, StopIteration):
+        return False
+    return True
+
+
 def remote_script_command(shell: str = "bash") -> Tuple[str, ...]:
     """把远程安装脚本交给平台原生的 shell 执行。
 

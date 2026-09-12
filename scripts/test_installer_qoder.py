@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -459,6 +461,55 @@ class UninstallTests(unittest.TestCase):
         self.assertTrue(any("uninstall" in argv for argv in calls))
         self.assertFalse(qoder.plugin_entries(qoder.read_registry(self.root)))
 
+    def test_soft_deleting_cli_cannot_leave_the_plugin_files_behind(self) -> None:
+        # qodercli 1.1.50 的 plugins uninstall 是软删除：清掉注册表条目后在缓存
+        # 目录里写一个 .orphaned_at，目录连同 skill 文件全部留着。若卸载器只在
+        # CLI 跑完之后读注册表，这时已经找不到 installPath，物理删除会被整个跳过，
+        # 界面报「成功」而文件仍在。
+        target = qoder.install_direct(self.root, self.stage, "1.0.0")
+        calls: list[list[str]] = []
+
+        def runner(args, timeout: float = 20.0) -> tuple[int, str]:
+            argv = [str(item) for item in args]
+            calls.append(argv)
+            if argv[1:2] == ["--version"]:
+                return 0, "qodercli 1.1.50"
+            if "uninstall" in argv:
+                document = qoder.read_registry(self.root)
+                document["plugins"].pop(qoder.PLUGIN_ID, None)
+                qoder.registry_path(self.root).write_text(
+                    json.dumps(document), encoding="utf-8"
+                )
+                (target / ".orphaned_at").write_text("1", encoding="utf-8")
+                return 0, json.dumps({"ok": True, "fullyRemoved": True})
+            return 0, "Usage: plugins install [path] [--scope user] [--json]"
+
+        with patch.object(qoder.shutil, "which", return_value="/usr/bin/qodercli"):
+            self.assertTrue(qoder.uninstall(self.descriptor, self.home, {"PATH": "/usr/bin"}, runner))
+        self.assertTrue(any("uninstall" in argv for argv in calls))
+        self.assertFalse(target.exists())
+        self.assertEqual(qoder.cached_copies(self.root), [])
+
+    def test_a_failed_registry_write_keeps_the_plugin_files(self) -> None:
+        # 注册表写不进去时插件可能仍被宿主加载，此时连文件都不能动：删了等于
+        # 毁掉一份仍在使用的安装。文件删除必须排在登记清理之后。
+        target = qoder.install_direct(self.root, self.stage, "1.0.0")
+
+        def runner(args, timeout: float = 20.0) -> tuple[int, str]:
+            argv = [str(item) for item in args]
+            if argv[1:2] == ["--version"]:
+                return 0, "qodercli 1.1.50"
+            if "uninstall" in argv:
+                return 0, json.dumps({"ok": True})
+            return 0, "Usage: plugins install [path] [--scope user] [--json]"
+
+        with patch.object(qoder, "_write_json", side_effect=qoder.QoderError("read-only")):
+            with patch.object(qoder.shutil, "which", return_value="/usr/bin/qodercli"):
+                with self.assertRaises(qoder.QoderError):
+                    qoder.uninstall(self.descriptor, self.home, {"PATH": "/usr/bin"}, runner)
+        self.assertTrue(target.is_dir())
+        self.assertIn(qoder.PLUGIN_ID, qoder.read_registry(self.root)["plugins"])
+
 
 class PresenceTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -640,6 +691,85 @@ class SharedStateTests(unittest.TestCase):
         with patch.object(shutil, "which", return_value=None):
             with patch.object(detector, "platform_subagents_state", return_value="up_to_date"):
                 self.assertFalse(detector.present("claude_plugin", context))
+
+    def test_installed_plugin_is_not_reported_as_a_leftover(self) -> None:
+        self.assertTrue(qoder.inspect(self.descriptor, self.home).installed)
+        self.assertFalse(qoder.inspect(self.descriptor, self.home).leftover)
+        self.assertFalse(self.detect().leftover)
+
+    def test_soft_deleted_cache_is_reported_as_a_leftover(self) -> None:
+        # CLI 软删除之后的磁盘状态：注册表空了，缓存目录连同 skill 文件还在。
+        # 检测必须以文件为准，否则卸载器会把组件当成「未安装，已忽略」，重跑
+        # 卸载永远清不掉这些文件。
+        document = qoder.read_registry(self.root)
+        document["plugins"].pop(qoder.PLUGIN_ID, None)
+        qoder.registry_path(self.root).write_text(json.dumps(document), encoding="utf-8")
+
+        state = qoder.inspect(self.descriptor, self.home)
+        self.assertFalse(state.installed)
+        self.assertTrue(state.leftover)
+
+        detected = self.detect()
+        self.assertEqual(detected.status, "not_installed")
+        self.assertTrue(detected.leftover)
+        self.assertEqual(
+            sorted(detector.component_leftovers("qodercn_plugin", self.context)),
+            [self.target.parent],
+        )
+
+    def test_an_empty_cache_directory_is_not_a_leftover(self) -> None:
+        # 空目录不会出现在宿主的待清理列表里，没必要为它报残留。
+        shutil.rmtree(self.target.parent)
+        self.target.parent.mkdir(parents=True)
+        document = qoder.read_registry(self.root)
+        document["plugins"].pop(qoder.PLUGIN_ID, None)
+        qoder.registry_path(self.root).write_text(json.dumps(document), encoding="utf-8")
+        self.assertFalse(self.detect().leftover)
+        self.assertEqual(detector.component_leftovers("qodercn_plugin", self.context), [])
+
+
+class UninstallRecapTests(unittest.TestCase):
+    """卸载汇总必须对着磁盘复核，不能对着满目录的 skill 文件报「已卸载」。"""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.descriptor = qoder.PLATFORMS["qodercn"]
+        self.root = self.home / ".qoder-cn"
+        self.root.mkdir()
+        self.target = qoder.install_direct(self.root, make_stage(self.home), "1.0.0")
+        self.context = detector.Context(
+            home=self.home,
+            marketplace_local=REPO_DIR,
+            version_file=self.home / "installed_versions",
+        )
+        self.environment = patch.dict(os.environ, empty_environment(), clear=False)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
+    def recap(self) -> str:
+        buffer = io.StringIO()
+        with patch.object(shutil, "which", return_value=None):
+            with contextlib.redirect_stdout(buffer):
+                detector.render_recap(
+                    "uninstall",
+                    [f"qodercn_plugin\tinstalled\t1"],
+                    self.context,
+                )
+        return buffer.getvalue()
+
+    def test_a_soft_deleted_cache_cannot_be_reported_as_uninstalled(self) -> None:
+        document = qoder.read_registry(self.root)
+        document["plugins"].pop(qoder.PLUGIN_ID, None)
+        qoder.registry_path(self.root).write_text(json.dumps(document), encoding="utf-8")
+        output = self.recap()
+        self.assertIn("仍有残留", output)
+        self.assertIn(".qoder-cn/plugins/cache/local/codekit".replace("/", os.sep), output)
+
+    def test_a_clean_uninstall_is_reported_as_success(self) -> None:
+        qoder.uninstall(self.descriptor, self.home, empty_environment())
+        self.assertIn("已卸载", self.recap())
 
 
 class PreflightTests(unittest.TestCase):
@@ -856,3 +986,28 @@ class UninstallFlowTests(unittest.TestCase):
             with patch.object(self.uninstaller, "uninstall_platform_agents", return_value=True):
                 self.assertTrue(self.uninstaller.uninstall_claude_plugin())
         self.assertFalse((self.home / ".claude" / "plugins" / "cache" / "co-daming").exists())
+
+    def test_leftover_only_component_is_offered_for_cleanup(self) -> None:
+        # 组件不算已安装、但缓存里还留着文件时，必须列进默认选择，否则用户重跑
+        # 卸载也碰不到它。
+        self.uninstaller.auto_yes = True
+        self.uninstaller.states = {
+            component.component_id: detector.ComponentState(component.component_id)
+            for component in detector.registry.COMPONENTS
+        }
+        self.uninstaller.states["qodercn_plugin"].leftover = True
+        self.assertIn("qodercn_plugin", self.uninstaller.select_components())
+
+    def test_leftover_only_component_is_cleaned_even_though_it_reads_absent(self) -> None:
+        document = qoder.read_registry(self.root)
+        document["plugins"].pop(qoder.PLUGIN_ID, None)
+        qoder.registry_path(self.root).write_text(json.dumps(document), encoding="utf-8")
+        self.uninstaller.context = detector.Context(
+            home=self.home,
+            marketplace_local=REPO_DIR,
+            version_file=self.home / "installed_versions",
+        )
+        with patch.object(shutil, "which", return_value=None):
+            with patch.object(self.uninstaller, "uninstall_platform_agents", return_value=True):
+                self.assertTrue(self.uninstaller.uninstall_component("qodercn_plugin"))
+        self.assertEqual(qoder.cached_copies(self.root), [])
