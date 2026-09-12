@@ -361,6 +361,7 @@ class GraphifyCapabilityTests(unittest.TestCase):
                 "    print('graphify 1.0')\n"
                 "elif sys.argv[1:] == ['--help']:\n"
                 "    print('extract --max-workers N')\n"
+                "    print('hook install            install post-commit git hooks')\n"
                 "elif sys.argv[1:] == ['extract', '--help']:\n"
                 "    print('--code-only --max-workers')\n",
                 encoding="utf-8",
@@ -377,6 +378,7 @@ class GraphifyCapabilityTests(unittest.TestCase):
             self.assertTrue(graphify["supports"]["max_workers"])
             self.assertTrue(graphify["supports"]["code_only"])
             self.assertTrue(graphify["supports"]["ast_process_pool"])
+            self.assertTrue(graphify["supports"]["git_hooks"])
 
     def test_ast_process_pool_probe_uses_graphify_shebang_python(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -423,6 +425,161 @@ class GraphifyCapabilityTests(unittest.TestCase):
                 mode, warnings = prepare.gitnexus_skill_mode(root)
             self.assertEqual("community-only", mode)
             self.assertEqual(1, len(warnings))
+
+
+class GraphifyGitHookTests(unittest.TestCase):
+    """图谱钩子默认开：只在 initialize 期间刷新的图会在下一次提交后腐烂。"""
+
+    def manifest(
+        self,
+        *,
+        options=None,
+        status="success",
+        available=True,
+        supports=None,
+        runner="/usr/bin/graphify",
+    ):
+        merged_options = {"graph_git_hooks": True}
+        merged_options.update(options or {})
+        merged_supports = {"git_hooks": True}
+        merged_supports.update(supports or {})
+        return {
+            "options": merged_options,
+            "worker_results": {"graphify": {"status": status}},
+            "tools": {
+                "graphify": {
+                    "available": available,
+                    "runner": runner,
+                    "supports": merged_supports,
+                }
+            },
+        }
+
+    def test_plan_installs_by_default_including_legacy_manifests(self):
+        action, detail = validator.graphify_git_hook_plan(self.manifest())
+        self.assertEqual(("install", "/usr/bin/graphify"), (action, detail))
+        # 早期 run manifest 里没有这一位时按默认开启处理，不得静默跳过。
+        legacy = self.manifest()
+        legacy["options"] = {}
+        self.assertEqual("install", validator.graphify_git_hook_plan(legacy)[0])
+
+    def test_plan_skip_reasons(self):
+        missing_receipt = self.manifest()
+        missing_receipt.pop("worker_results")
+        cases = (
+            (self.manifest(options={"graph_git_hooks": False}), "disabled-by-flag"),
+            (self.manifest(status="skipped"), "graphify-skipped"),
+            (self.manifest(status="failed"), "graphify-failed"),
+            (missing_receipt, "graphify-missing"),
+            (self.manifest(available=False), "tool-missing"),
+            (self.manifest(runner=None), "tool-missing"),
+            (self.manifest(supports={"git_hooks": False}), "unsupported"),
+        )
+        for manifest, reason in cases:
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    ("skip", reason), validator.graphify_git_hook_plan(manifest)
+                )
+
+    def test_partial_graph_still_gets_the_refresh_hook(self):
+        self.assertEqual(
+            "install", validator.graphify_git_hook_plan(self.manifest(status="partial"))[0]
+        )
+
+    def completed(self, returncode: int, stdout: str = "", stderr: str = ""):
+        return subprocess.CompletedProcess([], returncode, stdout=stdout, stderr=stderr)
+
+    def test_install_invokes_the_runner_in_this_repository(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            runner = str(root / "graphify")
+
+            def fake_run(argv, **kwargs):
+                # 钩子按仓库落盘：argv 必须是 <runner> hook install，cwd 必须是本仓库。
+                self.assertEqual([runner, "hook", "install"], list(argv))
+                self.assertEqual(root, Path(kwargs["cwd"]))
+                (root / ".git" / "hooks" / "post-commit").write_text("#!/bin/sh\n", encoding="utf-8")
+                return self.completed(0, "post-commit: installed")
+
+            with patch.object(validator.subprocess, "run", side_effect=fake_run) as execute:
+                record, warnings, degraded = validator.install_graphify_git_hooks(
+                    root, self.manifest(runner=runner), 30
+                )
+            self.assertEqual(1, execute.call_count)
+            self.assertEqual("installed", record["status"])
+            self.assertEqual(0, record["exit_code"])
+            self.assertIn("post-commit: installed", record["output_tail"])
+            self.assertTrue((root / ".git" / "hooks" / "post-commit").is_file())
+            self.assertEqual(([], False), (warnings, degraded))
+
+    def test_failure_degrades_the_run_and_names_the_rollback(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            with patch.object(
+                validator.subprocess, "run",
+                return_value=self.completed(1, "", "No git repository found"),
+            ):
+                record, warnings, degraded = validator.install_graphify_git_hooks(
+                    root, self.manifest(runner=str(root / "graphify")), 30
+                )
+            self.assertEqual("failed", record["status"])
+            self.assertEqual(1, record["exit_code"])
+            self.assertIn("graphify hook uninstall", record["rollback"])
+            self.assertTrue(degraded)
+            self.assertEqual(1, len(warnings))
+            self.assertIn("graphify hook install", warnings[0])
+            self.assertIn("--no-git-hooks", warnings[0])
+
+    def test_unlaunchable_runner_degrades_instead_of_raising(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            with patch.object(
+                validator.subprocess, "run", side_effect=OSError("no such file")
+            ):
+                record, warnings, degraded = validator.install_graphify_git_hooks(
+                    root, self.manifest(runner=str(root / "graphify")), 30
+                )
+            self.assertEqual("failed", record["status"])
+            self.assertIn("error", record)
+            self.assertTrue(degraded)
+            self.assertEqual(1, len(warnings))
+
+    def test_skipped_step_never_touches_the_repository(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            hooks = root / ".git" / "hooks"
+            before = sorted(path.name for path in hooks.iterdir())
+            record, warnings, degraded = validator.install_graphify_git_hooks(
+                root, self.manifest(options={"graph_git_hooks": False}), 30
+            )
+            self.assertEqual("skipped", record["status"])
+            self.assertEqual("disabled-by-flag", record["reason"])
+            self.assertEqual(([], False), (warnings, degraded))
+            self.assertEqual(before, sorted(path.name for path in hooks.iterdir()))
+
+    def test_unsupported_cli_warns_without_degrading(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            record, warnings, degraded = validator.install_graphify_git_hooks(
+                root, self.manifest(supports={"git_hooks": False}), 30
+            )
+            self.assertEqual("skipped", record["status"])
+            self.assertEqual("unsupported", record["reason"])
+            self.assertFalse(degraded)
+            self.assertEqual(1, len(warnings))
+
+    def test_controller_forwards_the_flag_to_prepare(self):
+        with patch.object(controller.prepare, "main", return_value=0) as main:
+            controller.main(["start", "--root", "."])
+        self.assertNotIn("--no-git-hooks", main.call_args.args[0])
+        with patch.object(controller.prepare, "main", return_value=0) as main:
+            controller.main(["start", "--root", ".", "--no-git-hooks"])
+        self.assertIn("--no-git-hooks", main.call_args.args[0])
 
 
 class GitNexusRunnerResolutionTests(unittest.TestCase):

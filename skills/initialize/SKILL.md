@@ -1,7 +1,7 @@
 ---
 name: initialize
 description: 初始化或升级仓库的 AI 开发规范、代码索引、知识图谱与项目上下文；GitNexus 由确定性控制器执行，Graphify 与 Context Scanner 强制派发为两个独立只读/受限写入 subagent，并执行基线隔离、结果门禁和可选受控提交。
-argument-hint: '[--language java[,python[,go[,cpp]]]] [--embeddings] [--force] [--allow-partial] [--commit] [--allow-global-writes]'
+argument-hint: '[--language java[,python[,go[,cpp]]]] [--embeddings] [--force] [--allow-partial] [--commit] [--allow-global-writes] [--no-git-hooks]'
 allowed-tools: 'Bash, Read, Write, Edit, Glob, Grep, Agent, Skill'
 ---
 
@@ -24,6 +24,7 @@ allowed-tools: 'Bash, Read, Write, Edit, Glob, Grep, Agent, Skill'
 - `--force`：显式重建 GitNexus/Graphify，不绕过验证或写入边界。
 - `--allow-partial`：允许工具缺失等可接受的 `skipped` 继续生成上下文；仍不得把整体标记为 success，也不得放行真实失败。协作不可用必须映射为 `skipped + collab-unavailable`，整体保持 `blocked`。
 - `--commit`：通过所有提交门禁后提交精确文件；默认不提交。
+- `--no-git-hooks`：跳过 Phase 4 在本仓库安装 Graphify 的 git 钩子（`post-commit`/`post-checkout` 与 merge driver）。**默认不跳过**：图谱只在 initialize 期间刷新，下一次提交就会腐烂，钩子才是它长期有效的条件。该步骤只写 `.git/hooks` 与本仓库 `git config`，不碰任何托管上下文文件；失败会把整体降级为 `partial` 并禁止自动提交，报告给出重试与 `graphify hook uninstall` 回滚命令。
 - `--allow-global-writes`：授权 Phase 0/1 在仓库之外写入一次（`gitnexus embeddings install`、把仓库写进真实 `GITNEXUS_HOME/registry.json`）。仅在用户明确同意后传入；未传入时按下面的前提分别降级。Phase 0 检测到需要全局写入却未获授权时，主 Agent 必须显式询问用户，不得自行授权：
   - **embedding 前提**：按 `gitnexus_embedding_mode=drop` 显式降级，不失败。
   - **注册前提**：`list`/`query`/`context`/`impact`/`trace`/`cypher`/`check`/`detect-changes` 与 MCP 图查询只从该注册表解析仓库，缺注册时索引有效但一律报 `No indexed repositories found`。因此 `start` 在零业务写入前失败（`PrepareError`）：获准后带 `--allow-global-writes` 重跑；用户拒绝时带 `--allow-partial` 明确接受 gitnexus 阶段降级为 `partial/registry-missing`。
@@ -153,6 +154,8 @@ python3 "<SKILL_DIR>/scripts/controller.py" finish --manifest <run-manifest.json
 ```
 
 `finish` 由控制器自行执行 reconcile 记录的每条 `required_for_initialize` 仓库验证命令，真实退出码写入 `final_report.validations`：命令不经 shell 解析，禁止重定向、管道、命令替换与通配符，可执行程序必须在控制器白名单内或为仓库内的明确脚本路径（Python 命令按宿主：macOS/Linux `python3 …`，Windows `py -3 …`），超时由 `--validation-timeout`（默认 900 秒）控制。reconcile 已用同一白名单预检这些命令：程序不在白名单、含禁用 shell 语法或仓库脚本缺失时作为可恢复的契约错误在写入任何托管文件之前中止（修复 context 后重试同一个 run）；白名单内但本机未安装的程序在 finish 记为 `skipped` 并写入 `final_report.validation_warnings`，整体降级为 `partial` 且禁止提交（`commit_status` 为 `blocked-skipped-validations`）。主 Agent 不预先执行验证命令，也不得用自己的判断替代控制器结果；`--validation-result` 只在显式 `--allow-attested-validations` 的外部验证环境下接受，此时仍禁止自动提交。
+
+其余校验全部干净后，`finish` 还会为本仓库执行一次 `graphify hook install`（`post-commit`/`post-checkout` 与 merge driver，只写 `.git/` 内的钩子和仓库级 git config，不产生 Git 可见变更，也不碰托管文件）。这一步默认开启，只有 `--no-git-hooks` 才跳过；命令、退出码与输出尾部写入 `final_report.graphify_git_hooks`。graphify 缺失、过旧或 graphify 阶段本身没有产出可用图谱时记为 `skipped` 并给出原因；真实失败会让整体降级为 `partial`、`commit_status` 变为 `blocked-graphify-git-hooks`，报告必须原样给出可重试命令与 `graphify hook uninstall` 回滚命令。
 
 随后展示本次托管文件的 status、diff stat 和关键 diff。若启动时显式传入 `--commit`，`finish` 由控制器在持锁状态下执行提交门禁，仅精确提交本次已授权且未被 Git ignore 的路径；不得由主 Agent在控制器之外自行 stage 或提交。
 

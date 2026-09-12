@@ -669,6 +669,83 @@ def run_repository_validations(
     return results, errors, warnings
 
 
+GRAPHIFY_HOOK_COMMAND = "graphify hook install"
+GRAPHIFY_HOOK_ROLLBACK = "graphify hook uninstall"
+
+
+def graphify_git_hook_plan(manifest: dict) -> tuple[str, str]:
+    """决定本次 run 是否为本仓库安装 graphify 的 git 钩子。
+
+    返回 ``(action, detail)``：``("install", <graphify runner>)`` 或
+    ``("skip", <reason>)``。这一步默认开启 —— 只在 initialize 期间刷新的图谱会在
+    下一次提交后立刻腐烂，post-commit/post-checkout 钩子才是它长期有效的条件。
+    只有显式 ``--no-git-hooks``、graphify 缺失或过旧、以及 graphify 阶段本身没有
+    产出可用图谱时才跳过。
+    """
+    if not manifest.get("options", {}).get("graph_git_hooks", True):
+        return "skip", "disabled-by-flag"
+    result = manifest.get("worker_results", {}).get("graphify")
+    status = result.get("status") if isinstance(result, dict) else None
+    if status not in {"success", "partial"}:
+        return "skip", f"graphify-{status or 'missing'}"
+    tools = manifest.get("tools", {}).get("graphify")
+    tools = tools if isinstance(tools, dict) else {}
+    if not tools.get("available"):
+        return "skip", "tool-missing"
+    if not tools.get("supports", {}).get("git_hooks"):
+        return "skip", "unsupported"
+    runner = tools.get("runner")
+    if not isinstance(runner, str) or not runner:
+        return "skip", "tool-missing"
+    return "install", runner
+
+
+def install_graphify_git_hooks(
+    root: Path, manifest: dict, timeout: int
+) -> tuple[dict[str, object], list[str], bool]:
+    """Execute ``graphify hook install`` inside this repository.
+
+    Returns ``(record, warnings, degraded)``.  A failure is never swallowed: the
+    graph would silently stop refreshing, so the run drops to ``partial`` and the
+    commit gate blocks until the user re-runs the command or opts out.
+    """
+    action, detail = graphify_git_hook_plan(manifest)
+    if action != "install":
+        record: dict[str, object] = {
+            "status": "skipped",
+            "reason": detail,
+            "command": GRAPHIFY_HOOK_COMMAND,
+        }
+        if detail == "unsupported":
+            return record, [
+                f"当前 graphify 不支持 `{GRAPHIFY_HOOK_COMMAND}`；升级后在仓库根目录执行，"
+                "图谱才会在提交时自动刷新"
+            ], False
+        return record, [], False
+    record = {"status": "failed", "command": GRAPHIFY_HOOK_COMMAND, "rollback": GRAPHIFY_HOOK_ROLLBACK}
+    print(f"initialize: running {GRAPHIFY_HOOK_COMMAND}", file=sys.stderr)
+    completed = None
+    try:
+        completed = subprocess.run(
+            [detail, "hook", "install"],
+            cwd=root, text=True, capture_output=True, check=False, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        record["error"] = str(exc)
+    if completed is not None:
+        record["exit_code"] = completed.returncode
+        record["output_tail"] = (completed.stdout + completed.stderr)[-2000:]
+        if completed.returncode == 0:
+            record["status"] = "installed"
+            return record, [], False
+    tail = str(record.get("output_tail") or record.get("error") or "").strip()
+    return record, [
+        f"{GRAPHIFY_HOOK_COMMAND} 失败（{tail[-300:]}）：本仓库的图谱不会随提交刷新。"
+        f"修复后可重试 `{GRAPHIFY_HOOK_COMMAND}`，或回滚 `{GRAPHIFY_HOOK_ROLLBACK}`；"
+        "不需要该钩子时带 --no-git-hooks 重跑"
+    ], True
+
+
 def commit_exact_paths(root: Path, paths: list[str]) -> str:
     if not paths:
         raise ValidationError("no eligible initialize changes to commit")
@@ -773,12 +850,31 @@ def final_command(args: argparse.Namespace, *, emit: bool = True) -> int:
         )
         dirty_managed = sorted(dirty_at_start & set(commit_paths))
         commit_requested = bool(manifest.get("options", {}).get("commit"))
+        # 图谱钩子是仓库级写入：只有在其余校验全部干净时才动手，已经失败的 run
+        # 不再往 .git 里追加副作用。
+        if errors:
+            planned, reason = graphify_git_hook_plan(manifest)
+            hook_record: dict[str, object] = {
+                "status": "skipped",
+                "reason": "run-already-failed" if planned == "install" else reason,
+                "command": GRAPHIFY_HOOK_COMMAND,
+            }
+            hook_warnings: list[str] = []
+            hook_degraded = False
+        else:
+            hook_record, hook_warnings, hook_degraded = install_graphify_git_hooks(
+                root, manifest, args.validation_timeout
+            )
+        validation_warnings.extend(hook_warnings)
+        for warning in hook_warnings:
+            print(f"initialize warning: {warning}", file=sys.stderr)
         # A required validation that could not run keeps the run out of success:
         # the missing toolchain may hide a real regression.
         skipped_validations = [
             item for item in validations if item.get("status") == "skipped"
         ]
-        overall = "failed" if errors else ("partial" if skipped_validations else gate_status)
+        degraded = bool(skipped_validations) or hook_degraded
+        overall = "failed" if errors else ("partial" if degraded else gate_status)
         commit_allowed = (
             commit_requested and overall == "success" and not dirty_managed
             and bool(commit_paths) and not attested
@@ -789,6 +885,8 @@ def final_command(args: argparse.Namespace, *, emit: bool = True) -> int:
             commit_status = "blocked-unverified-validations"
         elif commit_requested and skipped_validations:
             commit_status = "blocked-skipped-validations"
+        elif commit_requested and hook_degraded:
+            commit_status = "blocked-graphify-git-hooks"
         elif commit_requested and not commit_paths:
             commit_status = "no-changes"
         elif commit_requested and not commit_allowed:
@@ -809,6 +907,7 @@ def final_command(args: argparse.Namespace, *, emit: bool = True) -> int:
             "validations": validations,
             "validation_warnings": validation_warnings,
             "validation_source": "attested" if attested else "executed",
+            "graphify_git_hooks": hook_record,
             "dirty_managed_at_baseline": dirty_managed,
             "commit_requested": commit_requested,
             "commit_allowed": commit_allowed,

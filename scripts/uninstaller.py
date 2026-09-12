@@ -255,10 +255,26 @@ class Uninstaller(Installer):
             return self.uninstall_winget_package(winget_id)
         return True
 
+    def unregister_gitnexus_from_qoder(self) -> None:
+        """回收 CodeKit 为 Qoder 写入的 GitNexus MCP、hooks 与脚本副本。
+
+        这些落点不在 ``gitnexus uninstall`` 的目标表里，只能自己收：漏掉的话宿主
+        会继续去加载一个已经不存在的 MCP server 和 hook 脚本。
+        """
+        for root in qoder.existing_roots(qoder.PLATFORMS.values(), self.home):
+            try:
+                qoder.remove_mcp_server(root, qoder.GITNEXUS_MCP_NAME)
+                qoder.remove_gitnexus_hooks(root)
+            except ValueError as exc:
+                self.logger.error(f"Qoder（{root}）清理 GitNexus 注册失败：{exc}")
+                continue
+            platform_layer.rmtree(qoder.hook_script_dir(root), ignore_errors=True)
+
     def uninstall_gitnexus(self) -> bool:
         """清理 gitnexus 自身配置，并同时卸载用户 npm 前缀和默认 npm 前缀中的包。"""
         if self.command_exists("gitnexus"):
             self.run_command(["gitnexus", "uninstall", "--force"])
+        self.unregister_gitnexus_from_qoder()
         return self.uninstall_npm_component("gitnexus")
 
     def uninstall_npm_component(self, component_id: str) -> bool:
@@ -403,12 +419,19 @@ class Uninstaller(Installer):
         return self.uninstall_npm_component("feishu_cli")
 
     def uninstall_graphify(self) -> bool:
-        """卸载 pipx/pip 中的 graphifyy，并删除 CodeKit venv 和用户级软链接。"""
+        """卸载 pipx/pip 中的 graphifyy，并删除 CodeKit venv、用户级软链接与技能注册。"""
         if self.command_exists("pipx") and "graphifyy" in self.run_capture(["pipx", "list"]).stdout.lower():
             self.run_command(["pipx", "uninstall", "graphifyy"])
         if self.command_exists("pip3"):
             self.run_command(["pip3", "uninstall", "-y", "graphifyy"])
         platform_layer.rmtree(self.platform.venv_dir(self.home, "graphify"), ignore_errors=True)
+        # 技能注册是安装期 CodeKit 自己写的（agents 目标 + Qoder 各根镜像），
+        # 留着的话卸载后宿主仍然会把 /graphify 当成可用技能。
+        platform_layer.rmtree(
+            self.home / ".agents" / "skills" / "graphify", ignore_errors=True
+        )
+        for root in qoder.existing_roots(qoder.PLATFORMS.values(), self.home):
+            qoder.remove_mirrored_skill(root, "graphify")
         for name in dict.fromkeys(
             (self.platform.shim_name("graphify"), self.platform.binary_filename("graphify"))
         ):

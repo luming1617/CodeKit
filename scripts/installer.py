@@ -1192,7 +1192,105 @@ class Installer:
         """按策略表安装 gitnexus（npm），并执行其初始化命令。"""
         if not self.install_via_channels("gitnexus"):
             return False
-        return self.run_command(["gitnexus", "setup"]).returncode == 0
+        if self.run_command(["gitnexus", "setup"]).returncode != 0:
+            return False
+        return self.register_gitnexus_for_qoder()
+
+    def gitnexus_hook_source(self) -> Optional[Path]:
+        """GitNexus 自带 hook 脚本所在目录。
+
+        包内 ``hooks/claude`` 是 ``gitnexus setup`` 自己的规范源；只有从 PATH 上的
+        shim 定位不到包目录时，才退回 setup 已经复制到 ``~/.claude/hooks/gitnexus``
+        的那一份，避免 Qoder 依赖一次成功的 Claude 注册。
+        """
+        candidates: list[Path] = []
+        resolved = platform_layer.resolve_exe("gitnexus")
+        if resolved:
+            bin_dir = Path(resolved).parent
+            candidates.extend(
+                bin_dir.joinpath(*parts)
+                for parts in (
+                    ("node_modules", "gitnexus", "hooks", "claude"),
+                    ("..", "node_modules", "gitnexus", "hooks", "claude"),
+                    ("lib", "node_modules", "gitnexus", "hooks", "claude"),
+                )
+            )
+        candidates.append(self.home / ".claude" / "hooks" / "gitnexus")
+        return next(
+            (path for path in candidates if (path / "gitnexus-hook.cjs").is_file()),
+            None,
+        )
+
+    def prune_dead_qoder_mcp_file(self) -> None:
+        """删掉 ``gitnexus setup`` 写下的 ``~/.qoder.json``。
+
+        Qoder 的用户级 MCP 只从共享配置根的 settings.json 读取，这个文件没有任何
+        读者；留着会让「已注册」的假象在下一轮排查里反复出现。只有整份文档就是
+        gitnexus 一条时才删，避免动到第三方写进去的内容。
+        """
+        path = self.home / ".qoder.json"
+        if not path.is_file():
+            return
+        try:
+            document = config.read_json(path)
+        except ValueError:
+            return
+        if not isinstance(document, dict) or set(document) != {"mcpServers"}:
+            return
+        servers = document.get("mcpServers")
+        if not isinstance(servers, dict) or set(servers) != {qoder.GITNEXUS_MCP_NAME}:
+            return
+        path.unlink(missing_ok=True)
+        self.logger.info(
+            f"已删除 {path}：Qoder 不读这个文件，MCP 已注册进共享配置根的 settings.json。"
+        )
+
+    def register_gitnexus_for_qoder(self) -> bool:
+        """把 GitNexus 注册到 Qoder 真正加载的位置（MCP 与 hooks）。
+
+        ``gitnexus setup`` 的 Qoder MCP 目标指向无人读取的 ``~/.qoder.json``，而它的
+        hook 目标表里根本没有 Qoder，所以两端都由 CodeKit 补齐。宿主看不见等同没装，
+        因此这里失败必须报错，不能静默降级成「只注册了一半」。
+        """
+        roots = qoder.existing_roots(qoder.PLATFORMS.values(), self.home)
+        if not roots:
+            return True
+        resolved = platform_layer.resolve_exe("gitnexus")
+        if not resolved:
+            self.logger.error(
+                "gitnexus 不在 PATH 上，无法为 Qoder 注册 MCP 与 hooks；"
+                "请确认 npm 全局 bin 目录已加入 PATH 后重新安装。"
+            )
+            return False
+        source = self.gitnexus_hook_source()
+        if source is None:
+            self.logger.error(
+                "未找到 GitNexus 自带的 hook 脚本（hooks/claude），Qoder 侧的图谱增强"
+                "无法注册；请重新安装 gitnexus 后再试。"
+            )
+            return False
+        ok = True
+        for root in roots:
+            try:
+                qoder.register_mcp_server(
+                    root,
+                    qoder.GITNEXUS_MCP_NAME,
+                    {"command": str(resolved), "args": ["mcp"]},
+                )
+                script = qoder.install_gitnexus_hook_scripts(root, source)
+                qoder.register_gitnexus_hooks(root, script)
+            except (OSError, ValueError) as exc:
+                self.logger.error(f"Qoder（{root}）注册 GitNexus 失败：{exc}")
+                ok = False
+                continue
+            self.track(qoder.settings_path(root))
+            self.track(qoder.hook_script_dir(root))
+            self.logger.info(
+                f"GitNexus 已注册到 Qoder：MCP + hooks（{detector.display_path(root, self.home)}）"
+            )
+        if ok:
+            self.prune_dead_qoder_mcp_file()
+        return ok
 
     def ensure_unzip(self) -> bool:
         """确保钉钉 CLI 的安装脚本可以调用解压工具。
@@ -1229,6 +1327,9 @@ class Installer:
     def install_graphify(self) -> bool:
         """按策略表安装 graphify（pipx → 独立 venv），再为已装智能体注册。
 
+        注册目标固定包含 `agents`，并把产物镜像进每个 Qoder 配置根，否则 graphify
+        在 Qoder 两端都不可见（见 `mirror_graphify_skill`）。
+
         graphify 的注册命令按「当前项目」落盘，因此必须显式指定工作目录：opencode
         平台无条件往 cwd 写 `.opencode/plugins/graphify.js`（没有只装用户级的开关），
         `hook install` 更是要求 cwd 在 git 仓库内（`hooks.py` 从 cwd 向上找 `.git`）。
@@ -1248,6 +1349,11 @@ class Installer:
         ]
         if not platforms:
             platforms = ["claude"]
+        # `agents` 与上面三家的区别是它既不往 CLAUDE.md 写托管块、也不装 agent hook，
+        # 而它的落点 ~/.agents/skills 恰好是 Qoder IDE 唯一扫描的共享技能目录；
+        # 因此不管装了哪些智能体都必须注册它，否则 graphify 在 Qoder 里不可见。
+        if "agents" not in platforms:
+            platforms.append("agents")
         repo_root = self.git_repo_root()
         workdir = repo_root or self.graphify_project_dir()
         results = [
@@ -1264,7 +1370,37 @@ class Installer:
             )
         else:
             results.append(self.run_command(["graphify", "hook", "install"], cwd=workdir))
-        return all(result.returncode == 0 for result in results)
+        if not all(result.returncode == 0 for result in results):
+            return False
+        return self.mirror_graphify_skill()
+
+    def mirror_graphify_skill(self) -> bool:
+        """把 graphify 的 Agent-Skills 产物镜像进每个 Qoder 配置根。
+
+        两个 Qoder 运行时的技能扫描面并不一致：桌面 IDE 读 ``~/.agents/skills``，
+        而 CLI 的 ``skills list`` 只列 ``<root>/skills`` 与插件自带技能。双写才能
+        让同一个 graphify 在两端都可见。
+        """
+        roots = qoder.existing_roots(qoder.PLATFORMS.values(), self.home)
+        if not roots:
+            return True
+        source = self.home / ".agents" / "skills" / "graphify"
+        if not source.is_dir():
+            self.logger.error(
+                f"未找到 graphify 的 Agent-Skills 产物（{source}）；"
+                "请确认 `graphify install --platform agents` 是否成功。"
+            )
+            return False
+        ok = True
+        for root in roots:
+            try:
+                target = qoder.mirror_skill(root, source)
+            except (OSError, ValueError) as exc:
+                self.logger.error(f"graphify 技能镜像到 {root} 失败：{exc}")
+                ok = False
+                continue
+            self.track(target)
+        return ok
 
     def git_repo_root(self) -> Optional[Path]:
         """启动目录所在的 git 仓库根目录；不在任何仓库内时返回 None。"""

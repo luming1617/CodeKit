@@ -18,6 +18,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_agents as agents  # noqa: E402
+import installer_config as config  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 import installer_state as detector  # noqa: E402
 from installer import Installer, InstallerError  # noqa: E402
@@ -1011,3 +1012,151 @@ class UninstallFlowTests(unittest.TestCase):
             with patch.object(self.uninstaller, "uninstall_platform_agents", return_value=True):
                 self.assertTrue(self.uninstaller.uninstall_component("qodercn_plugin"))
         self.assertEqual(qoder.cached_copies(self.root), [])
+
+
+class GitNexusRegistrationTests(unittest.TestCase):
+    """CodeKit-owned Qoder registration for GitNexus MCP, hooks and skills."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.root = self.home / ".qoder-cn"
+        self.root.mkdir()
+        self.foreign_hook = {
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "rtk hook claude"}],
+        }
+        qoder.register_mcp_server(
+            self.root, "other", {"command": "/usr/bin/other", "args": []}
+        )
+        qoder.register_gitnexus_hooks(
+            self.root, self.home / "previous" / "gitnexus-hook.cjs"
+        )
+        document = qoder.read_settings(self.root)
+        document["hooks"]["PreToolUse"].insert(0, self.foreign_hook)
+        document["enabledPlugins"] = {qoder.PLUGIN_ID: True}
+        config.write_json(qoder.settings_path(self.root), document)
+
+    def settings(self) -> dict:
+        return qoder.read_settings(self.root)
+
+    def hook_commands(self, event: str) -> list[str]:
+        commands = []
+        for group in self.settings()["hooks"][event]:
+            for entry in group.get("hooks", []):
+                commands.append(str(entry.get("command", "")))
+        return commands
+
+    def test_mcp_registration_keeps_foreign_servers_and_unknown_keys(self) -> None:
+        payload = {"command": "/usr/bin/gitnexus", "args": ["mcp"]}
+        self.assertTrue(qoder.register_mcp_server(self.root, "gitnexus", payload))
+        document = self.settings()
+        self.assertEqual(document["mcpServers"]["gitnexus"], payload)
+        self.assertIn("other", document["mcpServers"])
+        self.assertEqual(document["enabledPlugins"], {qoder.PLUGIN_ID: True})
+        self.assertFalse(qoder.register_mcp_server(self.root, "gitnexus", payload))
+
+    def test_removing_the_last_mcp_server_also_removes_the_key(self) -> None:
+        qoder.register_mcp_server(self.root, "gitnexus", {"command": "gitnexus"})
+        self.assertTrue(qoder.remove_mcp_server(self.root, "gitnexus"))
+        self.assertIn("mcpServers", self.settings(), "a foreign server is still listed")
+        self.assertTrue(qoder.remove_mcp_server(self.root, "other"))
+        self.assertNotIn("mcpServers", self.settings())
+
+    def test_hook_events_use_the_claude_compatible_shape(self) -> None:
+        script = qoder.install_gitnexus_hook_scripts(self.root, self.make_script_dir())
+        qoder.register_gitnexus_hooks(self.root, script)
+        groups = self.settings()["hooks"]["PreToolUse"]
+        ours = [group for group in groups if qoder.GITNEXUS_HOOK_NEEDLE in str(group)]
+        self.assertEqual(len(ours), 1)
+        entry = ours[0]["hooks"][0]
+        self.assertEqual(entry["type"], "command")
+        self.assertEqual(entry["timeout"], qoder.GITNEXUS_HOOK_TIMEOUT_SECONDS)
+        self.assertTrue(entry["statusMessage"])
+        self.assertIn("Grep|Glob|Bash", [group.get("matcher") for group in ours])
+
+    def make_script_dir(self) -> Path:
+        source = self.home / "package-hooks"
+        source.mkdir()
+        for name in qoder.GITNEXUS_HOOK_SCRIPTS:
+            (source / name).write_text(f"// {name}\n", encoding="utf-8")
+        return source
+
+    def test_registering_twice_replaces_the_stale_script_path_only(self) -> None:
+        commands = self.hook_commands("PreToolUse")
+        self.assertTrue(any("previous" in item for item in commands))
+        script = qoder.install_gitnexus_hook_scripts(self.root, self.make_script_dir())
+        qoder.register_gitnexus_hooks(self.root, script)
+        commands = self.hook_commands("PreToolUse")
+        self.assertEqual(len(commands), 2, "the rtk hook must survive exactly once")
+        self.assertFalse(any("previous" in item for item in commands))
+        self.assertTrue(any("gitnexus-hook.cjs" in item for item in commands))
+        # 内容已一致，重复注册不再改写文件。
+        self.assertFalse(qoder.register_gitnexus_hooks(self.root, script))
+
+    def test_hook_scripts_are_copied_into_the_qoder_root(self) -> None:
+        script = qoder.install_gitnexus_hook_scripts(self.root, self.make_script_dir())
+        self.assertEqual(script, qoder.hook_script_dir(self.root) / "gitnexus-hook.cjs")
+        self.assertTrue(script.is_file())
+        self.assertTrue((script.parent / "hook-lock.cjs").is_file())
+
+    def test_missing_main_script_is_rejected_before_any_write(self) -> None:
+        empty = self.home / "no-hooks"
+        empty.mkdir()
+        with self.assertRaises(qoder.QoderError):
+            qoder.install_gitnexus_hook_scripts(self.root, empty)
+        self.assertFalse(qoder.hook_script_dir(self.root).exists())
+
+    def test_removing_hooks_keeps_foreign_groups(self) -> None:
+        self.assertTrue(qoder.remove_gitnexus_hooks(self.root))
+        document = self.settings()
+        self.assertEqual(document["hooks"]["PreToolUse"], [self.foreign_hook])
+        self.assertNotIn("PostToolUse", document["hooks"])
+        self.assertEqual(document["mcpServers"], {"other": {"command": "/usr/bin/other", "args": []}})
+        self.assertFalse(qoder.remove_gitnexus_hooks(self.root))
+
+    def test_malformed_mcp_field_is_rejected_not_overwritten(self) -> None:
+        document = self.settings()
+        document["mcpServers"] = []
+        config.write_json(qoder.settings_path(self.root), document)
+        with self.assertRaises(qoder.QoderError):
+            qoder.register_mcp_server(self.root, "gitnexus", {"command": "gitnexus"})
+        self.assertEqual(qoder.read_settings(self.root)["mcpServers"], [])
+
+    def test_malformed_hooks_field_is_rejected_not_overwritten(self) -> None:
+        document = self.settings()
+        document["hooks"] = "nope"
+        config.write_json(qoder.settings_path(self.root), document)
+        with self.assertRaises(qoder.QoderError):
+            qoder.register_gitnexus_hooks(self.root, self.root / "gitnexus-hook.cjs")
+        self.assertEqual(qoder.read_settings(self.root)["hooks"], "nope")
+
+    def test_skill_mirror_replaces_the_previous_copy(self) -> None:
+        source = self.home / ".agents" / "skills" / "graphify"
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text("# v1\n", encoding="utf-8")
+        (source / "references").mkdir()
+        (source / "references" / "a.md").write_text("a\n", encoding="utf-8")
+        target = qoder.mirror_skill(self.root, source)
+        self.assertEqual((target / "SKILL.md").read_text(encoding="utf-8"), "# v1\n")
+        self.assertTrue((target / "references" / "a.md").is_file())
+        (source / "SKILL.md").write_text("# v2\n", encoding="utf-8")
+        (source / "stale").write_text("x\n", encoding="utf-8")
+        qoder.mirror_skill(self.root, source)
+        self.assertEqual((target / "SKILL.md").read_text(encoding="utf-8"), "# v2\n")
+        self.assertFalse(
+            (qoder.skills_root(self.root) / ".graphify.codekit.9999").exists()
+        )
+        self.assertTrue(qoder.remove_mirrored_skill(self.root, "graphify"))
+        self.assertFalse(target.exists())
+        self.assertFalse(qoder.remove_mirrored_skill(self.root, "graphify"))
+
+    def test_existing_roots_only_reports_platforms_that_are_present(self) -> None:
+        roots = qoder.existing_roots(qoder.PLATFORMS.values(), self.home)
+        self.assertEqual(roots, [self.root])
+        (self.home / ".qoder").mkdir()
+        self.assertEqual(
+            qoder.existing_roots(qoder.PLATFORMS.values(), self.home),
+            [self.home / ".qoder", self.root],
+        )

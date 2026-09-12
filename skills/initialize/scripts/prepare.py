@@ -453,6 +453,7 @@ def tool_capabilities(root: Path) -> dict[str, object]:
                 "code_only": "--code-only" in help_text,
                 "backend_selection": "--backend" in help_text,
                 "max_workers": "--max-workers" in help_text,
+                "git_hooks": "hook install" in help_text,
                 "ast_process_pool": probe_graphify_ast_process_pool(Path(graphify_path), root),
             },
         }
@@ -567,6 +568,11 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
     parser.add_argument("--allow-partial", action="store_true")
     parser.add_argument("--commit", action="store_true")
     parser.add_argument("--allow-global-writes", action="store_true")
+    parser.add_argument(
+        "--no-git-hooks",
+        action="store_true",
+        help="skip `graphify hook install` in this repository (git hooks are on by default)",
+    )
     parser.add_argument("--run-id", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
@@ -644,6 +650,7 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
             "allow_partial": args.allow_partial,
             "commit": args.commit,
             "allow_global_writes": args.allow_global_writes,
+            "graph_git_hooks": not args.no_git_hooks,
         },
         "baseline_status": baseline_status,
         "baseline_files": baseline_files,

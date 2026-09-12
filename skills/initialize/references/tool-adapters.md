@@ -126,3 +126,9 @@ Graphify 能力由 `prepare.py` 写入 manifest 的 `tools.graphify.supports`：
 ```
 
 sidecar 的 digest 基于最终 CodeKit managed Graphify ignore block 和保留的用户规则计算。Graphify partial/failed 不得盖写为 success。
+
+### 仓库 git 钩子与宿主可见性
+
+`graphify hook install` 装的是**本仓库**的 `post-commit`/`post-checkout` 钩子和 merge driver（写 `.git/hooks` 与仓库级 `git config`，不产生 Git 可见变更），与智能体的 PreToolUse 钩子是两回事。它由 `controller.py finish` 默认执行，`--no-git-hooks` 才跳过；能力位 `tools.graphify.supports.git_hooks` 由 `--help` 是否列出 `hook install` 实测得到，缺失时记为 `skipped + unsupported` 并提示升级。回滚命令是 `graphify hook uninstall`，`graphify hook status` 可随时复核。
+
+initialize **不**调用任何 `graphify install` / `uninstall`：`claude`/`windows` 平台目标会改写 `~/.claude/CLAUDE.md`，与本次运行的单写者约束冲突。宿主注册归安装器（`scripts/installer.py`）。平台目标里只有 `agents`（别名 `skills`）既不写 CLAUDE.md 也不装 agent 钩子，其落点 `~/.agents/skills/graphify` 正是 Qoder 桌面 IDE 扫描的共享技能目录；`codex` 落在 `~/.codex/skills`，Qoder 不读。

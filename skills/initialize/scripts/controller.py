@@ -133,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--allow-partial", action="store_true")
     start.add_argument("--commit", action="store_true")
     start.add_argument("--allow-global-writes", action="store_true")
+    start.add_argument("--no-git-hooks", action="store_true")
     start.add_argument("--run-id", help=argparse.SUPPRESS)
 
     gate = commands.add_parser("gate", help="validate and seal all worker results")
@@ -179,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
             ("--allow-partial", args.allow_partial),
             ("--commit", args.commit),
             ("--allow-global-writes", args.allow_global_writes),
+            ("--no-git-hooks", args.no_git_hooks),
         ):
             if enabled:
                 forwarded.append(flag)

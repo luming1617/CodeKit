@@ -3,7 +3,7 @@
 ## 最终状态
 
 - `success`：所有 required 阶段成功，所有结果与 artifact 复核有效，无越界写入。
-- `partial`：仅存在允许的 skipped，且用户显式 `--allow-partial` 后完成上下文；不能称为成功。`required_for_initialize` 验证因白名单程序未安装而 `skipped` 时同样降级为 `partial`（此时即使 gate 为 success 也不得记为 success），并禁止提交。gitnexus 的 `partial/registry-missing` 属于同一档：索引与 artifact 有效，但仓库未注册进 GitNexus 全局 registry，`list`/`query`/`context`/`impact`/`trace`/`cypher`/`check`/`detect-changes` 与 MCP 图查询全部不可用；报告必须原样列出该限制并给出修复方式（获准后带 `--allow-global-writes` 重跑）。
+- `partial`：仅存在允许的 skipped，且用户显式 `--allow-partial` 后完成上下文；不能称为成功。`required_for_initialize` 验证因白名单程序未安装而 `skipped` 时同样降级为 `partial`（此时即使 gate 为 success 也不得记为 success），并禁止提交。gitnexus 的 `partial/registry-missing` 属于同一档：索引与 artifact 有效，但仓库未注册进 GitNexus 全局 registry，`list`/`query`/`context`/`impact`/`trace`/`cypher`/`check`/`detect-changes` 与 MCP 图查询全部不可用；报告必须原样列出该限制并给出修复方式（获准后带 `--allow-global-writes` 重跑）。`graphify hook install` 真实失败也是同一档：图谱本身有效，但仓库不会随提交刷新，`commit_status` 为 `blocked-graphify-git-hooks`，报告必须给出可重试命令、`graphify hook uninstall` 回滚命令，以及「不需要钩子时带 `--no-git-hooks` 重跑」。
 - `failed`：任一 required failure、工具存在但运行失败、artifact 无效、上下文生成/验证失败或越界写入。失败时 manifest 的 phase 为 `aborted`，只有 `final_report.status` 保留 `failed`；不会持久化未定义的 `failed` phase。
 
 ## 验证
@@ -24,6 +24,7 @@
 - overall status 是 success（不是 partial）；
 - 用户显式传入 `--commit`；
 - validators 全部执行且通过，没有 `skipped`，且验证证据由控制器自己执行得到（`validation_source` 为 `executed`）；存在 skipped 时 `commit_status` 为 `blocked-skipped-validations`；
+- `graphify hook install` 没有被判失败；失败时 `commit_status` 为 `blocked-graphify-git-hooks`（显式 `--no-git-hooks` 或工具缺失导致的 `skipped` 不挡提交，但必须原样报告原因）；
 - 没有未申报/越界写入；
 - 每个将 stage 的托管文件在 Phase 0 都不是 dirty；
 - stage 列表是运行清单中的精确文件，不包含整个目录或通配符。
@@ -36,4 +37,4 @@
 
 ## 报告字段
 
-报告 run-id、root、languages、各阶段及 gitnexus 步骤（控制器执行）/ `initialize-graphify` / `initialize-context-scanner` 状态、partial 原因、artifact 验证、变更文件、validators（含来源、命令、退出码与输出尾部）、`validation_warnings`（skipped 验证原样展示）、commit decision、锁释放结果。上下文截断或渲染告警（`context_warnings`，如 AGENTS.md 条目超行预算被裁剪）必须原样展示，不得静默丢弃。不要声称 skipped 的分析已完成，不隐藏 Graphify chunk/健康警告。
+报告 run-id、root、languages、各阶段及 gitnexus 步骤（控制器执行）/ `initialize-graphify` / `initialize-context-scanner` 状态、partial 原因、artifact 验证、变更文件、validators（含来源、命令、退出码与输出尾部）、`validation_warnings`（skipped 验证原样展示）、`graphify_git_hooks`（`installed`/`skipped`/`failed` 与 `reason`/`command`/`exit_code`/`output_tail`/`rollback`；`skipped` 的原因不得省略）、commit decision、锁释放结果。上下文截断或渲染告警（`context_warnings`，如 AGENTS.md 条目超行预算被裁剪）必须原样展示，不得静默丢弃。不要声称 skipped 的分析已完成，不隐藏 Graphify chunk/健康警告。

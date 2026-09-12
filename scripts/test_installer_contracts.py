@@ -34,6 +34,27 @@ from uninstaller import Uninstaller  # noqa: E402
 HELPER_SCRIPT = SCRIPT_DIR / "manage-global-agents.py"
 SELECTOR_SCRIPT = SCRIPT_DIR / "component-selector.py"
 
+# 只要宿主导出过 QODER*_CONFIG_DIR，Qoder 配置根就会被解析到真实用户目录，用例
+# 会去改用户机器上的 settings.json 与 skills。整模块运行期间先移除它们。
+_AMBIENT_ENV_PATCH = None
+
+
+def setUpModule() -> None:
+    """隔离宿主导出的 Qoder 根目录覆盖。"""
+    global _AMBIENT_ENV_PATCH
+    _AMBIENT_ENV_PATCH = patch.dict(os.environ, {}, clear=False)
+    _AMBIENT_ENV_PATCH.start()
+    for key in ("QODER_CONFIG_DIR", "QODERCN_CONFIG_DIR"):
+        os.environ.pop(key, None)
+
+
+def tearDownModule() -> None:
+    """恢复本模块运行前的环境。"""
+    global _AMBIENT_ENV_PATCH
+    if _AMBIENT_ENV_PATCH is not None:
+        _AMBIENT_ENV_PATCH.stop()
+        _AMBIENT_ENV_PATCH = None
+
 
 def bare_installer(home: Path) -> Installer:
     """装配仅含命令执行与平台探测所需字段的安装会话。"""
@@ -1805,6 +1826,183 @@ class ShellPathConfigTests(unittest.TestCase):
             self.assertEqual(1, profile.count("# Added by CodeKit Plugin"))
             # 凭空创建 ~/.bash_profile 会让 bash login shell 不再读 ~/.profile。
             self.assertFalse((home / ".bash_profile").exists())
+
+
+class GitNexusQoderRegistrationTests(unittest.TestCase):
+    """GitNexus 必须落到 Qoder 真正加载的位置。
+
+    实测上游 `gitnexus setup` 把 Qoder 的 MCP 写进没有读者的 `~/.qoder.json`
+    （`mcp list` 仍回答 "No MCP servers configured"），而它的 hook 目标表里只有
+    claude/codex/antigravity，根本没有 Qoder。两端都得由 CodeKit 补齐，且补不上
+    就等于没装，必须让组件失败。
+    """
+
+    def _home(self, directory: str) -> Path:
+        home = Path(directory)
+        (home / ".qoder-cn").mkdir()
+        return home
+
+    def _fake_install(self, home: Path) -> Path:
+        """伪造一次 npm 全局安装：bin 目录里有 shim，包目录里有 hook 脚本。"""
+        scripts = home / "npm" / "node_modules" / "gitnexus" / "hooks" / "claude"
+        scripts.mkdir(parents=True)
+        for name in qoder.GITNEXUS_HOOK_SCRIPTS:
+            (scripts / name).write_text("// hook\n", encoding="utf-8")
+        return home / "npm" / "gitnexus.cmd"
+
+    def _installer(self, home: Path) -> Installer:
+        installer = bare_installer(home)
+        installer.install_via_channels = Mock(return_value=True)
+        installer.run_command = Mock(return_value=RunResult(0))
+        return installer
+
+    def test_install_registers_mcp_and_hooks_in_the_shared_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._home(directory)
+            root = home / ".qoder-cn"
+            shim = self._fake_install(home)
+            installer = self._installer(home)
+            with patch.object(platform_layer, "resolve_exe", return_value=str(shim)):
+                self.assertTrue(installer.install_gitnexus())
+            document = qoder.read_settings(root)
+            self.assertEqual(
+                document["mcpServers"]["gitnexus"],
+                {"command": str(shim), "args": ["mcp"]},
+            )
+            commands = {
+                entry["command"]
+                for groups in document["hooks"].values()
+                for group in groups
+                for entry in group["hooks"]
+            }
+            self.assertEqual(len(commands), 1, "两个事件指向同一个脚本")
+            self.assertTrue((qoder.hook_script_dir(root) / "gitnexus-hook.cjs").is_file())
+            self.assertIn(str(qoder.settings_path(root)), installer.changed_paths)
+            # 上游 setup 仍然是第一步，Qoder 注册只是追加。
+            self.assertIn(
+                ["gitnexus", "setup"],
+                [entry.args[0] for entry in installer.run_command.call_args_list],
+            )
+
+    def test_dead_qoder_json_is_pruned_and_a_foreign_one_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._home(directory)
+            shim = self._fake_install(home)
+            dead = home / ".qoder.json"
+            dead.write_text(
+                json.dumps(
+                    {"mcpServers": {"gitnexus": {"command": "gitnexus", "args": ["mcp"]}}}
+                ),
+                encoding="utf-8",
+            )
+            installer = self._installer(home)
+            with patch.object(platform_layer, "resolve_exe", return_value=str(shim)):
+                self.assertTrue(installer.install_gitnexus())
+            self.assertFalse(dead.exists(), "Qoder 从不读取这个文件")
+
+            dead.write_text(
+                json.dumps({"mcpServers": {"gitnexus": {}, "other": {}}}),
+                encoding="utf-8",
+            )
+            installer.prune_dead_qoder_mcp_file()
+            self.assertTrue(dead.exists(), "别人的 server 不能被顺手删掉")
+
+    def test_missing_hook_scripts_fail_the_component(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._home(directory)
+            (home / "npm").mkdir()
+            installer = self._installer(home)
+            shim = home / "npm" / "gitnexus.cmd"
+            with patch.object(platform_layer, "resolve_exe", return_value=str(shim)):
+                self.assertFalse(installer.install_gitnexus())
+            self.assertTrue(installer.logger.error.called)
+            self.assertEqual(qoder.read_settings(home / ".qoder-cn"), {})
+
+    def test_uninstall_removes_everything_install_wrote(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._home(directory)
+            root = home / ".qoder-cn"
+            shim = self._fake_install(home)
+            installer = self._installer(home)
+            with patch.object(platform_layer, "resolve_exe", return_value=str(shim)):
+                installer.install_gitnexus()
+            qoder.register_mcp_server(root, "other", {"command": "other"})
+            uninstaller = bare_uninstaller(home)
+            uninstaller.command_exists = Mock(return_value=False)
+            uninstaller.uninstall_npm_component = Mock(return_value=True)
+            self.assertTrue(uninstaller.uninstall_gitnexus())
+            document = qoder.read_settings(root)
+            self.assertEqual(document["mcpServers"], {"other": {"command": "other"}})
+            self.assertNotIn("hooks", document)
+            self.assertFalse(qoder.hook_script_dir(root).exists())
+
+
+class GraphifyQoderVisibilityTests(unittest.TestCase):
+    """graphify 技能必须出现在 Qoder 两端读取的目录里。"""
+
+    def setUp(self) -> None:
+        patcher = patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in ("QODER_CONFIG_DIR", "QODERCN_CONFIG_DIR"):
+            os.environ.pop(key, None)
+
+    def _installer(self, home: Path) -> Installer:
+        installer = bare_installer(home)
+        installer.install_via_channels = Mock(return_value=True)
+        installer.command_exists = Mock(return_value=False)
+        installer.run_capture = Mock(return_value=RunResult(1))
+        installer.run_command = Mock(return_value=RunResult(0))
+        return installer
+
+    def _fake_agents_skill(self, home: Path) -> Path:
+        source = home / ".agents" / "skills" / "graphify"
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text("# graphify\n", encoding="utf-8")
+        return source
+
+    def test_agents_platform_is_registered_even_without_other_agents(self) -> None:
+        # 三家智能体一个都没装时也要注册 agents 目标：它是 Qoder IDE 唯一的共享
+        # 技能入口，而且既不写 CLAUDE.md 也不装 agent hook。
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".qoder-cn").mkdir()
+            installer = self._installer(home)
+            self._fake_agents_skill(home)
+            self.assertTrue(installer.install_graphify())
+            platforms = [
+                argv[3]
+                for argv in (
+                    entry.args[0] for entry in installer.run_command.call_args_list
+                )
+                if argv[:2] == ["graphify", "install"]
+            ]
+            self.assertIn("agents", platforms)
+
+    def test_skill_is_mirrored_into_every_existing_qoder_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            for name in (".qoder", ".qoder-cn"):
+                (home / name).mkdir()
+            installer = self._installer(home)
+            source = self._fake_agents_skill(home)
+            self.assertTrue(installer.mirror_graphify_skill())
+            for name in (".qoder", ".qoder-cn"):
+                mirrored = home / name / "skills" / "graphify" / "SKILL.md"
+                self.assertTrue(mirrored.is_file(), name)
+                self.assertEqual(
+                    mirrored.read_text(encoding="utf-8"),
+                    (source / "SKILL.md").read_text(encoding="utf-8"),
+                )
+            self.assertEqual(len(installer.changed_paths), 2)
+
+    def test_missing_agents_output_is_reported_instead_of_a_quiet_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".qoder-cn").mkdir()
+            installer = self._installer(home)
+            self.assertFalse(installer.mirror_graphify_skill())
+            self.assertTrue(installer.logger.error.called)
 
 
 if __name__ == "__main__":

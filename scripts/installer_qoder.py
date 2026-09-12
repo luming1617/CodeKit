@@ -294,6 +294,217 @@ def set_plugin_enabled(
     return _write_json(settings_path(root), document)
 
 
+# ---------------------------------------------------------------------------
+# GitNexus registration.
+#
+# GitNexus ships its own editor target table, but Qoder is only half covered by
+# it: the MCP entry goes to ``~/.qoder.json`` -- a file neither the Qoder CLI
+# nor the desktop IDE reads (the real user-scope surface is ``mcpServers`` in
+# the shared settings document) -- and the hook table has no Qoder target at
+# all.  Everything below is therefore owned by CodeKit, not delegated upstream.
+# ---------------------------------------------------------------------------
+
+GITNEXUS_MCP_NAME = "gitnexus"
+# Identifies entries CodeKit wrote; foreign hooks are never touched.
+GITNEXUS_HOOK_NEEDLE = "gitnexus-hook"
+GITNEXUS_HOOK_TIMEOUT_SECONDS = 10
+GITNEXUS_HOOK_EVENTS: tuple[tuple[str, str, str], ...] = (
+    ("PreToolUse", "Grep|Glob|Bash", "Enriching with GitNexus graph context..."),
+    ("PostToolUse", "Bash", "Checking GitNexus index freshness..."),
+)
+GITNEXUS_HOOK_SCRIPTS: tuple[str, ...] = (
+    "gitnexus-hook.cjs",
+    "hook-db-lock-probe.cjs",
+    "hook-lock.cjs",
+    "resolve-analyze-cmd.cjs",
+    "win-rm-list-json.ps1",
+)
+
+
+def skills_root(root: Path) -> Path:
+    """Return the per-root skill directory Qoder scans on both surfaces."""
+    return Path(root) / "skills"
+
+
+def hook_script_dir(root: Path) -> Path:
+    """Return CodeKit's own copy of the GitNexus hook scripts for one root."""
+    return Path(root) / "hooks" / "gitnexus"
+
+
+def register_mcp_server(root: Path, name: str, payload: Mapping[str, Any]) -> bool:
+    """Merge one ``mcpServers`` entry, keeping foreign servers and keys."""
+    document = read_settings(root)
+    servers = document.get("mcpServers")
+    if servers is None:
+        servers = {}
+        document["mcpServers"] = servers
+    elif not isinstance(servers, dict):
+        raise QoderError(
+            f"Qoder settings field 'mcpServers' must be an object: {settings_path(root)}"
+        )
+    servers[name] = dict(payload)
+    return _write_json(settings_path(root), document)
+
+
+def remove_mcp_server(root: Path, name: str) -> bool:
+    """Drop one ``mcpServers`` entry; the key itself goes when it turns empty."""
+    document = read_settings(root)
+    servers = document.get("mcpServers")
+    if not isinstance(servers, dict) or name not in servers:
+        return False
+    servers.pop(name)
+    if not servers:
+        document.pop("mcpServers", None)
+    return _write_json(settings_path(root), document)
+
+
+def mcp_server(root: Path, name: str) -> dict[str, Any]:
+    """Return the effective ``mcpServers`` entry for a name, if any."""
+    servers = read_settings(root).get("mcpServers")
+    if not isinstance(servers, dict):
+        return {}
+    entry = servers.get(name)
+    return dict(entry) if isinstance(entry, dict) else {}
+
+
+def _hook_map(document: dict[str, Any], root: Path) -> dict[str, Any]:
+    """Return the mutable ``hooks`` object, rejecting a document of the wrong shape."""
+    hooks = document.get("hooks")
+    if hooks is None:
+        hooks = {}
+        document["hooks"] = hooks
+    elif not isinstance(hooks, dict):
+        raise QoderError(
+            f"Qoder settings field 'hooks' must be an object: {settings_path(root)}"
+        )
+    return hooks
+
+
+def _mentions_hook_needle(entry: Any) -> bool:
+    """True when a hook group is one CodeKit wrote for GitNexus."""
+    try:
+        return GITNEXUS_HOOK_NEEDLE in json.dumps(entry, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return False
+
+
+def register_gitnexus_hooks(root: Path, script: Path) -> bool:
+    """Write GitNexus hook entries shaped like Claude Code's own.
+
+    Previous CodeKit entries are replaced (a moved script must stop firing) and
+    every foreign group is preserved.
+    """
+    command = f'node "{Path(script).as_posix()}"'
+    document = read_settings(root)
+    hooks = _hook_map(document, root)
+    for event, matcher, status_message in GITNEXUS_HOOK_EVENTS:
+        entries = hooks.get(event)
+        if entries is None:
+            entries = []
+        elif not isinstance(entries, list):
+            raise QoderError(
+                f"Qoder settings hook event '{event}' must be a list: "
+                f"{settings_path(root)}"
+            )
+        desired: dict[str, Any] = {
+            "matcher": matcher,
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command,
+                    "timeout": GITNEXUS_HOOK_TIMEOUT_SECONDS,
+                    "statusMessage": status_message,
+                }
+            ],
+        }
+        kept = [entry for entry in entries if not _mentions_hook_needle(entry)]
+        kept.append(desired)
+        hooks[event] = kept
+    return _write_json(settings_path(root), document)
+
+
+def remove_gitnexus_hooks(root: Path) -> bool:
+    """Strip every CodeKit GitNexus hook group, keeping foreign hooks."""
+    document = read_settings(root)
+    hooks = document.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    changed = False
+    for event, entries in list(hooks.items()):
+        if not isinstance(entries, list):
+            continue
+        kept = [entry for entry in entries if not _mentions_hook_needle(entry)]
+        if len(kept) != len(entries):
+            changed = True
+        if kept:
+            hooks[event] = kept
+        else:
+            hooks.pop(event)
+    if changed and not hooks:
+        document.pop("hooks", None)
+    return _write_json(settings_path(root), document) if changed else False
+
+
+def install_gitnexus_hook_scripts(root: Path, source_dir: Path) -> Path:
+    """Copy the bundled hook scripts into this root so Qoder needs no Claude install."""
+    source = Path(source_dir)
+    missing = [name for name in GITNEXUS_HOOK_SCRIPTS if not (source / name).is_file()]
+    if "gitnexus-hook.cjs" in missing:
+        raise QoderError(f"no GitNexus hook script to install under {source}")
+    target = hook_script_dir(root)
+    target.mkdir(parents=True, exist_ok=True)
+    for name in GITNEXUS_HOOK_SCRIPTS:
+        if (source / name).is_file():
+            shutil.copy2(source / name, target / name)
+    return target / "gitnexus-hook.cjs"
+
+
+def mirror_skill(root: Path, source: Path) -> Path:
+    """Copy a prepared skill directory into this root's own skills directory."""
+    source = Path(source)
+    if not source.is_dir():
+        raise QoderError(f"skill source directory is missing: {source}")
+    target = skills_root(root) / source.name
+    staging = skills_root(root) / f".{source.name}.codekit.{os.getpid()}"
+    rmtree(staging, ignore_errors=True)
+    try:
+        staging.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, staging, dirs_exist_ok=True)
+        if target.exists() or target.is_symlink():
+            rmtree(target, ignore_errors=True)
+            target.unlink(missing_ok=True)
+        os.replace(staging, target)
+    except OSError as exc:
+        raise QoderError(f"could not mirror {source} into {target}: {exc}") from exc
+    rmtree(staging, ignore_errors=True)
+    return target
+
+
+def remove_mirrored_skill(root: Path, name: str) -> bool:
+    """Delete one mirrored skill directory from a Qoder root."""
+    target = skills_root(root) / name
+    if not target.exists():
+        return False
+    if target.is_dir() and not target.is_symlink():
+        rmtree(target, ignore_errors=True)
+    else:
+        target.unlink(missing_ok=True)
+    return not target.exists()
+
+
+def existing_roots(descriptors: Iterable[Platform], home: Path) -> list[Path]:
+    """Return the config roots of platforms that are actually present."""
+    roots: list[Path] = []
+    for descriptor in descriptors:
+        try:
+            root = resolve_config_root(descriptor, home)
+        except (QoderError, OSError):
+            continue
+        if root.is_dir() and root not in roots:
+            roots.append(root)
+    return roots
+
+
 def plugin_cache_root(root: Path) -> Path:
     """Return the cache directory holding locally installed Qoder plugins."""
     return Path(root) / "plugins" / "cache" / CACHE_MARKETPLACE / PLUGIN_NAME
