@@ -1,4 +1,4 @@
 interface:
   display_name: "AI开发环境初始化"
   short_description: "安全编排规范、索引、知识图谱与项目上下文初始化"
-  default_prompt: "使用 $initialize [--language java,python,go,cpp] [--embeddings] [--force] [--allow-partial] [--commit] [--allow-global-writes] 初始化当前仓库：GitNexus 由确定性控制器执行，强制派发 Graphify 与 Context Scanner 两个独立 Subagent，默认只生成、验证和报告 diff，不提交。需要补齐 GitNexus 本地 embedding 栈等仓库外写入时，先向用户申请授权再追加 --allow-global-writes。"
+  default_prompt: "使用 $initialize [--language java,python,go,cpp] [--embeddings] [--force] [--allow-partial] [--commit] [--allow-global-writes] 初始化当前仓库：GitNexus 由确定性控制器执行，强制派发 Graphify 与 Context Scanner 两个独立 Subagent，默认只生成、验证和报告 diff，不提交。需要补齐 GitNexus 本地 embedding 栈等仓库外写入时，先向用户申请授权再追加 --allow-global-writes。面向用户的回报从第一句起全程使用简体中文，代码、命令、路径与状态字面量保持原文。"

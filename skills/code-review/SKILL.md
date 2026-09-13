@@ -9,7 +9,7 @@ allowed-tools: 'Bash, Read, Agent, Grep'
 
 在不修改被审查代码或外部系统的前提下，冻结新建或变更后的 PRD/TDD/RPD 和目标快照，建立规格追踪，按风险调度只读 Specialist Reviewers，用独立 Evidence Verifier 反证候选问题，并以本地工具证据和 Release Gate 形成可复核的四态结论。
 
-**输出语言：**最终审查报告和面向用户的状态使用简体中文；专有名词、参数、代码、命令、路径、JSON 字段名与状态字面量（如 `CONFIRMED`、`REJECTED`、`UNVERIFIED`、`APPROVE`）和原始日志保持英文原文；快照、规范化 JSON 报告负载与其他产物按 `references/contracts.md` 的既有语言要求执行，渲染中文正文时不得改动这些标识符。规则原文见 `$SKILLS_ROOT/_shared/prompts/output-language.md`，派发子代理时必须把该规则带进任务正文。
+**输出语言（本轮第一句回复即生效；只用 `@code-review` 等无自然语言方式触发时同样默认简体中文）：**最终审查报告和面向用户的状态使用简体中文；专有名词、参数、代码、命令、路径、JSON 字段名与状态字面量（如 `CONFIRMED`、`REJECTED`、`UNVERIFIED`、`APPROVE`）和原始日志保持英文原文；快照、规范化 JSON 报告负载与其他产物按 `references/contracts.md` 的既有语言要求执行，渲染中文正文时不得改动这些标识符。规则原文见 `$SKILLS_ROOT/_shared/prompts/output-language.md`，派发子代理时必须把该规则带进任务正文。
 
 **术语：**本 SKILL 中 `PRD` 指产品需求文档，`TDD` 指技术设计文档，`RPD` 指发布方案文档；不要把这里的 TDD 解释为测试驱动开发。
 

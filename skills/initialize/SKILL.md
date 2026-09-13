@@ -9,7 +9,7 @@ allowed-tools: 'Bash, Read, Write, Edit, Glob, Grep, Agent, Skill'
 
 把内置规范复制到目标仓库，建立或复用 GitNexus 与 Graphify 产物，并由主 Agent 统一维护 `AGENTS.md`、`CLAUDE.md`。默认只生成、验证和报告 diff；只有显式 `--commit` 才允许提交。
 
-**输出语言：**面向用户的过程说明、diff 摘要和最终报告使用简体中文；专有名词、参数、代码、命令、路径、JSON 字段名与状态字面量（如 `BLOCKED`）和原始日志保持英文原文；写入 `AGENTS.md`、`CLAUDE.md`、`.standard/` 与运行目录产物等内容按各自模板与契约的既有语言要求执行。规则原文见 `$SKILLS_ROOT/_shared/prompts/output-language.md`，派发子代理时必须把该规则带进任务正文。
+**输出语言（本轮第一句回复即生效；只用 `@initialize` 等无自然语言方式触发时同样默认简体中文）：**面向用户的过程说明、diff 摘要和最终报告使用简体中文；专有名词、参数、代码、命令、路径、JSON 字段名与状态字面量（如 `BLOCKED`）和原始日志保持英文原文；写入 `AGENTS.md`、`CLAUDE.md`、`.standard/` 与运行目录产物等内容按各自模板与契约的既有语言要求执行。规则原文见 `$SKILLS_ROOT/_shared/prompts/output-language.md`，派发子代理时必须把该规则带进任务正文。
 
 ## 成功标准
 

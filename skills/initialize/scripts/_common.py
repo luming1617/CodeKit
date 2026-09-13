@@ -67,6 +67,15 @@ PROJECT_START = "<!-- codekit:initialize:project-context:start -->"
 PROJECT_END = "<!-- codekit:initialize:project-context:end -->"
 STANDARDS_START = "<!-- codekit:initialize:standards:start -->"
 STANDARDS_END = "<!-- codekit:initialize:standards:end -->"
+# Repo-level reply-language anchor.  AGENTS.md / CLAUDE.md and the ``.standard``
+# indexes are loaded into every session, so this is the only layer that keeps the
+# reply language stable when the user triggers a skill with ``@skill`` alone and
+# the turn carries no natural language for the host to mirror.
+REPLY_LANGUAGE_RULE = (
+    "回复语言：面向用户的说明、状态、判断和报告默认使用简体中文，"
+    "用户只用 `@skill`/斜杠命令触发、本轮没有自然语言时同样适用；"
+    "代码、命令、路径、参数、字段名与状态字面量保持原文，产物文件正文按各自模板与契约的语言要求执行。"
+)
 RESERVED_MARKERS = (
     "<!-- codekit:initialize:project-context:",
     "<!-- codekit:initialize:standards:",

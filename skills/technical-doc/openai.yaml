@@ -1,4 +1,4 @@
 interface:
   display_name: "后端技术方案（TDD）"
   short_description: "基于 PRD 生成可评审、可实现、可验证的中文技术方案"
-  default_prompt: "使用 $technical-doc，参数传当前需求目录 <feature-directory>（必须已包含 product-doc.md）：先初始化 tech_doc_controller.py 运行目录冻结输入，再依次具名派发 tech-context、tech-architect、tech-critic、tech-refiner 与每轮全新的 tech-reviewer，Finding 逐项闭环后由 gate 判定交付，产出 technical-doc.md；正文使用中文，代码与技术标识符保留原文。"
+  default_prompt: "使用 $technical-doc，参数传当前需求目录 <feature-directory>（必须已包含 product-doc.md）：先初始化 tech_doc_controller.py 运行目录冻结输入，再依次具名派发 tech-context、tech-architect、tech-critic、tech-refiner 与每轮全新的 tech-reviewer，Finding 逐项闭环后由 gate 判定交付，产出 technical-doc.md；正文使用中文，代码与技术标识符保留原文；面向用户的回报从第一句起同样使用简体中文。"

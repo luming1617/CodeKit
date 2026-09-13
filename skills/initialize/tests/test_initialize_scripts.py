@@ -1647,8 +1647,17 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(0, finish_code, finish_output.getvalue())
             self.assertFalse((git_dir / "codekit-initialize.lock").exists())
             self.assertFalse((root / ".codekit").exists())
-            self.assertIn("user agents", (root / "AGENTS.md").read_text(encoding="utf-8"))
-            self.assertIn("codekit:initialize:project-context:start", (root / "AGENTS.md").read_text(encoding="utf-8"))
+            agents_text = (root / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("user agents", agents_text)
+            self.assertIn("codekit:initialize:project-context:start", agents_text)
+            # 仓库级回复语言锚点：目标仓库里只用 @skill 触发、本轮没有自然语言时，
+            # 这是唯一会被加载的语言信号。
+            self.assertIn("回复语言", agents_text)
+            self.assertIn("回复语言", (root / "CLAUDE.md").read_text(encoding="utf-8"))
+            self.assertIn(
+                "回复语言",
+                (root / ".standard/01-global/00-instructions.md").read_text(encoding="utf-8"),
+            )
 
             managed_before = {
                 path.relative_to(root).as_posix(): path.read_bytes()

@@ -25,6 +25,7 @@ from _common import (
     INDEX_END,
     INDEX_START,
     MANAGED_GITIGNORE_ENTRIES,
+    REPLY_LANGUAGE_RULE,
     InitializeError,
     atomic_write,
     git_status,
@@ -639,7 +640,8 @@ def update_standard_indexes(root: Path) -> list[str]:
         if not existing:
             existing = (
                 "这是规范索引，不是完整规范。规范优先级为：Security > Project > Stack > Global。\n\n"
-                "仅在任务进入对应场景时读取相关详细文件；不要预先加载全部规范。\n"
+                "仅在任务进入对应场景时读取相关详细文件；不要预先加载全部规范。\n\n"
+                f"{REPLY_LANGUAGE_RULE}\n"
             )
         entries = [
             f"- `{path.relative_to(root).as_posix()}`：进入与 `{path.stem}` 相关的场景时读取。"

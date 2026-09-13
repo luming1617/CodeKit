@@ -8,7 +8,6 @@
 # codekit:initialize:ignore:start
 .codekit/
 .gitnexus/
-graphify-out/
 .graphifyignore
 .claude/skills/gitnexus*/
 .agents/skills/gitnexus*/
@@ -103,7 +102,7 @@ Scanner 在标记 `required_for_initialize: true` 之前必须先用 `command -v
 <!-- codekit:initialize:index-files:end -->
 ```
 
-索引只列真实存在的同目录 Markdown 文件，声明 `Security > Project > Stack > Global` 和按场景渐进读取。
+索引只列真实存在的同目录 Markdown 文件。内置 `standard/` 模板是空占位，空索引由 `prepare.py` 写入种子文案，内容固定为：声明 `Security > Project > Stack > Global`、按场景渐进读取，以及 `_common.REPLY_LANGUAGE_RULE` 的仓库级回复语言锚点（默认简体中文，用户只用 `@skill`/斜杠命令触发、本轮没有自然语言时同样适用）。
 
 ## AGENTS.md 与 CLAUDE.md
 
@@ -111,7 +110,7 @@ Scanner 在标记 `required_for_initialize: true` 之前必须先用 `command -v
 
 - `AGENTS.md`：最多四个简洁事实章节、60 行预算（standards block 不计），随后维护 `codekit:initialize:standards` block；路径全部来自实际 `.standard/`。每类条目最多 20 条，超出预算的条目从尾部裁剪并写入 `context_warnings`，不把 Scanner 的超长输出当作整个运行的失败。
 - `CLAUDE.md`：只在同名 standards block 中生成存在的 `@.standard/.../00-instructions.md` imports。
-- 两个文件分别渲染；禁止互相复制。
+- 两个文件分别渲染；禁止互相复制。两者的 standards block 都带上同一行 `_common.REPLY_LANGUAGE_RULE`（回复语言默认简体中文，`@skill`/斜杠命令等无自然语言触发时同样适用）——它来自共享常量而不是互相拷贝，是目标仓库每个会话都会加载的唯一语言信号。
 
 managed block 若仅有单边 marker、重复 marker 或顺序错误，停止并报告，不能猜测覆盖范围。写入使用同目录临时文件加原子替换，内容末尾保持单个换行。
 

@@ -13,7 +13,7 @@ argument-hint: '<feature-directory>'
 
 本 Skill 采用“主控 Agent 编排、Dependency Resolver 前置解析、Runbook Generator 成稿、Chaos Critic 故障审查、Runbook Refiner 定向补全、Release Plan Reviewer 独立评审”的五阶段闭环。五个子代理只分析资料和生成发布方案，不直接执行生产发布；主控 Agent 负责输入准备、阶段门禁、事实追溯、结果合并和最终交付。
 
-**输出语言：**面向用户的说明、风险清单、协调请求和交付报告使用简体中文；专有名词、参数、代码、命令、路径、服务与产物标识、JSON 字段名与状态字面量（如 `BLOCKED`）和原始日志保持英文原文；发布方案正文按 `release-doc-template.md` 与评审契约的既有语言要求执行。规则原文见 `$SKILLS_ROOT/_shared/prompts/output-language.md`，派发子代理时必须把该规则带进任务正文。
+**输出语言（本轮第一句回复即生效；只用 `@release-doc` 等无自然语言方式触发时同样默认简体中文）：**面向用户的说明、风险清单、协调请求和交付报告使用简体中文；专有名词、参数、代码、命令、路径、服务与产物标识、JSON 字段名与状态字面量（如 `BLOCKED`）和原始日志保持英文原文；发布方案正文按 `release-doc-template.md` 与评审契约的既有语言要求执行。规则原文见 `$SKILLS_ROOT/_shared/prompts/output-language.md`，派发子代理时必须把该规则带进任务正文。
 
 本 Skill 的独立角色使用全局 agents：`release-dependencies`、`release-writer`、`release-critic`、`release-refiner`、`release-reviewer`，规范源文件位于 `skills/release-doc/agents/`。
 

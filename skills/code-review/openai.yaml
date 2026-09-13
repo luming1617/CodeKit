@@ -1,4 +1,4 @@
 interface:
   display_name: "证据驱动代码审查"
   short_description: "基于 PRD/TDD/RPD 或可用证据的只读审查、需求追踪与发布门禁"
-  default_prompt: "使用 $code-review，可选传当前需求目录 <feature-directory>（该目录下的 product-doc.md、technical-doc.md、release-doc.md 缺失时降级为证据驱动审查且不得给出 APPROVE），对指定 PR、MR、分支、提交范围或本地 Diff 执行只读审查，输出四态结论与追踪矩阵，全程不得修改代码或发布评论。"
+  default_prompt: "使用 $code-review，可选传当前需求目录 <feature-directory>（该目录下的 product-doc.md、technical-doc.md、release-doc.md 缺失时降级为证据驱动审查且不得给出 APPROVE），对指定 PR、MR、分支、提交范围或本地 Diff 执行只读审查，输出四态结论与追踪矩阵，全程不得修改代码或发布评论。面向用户的回报从第一句起全程使用简体中文，代码、命令、路径与状态字面量保持原文。"
