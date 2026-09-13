@@ -3,6 +3,8 @@
 
 规范目录为 `.standard/`。先读取下列短索引；只有进入对应场景时，才读取索引中的详细规范。
 
+回复语言：面向用户的说明、状态、判断和报告默认使用简体中文，用户只用 `@skill`/斜杠命令触发、本轮没有自然语言时同样适用；代码、命令、路径、参数、字段名与状态字面量保持原文，产物文件正文按各自模板与契约的语言要求执行。
+
 @.standard/01-global/00-instructions.md
 @.standard/02-stack/python/00-instructions.md
 <!-- codekit:initialize:standards:end -->
