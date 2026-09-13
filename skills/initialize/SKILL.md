@@ -18,12 +18,14 @@ allowed-tools: 'Bash, Read, Write, Edit, Glob, Grep, Agent, Skill'
 - 主 Agent 独立核验 Worker 状态、写入范围与 artifact，不把 `partial`/`failed` 转译为 `success`。
 - `AGENTS.md`、`CLAUDE.md` 只有主 Agent在 Barrier 之后写入，且仅更新 CodeKit managed block。
 - required 阶段全部成功；重复执行无无意义 diff；提交行为满足显式授权与 dirty 基线门禁。
+- 同一仓库重复执行 initialize 是受支持的常规路径：每次 `start` 重新冻结基线，托管文件只替换各自的 CodeKit managed block，内容未变时不落盘，因此对已完成初始化的仓库再跑一次应得到空的 `prepared_changed_files` 与零 diff。
+- 非 `failed` 的运行以醒目的「需要重启 Agent 应用以生效」提示结束报告。
 
 ## 参数
 
 - `--language <set>`：逗号分隔的 `java | python | go | cpp`；省略时收集仓库内全部匹配语言，检测不到时使用 `java`。
 - `--embeddings`：显式要求 GitNexus 构建语义索引；默认关闭。
-- `--force`：显式重建 GitNexus/Graphify，不绕过验证或写入边界。
+- `--force`：显式重建 GitNexus/Graphify，不绕过验证或写入边界。重复执行 initialize 本身不需要该参数，缺省时索引与图谱按 current 复用。
 - `--allow-partial`：允许工具缺失等可接受的 `skipped` 继续生成上下文；仍不得把整体标记为 success，也不得放行真实失败。协作不可用必须映射为 `skipped + collab-unavailable`，整体保持 `blocked`。
 - `--commit`：通过所有提交门禁后提交精确文件；默认不提交。
 - `--no-git-hooks`：跳过 Phase 4 在本仓库安装 Graphify 的 git 钩子（`post-commit`/`post-checkout` 与 merge driver）。**默认不跳过**：图谱只在 initialize 期间刷新，下一次提交就会腐烂，钩子才是它长期有效的条件。该步骤只写 `.git/hooks` 与本仓库 `git config`，不碰任何托管上下文文件；失败会把整体降级为 `partial` 并禁止自动提交，报告给出重试与 `graphify hook uninstall` 回滚命令。
@@ -42,11 +44,11 @@ allowed-tools: 'Bash, Read, Write, Edit, Glob, Grep, Agent, Skill'
 ## 核心不变量
 
 1. 所有阶段只通过 `scripts/controller.py` 进入；先基线、后写入，先能力探测、后工具调用。
-2. `.codekit/initialize.lock` 是仓库级独占锁；冲突时停止，不并发初始化同一仓库。
+2. `.codekit/initialize.lock` 是仓库级独占锁，不是「初始化过就不再允许」的标记：同一仓库可以重复执行 initialize。冲突时控制器先判定持有者——manifest 已终态（`finished`/`aborted`）或已不可读的遗留锁由控制器回收并写入 warning 后继续；仍可能活跃的 run 则停止，不并发初始化同一仓库，并在报错中原样给出 owning run-id、manifest 路径与可执行的 `abort` 回收命令。
 3. 临时清单放在项目根 `.codekit/initialize/<run-id>/`；若遇 EROFS/EACCES/EPERM，控制器必须输出明确 warning 并降级到私有系统临时目录，不把底层 `O_EXCL` 异常直接暴露为无上下文失败。
 4. 一次用户调用只允许一个 `run-id`。Barrier 的输入路径/JSON 错误是可恢复错误：保持当前 phase 和锁，修复或复制输入后重试同一个 run；不得自动重新执行完整 initialize。只有用户明确再次请求时才启动新 run。
 5. GitNexus 和 Graphify 不得写 `AGENTS.md`、`CLAUDE.md`；`initialize-context-scanner` 只返回事实和证据路径。
-6. `.gitignore`、`.graphifyignore`、规范索引和上下文文件只更新各自的 CodeKit managed block，保留用户内容及其他工具 block。
+6. `.gitignore`、`.graphifyignore`、规范索引和上下文文件只更新各自的 CodeKit managed block，保留用户内容及其他工具 block。渲染后的内容与现有文件一致时跳过落盘，因此上一次运行之后没有变更时，重复执行的 `prepared_changed_files` 为空；被人工改过的规范模板文件会在重复执行时被模板覆盖，这是预期的升级路径而不是幂等性缺陷。
 7. Worker 只能写声明的路径；Git 可见的真实 diff 按路径申报，被 ignore 的分析产物目录按控制器授予的前缀判定。出现未授权或未申报路径时停止收敛与自动提交。
 8. 任一 required 阶段失败即失败；工具不存在是 `skipped`，整体为 partial，默认禁止提交。`required_for_initialize` 验证命令的程序未安装同样记为 `skipped`（partial 且禁止提交）；程序不在控制器白名单则是可恢复的契约错误，在 reconcile 写入前报错，不是 finish 阶段的失败。失败 manifest phase 统一为 `aborted`，final report status 仍为 `failed`。
 9. 任一托管文件在运行前 dirty 时可更新其 managed block，但本次运行禁止自动提交。
@@ -160,6 +162,8 @@ python3 "<SKILL_DIR>/scripts/controller.py" finish --manifest <run-manifest.json
 其余校验全部干净后，`finish` 还会为本仓库执行一次 `graphify hook install`（`post-commit`/`post-checkout` 与 merge driver，只写 `.git/` 内的钩子和仓库级 git config，不产生 Git 可见变更，也不碰托管文件）。这一步默认开启，只有 `--no-git-hooks` 才跳过；命令、退出码与输出尾部写入 `final_report.graphify_git_hooks`。graphify 缺失、过旧或 graphify 阶段本身没有产出可用图谱时记为 `skipped` 并给出原因；真实失败会让整体降级为 `partial`、`commit_status` 变为 `blocked-graphify-git-hooks`，报告必须原样给出可重试命令与 `graphify hook uninstall` 回滚命令。
 
 随后展示本次托管文件的 status、diff stat 和关键 diff。若启动时显式传入 `--commit`，`finish` 由控制器在持锁状态下执行提交门禁，仅精确提交本次已授权且未被 Git ignore 的路径；不得由主 Agent在控制器之外自行 stage 或提交。
+
+`finish` 在非 `failed` 时返回 `restart_required: true` 与 `restart_notice`（同时打到 stderr）。最终报告必须把该提示作为**最后一个醒目段落**原样转述给宿主应用重启，不得省略或降级为脚注；`failed` 时 `restart_required` 为 `false`，不得输出成功态提示。规则见 [references/final-report.md](references/final-report.md)。
 
 不推送，不创建 MR/PR。控制器在 `finish` 后释放锁；gate/reconcile 失败会自动 abort。若宿主在阶段之间被中断，使用：
 

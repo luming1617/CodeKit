@@ -672,6 +672,14 @@ def run_repository_validations(
 GRAPHIFY_HOOK_COMMAND = "graphify hook install"
 GRAPHIFY_HOOK_ROLLBACK = "graphify hook uninstall"
 
+# 宿主只在启动时加载 skills、agents 与上下文文件，运行中新写的文件不会热生效；
+# 提示必须同时进入 final_report 和 stderr，避免只剩下一个模型可以忽略的 JSON 字段。
+RESTART_NOTICE = (
+    "需要重启 Agent 应用以生效：本次生成或更新的 AGENTS.md、CLAUDE.md、.standard/ "
+    "与 GitNexus / Graphify skills 只有在重启 Claude Code、Codex、OpenCode 或 Qoder "
+    "之后才会被加载。"
+)
+
 
 def graphify_git_hook_plan(manifest: dict) -> tuple[str, str]:
     """决定本次 run 是否为本仓库安装 graphify 的 git 钩子。
@@ -925,6 +933,10 @@ def final_command(args: argparse.Namespace, *, emit: bool = True) -> int:
     if errors:
         report["status"] = "failed"
         report["commit_allowed"] = False
+    report["restart_required"] = report["status"] != "failed"
+    report["restart_notice"] = RESTART_NOTICE if report["restart_required"] else None
+    if report["restart_required"]:
+        print(f"initialize: {RESTART_NOTICE}", file=sys.stderr)
     manifest["phase"] = "finished" if report["status"] != "failed" else "aborted"
     manifest["final_report"] = report
     atomic_json(args.manifest, manifest)

@@ -37,4 +37,8 @@
 
 ## 报告字段
 
-报告 run-id、root、languages、各阶段及 gitnexus 步骤（控制器执行）/ `initialize-graphify` / `initialize-context-scanner` 状态、partial 原因、artifact 验证、变更文件、validators（含来源、命令、退出码与输出尾部）、`validation_warnings`（skipped 验证原样展示）、`graphify_git_hooks`（`installed`/`skipped`/`failed` 与 `reason`/`command`/`exit_code`/`output_tail`/`rollback`；`skipped` 的原因不得省略）、commit decision、锁释放结果。上下文截断或渲染告警（`context_warnings`，如 AGENTS.md 条目超行预算被裁剪）必须原样展示，不得静默丢弃。不要声称 skipped 的分析已完成，不隐藏 Graphify chunk/健康警告。
+报告 run-id、root、languages、各阶段及 gitnexus 步骤（控制器执行）/ `initialize-graphify` / `initialize-context-scanner` 状态、partial 原因、artifact 验证、变更文件、validators（含来源、命令、退出码与输出尾部）、`validation_warnings`（skipped 验证原样展示）、`graphify_git_hooks`（`installed`/`skipped`/`failed` 与 `reason`/`command`/`exit_code`/`output_tail`/`rollback`；`skipped` 的原因不得省略）、commit decision、锁释放结果、`restart_required` 与 `restart_notice`。上下文截断或渲染告警（`context_warnings`，如 AGENTS.md 条目超行预算被裁剪）必须原样展示，不得静默丢弃。不要声称 skipped 的分析已完成，不隐藏 Graphify chunk/健康警告。
+
+## 生效提示（重启 Agent 应用）
+
+`finish` 在 `status` 非 `failed` 时返回 `restart_required: true` 与固定文案的 `restart_notice`，并同时把该文案打到 stderr。主 Agent 必须把它作为最终报告的**最后一个**醒目标记段落原样转述（加粗或引用块，不得改写成脚注、不得省略、不得合并进 diff 摘要），因为宿主只在启动时加载 `AGENTS.md`、`CLAUDE.md`、`.standard/` 与新生成的 GitNexus / Graphify skills，不重启就看不到本次产物。`success` 与 `partial` 都要输出；`failed`（`restart_required: false`、`restart_notice: null`）不得输出，避免在失败报告上出现成功提示。

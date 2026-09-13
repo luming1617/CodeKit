@@ -286,6 +286,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    from _common import configure_utf8_streams
+
+    configure_utf8_streams()
     try:
         raise SystemExit(main())
     except (prepare.PrepareError, reconcile.ReconcileError, validator.ValidationError, OSError) as error:

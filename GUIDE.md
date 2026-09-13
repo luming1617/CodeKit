@@ -169,7 +169,7 @@ rtk gain          # 查看节省统计
 
 ## 快速开始
 
-### 第一步：初始化项目（每个仓库只需一次）
+### 第一步：初始化项目（每个仓库一次，之后可随时重跑）
 
 进入项目目录，启动 Claude 或 OpenCode，执行：
 
@@ -178,6 +178,10 @@ rtk gain          # 查看节省统计
 ```
 
 `initialize` 自动识别技术栈，由确定性控制器执行 GitNexus、强制派发 Graphify 与 Context Scanner 两个独立 Subagent，挂载规范并生成或更新 `AGENTS.md`、`CLAUDE.md`，为后续开发建立完整上下文。
+
+> **完成后必须重启当前 Agent 应用**（Claude Code / Codex / OpenCode / Qoder）：宿主只在启动时加载 `AGENTS.md`、`CLAUDE.md`、`.standard/` 与新生成的 GitNexus / Graphify skills，不重启看不到本次产物。`initialize` 的报告会在最后醒目输出该提示。
+>
+> **重跑是安全的**：同一仓库重复执行不需要 `--force`，控制器重新冻结基线并只更新各自的 CodeKit managed block，内容未变时不落盘，因此没有额外 diff。升级 CodeKit 或规范模板后重跑一次即可拿到更新。
 
 ### 第二步：开始需求开发或问题排查
 

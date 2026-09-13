@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -15,6 +16,22 @@ from pathlib import Path, PurePosixPath
 
 class InitializeError(RuntimeError):
     """Base error shared by all initialize phases."""
+
+
+def configure_utf8_streams() -> None:
+    """把标准流切到 UTF-8，中文提示与 JSON 才能被上层按 UTF-8 读回。
+
+    Windows 默认用 ANSI 代码页编码 ``stdout``/``stderr``：重定向到管道时
+    ``UnicodeEncodeError``，被 UTF-8 解码的调用方（Agent 工具、CI）拿到的是乱码。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
 
 
 class ValidationProgramMissing(InitializeError):

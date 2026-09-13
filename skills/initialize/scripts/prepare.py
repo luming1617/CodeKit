@@ -44,6 +44,43 @@ WORKER_TREE_ROOTS = [".gitnexus", "graphify-out", ".claude/skills", ".agents/ski
 PrepareError = InitializeError
 
 
+TERMINAL_LOCK_PHASES = {"finished", "aborted"}
+
+
+def inspect_conflicting_lock(lock_path: Path) -> tuple[bool, str]:
+    """判定冲突锁是否可回收，返回 ``(reclaimable, detail)``。
+
+    每一条正常退出路径都先释放锁再写终态 phase，所以「锁还在、manifest 已是终态
+    或已不可读」只可能是崩溃遗留的 unlink，回收它不会侵入仍在工作的 run。phase 仍
+    是中间态时该 run 可能活着，只能停止并给出精确的 ``abort`` 回收命令由人确认。
+    """
+    try:
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True, "the lock file is not readable JSON"
+    if not isinstance(lock, dict):
+        return True, "the lock file is not a JSON object"
+    run_id = lock.get("run_id") or "<unknown>"
+    manifest_raw = lock.get("manifest")
+    if not isinstance(manifest_raw, str) or not manifest_raw:
+        return True, f"run {run_id} did not record a run manifest path"
+    manifest_path = Path(manifest_raw)
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True, f"run {run_id} has no readable manifest left: {manifest_path}"
+    phase = manifest.get("phase") if isinstance(manifest, dict) else None
+    if phase in TERMINAL_LOCK_PHASES:
+        return True, f"run {run_id} already reached terminal phase '{phase}'"
+    created_at = manifest.get("started_at") or lock.get("created_at") or "unknown"
+    return False, (
+        f"run {run_id} (started {created_at}, phase '{phase or 'unknown'}') may still be "
+        f"active. Confirm no initialize is running, then release the lock with: "
+        f"controller.py abort --manifest {manifest_path} "
+        '--reason "release stale initialize lock"'
+    )
+
+
 def acquire_state_lock(root: Path, run_id: str) -> tuple[Path, Path, Path, bool, list[str], int]:
     """Create project-local state and acquire its exclusive initialize lock.
 
@@ -51,6 +88,13 @@ def acquire_state_lock(root: Path, run_id: str) -> tuple[Path, Path, Path, bool,
     the repository read-only, so EROFS/EACCES/EPERM is an explicit, visible
     downgrade to a private temporary state directory. FileExistsError remains
     a real concurrent-run conflict.
+
+    Repeated initialize is the supported path, so a conflicting lock is not
+    treated as a stop by itself: a lock whose run is already terminal or whose
+    manifest is gone is a crashed leftover and is reclaimed with a warning
+    (see ``inspect_conflicting_lock``). Only a run that may still be active
+    stops, and its error names the manifest and the ``abort`` command that
+    releases it.
     """
     preferred_root = root / ".codekit"
     preferred_parent = preferred_root / "initialize"
@@ -58,10 +102,31 @@ def acquire_state_lock(root: Path, run_id: str) -> tuple[Path, Path, Path, bool,
         require_repository_target(root, preferred_root)
         preferred_parent.mkdir(parents=True, exist_ok=True)
         lock_path = preferred_root / "initialize.lock"
-        try:
-            descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError as exc:
-            raise PrepareError(f"another initialize run holds {lock_path}") from exc
+        reclaimed: list[str] = []
+        for attempt in (1, 2):
+            try:
+                descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                break
+            except FileExistsError as exc:
+                reclaimable, detail = inspect_conflicting_lock(lock_path)
+                if not reclaimable:
+                    raise PrepareError(
+                        f"another initialize run holds {lock_path}: {detail}"
+                    ) from exc
+                if attempt == 2:
+                    raise PrepareError(
+                        f"another initialize run re-acquired {lock_path}: {detail}"
+                    ) from exc
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+                warning = (
+                    f"reclaimed the stale initialize lock {lock_path} left behind by "
+                    f"an interrupted run ({detail})."
+                )
+                print(f"initialize warning: {warning}", file=sys.stderr)
+                reclaimed.append(warning)
 
         run_dir = preferred_parent / run_id
         try:
@@ -76,7 +141,7 @@ def acquire_state_lock(root: Path, run_id: str) -> tuple[Path, Path, Path, bool,
             except OSError:
                 pass
             raise PrepareError(f"initialize run directory already exists: {run_dir}") from exc
-        return preferred_root, lock_path, run_dir, False, [], descriptor
+        return preferred_root, lock_path, run_dir, False, reclaimed, descriptor
     except OSError as exc:
         if exc.errno not in {errno.EROFS, errno.EACCES, errno.EPERM}:
             raise

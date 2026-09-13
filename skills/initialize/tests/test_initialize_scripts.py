@@ -1726,6 +1726,75 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(managed_before, managed_after)
 
 
+class RepeatInitializeTests(unittest.TestCase):
+    """同一仓库重复 initialize：遗留锁可回收，仍可能活跃的 run 不被抢占。"""
+
+    def held_lock(self, root: Path, run_id: str, manifest: dict) -> tuple[Path, Path]:
+        manifest_path = root / ".codekit" / "initialize" / run_id / "run-manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        lock_path = root / ".codekit" / "initialize.lock"
+        lock_path.write_text(json.dumps({
+            "schema_version": 1,
+            "run_id": run_id,
+            "root": str(root),
+            "manifest": str(manifest_path),
+            "created_at": "2026-09-08T00:00:00Z",
+        }), encoding="utf-8")
+        return manifest_path, lock_path
+
+    def start(self, root: Path, run_id: str) -> int:
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            return controller.main([
+                "start", "--root", str(root), "--language", "python", "--run-id", run_id
+            ])
+
+    def test_leftover_lock_from_a_terminal_run_is_reclaimed(self):
+        with git_scratch_directory() as directory, isolated_gitnexus_home(Path(directory)):
+            root = Path(directory)
+            git_repository(root)
+            _, lock_path = self.held_lock(
+                root, "stale", {"phase": "aborted", "started_at": "2026-09-08T00:00:00Z"}
+            )
+            self.assertEqual(0, self.start(root, "repeat"))
+            self.assertEqual("repeat", json.loads(lock_path.read_text(encoding="utf-8"))["run_id"])
+            manifest = json.loads(
+                (root / ".codekit/initialize/repeat/run-manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(
+                any("reclaimed the stale initialize lock" in warning for warning in manifest["warnings"]),
+                manifest["warnings"],
+            )
+            # 回收只针对锁本身，遗留 run 的目录仍是失败证据。
+            self.assertTrue((root / ".codekit/initialize/stale").is_dir())
+
+    def test_unreadable_lock_is_reclaimed(self):
+        with git_scratch_directory() as directory, isolated_gitnexus_home(Path(directory)):
+            root = Path(directory)
+            git_repository(root)
+            (root / ".codekit").mkdir()
+            lock_path = root / ".codekit" / "initialize.lock"
+            lock_path.write_text("not json", encoding="utf-8")
+            self.assertEqual(0, self.start(root, "repeat"))
+            self.assertEqual("repeat", json.loads(lock_path.read_text(encoding="utf-8"))["run_id"])
+
+    def test_possibly_live_lock_stops_with_the_reclaim_command(self):
+        with git_scratch_directory() as directory, isolated_gitnexus_home(Path(directory)):
+            root = Path(directory)
+            git_repository(root)
+            manifest_path, lock_path = self.held_lock(
+                root, "live", {"phase": "prepared", "started_at": "2026-09-08T00:00:00Z"}
+            )
+            with self.assertRaises(prepare.PrepareError) as caught:
+                self.start(root, "intruder")
+            message = str(caught.exception)
+            self.assertIn("may still be active", message)
+            self.assertIn("abort --manifest", message)
+            self.assertIn(str(manifest_path), message)
+            self.assertEqual("live", json.loads(lock_path.read_text(encoding="utf-8"))["run_id"])
+            self.assertFalse((root / ".codekit/initialize/intruder").exists())
+
+
 class IgnoredScopeTests(unittest.TestCase):
     """Ignored analyzer areas are compared by authorized prefix, not per file."""
 
@@ -1967,6 +2036,8 @@ class ValidationExecutionTests(unittest.TestCase):
             ]), commit=True)
             self.assertEqual(0, code, report["errors"])
             self.assertEqual("committed", report["commit_status"])
+            self.assertTrue(report["restart_required"])
+            self.assertIn("需要重启 Agent 应用以生效", report["restart_notice"])
             self.assertEqual(2, commit_count(root))
             committed = subprocess.run(
                 ["git", "-C", str(root), "show", "--pretty=format:", "--name-only", "HEAD"],
@@ -1987,6 +2058,8 @@ class ValidationExecutionTests(unittest.TestCase):
                 f"repository validation failed: {VALIDATION_PYTHON} check_bad.py", report["errors"]
             )
             self.assertFalse(report["commit_allowed"])
+            self.assertFalse(report["restart_required"])
+            self.assertIsNone(report["restart_notice"])
             self.assertEqual(1, commit_count(root))
             manifest = json.loads(
                 (root / ".codekit/initialize/flow/run-manifest.json").read_text(encoding="utf-8")
@@ -2090,6 +2163,7 @@ class ValidationExecutionTests(unittest.TestCase):
             self.assertTrue(report["validation_warnings"])
             self.assertFalse(report["commit_allowed"])
             self.assertEqual("blocked-skipped-validations", report["commit_status"])
+            self.assertTrue(report["restart_required"])
             self.assertEqual(1, commit_count(root))
 
     def test_flow_rejects_non_allow_listed_required_command_before_writing(self):

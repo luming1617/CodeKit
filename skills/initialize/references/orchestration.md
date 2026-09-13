@@ -13,7 +13,9 @@
 
 托管集合至少包括 `.gitignore`、`.graphifyignore`、`AGENTS.md`、`CLAUDE.md`、将复制或更新的 `.standard/**/*.md`；Worker 后续申报的路径加入本次 managed set。
 
-锁文件内容必须包含 schema、run-id、root、创建时间和运行清单路径。用独占创建取得锁；已有锁即停止并报告，不覆盖。结束时只有锁内 run-id 与当前清单一致才可释放。崩溃遗留锁由用户确认后人工恢复。
+锁文件内容必须包含 schema、run-id、root、创建时间和运行清单路径。用独占创建取得锁；结束时只有锁内 run-id 与当前清单一致才可释放。同一仓库允许重复 initialize：每次 `start` 重新冻结基线，渲染后内容未变的托管文件跳过落盘，所以无变更的重复执行不产生新 diff。
+
+锁冲突不是无条件停止。控制器读取锁内 manifest，按持有者是否可能仍在工作分类：manifest 缺失、不可解析或已处于 `finished`/`aborted` 终态时，该 run 不可能再触碰锁（所有退出路径都先释放锁再写终态 phase），遗留锁自动回收，回收事实写入 stderr 与新 manifest 的 `warnings`。phase 仍是中间态时该 run 可能活着，不抢占：停止并给出 owning run-id、`started_at`、manifest 路径与可执行的 `controller.py abort --manifest <path> --reason "release stale initialize lock"`，由用户确认后回收。
 
 ## Phase 1 容量规划
 
