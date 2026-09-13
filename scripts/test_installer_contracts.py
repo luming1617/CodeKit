@@ -24,6 +24,7 @@ REPO_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_agents as agents  # noqa: E402
+import installer_codex as codex  # noqa: E402
 import installer_config as config  # noqa: E402
 import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
@@ -140,6 +141,7 @@ class HelperContractTests(unittest.TestCase):
                 "component-selector.py",
                 "installer.py",
                 "installer_agents.py",
+                "installer_codex.py",
                 "installer_config.py",
                 "installer_platform.py",
                 "installer_qoder.py",
@@ -2003,6 +2005,142 @@ class GraphifyQoderVisibilityTests(unittest.TestCase):
             installer = self._installer(home)
             self.assertFalse(installer.mirror_graphify_skill())
             self.assertTrue(installer.logger.error.called)
+
+
+class CodexMultiAgentTests(unittest.TestCase):
+    """Codex 子代理开关：以实测工具面为准，写用户配置必须有本次授权。"""
+
+    CONFIG = (
+        'model = "gpt-5"\n'
+        "approval_policy = \"on-request\"\n"
+        "\n"
+        "[features]\n"
+        "web_search_request = false\n"
+        "multi_agent_v2 = false  # off until restart\n"
+        "\n"
+        "[mcp_servers.gitnexus]\n"
+        'command = "gitnexus"\n'
+    )
+    TOOLS = "tools: spawn_agent list_agents wait_agent send_message interrupt_agent"
+
+    def _installer(self, home: Path, selected: list[str] = ()) -> Installer:
+        installer = bare_installer(home)
+        installer.auto_yes = True
+        installer.selected = list(selected)
+        installer.agent_capabilities = []
+        installer.logger = Mock()
+        installer.logger.log_path = home / "install.log"
+        return installer
+
+    def test_patch_preserves_everything_outside_the_one_key(self) -> None:
+        updated, changed = codex.enable_multi_agent(self.CONFIG)
+        self.assertTrue(changed)
+        self.assertIn('model = "gpt-5"', updated)
+        self.assertIn("web_search_request = false", updated)
+        self.assertIn("[mcp_servers.gitnexus]", updated)
+        # 行尾注释与其前面的空白原样保留，只替换值本身。
+        self.assertIn("multi_agent_v2 = true  # off until restart", updated)
+        self.assertEqual(codex.enable_multi_agent(updated)[1], False)
+
+    def test_patch_creates_the_table_without_touching_other_tables(self) -> None:
+        updated, changed = codex.enable_multi_agent('[a.features]\nx = 1\n')
+        self.assertTrue(changed)
+        self.assertEqual(updated, '[a.features]\nx = 1\n\n[features]\nmulti_agent_v2 = true\n')
+
+    def test_only_a_measured_empty_surface_counts_as_unavailable(self) -> None:
+        self.assertEqual(codex.classify_probe(1, self.TOOLS), codex.UNKNOWN)
+        self.assertEqual(codex.classify_probe(0, "no agent tools here"), codex.UNAVAILABLE)
+        self.assertEqual(codex.classify_probe(0, self.TOOLS), codex.AVAILABLE)
+
+    def test_apply_rolls_back_byte_for_byte_when_reprobe_still_sees_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = codex.config_path(home)
+            config.parent.mkdir()
+            config.write_text(self.CONFIG, encoding="utf-8")
+            before = config.read_bytes()
+            installer = self._installer(home)
+            with patch.object(Installer, "codex_collab_verdict", return_value=(codex.UNAVAILABLE, "")):
+                self.assertFalse(installer.apply_codex_multi_agent(config))
+            self.assertEqual(config.read_bytes(), before)
+
+    def test_apply_keeps_the_change_once_the_surface_reappears(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = codex.config_path(home)
+            config.parent.mkdir()
+            config.write_text(self.CONFIG, encoding="utf-8")
+            installer = self._installer(home)
+            with patch.object(Installer, "codex_collab_verdict", return_value=(codex.AVAILABLE, self.TOOLS)):
+                self.assertTrue(installer.apply_codex_multi_agent(config))
+            self.assertIn("multi_agent_v2 = true", config.read_text(encoding="utf-8"))
+            self.assertIn(str(config), installer.changed_paths)
+
+    def test_selecting_codex_plugin_enables_it_without_a_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = codex.config_path(home)
+            config.parent.mkdir()
+            config.write_text(self.CONFIG, encoding="utf-8")
+            installer = self._installer(home, ["codex_plugin"])
+            with patch.object(Installer, "command_exists", return_value=True), patch.object(
+                Installer,
+                "codex_collab_verdict",
+                side_effect=[(codex.UNAVAILABLE, ""), (codex.AVAILABLE, self.TOOLS)],
+            ):
+                installer.configure_agent_capabilities()
+            self.assertEqual(installer.agent_capabilities[0]["outcome"], "enabled")
+            self.assertIn("multi_agent_v2 = true", config.read_text(encoding="utf-8"))
+
+    def test_probe_that_cannot_run_leaves_the_config_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = codex.config_path(home)
+            config.parent.mkdir()
+            config.write_text(self.CONFIG, encoding="utf-8")
+            installer = self._installer(home, ["codex_plugin"])
+            with patch.object(Installer, "command_exists", return_value=True), patch.object(
+                Installer, "codex_collab_verdict", return_value=(codex.UNKNOWN, "")
+            ), patch.object(Installer, "apply_codex_multi_agent") as applied:
+                installer.configure_agent_capabilities()
+            self.assertEqual(installer.agent_capabilities[0]["outcome"], "unknown")
+            self.assertFalse(applied.called)
+            self.assertEqual(config.read_text(encoding="utf-8"), self.CONFIG)
+
+    def test_other_platforms_get_no_invented_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            installer = self._installer(home, ["claude_plugin", "opencode_plugin", "qoder_plugin"])
+            with patch.object(Installer, "enable_codex_multi_agent") as enable, patch.object(
+                Installer, "agent_role_count", return_value=26
+            ):
+                installer.configure_agent_capabilities()
+            self.assertFalse(enable.called)
+            self.assertEqual(
+                [entry["outcome"] for entry in installer.agent_capabilities],
+                ["no-switch"] * 3,
+            )
+            self.assertFalse((home / ".codex").exists())
+
+    def test_notice_lists_every_platform_and_demands_a_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(Path(directory), ["codex_plugin", "claude_plugin"])
+            with patch.object(Installer, "enable_codex_multi_agent", return_value="enabled"), patch.object(
+                Installer, "agent_role_count", return_value=26
+            ):
+                installer.configure_agent_capabilities()
+            box = "\n".join(call.args[0] for call in installer.logger.info.call_args_list)
+            self.assertIn("需要重启 Agent 应用", box)
+            self.assertIn("Codex", box)
+            self.assertIn("Claude Code", box)
+            self.assertIn("无 multi_agent 开关", box)
+
+    def test_nothing_printed_without_a_plugin_component(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(Path(directory), ["gitnexus"])
+            installer.configure_agent_capabilities()
+            self.assertEqual(installer.agent_capabilities, [])
+            self.assertFalse(installer.logger.info.called)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ allowed-tools: 'Bash, Read, Write, Agent, Grep, Skill'
 ## 路径与产物约定
 
 - **`SKILL_DIR`**：本 `SKILL.md` 所在目录的绝对路径；插件安装时该目录为 `<plugin-cache>/skills/bugfix`。本 Skill 的脚本、模板和参考资料一律按 `SKILL_DIR` 解析后调用，不得假设当前工作目录就是 Skill 目录，也不得把 `skills/bugfix/...` 当作仓库相对路径直接执行。
+- **`<PYTHON>`**：调用本 Skill 门禁脚本时使用的 Python 启动器占位符，执行前替换成字面量（不是 shell 变量）：Windows 用 `py -3`，macOS/Linux 用 `python3`，替换前用 `--version` 实测退出码为 0。Windows 上不要发 `python3`：干净系统里它是微软商店别名桩，`which` 找得到却无任何输出即以非零码退出，会被误判成本机没有 Python。完整解析纪律见 `$SKILLS_ROOT/_shared/prompts/path-convention.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。
 - **`RUN_DIR`**：`<仓库根目录>/.codekit/bugfix/<run-id>/`，由 `bugfix_state.py start` 创建，是本次 Bugfix 唯一允许的产物落盘位置。该目录自带局部 `.gitignore`（内容 `*`），因此审批前保存提案仍然满足“审批前只读”，不会留下受版本控制的文件变化。
 - 产物布局：`state.json`（快照、提案与审批绑定）、`proposal.md`（调查与修复提案）、`approval.txt`（用户批准原文）、`validation-record.json`（真实执行的验证证据）、`delivery-report.md`（最终交付报告）。这些中间产物一律不进版本库；最终 Diff 只能包含获批的源码与测试改动。
 
@@ -219,7 +220,7 @@ flowchart TB
 参数与资料解析完成后，创建 `RUN_DIR` 并冻结快照（`<run-id>` 用 `YYYYMMDD-short-name`，`--documents` 只传实际找到的文档；`DOCUMENTS: NOT_AVAILABLE` 时省略该参数，不得传占位路径）：
 
 ```bash
-python3 "$SKILL_DIR/scripts/bugfix_state.py" start --root <仓库根目录> --run-id <run-id> \
+<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" start --root <仓库根目录> --run-id <run-id> \
   --documents <PRD/TDD/RPD 路径>
 ```
 
@@ -276,8 +277,8 @@ python3 "$SKILL_DIR/scripts/bugfix_state.py" start --root <仓库根目录> --ru
 严格使用提案模板输出：问题判定、问题原因、证据链、修复方案、允许修改文件、明确不修改、影响风险、验证计划和审批信息。提案必须写入 `RUN_DIR/proposal.md`，保存后运行结构校验并记录提案：
 
 ```bash
-python3 "$SKILL_DIR/scripts/validate_bugfix_proposal.py" "$RUN_DIR/proposal.md"
-python3 "$SKILL_DIR/scripts/bugfix_state.py" record-proposal --manifest "$RUN_DIR/state.json" \
+<PYTHON> "$SKILL_DIR/scripts/validate_bugfix_proposal.py" "$RUN_DIR/proposal.md"
+<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" record-proposal --manifest "$RUN_DIR/state.json" \
   --proposal "$RUN_DIR/proposal.md" --proposal-id <BF-YYYYMMDD-short-name> --version <N> --review-mode FULL
 ```
 
@@ -298,7 +299,7 @@ python3 "$SKILL_DIR/scripts/bugfix_state.py" record-proposal --manifest "$RUN_DI
 条件 2–4 由脚本核验，不接受任何角色的自述。把用户批准原文逐字保存为 `RUN_DIR/approval.txt` 后运行：
 
 ```bash
-python3 "$SKILL_DIR/scripts/bugfix_state.py" verify-approval --manifest "$RUN_DIR/state.json" \
+<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" verify-approval --manifest "$RUN_DIR/state.json" \
   --approval-file "$RUN_DIR/approval.txt" --proposal "$RUN_DIR/proposal.md"
 ```
 
@@ -319,7 +320,7 @@ Implementer 只修改契约允许的文件，先添加或确认能暴露问题�
 用控制器计算实际变更并与获批范围做差集，再人工核对 Diff 能否逐项映射到获批方案、明确不修改的行为是否保持：
 
 ```bash
-python3 "$SKILL_DIR/scripts/bugfix_state.py" verify-scope --manifest "$RUN_DIR/state.json" \
+<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" verify-scope --manifest "$RUN_DIR/state.json" \
   --allowed <获批仓库相对路径>
 ```
 
@@ -330,7 +331,7 @@ python3 "$SKILL_DIR/scripts/bugfix_state.py" verify-scope --manifest "$RUN_DIR/s
 依次执行回归测试、受影响单元/集成/契约测试、编译/静态检查，以及触发的并发、事务、兼容、Migration、性能或回滚验证。每项都必须由控制器真实执行并落盘：
 
 ```bash
-python3 "$SKILL_DIR/scripts/bugfix_state.py" run-validation --manifest "$RUN_DIR/state.json" \
+<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" run-validation --manifest "$RUN_DIR/state.json" \
   --proves "<该检查证明的具体主张>" -- <命令与参数>
 ```
 

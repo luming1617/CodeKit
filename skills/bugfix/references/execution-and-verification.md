@@ -9,9 +9,9 @@
 先运行两个门禁，再逐项人工确认：
 
 ```bash
-python3 "$SKILL_DIR/scripts/bugfix_state.py" verify-approval --manifest "$RUN_DIR/state.json" \
+<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" verify-approval --manifest "$RUN_DIR/state.json" \
   --approval-file "$RUN_DIR/approval.txt" --proposal "$RUN_DIR/proposal.md"
-python3 "$SKILL_DIR/scripts/bugfix_state.py" check-snapshot --manifest "$RUN_DIR/state.json"
+<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" check-snapshot --manifest "$RUN_DIR/state.json"
 ```
 
 - 当前 `HEAD SHA`、工作树摘要和文档摘要是否仍与提案绑定快照一致；

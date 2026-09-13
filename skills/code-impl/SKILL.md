@@ -13,7 +13,7 @@ allowed-tools: 'Bash, Read, Write, Agent, Grep, LSP, Skill'
 
 ## 路径解析约定
 
-> 本文档中的 `SKILL_DIR` / `SKILLS_ROOT` 解析方式、派发时必须显式传入的路径清单，以及“Skill 之间不得用相对路径互相引用文件”的纪律，统一见 `$SKILLS_ROOT/_shared/prompts/path-convention.md`；下面是本 Skill 的特有补充。
+> 本文档中的 `SKILL_DIR` / `SKILLS_ROOT` 解析方式、`<PYTHON>` 启动器按宿主的解析规则、派发时必须显式传入的路径清单，以及“Skill 之间不得用相对路径互相引用文件”的纪律，统一见 `$SKILLS_ROOT/_shared/prompts/path-convention.md`；下面是本 Skill 的特有补充。
 
 本 Skill 自带 `scripts/code_impl_controller.py`，用于输入冻结、运行状态、Agent 调用登记、预存 Diff 隔离、范围检查、审查快照和失败归属；编译、测试、Lint 等 Local Validator 仍使用目标仓库自己的工具。**`SKILL_DIR` = 本文档所在目录的绝对路径**（插件安装时为 `<plugin-cache>/skills/code-impl`）只用于定位 `references/`、`agents/` 和该控制器；在命令行、Agent 提示或任何外部进程中引用这些路径时统一使用 `$SKILL_DIR`，并在调用前解析为绝对路径，不要假设当前目录、当前插件目录或仓库根目录就是 Skill 目录。正文内联的资源描述（例如 `references/contracts.md`）按“相对 `SKILL_DIR`”理解，由主 Agent 读取时解析。
 
@@ -25,7 +25,7 @@ allowed-tools: 'Bash, Read, Write, Agent, Grep, LSP, Skill'
 `state.json` 路径带入后续阶段：
 
 ```bash
-python3 "$SKILL_DIR/scripts/code_impl_controller.py" init \
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" init \
   --repo-root "$repo_root" \
   --feature-directory "$feature_directory" \
   --run-id "$run_id"
@@ -226,7 +226,7 @@ Orchestrator 独立检查：
 在派发 Implementer 前先登记 Task 及其精确写入范围：
 
 ```bash
-python3 "$SKILL_DIR/scripts/code_impl_controller.py" record-task \
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" record-task \
   --state "$state_path" --task-id '<task-id>' \
   --allowed-file '<repo-relative-file>' \
   --plan-version '<current-plan-version>'
@@ -244,15 +244,15 @@ python3 "$SKILL_DIR/scripts/code_impl_controller.py" record-task \
 
 ```bash
 # PENDING → READY（依赖已满足，准备派发）
-python3 "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
   --state "$state_path" --task-id '<task-id>' --status READY
 
 # READY → RUNNING（Implementer Sub-agent 已创建）
-python3 "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
   --state "$state_path" --task-id '<task-id>' --status RUNNING
 
 # RUNNING → VALIDATING（Implementer 返回 DONE，进入任务验证）
-python3 "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
   --state "$state_path" --task-id '<task-id>' --status VALIDATING
 ```
 
@@ -274,7 +274,7 @@ Implementer 返回 DONE 不等于任务通过，必须进入步骤 07。
 Sub-agent 创建后，Orchestrator 必须登记真实角色名、会话 ID、输入 digest 和返回状态：
 
 ```bash
-python3 "$SKILL_DIR/scripts/code_impl_controller.py" record-agent \
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" record-agent \
   --state "$state_path" --role impl-implementer --name impl-implementer \
   --session-id "$session_id" --input-digest "$task_contract_digest" --status RUNNING
 ```
@@ -291,7 +291,7 @@ Orchestrator 使用本地工具对本次任务产生的新 Diff 执行：
 范围检查必须由控制器执行，而不是只看 Implementer 自报：
 
 ```bash
-python3 "$SKILL_DIR/scripts/code_impl_controller.py" check-scope \
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" check-scope \
   --state "$state_path" \
   --allowed-file '<repo-relative-file>'
 ```
@@ -311,11 +311,11 @@ python3 "$SKILL_DIR/scripts/code_impl_controller.py" check-scope \
 
 ```bash
 # 任务通过
-python3 "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
   --state "$state_path" --task-id '<task-id>' --status PASS
 
 # 任务失败（验证未通过）
-python3 "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
   --state "$state_path" --task-id '<task-id>' --status FAILED
 ```
 
@@ -347,7 +347,7 @@ Orchestrator 根据证据决策：
 进入 `replan` 或人工介入，不能把整体失败直接追加到任意一个 Task Contract。
 
 ```bash
-python3 "$SKILL_DIR/scripts/code_impl_controller.py" record-failure \
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" record-failure \
   --state "$state_path" --failure-scope overall \
   --impacted-task-id '<task-id>' --root-cause CODE_OR_TEST \
   --error-fingerprint '<normalized-fingerprint>'
@@ -364,7 +364,7 @@ python3 "$SKILL_DIR/scripts/code_impl_controller.py" record-failure \
 `TASK_PLAN` 根因或多任务影响时，必须先调用 `replan` 推进计划版本，再退回步骤 03 重新规划：
 
 ```bash
-python3 "$SKILL_DIR/scripts/code_impl_controller.py" replan \
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" replan \
   --state "$state_path" --new-plan-version '<current+1>'
 ```
 
@@ -386,7 +386,7 @@ python3 "$SKILL_DIR/scripts/code_impl_controller.py" replan \
 整体验证通过后必须冻结审查快照：
 
 ```bash
-python3 "$SKILL_DIR/scripts/code_impl_controller.py" freeze-review --state "$state_path"
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" freeze-review --state "$state_path"
 ```
 
 Code Review Handoff 的 `base_sha`、`head_sha`、`diff_digest`、预存快照和本轮

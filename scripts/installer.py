@@ -41,6 +41,7 @@ except ValueError as exc:
     raise SystemExit(1)
 
 import installer_agents as agents  # noqa: E402
+import installer_codex as codex  # noqa: E402
 import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 import installer_sources as source_builder  # noqa: E402
@@ -153,6 +154,8 @@ class Installer:
     def __init__(self, auto_yes: bool) -> None:
         """创建一次安装会话，并初始化路径、状态和结果记录。"""
         self.auto_yes = auto_yes
+        # 每个选中插件平台的 subagent 派发能力结论，由 configure_agent_capabilities 填写。
+        self.agent_capabilities: list[dict] = []
         self.home = Path.home()
         # 平台差异（npm 前缀、venv 布局、状态目录、临时目录、交互能力）全部由
         # 适配层给出，安装/卸载/状态检测三处不再各自硬编码 POSIX 假设。
@@ -1648,6 +1651,151 @@ class Installer:
         self.announce_plugin_install("codex_plugin")
         return True
 
+    def codex_collab_verdict(self) -> tuple[str, str]:
+        """零 token 探测：模型可见 prompt 里到底有没有派发工具。
+
+        ``codex features list`` 不算证据——它可以在工具面为空时仍报 stable true。
+        """
+        result = self.run_capture(codex.probe_command(), timeout=45)
+        return codex.classify_probe(result.returncode, result.stdout), result.stdout
+
+    def write_codex_config(self, path: Path, payload: bytes) -> None:
+        """同目录临时文件 + os.replace 落盘，避免半写状态；新文件按 600 收紧。"""
+        temporary = path.with_name(f"{path.name}.codekit-tmp")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_bytes(payload)
+        if os.name != "nt":
+            os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+
+    def apply_codex_multi_agent(self, path: Path) -> bool:
+        """备份 → 只改一个键 → 复验 → 失败即回滚；复验用同一次零 token 探测。"""
+        try:
+            original = path.read_bytes() if path.is_file() else None
+        except OSError as exc:
+            self.logger.warn(f"无法读取 {path}：{exc}；未改动 Codex 配置。")
+            return False
+        try:
+            text = original.decode("utf-8") if original is not None else ""
+        except UnicodeDecodeError:
+            self.logger.warn(f"{path} 不是 UTF-8 文本；未改动 Codex 配置。")
+            return False
+        updated, changed = codex.enable_multi_agent(text)
+        if not changed:
+            self.logger.warn(
+                f"{path} 已声明 {codex.MULTI_AGENT_KEY} = true，但探测仍看不到子代理工具。"
+                "通常是 Codex 版本改动了 flag 名称，安装器不猜测新名称，也未改动配置。"
+            )
+            return False
+        payload = updated.encode("utf-8")
+        try:
+            self.write_codex_config(path, payload)
+        except OSError as exc:
+            self.logger.warn(f"无法写入 {path}：{exc}")
+            return False
+        self.track(path)
+        if self.codex_collab_verdict()[0] == codex.AVAILABLE:
+            self.logger.success(
+                f"已在 {path} 写入 [features] {codex.MULTI_AGENT_KEY} = true。"
+                "必须完全退出并重启 Codex：正在运行的会话不会获得子代理工具。"
+            )
+            return True
+        try:
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                self.write_codex_config(path, original)
+        except OSError as exc:
+            self.logger.error(
+                f"写入 {path} 后 Codex 不再暴露子代理工具，且回滚失败：{exc}。"
+                f"请手工删除该文件中的 [features] {codex.MULTI_AGENT_KEY} 行。"
+            )
+            return False
+        self.logger.warn(
+            f"写入 {path} 后探测仍看不到子代理工具，已回滚为原内容。"
+            "请升级 Codex 或手工确认该版本的 flag 名称。"
+        )
+        return False
+
+    # 只有 Codex 有可开启的多代理 feature flag；其余平台的派发工具由宿主内置，
+    # 真正的前置是全局角色文件已装到该平台目录，没有键可写。
+    PLUGIN_COMPONENT_TO_TOOL = {
+        "claude_plugin": "claude",
+        "codex_plugin": "codex",
+        "opencode_plugin": "opencode",
+        "qoder_plugin": "qoder",
+        "qodercn_plugin": "qodercn",
+    }
+
+    def enable_codex_multi_agent(self) -> str:
+        """探测 Codex 子代理工具面，缺失就直接开启并复验；返回结论供提示框汇总。"""
+        if not self.command_exists("codex"):
+            return "no-cli"
+        verdict, _ = self.codex_collab_verdict()
+        if verdict == codex.AVAILABLE:
+            return "already-on"
+        if verdict == codex.UNKNOWN:
+            return "unknown"
+        if self.apply_codex_multi_agent(codex.config_path(self.home)):
+            return "enabled"
+        return "rolled-back"
+
+    def agent_role_count(self, tool: str) -> int:
+        """该平台已安装的全局 subagent 角色数；目录无法解析时返回 -1。"""
+        try:
+            _, directory = agents.global_agent_plan(tool, self.home)
+        except ValueError:
+            return -1
+        return len(list(directory.glob("*.toml" if tool == "codex" else "*.md")))
+
+    def configure_agent_capabilities(self) -> None:
+        """勾选了哪个平台的 CodeKit 插件，就为哪个平台确认 subagent 派发能力。
+
+        勾选即授权：Codex 缺开关时直接写入并复验，失败逐字节回滚。写入只对
+        **下一次**启动生效，所以这里只声称"已改配置"，不声称当前会话已可用。
+        """
+        self.agent_capabilities = []
+        for component_id in self.selected:
+            tool = self.PLUGIN_COMPONENT_TO_TOOL.get(component_id)
+            if tool is None:
+                continue
+            outcome = self.enable_codex_multi_agent() if tool == "codex" else "no-switch"
+            self.agent_capabilities.append(
+                {"platform": tool, "outcome": outcome, "roles": self.agent_role_count(tool)}
+            )
+        self.report_agent_capabilities()
+
+    def report_agent_capabilities(self) -> None:
+        """把每个平台的探测与处置结论渲染成一次醒目提示，而不是散落的日志行。"""
+        if not self.agent_capabilities:
+            return
+        labels = {
+            "claude": "Claude Code",
+            "codex": "Codex",
+            "opencode": "OpenCode",
+            "qoder": "Qoder",
+            "qodercn": "Qoder CN",
+        }
+        outcomes = {
+            "enabled": "已写入 [features] multi_agent_v2 = true，复验已看到派发工具",
+            "already-on": "多代理能力已开启（模型可见派发工具在位）",
+            "unknown": "探测未成功（codex debug prompt-input 未正常返回），未改动配置",
+            "no-cli": "未找到 codex 命令，未做探测",
+            "rolled-back": "写入后复验仍看不到派发工具，已回滚配置",
+            "no-switch": "实测无 multi_agent 开关，派发工具由宿主内置",
+        }
+        lines = ["多代理能力（CodeKit 技能派发 subagent 的前置）"]
+        for entry in self.agent_capabilities:
+            detail = outcomes.get(entry["outcome"], entry["outcome"])
+            if entry["outcome"] == "no-switch":
+                detail += f"；全局角色 {entry['roles']} 个"
+            lines.append(f"  · {labels.get(entry['platform'], entry['platform'])}：{detail}")
+        lines.append("")
+        lines.append("★ 需要重启 Agent 应用才能生效：请完全退出并重新打开上表涉及的智能体应用。")
+        lines.append("  宿主只在启动时读取配置与角色文件，正在运行的会话不会获得新的派发工具，")
+        lines.append("  重启前直接运行 CodeKit 技能会停在 collab-unavailable。")
+        self.logger.info("\n" + self.agent_notice_box(lines))
+
     def qoder_run(self, args: Sequence[str], timeout: float = 20.0) -> tuple[int, str]:
         """执行 Qoder CLI 命令；到期即终止子进程，避免安装/卸载无限阻塞。"""
         result = self.run_command(args, timeout=timeout)
@@ -1813,6 +1961,16 @@ class Installer:
             rows.append(("OpenCode 中输入：/initialize", "初始化当前仓库"))
         if self.command_exists("codex"):
             rows.append(("Codex 中输入：$initialize", "初始化当前仓库"))
+        if any(
+            entry["outcome"] in {"unknown", "rolled-back", "no-cli"}
+            for entry in self.agent_capabilities
+        ):
+            rows.append(
+                (
+                    "手工确认所选平台的子代理派发能力",
+                    "安装器未能确认或已回滚该配置，CodeKit 技能会停在 collab-unavailable",
+                )
+            )
         qoder_labels = [
             descriptor.display_name.removeprefix("CodeKit Plugin (").removesuffix(")")
             for descriptor in (
@@ -1879,6 +2037,7 @@ class Installer:
         self.save_versions()
         if getattr(self, "setup_path_selected", False):
             self.setup_shell_path()
+        self.configure_agent_capabilities()
         self.print_next_steps()
         try:
             detector.render_recap("install", ("\t".join(row) for row in self.install_records), self.context)

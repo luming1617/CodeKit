@@ -40,7 +40,7 @@
 - [ ] 标题、层级、表头、编号前缀（OBJ/KPI/SC/FR/BR/AF/ST/UI/F/EVT/EXP/AC/DEP/RISK/Q/DEC）和状态枚举与模板一致。
 - [ ] 需求规模 S/M/L 的判断依据来自模板《文档裁剪》表（唯一事实源），并写入 1.1 基本信息行（形如 `S / P0`）；条件章节的取舍与该规模匹配；无法判断时按较高一级检查。
 - [ ] 9.3 来源与追踪台账任何规模均为必填：正文中每个正式需求编号至少有一行支撑（`SRC-XXX`、定位、可信度、推导依据），台账行不得指向正文中不存在的编号（幽灵行）。
-- [ ] `python3 "$SKILL_DIR/scripts/validate_prd.py" <feature-directory>/product-doc.md` 返回 0。
+- [ ] `<PYTHON> "$SKILL_DIR/scripts/validate_prd.py" <feature-directory>/product-doc.md` 返回 0。
 - [ ] 模板示例、示例编号、示例文案和示例事件已全部替换或删除。
 
 ## 文档信息与变更（第 1 章）
@@ -120,7 +120,7 @@
 - [ ] 自检结论与 Q/DEP/RISK 编号一致，阻塞项和遗留项已列出负责人与期限。
 - [ ] 签署人与实际信息完整性一致；存在未闭环阻塞项、自检有“不通过”项或阻塞项与遗留项非空时，结论不写“已确认”。
 - [ ] 独立评审意见原样追加在文档末尾，未被修改、删减或覆盖；每份回执保留 `review_id`、`perspective`、`review_round` 与稿件摘要，且 `review_id` 已登记在 `prd-review.json`。
-- [ ] `python3 "$SKILL_DIR/scripts/review_state.py" verify --state <feature-directory>/prd-review.json` 返回 0；阻塞交付时只能使用 `verify --allow-blocked`，且交付报告不得声称 PRD 已确认。
+- [ ] `<PYTHON> "$SKILL_DIR/scripts/review_state.py" verify --state <feature-directory>/prd-review.json` 返回 0；阻塞交付时只能使用 `verify --allow-blocked`，且交付报告不得声称 PRD 已确认。
 
 ## 禁止的质量问题
 

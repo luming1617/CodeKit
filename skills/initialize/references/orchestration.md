@@ -2,6 +2,8 @@
 
 ## Phase 0 清单
 
+`controller.py start` 之前先实测宿主的协作能力（`$SKILLS_ROOT/_shared/scripts/probe-collab.py --host <宿主>`）：默认只读、不写仓库也不改宿主配置，在 Codex 上以模型可见 prompt 中的派发工具为准（`codex features list` 的 flag 状态不算证据）。`unavailable` 时先向用户申请授权，同意后带 `--enable` 重跑该脚本（只改一个键，复验失败逐字节回滚），无论写没写都以醒目的重启提示结束本轮，不进入 `start`，因此零业务写入、零锁；`unknown` 不构成阻断证据，照常继续并在派发失败时按 `collab-unavailable` 停止。
+
 只能通过 `scripts/controller.py start` 启动。任何写入前完成并记录：
 
 1. `git rev-parse --show-toplevel` 的绝对仓库根。

@@ -20,7 +20,10 @@ sys.path.insert(0, str(SKILL_DIR / "scripts"))
 
 
 def load_script(name: str):
+    """按名字加载技能自带脚本，找不到时回退到 skills/_shared/scripts 的共享脚本。"""
     path = SKILL_DIR / "scripts" / name
+    if not path.is_file():
+        path = SKILL_DIR.parent / "_shared" / "scripts" / name
     spec = importlib.util.spec_from_file_location(name.replace("-", "_"), path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -34,6 +37,7 @@ validator = load_script("validate-result.py")
 controller = load_script("controller.py")
 gitnexus_runner = load_script("run-gitnexus.py")
 gitnexus_step = load_script("gitnexus-step.py")
+probe_collab = load_script("probe-collab.py")
 common = sys.modules["_common"]
 
 # Windows reports every writable file as 0o666: os.chmod only maps the read-only
@@ -2344,6 +2348,176 @@ class ContextContractTests(unittest.TestCase):
             text, warnings = reconcile.render_project_context(context)
         self.assertLessEqual(len(text.splitlines()), 9)
         self.assertTrue(any("line budget" in warning for warning in warnings))
+
+
+class CollabProbeTests(unittest.TestCase):
+    """Phase 0 协作能力探测：只有实测到空工具面才允许阻断，探测本身不落盘。"""
+
+    TOOLS = "… spawn_agent list_agents wait_agent send_message interrupt_agent …"
+
+    def _runner(self, returncode, output):
+        calls = []
+
+        def runner(argv, timeout):
+            calls.append(list(argv))
+            return returncode, output
+
+        return runner, calls
+
+    def test_measured_tool_surface_is_available(self):
+        runner, calls = self._runner(0, self.TOOLS)
+        result = probe_collab.run_probe("codex", runner, Path("/nonexistent-home"))
+        self.assertEqual(result["collab"], probe_collab.AVAILABLE)
+        self.assertIn("spawn_agent", result["evidence"]["tools"])
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("fix", result)
+
+    def test_empty_surface_is_the_only_blocking_verdict(self):
+        runner, _ = self._runner(0, "no agent tools in this prompt")
+        result = probe_collab.run_probe("codex", runner, Path("/nonexistent-home"))
+        self.assertEqual(result["collab"], probe_collab.UNAVAILABLE)
+        self.assertIn("multi_agent_v2", result["fix"])
+        self.assertTrue(result["restart_required"])
+
+    def test_failed_probe_is_unknown_not_unavailable(self):
+        runner, _ = self._runner(1, "")
+        self.assertEqual(
+            probe_collab.run_probe("codex", runner, Path("/h"))["collab"],
+            probe_collab.UNKNOWN,
+        )
+
+    def test_hosts_without_a_measured_probe_are_never_blocked(self):
+        runner, calls = self._runner(0, self.TOOLS)
+        result = probe_collab.run_probe("claude", runner, Path("/h"))
+        self.assertEqual(result["collab"], probe_collab.UNKNOWN)
+        self.assertEqual(result["evidence"]["reason"], "no-measured-probe-for-host")
+        self.assertEqual(calls, [])
+
+    def test_missing_host_cli_is_unknown(self):
+        runner, calls = self._runner(0, self.TOOLS)
+        with patch.object(probe_collab, "resolve", return_value=None):
+            result = probe_collab.run_probe("codex", runner, Path("/h"))
+        self.assertEqual(result["collab"], probe_collab.UNKNOWN)
+        self.assertEqual(result["evidence"]["reason"], "host-cli-not-on-path")
+        self.assertEqual(calls, [])
+
+    def test_flag_already_true_points_at_version_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = home / ".codex" / "config.toml"
+            config.parent.mkdir()
+            config.write_text("[features]\nmulti_agent_v2 = true\n", encoding="utf-8")
+            runner, _ = self._runner(0, "nothing")
+            result = probe_collab.run_probe("codex", runner, home)
+            self.assertEqual(result["codex_multi_agent_v2"], "true")
+            self.assertEqual(result["collab"], probe_collab.UNAVAILABLE)
+            self.assertIn("flag", result["fix"])
+
+    def test_flag_reader_ignores_other_tables_and_comments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = home / ".codex" / "config.toml"
+            config.parent.mkdir()
+            config.write_text(
+                "[a.features]\nmulti_agent_v2 = 1\n\n[features]\n# multi_agent_v2 = 9\n"
+                "other = true\nmulti_agent_v2 = false\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(probe_collab.multi_agent_flag(home), "false")
+            self.assertIsNone(probe_collab.multi_agent_flag(home / "missing"))
+
+    def test_host_detection_from_environment(self):
+        self.assertEqual(probe_collab.detect_host({"CODEX_HOME": "/x"}), "codex")
+        self.assertEqual(probe_collab.detect_host({"CLAUDECODE": "1"}), "claude")
+        self.assertEqual(probe_collab.detect_host({}), "unknown")
+
+    def test_enable_writes_then_keeps_the_change_when_tools_reappear(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = home / ".codex" / "config.toml"
+            config.parent.mkdir()
+            config.write_text('[features]\nother = true\nmulti_agent_v2 = false\n', encoding="utf-8")
+            runner, _ = self._runner(0, self.TOOLS)
+            with patch.object(probe_collab, "resolve", return_value=["codex"]):
+                outcome = probe_collab.enable("codex", home, runner)
+            self.assertEqual(outcome["action"], probe_collab.ENABLED)
+            written = config.read_text(encoding="utf-8")
+            self.assertIn("multi_agent_v2 = true", written)
+            self.assertIn("other = true", written)
+
+    def test_enable_rolls_back_byte_for_byte_when_verification_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = home / ".codex" / "config.toml"
+            config.parent.mkdir()
+            config.write_text('[features]\nmulti_agent_v2 = false\n', encoding="utf-8")
+            before = config.read_bytes()
+            runner, _ = self._runner(0, "nothing")
+            with patch.object(probe_collab, "resolve", return_value=["codex"]):
+                outcome = probe_collab.enable("codex", home, runner)
+            self.assertEqual(outcome["action"], probe_collab.ROLLED_BACK)
+            self.assertEqual(config.read_bytes(), before)
+
+    def test_enable_refuses_hosts_without_a_measured_switch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            for host in ("claude", "opencode", "qoder", "qodercn"):
+                with self.subTest(host):
+                    runner, calls = self._runner(0, self.TOOLS)
+                    outcome = probe_collab.enable(host, home, runner)
+                    self.assertEqual(outcome["action"], "refused")
+                    self.assertEqual(calls, [])
+            self.assertEqual(list(home.iterdir()), [])
+
+    def test_enable_does_not_guess_a_new_flag_name_when_the_key_is_already_true(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = home / ".codex" / "config.toml"
+            config.parent.mkdir()
+            config.write_text("[features]\nmulti_agent_v2 = true\n", encoding="utf-8")
+            before = config.read_bytes()
+            runner, _ = self._runner(0, "nothing")
+            with patch.object(probe_collab, "resolve", return_value=["codex"]):
+                outcome = probe_collab.enable("codex", home, runner)
+            self.assertEqual(outcome["action"], "noop")
+            self.assertEqual(config.read_bytes(), before)
+
+    def test_main_reports_enable_outcome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(probe_collab, "enable", return_value={"action": "refused", "reason": "x"}):
+                with redirect_stdout(StringIO()):
+                    self.assertEqual(
+                        probe_collab.main(["--host", "claude", "--enable", "--home", directory]), 0
+                    )
+            with patch.object(probe_collab, "enable", return_value={"action": probe_collab.ROLLED_BACK}):
+                with redirect_stdout(StringIO()):
+                    self.assertEqual(
+                        probe_collab.main(["--host", "codex", "--enable", "--home", directory]), 2
+                    )
+
+    def test_main_exit_codes_and_no_writes(self):
+        for verdict, output, expected in (
+            (probe_collab.AVAILABLE, "spawn_agent", 0),
+            (probe_collab.UNAVAILABLE, "nothing", 1),
+        ):
+            with self.subTest(verdict):
+                with tempfile.TemporaryDirectory() as directory:
+                    home = Path(directory)
+                    cwd = home / "cwd"
+                    cwd.mkdir()
+                    runner, _ = self._runner(0, output)
+                    previous = os.getcwd()
+                    os.chdir(cwd)
+                    try:
+                        with patch.object(probe_collab, "subprocess_runner", runner), \
+                                redirect_stdout(StringIO()):
+                            self.assertEqual(
+                                probe_collab.main(["--host", "codex", "--home", str(home / "nope")]),
+                                expected,
+                            )
+                    finally:
+                        os.chdir(previous)
+                    self.assertEqual(list(cwd.iterdir()), [])
 
 
 if __name__ == "__main__":

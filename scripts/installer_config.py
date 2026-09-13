@@ -68,6 +68,7 @@ REQUIRED_HELPER_FILES = (
     "component-selector.py",
     "installer.py",
     "installer_agents.py",
+    "installer_codex.py",
     "installer_config.py",
     "installer_platform.py",
     "installer_qoder.py",

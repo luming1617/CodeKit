@@ -1,0 +1,17 @@
+{
+  "name": "co-daming",
+  "interface": {
+    "displayName": "Dev Marketplace"
+  },
+  "plugins": [
+    {
+      "name": "codekit",
+      "description": "AI-assisted development workflow: setup, product and technical proposals, release plans, coding, review, bug fixing (7 skills)",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

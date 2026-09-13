@@ -4,9 +4,9 @@
 不依赖子代理或主 Agent 的自述：直接解析生成的 ``product-doc.md``，校验模板结构、
 编号追踪、9.3 来源台账覆盖、占位符与模糊表述残留、变更历史与独立评审回执的一致性。
 
-用法：
-    python3 validate_prd.py <product-doc.md>
-    python3 validate_prd.py --check-template-refs --refs-target SKILL.md --refs-target references/check-standard.md
+用法（``<PYTHON>`` 按宿主解析：Windows 用 ``py -3``，macOS/Linux 用 ``python3``）：
+    <PYTHON> validate_prd.py <product-doc.md>
+    <PYTHON> validate_prd.py --check-template-refs --refs-target SKILL.md --refs-target references/check-standard.md
 """
 
 from __future__ import annotations

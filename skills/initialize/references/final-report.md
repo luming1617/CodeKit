@@ -37,7 +37,7 @@
 
 ## 报告字段
 
-报告 run-id、root、languages、各阶段及 gitnexus 步骤（控制器执行）/ `initialize-graphify` / `initialize-context-scanner` 状态、partial 原因、artifact 验证、变更文件、validators（含来源、命令、退出码与输出尾部）、`validation_warnings`（skipped 验证原样展示）、`graphify_git_hooks`（`installed`/`skipped`/`failed` 与 `reason`/`command`/`exit_code`/`output_tail`/`rollback`；`skipped` 的原因不得省略）、commit decision、锁释放结果、`restart_required` 与 `restart_notice`。上下文截断或渲染告警（`context_warnings`，如 AGENTS.md 条目超行预算被裁剪）必须原样展示，不得静默丢弃。不要声称 skipped 的分析已完成，不隐藏 Graphify chunk/健康警告。
+报告 run-id、root、languages、各阶段及 gitnexus 步骤（控制器执行）/ `initialize-graphify` / `initialize-context-scanner` 状态、partial 原因、artifact 验证、变更文件、validators（含来源、命令、退出码与输出尾部）、`validation_warnings`（skipped 验证原样展示）、`graphify_git_hooks`（`installed`/`skipped`/`failed` 与 `reason`/`command`/`exit_code`/`output_tail`/`rollback`；`skipped` 的原因不得省略）、commit decision、锁释放结果、`restart_required` 与 `restart_notice`。协作能力探测结论（`$SKILLS_ROOT/_shared/scripts/probe-collab.py` 的 `host`、`collab`、`evidence` 中的 command / exit_code / tools）必须原样列出：它是「宿主确实能派发」的证据，不是主 Agent 的自述；取得用户授权后运行过 `--enable` 的，还要登记其 `enable.action`（`enabled` / `noop` / `refused` / `rolled-back`）与改动的文件路径，`rolled-back` 时不得声称已开启。`collab` 为 `unavailable` 时 `fix` 字段原文照抄、不得把本次描述为已完成，并以醒目的重启提示作为报告最后一段。上下文截断或渲染告警（`context_warnings`，如 AGENTS.md 条目超行预算被裁剪）必须原样展示，不得静默丢弃。不要声称 skipped 的分析已完成，不隐藏 Graphify chunk/健康警告。
 
 ## 生效提示（重启 Agent 应用）
 

@@ -40,7 +40,7 @@ flowchart LR
 
 ## 路径与调用约定
 
-`SKILL_DIR`、`SKILLS_ROOT` 的解析方式与派发时必须显式传入的路径清单见 `$SKILLS_ROOT/_shared/prompts/path-convention.md`；跨宿主具名派发规则与降级门禁见 `$SKILLS_ROOT/_shared/prompts/subagent-mandate.md`。进入阶段 0 前必须读完这两份文件。
+`SKILL_DIR`、`SKILLS_ROOT` 与 `<PYTHON>` 启动器的解析方式，以及派发时必须显式传入的路径清单，见 `$SKILLS_ROOT/_shared/prompts/path-convention.md`；跨宿主具名派发规则与降级门禁见 `$SKILLS_ROOT/_shared/prompts/subagent-mandate.md`。进入阶段 0 前必须读完这两份文件。
 
 本 Skill 的不变式（与共享规范一致，冲突时以本文档为准）：
 
@@ -69,7 +69,7 @@ flowchart LR
 阶段 0 的第一件事是初始化运行目录，后续每一步都用控制器的退出码判定，而不是用主 Agent 的自述：
 
 ```bash
-STATE=$(python3 "$SKILL_DIR/scripts/tech_doc_controller.py" init \
+STATE=$(<PYTHON> "$SKILL_DIR/scripts/tech_doc_controller.py" init \
   --repo-root "$PWD" --feature-directory "$feature_directory" --run-id "$run_id")
 ```
 
@@ -163,7 +163,7 @@ PRD 当前版本中用户最新明确的方案和逻辑优先于旧 PRD、旧 TD
 写入 `<feature-directory>/technical-doc.md`（文件名固定；目录不存在则创建），包含方案正文、ADR、风险登记与工作量评估、审查闭环记录、Finding 处置映射、`review_round` 与最终评审状态，以及（变更时）历史版本索引。
 
 ```bash
-python3 "$SKILL_DIR/scripts/tech_doc_controller.py" gate --state "$STATE" \
+<PYTHON> "$SKILL_DIR/scripts/tech_doc_controller.py" gate --state "$STATE" \
   --tdd-file "$feature_directory/technical-doc.md"
 ```
 

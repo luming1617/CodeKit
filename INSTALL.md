@@ -107,6 +107,8 @@ PowerShell 的 CMD 包装（供 CMD 与双击使用）。
 | `-y`, `--yes` | 免交互模式：安装缺失/有更新的组件，或卸载当前已安装组件 |
 | `-h`, `--help` | 打印用法说明并退出 |
 
+> 勾选某平台的 CodeKit 插件即视为授权为该平台开启 subagent 派发能力（见 [7.9](#79-多代理能力configure_agent_capabilities)），`-y` 下同样执行；不需要就取消该平台组件。
+
 > 传入已取消的 `upgrade` 会直接报错退出，并提示改用 `install`。
 
 **子命令缺省规则**：未指定子命令时一律默认 `install`（不再依据版本记录文件 `${CodeKit_VERSION_FILE}` 推断动作）。
@@ -230,6 +232,7 @@ configure_git                         # 配置全局 git 选项
 save_versions                         # 写入版本记录文件
 [可选] setup_shell_path               # 将用户级 bin 永久写入 shell 配置
   ↓
+configure_agent_capabilities        # 为本次选中的每个插件平台确认 subagent 派发能力（见 7.9）
 print_next_steps                      # 打印带作用说明的安装后操作表格
 render_recap                          # 打印最终结果汇总
 ```
@@ -361,7 +364,25 @@ render_recap           # 打印卸载结果汇总
 ### 7.8 最终结果与安装后操作
 
 - `render_recap`：等待所有组件安装、全局配置和版本记录完成后，逐项打印安装/卸载结果；未选择的组件显示 `未选择`，安装路径和安装版本显示 `---`。
-- `print_next_steps`：按已装组件**条件化**打印带作用说明的后续配置表格（重启智能体应用、PATH、glab/gh 登录、GitNexus/Graphify 用法、`/codekit:initialize` 等）。
+- `print_next_steps`：按已装组件**条件化**打印带作用说明的后续配置表格（重启智能体应用、PATH、glab/gh 登录、GitNexus/Graphify 用法、`/codekit:initialize` 等）；某个平台的能力既没确认也没成功开启（`unknown` / `rolled-back` / `no-cli`）时，追加一行「手工确认所选平台的子代理派发能力」。
+
+### 7.9 多代理能力（`configure_agent_capabilities`）
+
+CodeKit 各 Skill 的 subagent 门禁要求宿主**真的**向模型暴露派发工具。安装器为本次勾选的每个插件平台各确认一次，结论汇总成一个醒目的边框提示（`agent_notice_box`），而不是散落的日志行。
+
+实测结论（2026-09-13，claude 2.1.268 / codex-cli 0.154.0 / opencode 1.18.30 / Qoder CN）决定了这里能做什么：
+
+| 平台 | 有可开启的开关吗 | 依据 |
+|------|------|------|
+| Codex | ✅ `[features] multi_agent_v2` | 零 token 探测 `codex debug prompt-input`，工具面随该键出现/消失 |
+| Claude Code | ❌ | `--help` 里 `--agents/--agent/--forward-subagent-text` 是参数不是开关；`~/.claude/settings.json` 只有 `enabledPlugins/extraKnownMarketplaces/hooks`，Task 工具内置 |
+| OpenCode | ❌ | `opencode agent list` 显示 `"permission":"*" → allow`，只有 per-agent 权限规则，无全局开关 |
+| Qoder / Qoder CN | ❌ | `settings.json` 只有 `enabledPlugins/hooks/mcpServers/providers`；`Agent(subagent_type=<角色名>)` 实测可直接派发 |
+
+- **Codex**：探测 → 缺失就直接开启（勾选即授权，`-y` 同样执行，不逐次询问）→ 复验 → 失败逐字节回滚。`codex features list` 的 flag 状态**不算证据**，实测可以在工具面为零时仍报 `multi_agent stable true`，所以判据只看模型可见 prompt 里有没有 `spawn_agent` / `list_agents` / `wait_agent` / `send_message` / `interrupt_agent`。探测跑不通记 `unknown`，不改配置——绝不把「测不出来」当成「没有能力」。
+- **其余三平台**：只核对该平台的全局 subagent 角色文件是否到位（`agent_role_count`，由 `install_platform_agents` 保证），提示里如实写"无 multi_agent 开关，派发工具由宿主内置"。**不写任何宿主配置**：给一个没人读的键看起来像修好了，实际只是污染用户文件。
+- **写入边界**：只改 `[features]` 表内的一个键（存在则替换值并保留行尾注释，缺失则插入，无该表则在文件末尾追加），其余内容逐字节保留；同目录临时文件 + `os.replace` 落盘，新建文件按 `0600` 收紧；复验仍看不到工具就把原内容逐字节写回（原本没有该文件则删除），回滚也失败时给出手工删除指引。
+- **生效边界**：宿主只在启动时读取配置与角色文件，所以提示必须写明「需要完全退出并重启 Agent 应用」，不声称当前会话已可用。技能侧的同一检查见 `skills/_shared/prompts/subagent-mandate.md`；安装器把这件事一次/机器地做完之后，技能侧探测就直接得到 `available`。
 
 ---
 
@@ -660,6 +681,7 @@ OpenCode 将 `~/.config/opencode/` 本身当作一个 npm 包管理，插件安�
 | `Installer.run_platform_agents` | 安装/卸载共用同一实现的全局 subagent 同步与清理 |
 | `Installer.ensure_agent_cli` | 勾选平台插件时先自动安装对应 CLI |
 | `installer_qoder.py` | Qoder 平台适配层：共享根解析、注册表与 settings 读写、CLI 能力探测、直写安装与卸载、平台可用性探测 |
+| `installer_codex.py` | Codex 宿主能力层：子代理工具面探测分类、`[features] multi_agent_v2` 的最小化 TOML 补丁（保留其余内容与行尾注释） |
 | `installer_state.agent_presence` / `qoder.agent_presence` | 识别 CLI、Desktop 应用、Linux 启动器与共享配置根 |
 | `installer_state.marketplace_sha` | 取本地仓库 `HEAD` 作为 marketplace 版本（替代旧 bash 的 `_get_marketplace_latest_sha`） |
 | `installer_state.version_source_url` | 从策略表派生组件的版本源（npm/pypi/github/gitlab） |

@@ -52,7 +52,11 @@ function Show-Usage {
         '       uninstall.cmd [-y]',
         '',
         '  install     install or upgrade selected components',
-        '  -y, --yes   proceed with default selections'
+        '  -y, --yes   proceed with default selections',
+        '',
+        '  Selecting a platform''s CodeKit plugin also enables that platform''s',
+        '  subagent capability where a switch exists (Codex: multi_agent_v2);',
+        '  a full restart of the agent app is then required.'
     ) | ForEach-Object { Write-Host $_ }
 }
 

@@ -18,6 +18,7 @@ allowed-tools: 'Bash, Read, Write, Edit, Glob, Grep, Agent, Skill'
 - 主 Agent 独立核验 Worker 状态、写入范围与 artifact，不把 `partial`/`failed` 转译为 `success`。
 - `AGENTS.md`、`CLAUDE.md` 只有主 Agent在 Barrier 之后写入，且仅更新 CodeKit managed block。
 - required 阶段全部成功；重复执行无无意义 diff；提交行为满足显式授权与 dirty 基线门禁。
+- 宿主没有暴露子代理工具面时，在 Phase 1 产生任何业务写入之前就停止，并给出可执行的修复路径；不得留下一半的托管文件变更。
 - 同一仓库重复执行 initialize 是受支持的常规路径：每次 `start` 重新冻结基线，托管文件只替换各自的 CodeKit managed block，内容未变时不落盘，因此对已完成初始化的仓库再跑一次应得到空的 `prepared_changed_files` 与零 diff。
 - 非 `failed` 的运行以醒目的「需要重启 Agent 应用以生效」提示结束报告。
 
@@ -37,7 +38,7 @@ allowed-tools: 'Bash, Read, Write, Edit, Glob, Grep, Agent, Skill'
 
 ## 路径解析约定
 
-> 本文档中的 `SKILL_DIR` / `SKILLS_ROOT` 解析方式、派发时必须显式传入的路径清单，以及“Skill 之间不得用相对路径互相引用文件”的纪律，统一见 `$SKILLS_ROOT/_shared/prompts/path-convention.md`；下面是本 Skill 的特有补充。
+> 本文档中的 `SKILL_DIR` / `SKILLS_ROOT` 解析方式、`<PYTHON>` 启动器按宿主的解析规则、派发时必须显式传入的路径清单，以及“Skill 之间不得用相对路径互相引用文件”的纪律，统一见 `$SKILLS_ROOT/_shared/prompts/path-convention.md`；下面是本 Skill 的特有补充。
 
 本 Skill 所有脚本一律以 **`<SKILL_DIR>` = 本文档所在目录的绝对路径** 解析后调用；插件安装时该目录为 `<plugin-cache>/skills/initialize`。示例中的 `<SKILL_DIR>` 必须先替换成该绝对路径再执行，不得依赖当前工作目录或残留的 shell 变量。派发 Sub-agent 时，必须在输入中显式给出 `<SKILL_DIR>` 的绝对路径与 `run-manifest.json` 的绝对路径，不得让 Sub-agent 自行猜测脚本位置。
 
@@ -79,7 +80,7 @@ flowchart TD
 | `initialize-graphify` | 校验缓存与 sidecar，执行 full/update，报告 chunk 状态 | `graphify-out/` |
 | `initialize-context-scanner` | 收集结构、模块、命令和证据，不做推断性写入 | 无 |
 
-不要假设永远有三个分析槽位。GitNexus 由控制器同步执行，Graphify 与 Context Scanner 必须创建两个指定名称的独立会话；容量足够时并行两路，容量不足时按可用槽位分批或串行，但两个会话都必须建立。协作能力不可用或指定角色无法创建时，状态必须为 `BLOCKED`，不得由主 Agent代做、普通串行自检或伪造独立结果。Claude 使用 Agent/Skill，Codex 使用 `spawn_agent` 等协作能力，OpenCode 使用其 task/subagent 能力；`allowed-tools` 不是跨平台能力开关。
+不要假设永远有三个分析槽位。GitNexus 由控制器同步执行，Graphify 与 Context Scanner 必须创建两个指定名称的独立会话；容量足够时并行两路，容量不足时按可用槽位分批或串行，但两个会话都必须建立。协作能力不可用或指定角色无法创建时，状态必须为 `BLOCKED`，不得由主 Agent代做、普通串行自检或伪造独立结果。Claude 使用 Agent/Skill，Codex 使用 `spawn_agent` 等协作能力，OpenCode 使用其 task/subagent 能力；`allowed-tools` 不是跨平台能力开关。该能力是否真的存在，以 Phase 0 的 `probe-collab.py` 实测结论为准：宿主自报「支持多代理」和 `codex features list` 的 flag 状态都不构成证据，实测可以在工具面为空时仍报 stable。
 
 ## 派发规则与 GitNexus 执行方式（Claude Code / Codex / OpenCode）
 
@@ -97,11 +98,29 @@ GitNexus 这一路不同：它是一次没有判断成分的工具调用，因�
 
 ### Phase 0：冻结基线
 
-读取 [references/orchestration.md](references/orchestration.md)，按其中 Phase 0 清单启动控制器：
+读取 [references/orchestration.md](references/orchestration.md)，先按 `$SKILLS_ROOT/_shared/prompts/path-convention.md` 解析 `<PYTHON>`（Windows `py -3`，macOS/Linux `python3`）。
+
+**第一步是实测宿主的协作能力**，它必须排在 `start` 之前：`start` 就会写 `.standard/` 与 managed ignore，而派发能力缺失原本要到 Phase 1 才暴露，先写后停会留下一半的托管变更。
 
 ```bash
-python3 "<SKILL_DIR>/scripts/controller.py" start [initialize arguments]
+<PYTHON> "$SKILLS_ROOT/_shared/scripts/probe-collab.py" --host <claude|codex|opencode|qoder|qodercn>
 ```
+
+`--host` 按你自己所在的宿主显式填写：脚本只能按环境变量猜宿主，猜错会误阻断一次本可完成的初始化。默认模式只读，不写仓库也不改任何宿主配置；在 Codex 上它本地导出模型可见 prompt，检查 `spawn_agent` 等工具是否真的存在，不产生 token。退出码 1 表示 `unavailable`，0 表示 `available` 或 `unknown`。
+
+- `unavailable`：**不启动 run**，按共享契约的顺序处理——先向用户说明缺的是宿主的子代理工具并申请授权；同意后运行同一脚本加 `--enable`（它只改一个键，写完自测复验，复验不过逐字节回滚）；用户拒绝时不写任何配置。两种结果都必须以醒目的重启提示结束本轮：宿主只在启动时读取配置，**本轮不可能靠改配置继续**，需完全退出并重启该 Agent 应用后重跑 initialize。`fix` 字段原文转述。
+- `unknown`：既不放行也不阻断，照常进入 `start`；真正派发失败时按 `collab-unavailable` 停止。
+- `available`：把实测到的工具列表原样写进最终报告作为证据。
+
+只有 Codex 有可开启的开关；Claude / OpenCode / Qoder 的派发工具由宿主内置，`--enable` 对它们返回 `refused` 且不写任何配置——不得为这些平台编造配置项，也不得把"没有开关"报成"已开启"。
+
+随后按其中 Phase 0 清单启动控制器：
+
+```bash
+<PYTHON> "<SKILL_DIR>/scripts/controller.py" start [initialize arguments]
+```
+
+只有按该回退顺序把每个候选都用 `--version` 实测过、全部拿不到版本号时，才能判定 Python 缺失；单次静默非零退出（Windows 上的 `python3` 商店别名桩就是这样）不是证据。报告必须写出你实测过的命令、退出码与输出。
 
 控制器创建 manifest、取得锁并进入 `prepared`。`prepare.py`、`reconcile.py`、`validate-result.py` 是控制器内部模块，不作为编排入口直接调用。
 
@@ -115,7 +134,7 @@ Phase 0 同时在任何写入之前解析 GitNexus runner 并判定 embedding �
 2. **在等待窗口内运行 GitNexus 步骤**（控制器同步执行，不派发 Sub-agent）：
 
 ```bash
-python3 "<SKILL_DIR>/scripts/controller.py" analyze --manifest <run-manifest.json>
+<PYTHON> "<SKILL_DIR>/scripts/controller.py" analyze --manifest <run-manifest.json>
 ```
 
 控制器按冻结的 runner 与索引模式执行，并按 Worker contract 写出 `<run-id>/gitnexus-result.json`；它只写这一个 result，不推进 manifest 阶段（阶段由 gate 推进）。
@@ -131,7 +150,7 @@ python3 "<SKILL_DIR>/scripts/controller.py" analyze --manifest <run-manifest.jso
 不得在所有已启动 Worker 结束前生成上下文。使用：
 
 ```bash
-python3 "<SKILL_DIR>/scripts/controller.py" gate \
+<PYTHON> "<SKILL_DIR>/scripts/controller.py" gate \
   --manifest <run-manifest.json> --result <worker-result.json>...
 ```
 
@@ -142,7 +161,7 @@ python3 "<SKILL_DIR>/scripts/controller.py" gate \
 读取 [references/context-files.md](references/context-files.md)。主 Agent基于 Scanner 事实和已验证 artifact 形成输入，再调用：
 
 ```bash
-python3 "<SKILL_DIR>/scripts/controller.py" reconcile \
+<PYTHON> "<SKILL_DIR>/scripts/controller.py" reconcile \
   --manifest <run-manifest.json> --context <scanner-result.json> \
   --worker-result <worker-result.json>...
 ```
@@ -154,7 +173,7 @@ python3 "<SKILL_DIR>/scripts/controller.py" reconcile \
 读取 [references/final-report.md](references/final-report.md)，执行：
 
 ```bash
-python3 "<SKILL_DIR>/scripts/controller.py" finish --manifest <run-manifest.json>
+<PYTHON> "<SKILL_DIR>/scripts/controller.py" finish --manifest <run-manifest.json>
 ```
 
 `finish` 由控制器自行执行 reconcile 记录的每条 `required_for_initialize` 仓库验证命令，真实退出码写入 `final_report.validations`：命令不经 shell 解析，禁止重定向、管道、命令替换与通配符，可执行程序必须在控制器白名单内或为仓库内的明确脚本路径（Python 命令按宿主：macOS/Linux `python3 …`，Windows `py -3 …`），超时由 `--validation-timeout`（默认 900 秒）控制。reconcile 已用同一白名单预检这些命令：程序不在白名单、含禁用 shell 语法或仓库脚本缺失时作为可恢复的契约错误在写入任何托管文件之前中止（修复 context 后重试同一个 run）；白名单内但本机未安装的程序在 finish 记为 `skipped` 并写入 `final_report.validation_warnings`，整体降级为 `partial` 且禁止提交（`commit_status` 为 `blocked-skipped-validations`）。主 Agent 不预先执行验证命令，也不得用自己的判断替代控制器结果；`--validation-result` 只在显式 `--allow-attested-validations` 的外部验证环境下接受，此时仍禁止自动提交。
@@ -168,7 +187,7 @@ python3 "<SKILL_DIR>/scripts/controller.py" finish --manifest <run-manifest.json
 不推送，不创建 MR/PR。控制器在 `finish` 后释放锁；gate/reconcile 失败会自动 abort。若宿主在阶段之间被中断，使用：
 
 ```bash
-python3 "<SKILL_DIR>/scripts/controller.py" abort \
+<PYTHON> "<SKILL_DIR>/scripts/controller.py" abort \
   --manifest <run-manifest.json> --reason <reason>
 ```
 

@@ -113,7 +113,11 @@ usage() {
     "       bash uninstall.sh [-y]" \
     "" \
     "  install     install or upgrade selected components" \
-    "  -y, --yes   proceed with default selections"
+    "  -y, --yes   proceed with default selections" \
+    "" \
+    "  Selecting a platform's CodeKit plugin also enables that platform's" \
+    "  subagent capability where a switch exists (Codex: multi_agent_v2);" \
+    "  a full restart of the agent app is then required."
 }
 
 # 兼容旧调用方式，但立即转交独立卸载入口，避免执行安装依赖准备。
