@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -15,9 +17,33 @@ from unittest.mock import Mock, patch
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+import installer_agents as agents  # noqa: E402
+import installer_config as config  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 import installer_state as detector  # noqa: E402
 from installer import Installer, InstallerError  # noqa: E402
+
+
+# 宿主若导出了 QODER*_CONFIG_DIR，共享配置根会被覆盖，断言就会指向真实用户目录
+# 而不是临时目录。整模块运行期间先移除它们，tearDown 时再恢复。
+_AMBIENT_ENV_PATCH = None
+
+
+def setUpModule() -> None:
+    """隔离宿主导出的 Qoder 根目录覆盖。"""
+    global _AMBIENT_ENV_PATCH
+    _AMBIENT_ENV_PATCH = patch.dict(os.environ, {}, clear=False)
+    _AMBIENT_ENV_PATCH.start()
+    for key in ("QODER_CONFIG_DIR", "QODERCN_CONFIG_DIR"):
+        os.environ.pop(key, None)
+
+
+def tearDownModule() -> None:
+    """恢复本模块运行前的环境。"""
+    global _AMBIENT_ENV_PATCH
+    if _AMBIENT_ENV_PATCH is not None:
+        _AMBIENT_ENV_PATCH.stop()
+        _AMBIENT_ENV_PATCH = None
 
 
 # A registry entry shaped the way the desktop IDE writes it: an install path with
@@ -86,7 +112,8 @@ class ConfigRootTests(unittest.TestCase):
     def test_home_relative_override_is_expanded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / "cfg").mkdir()
-            with patch.dict(os.environ, {"HOME": directory}, clear=False):
+            # Windows 的 expanduser("~") 读 USERPROFILE 而不是 HOME，两个都要给。
+            with patch.dict(os.environ, {"HOME": directory, "USERPROFILE": directory}, clear=False):
                 root = qoder.resolve_config_root(
                     self.descriptor, Path(directory), {self.descriptor.config_env: "~/cfg"}
                 )
@@ -435,6 +462,55 @@ class UninstallTests(unittest.TestCase):
         self.assertTrue(any("uninstall" in argv for argv in calls))
         self.assertFalse(qoder.plugin_entries(qoder.read_registry(self.root)))
 
+    def test_soft_deleting_cli_cannot_leave_the_plugin_files_behind(self) -> None:
+        # qodercli 1.1.50 的 plugins uninstall 是软删除：清掉注册表条目后在缓存
+        # 目录里写一个 .orphaned_at，目录连同 skill 文件全部留着。若卸载器只在
+        # CLI 跑完之后读注册表，这时已经找不到 installPath，物理删除会被整个跳过，
+        # 界面报「成功」而文件仍在。
+        target = qoder.install_direct(self.root, self.stage, "1.0.0")
+        calls: list[list[str]] = []
+
+        def runner(args, timeout: float = 20.0) -> tuple[int, str]:
+            argv = [str(item) for item in args]
+            calls.append(argv)
+            if argv[1:2] == ["--version"]:
+                return 0, "qodercli 1.1.50"
+            if "uninstall" in argv:
+                document = qoder.read_registry(self.root)
+                document["plugins"].pop(qoder.PLUGIN_ID, None)
+                qoder.registry_path(self.root).write_text(
+                    json.dumps(document), encoding="utf-8"
+                )
+                (target / ".orphaned_at").write_text("1", encoding="utf-8")
+                return 0, json.dumps({"ok": True, "fullyRemoved": True})
+            return 0, "Usage: plugins install [path] [--scope user] [--json]"
+
+        with patch.object(qoder.shutil, "which", return_value="/usr/bin/qodercli"):
+            self.assertTrue(qoder.uninstall(self.descriptor, self.home, {"PATH": "/usr/bin"}, runner))
+        self.assertTrue(any("uninstall" in argv for argv in calls))
+        self.assertFalse(target.exists())
+        self.assertEqual(qoder.cached_copies(self.root), [])
+
+    def test_a_failed_registry_write_keeps_the_plugin_files(self) -> None:
+        # 注册表写不进去时插件可能仍被宿主加载，此时连文件都不能动：删了等于
+        # 毁掉一份仍在使用的安装。文件删除必须排在登记清理之后。
+        target = qoder.install_direct(self.root, self.stage, "1.0.0")
+
+        def runner(args, timeout: float = 20.0) -> tuple[int, str]:
+            argv = [str(item) for item in args]
+            if argv[1:2] == ["--version"]:
+                return 0, "qodercli 1.1.50"
+            if "uninstall" in argv:
+                return 0, json.dumps({"ok": True})
+            return 0, "Usage: plugins install [path] [--scope user] [--json]"
+
+        with patch.object(qoder, "_write_json", side_effect=qoder.QoderError("read-only")):
+            with patch.object(qoder.shutil, "which", return_value="/usr/bin/qodercli"):
+                with self.assertRaises(qoder.QoderError):
+                    qoder.uninstall(self.descriptor, self.home, {"PATH": "/usr/bin"}, runner)
+        self.assertTrue(target.is_dir())
+        self.assertIn(qoder.PLUGIN_ID, qoder.read_registry(self.root)["plugins"])
+
 
 class PresenceTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -469,12 +545,17 @@ class PresenceTests(unittest.TestCase):
     def test_cli_wins_over_the_shared_root(self) -> None:
         root = self.home / ".qoder"
         root.mkdir()
+        # Windows 的 shutil.which 依赖 PATHEXT，裸文件不会被当作命令；解析结果还会
+        # 把后缀规范成大写（qoder.CMD），因此按文件身份比较而不是字符串。
+        windows = os.name == "nt"
+        executable = self.home / ("qoder.cmd" if windows else "qoder")
+        executable.write_text("@echo off\r\n" if windows else "#!/bin/sh\n", encoding="utf-8")
+        executable.chmod(0o755)
         environ = dict(self.environ, PATH=str(self.home))
-        (self.home / "qoder").write_text("#!/bin/sh\n", encoding="utf-8")
-        os.chmod(self.home / "qoder", 0o755)
-        self.assertEqual(
-            qoder.agent_presence("qoder", self.home, "Linux", environ),
-            f"qoder ({self.home / 'qoder'})",
+        source = qoder.agent_presence("qoder", self.home, "Linux", environ)
+        self.assertTrue(source.startswith("qoder ("), source)
+        self.assertTrue(
+            os.path.samefile(source.removeprefix("qoder (").removesuffix(")"), executable)
         )
 
     def test_agent_location_exposes_the_shared_agents_directory(self) -> None:
@@ -569,7 +650,10 @@ class SharedStateTests(unittest.TestCase):
         with patch.dict(os.environ, self.no_cli_env, clear=False):
             os.environ.pop(self.descriptor.config_env, None)
             path = detector.component_install_path("qodercn_plugin", self.context)
-        self.assertTrue(path.endswith(".qoder-cn/plugins/cache/local/codekit"))
+        # 展示路径按宿主分隔符渲染，Windows 上是反斜杠。
+        self.assertTrue(
+            path.replace("\\", "/").endswith(".qoder-cn/plugins/cache/local/codekit")
+        )
 
     def test_broken_shared_root_never_raises_out_of_detection(self) -> None:
         with patch.dict(os.environ, {self.descriptor.config_env: str(self.home / "gone")}, clear=False):
@@ -608,6 +692,85 @@ class SharedStateTests(unittest.TestCase):
         with patch.object(shutil, "which", return_value=None):
             with patch.object(detector, "platform_subagents_state", return_value="up_to_date"):
                 self.assertFalse(detector.present("claude_plugin", context))
+
+    def test_installed_plugin_is_not_reported_as_a_leftover(self) -> None:
+        self.assertTrue(qoder.inspect(self.descriptor, self.home).installed)
+        self.assertFalse(qoder.inspect(self.descriptor, self.home).leftover)
+        self.assertFalse(self.detect().leftover)
+
+    def test_soft_deleted_cache_is_reported_as_a_leftover(self) -> None:
+        # CLI 软删除之后的磁盘状态：注册表空了，缓存目录连同 skill 文件还在。
+        # 检测必须以文件为准，否则卸载器会把组件当成「未安装，已忽略」，重跑
+        # 卸载永远清不掉这些文件。
+        document = qoder.read_registry(self.root)
+        document["plugins"].pop(qoder.PLUGIN_ID, None)
+        qoder.registry_path(self.root).write_text(json.dumps(document), encoding="utf-8")
+
+        state = qoder.inspect(self.descriptor, self.home)
+        self.assertFalse(state.installed)
+        self.assertTrue(state.leftover)
+
+        detected = self.detect()
+        self.assertEqual(detected.status, "not_installed")
+        self.assertTrue(detected.leftover)
+        self.assertEqual(
+            sorted(detector.component_leftovers("qodercn_plugin", self.context)),
+            [self.target.parent],
+        )
+
+    def test_an_empty_cache_directory_is_not_a_leftover(self) -> None:
+        # 空目录不会出现在宿主的待清理列表里，没必要为它报残留。
+        shutil.rmtree(self.target.parent)
+        self.target.parent.mkdir(parents=True)
+        document = qoder.read_registry(self.root)
+        document["plugins"].pop(qoder.PLUGIN_ID, None)
+        qoder.registry_path(self.root).write_text(json.dumps(document), encoding="utf-8")
+        self.assertFalse(self.detect().leftover)
+        self.assertEqual(detector.component_leftovers("qodercn_plugin", self.context), [])
+
+
+class UninstallRecapTests(unittest.TestCase):
+    """卸载汇总必须对着磁盘复核，不能对着满目录的 skill 文件报「已卸载」。"""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.descriptor = qoder.PLATFORMS["qodercn"]
+        self.root = self.home / ".qoder-cn"
+        self.root.mkdir()
+        self.target = qoder.install_direct(self.root, make_stage(self.home), "1.0.0")
+        self.context = detector.Context(
+            home=self.home,
+            marketplace_local=REPO_DIR,
+            version_file=self.home / "installed_versions",
+        )
+        self.environment = patch.dict(os.environ, empty_environment(), clear=False)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
+    def recap(self) -> str:
+        buffer = io.StringIO()
+        with patch.object(shutil, "which", return_value=None):
+            with contextlib.redirect_stdout(buffer):
+                detector.render_recap(
+                    "uninstall",
+                    [f"qodercn_plugin\tinstalled\t1"],
+                    self.context,
+                )
+        return buffer.getvalue()
+
+    def test_a_soft_deleted_cache_cannot_be_reported_as_uninstalled(self) -> None:
+        document = qoder.read_registry(self.root)
+        document["plugins"].pop(qoder.PLUGIN_ID, None)
+        qoder.registry_path(self.root).write_text(json.dumps(document), encoding="utf-8")
+        output = self.recap()
+        self.assertIn("仍有残留", output)
+        self.assertIn(".qoder-cn/plugins/cache/local/codekit".replace("/", os.sep), output)
+
+    def test_a_clean_uninstall_is_reported_as_success(self) -> None:
+        qoder.uninstall(self.descriptor, self.home, empty_environment())
+        self.assertIn("已卸载", self.recap())
 
 
 class PreflightTests(unittest.TestCase):
@@ -649,6 +812,26 @@ class PreflightTests(unittest.TestCase):
         message = "\n".join(str(call.args[0]) for call in installer.logger.info.call_args_list)
         for label in ("Claude Code", "Codex", "OpenCode", "Qoder", "Qoder CN"):
             self.assertIn(label, message)
+
+    def test_detected_clis_are_tabulated_one_row_each_with_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self.build(Path(directory))
+
+            def which(command: str, path: str | None = None) -> str | None:
+                return f"/usr/bin/{command}"
+
+            with patch.object(shutil, "which", side_effect=which):
+                with patch.object(agents, "cli_version", return_value="1.2.3"):
+                    self.assertTrue(installer.preflight_agents())
+
+        installer.logger.warn.assert_not_called()
+        message = "\n".join(str(call.args[0]) for call in installer.logger.info.call_args_list)
+        # 表格边框行数 = 表头 1 行 + 每个已检测到的 CLI 1 行。
+        rows = [line for line in message.splitlines() if line.lstrip().startswith("║")]
+        self.assertEqual(len(rows), 1 + len(agents.AGENT_CLIS))
+        for entry in agents.AGENT_CLIS:
+            self.assertIn(entry.key, message)
+        self.assertIn("1.2.3", message)
 
 
 def build_installer(home: Path, stage: Path | None) -> Installer:
@@ -804,3 +987,176 @@ class UninstallFlowTests(unittest.TestCase):
             with patch.object(self.uninstaller, "uninstall_platform_agents", return_value=True):
                 self.assertTrue(self.uninstaller.uninstall_claude_plugin())
         self.assertFalse((self.home / ".claude" / "plugins" / "cache" / "co-daming").exists())
+
+    def test_leftover_only_component_is_offered_for_cleanup(self) -> None:
+        # 组件不算已安装、但缓存里还留着文件时，必须列进默认选择，否则用户重跑
+        # 卸载也碰不到它。
+        self.uninstaller.auto_yes = True
+        self.uninstaller.states = {
+            component.component_id: detector.ComponentState(component.component_id)
+            for component in detector.registry.COMPONENTS
+        }
+        self.uninstaller.states["qodercn_plugin"].leftover = True
+        self.assertIn("qodercn_plugin", self.uninstaller.select_components())
+
+    def test_leftover_only_component_is_cleaned_even_though_it_reads_absent(self) -> None:
+        document = qoder.read_registry(self.root)
+        document["plugins"].pop(qoder.PLUGIN_ID, None)
+        qoder.registry_path(self.root).write_text(json.dumps(document), encoding="utf-8")
+        self.uninstaller.context = detector.Context(
+            home=self.home,
+            marketplace_local=REPO_DIR,
+            version_file=self.home / "installed_versions",
+        )
+        with patch.object(shutil, "which", return_value=None):
+            with patch.object(self.uninstaller, "uninstall_platform_agents", return_value=True):
+                self.assertTrue(self.uninstaller.uninstall_component("qodercn_plugin"))
+        self.assertEqual(qoder.cached_copies(self.root), [])
+
+
+class GitNexusRegistrationTests(unittest.TestCase):
+    """CodeKit-owned Qoder registration for GitNexus MCP, hooks and skills."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.root = self.home / ".qoder-cn"
+        self.root.mkdir()
+        self.foreign_hook = {
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "rtk hook claude"}],
+        }
+        qoder.register_mcp_server(
+            self.root, "other", {"command": "/usr/bin/other", "args": []}
+        )
+        qoder.register_gitnexus_hooks(
+            self.root, self.home / "previous" / "gitnexus-hook.cjs"
+        )
+        document = qoder.read_settings(self.root)
+        document["hooks"]["PreToolUse"].insert(0, self.foreign_hook)
+        document["enabledPlugins"] = {qoder.PLUGIN_ID: True}
+        config.write_json(qoder.settings_path(self.root), document)
+
+    def settings(self) -> dict:
+        return qoder.read_settings(self.root)
+
+    def hook_commands(self, event: str) -> list[str]:
+        commands = []
+        for group in self.settings()["hooks"][event]:
+            for entry in group.get("hooks", []):
+                commands.append(str(entry.get("command", "")))
+        return commands
+
+    def test_mcp_registration_keeps_foreign_servers_and_unknown_keys(self) -> None:
+        payload = {"command": "/usr/bin/gitnexus", "args": ["mcp"]}
+        self.assertTrue(qoder.register_mcp_server(self.root, "gitnexus", payload))
+        document = self.settings()
+        self.assertEqual(document["mcpServers"]["gitnexus"], payload)
+        self.assertIn("other", document["mcpServers"])
+        self.assertEqual(document["enabledPlugins"], {qoder.PLUGIN_ID: True})
+        self.assertFalse(qoder.register_mcp_server(self.root, "gitnexus", payload))
+
+    def test_removing_the_last_mcp_server_also_removes_the_key(self) -> None:
+        qoder.register_mcp_server(self.root, "gitnexus", {"command": "gitnexus"})
+        self.assertTrue(qoder.remove_mcp_server(self.root, "gitnexus"))
+        self.assertIn("mcpServers", self.settings(), "a foreign server is still listed")
+        self.assertTrue(qoder.remove_mcp_server(self.root, "other"))
+        self.assertNotIn("mcpServers", self.settings())
+
+    def test_hook_events_use_the_claude_compatible_shape(self) -> None:
+        script = qoder.install_gitnexus_hook_scripts(self.root, self.make_script_dir())
+        qoder.register_gitnexus_hooks(self.root, script)
+        groups = self.settings()["hooks"]["PreToolUse"]
+        ours = [group for group in groups if qoder.GITNEXUS_HOOK_NEEDLE in str(group)]
+        self.assertEqual(len(ours), 1)
+        entry = ours[0]["hooks"][0]
+        self.assertEqual(entry["type"], "command")
+        self.assertEqual(entry["timeout"], qoder.GITNEXUS_HOOK_TIMEOUT_SECONDS)
+        self.assertTrue(entry["statusMessage"])
+        self.assertIn("Grep|Glob|Bash", [group.get("matcher") for group in ours])
+
+    def make_script_dir(self) -> Path:
+        source = self.home / "package-hooks"
+        source.mkdir()
+        for name in qoder.GITNEXUS_HOOK_SCRIPTS:
+            (source / name).write_text(f"// {name}\n", encoding="utf-8")
+        return source
+
+    def test_registering_twice_replaces_the_stale_script_path_only(self) -> None:
+        commands = self.hook_commands("PreToolUse")
+        self.assertTrue(any("previous" in item for item in commands))
+        script = qoder.install_gitnexus_hook_scripts(self.root, self.make_script_dir())
+        qoder.register_gitnexus_hooks(self.root, script)
+        commands = self.hook_commands("PreToolUse")
+        self.assertEqual(len(commands), 2, "the rtk hook must survive exactly once")
+        self.assertFalse(any("previous" in item for item in commands))
+        self.assertTrue(any("gitnexus-hook.cjs" in item for item in commands))
+        # 内容已一致，重复注册不再改写文件。
+        self.assertFalse(qoder.register_gitnexus_hooks(self.root, script))
+
+    def test_hook_scripts_are_copied_into_the_qoder_root(self) -> None:
+        script = qoder.install_gitnexus_hook_scripts(self.root, self.make_script_dir())
+        self.assertEqual(script, qoder.hook_script_dir(self.root) / "gitnexus-hook.cjs")
+        self.assertTrue(script.is_file())
+        self.assertTrue((script.parent / "hook-lock.cjs").is_file())
+
+    def test_missing_main_script_is_rejected_before_any_write(self) -> None:
+        empty = self.home / "no-hooks"
+        empty.mkdir()
+        with self.assertRaises(qoder.QoderError):
+            qoder.install_gitnexus_hook_scripts(self.root, empty)
+        self.assertFalse(qoder.hook_script_dir(self.root).exists())
+
+    def test_removing_hooks_keeps_foreign_groups(self) -> None:
+        self.assertTrue(qoder.remove_gitnexus_hooks(self.root))
+        document = self.settings()
+        self.assertEqual(document["hooks"]["PreToolUse"], [self.foreign_hook])
+        self.assertNotIn("PostToolUse", document["hooks"])
+        self.assertEqual(document["mcpServers"], {"other": {"command": "/usr/bin/other", "args": []}})
+        self.assertFalse(qoder.remove_gitnexus_hooks(self.root))
+
+    def test_malformed_mcp_field_is_rejected_not_overwritten(self) -> None:
+        document = self.settings()
+        document["mcpServers"] = []
+        config.write_json(qoder.settings_path(self.root), document)
+        with self.assertRaises(qoder.QoderError):
+            qoder.register_mcp_server(self.root, "gitnexus", {"command": "gitnexus"})
+        self.assertEqual(qoder.read_settings(self.root)["mcpServers"], [])
+
+    def test_malformed_hooks_field_is_rejected_not_overwritten(self) -> None:
+        document = self.settings()
+        document["hooks"] = "nope"
+        config.write_json(qoder.settings_path(self.root), document)
+        with self.assertRaises(qoder.QoderError):
+            qoder.register_gitnexus_hooks(self.root, self.root / "gitnexus-hook.cjs")
+        self.assertEqual(qoder.read_settings(self.root)["hooks"], "nope")
+
+    def test_skill_mirror_replaces_the_previous_copy(self) -> None:
+        source = self.home / ".agents" / "skills" / "graphify"
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text("# v1\n", encoding="utf-8")
+        (source / "references").mkdir()
+        (source / "references" / "a.md").write_text("a\n", encoding="utf-8")
+        target = qoder.mirror_skill(self.root, source)
+        self.assertEqual((target / "SKILL.md").read_text(encoding="utf-8"), "# v1\n")
+        self.assertTrue((target / "references" / "a.md").is_file())
+        (source / "SKILL.md").write_text("# v2\n", encoding="utf-8")
+        (source / "stale").write_text("x\n", encoding="utf-8")
+        qoder.mirror_skill(self.root, source)
+        self.assertEqual((target / "SKILL.md").read_text(encoding="utf-8"), "# v2\n")
+        self.assertFalse(
+            (qoder.skills_root(self.root) / ".graphify.codekit.9999").exists()
+        )
+        self.assertTrue(qoder.remove_mirrored_skill(self.root, "graphify"))
+        self.assertFalse(target.exists())
+        self.assertFalse(qoder.remove_mirrored_skill(self.root, "graphify"))
+
+    def test_existing_roots_only_reports_platforms_that_are_present(self) -> None:
+        roots = qoder.existing_roots(qoder.PLATFORMS.values(), self.home)
+        self.assertEqual(roots, [self.root])
+        (self.home / ".qoder").mkdir()
+        self.assertEqual(
+            qoder.existing_roots(qoder.PLATFORMS.values(), self.home),
+            [self.home / ".qoder", self.root],
+        )

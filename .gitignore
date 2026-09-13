@@ -6,6 +6,8 @@
 *.ipr
 *.iws
 .claude/
+.agents/
+.opencode/
 
 # Python bytecode caches (skills ship runnable test suites)
 __pycache__/
@@ -17,4 +19,6 @@ __pycache__/
 .gitnexus/
 graphify-out/
 .graphifyignore
+.claude/skills/gitnexus*/
+.agents/skills/gitnexus*/
 # codekit:initialize:ignore:end

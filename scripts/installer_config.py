@@ -69,6 +69,7 @@ REQUIRED_HELPER_FILES = (
     "installer.py",
     "installer_agents.py",
     "installer_config.py",
+    "installer_platform.py",
     "installer_qoder.py",
     "installer_sources.py",
     "installer_state.py",
@@ -340,9 +341,86 @@ def json_asset_sha_from_stdin(asset_name: str) -> str:
     return ""
 
 
+_JSONC_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
+
+
+def strip_jsonc(text: str) -> str:
+    """去掉 JSONC 的注释与尾随逗号，仅在字符串之外生效。"""
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    in_string = False
+    while index < length:
+        char = text[index]
+        if in_string:
+            out.append(char)
+            if char == "\\" and index + 1 < length:
+                # 转义序列整体保留，避免把 \" 误判成字符串结束。
+                out.append(text[index + 1])
+                index += 2
+                continue
+            if char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        if char == "/" and index + 1 < length and text[index + 1] == "/":
+            while index < length and text[index] not in "\r\n":
+                index += 1
+            continue
+        if char == "/" and index + 1 < length and text[index + 1] == "*":
+            index += 2
+            while index + 1 < length and not (text[index] == "*" and text[index + 1] == "/"):
+                index += 1
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    return _JSONC_TRAILING_COMMA.sub(r"\1", "".join(out))
+
+
+def read_opencode_config(path: Path) -> Any:
+    """读取 OpenCode 配置，容忍 JSONC 注释与尾随逗号。"""
+    if not path.exists():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"could not read {path}: {exc}") from exc
+    try:
+        return json.loads(strip_jsonc(text))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON file {path}: {exc}") from exc
+
+
+# OpenCode 解析配置文件的顺序（取自其二进制内的 resolveConfigFile）：
+#   opencode.json → opencode.jsonc → .opencode/opencode.json → .opencode/opencode.jsonc
+# 都不存在时它落地 opencode.json。安装器必须写同一个文件，否则同一个插件会同时
+# 出现在两份配置里 —— `opencode plugin -g` 写的也是这个解析结果。
+OPENCODE_CONFIG_FILENAMES = ("opencode.json", "opencode.jsonc")
+OPENCODE_ALT_DIRNAME = ".opencode"
+
+
+def opencode_config_file(directory: Path) -> Path:
+    """返回 OpenCode 在给定配置目录里实际读写的那份配置文件。"""
+    directory = Path(directory)
+    candidates = [directory / name for name in OPENCODE_CONFIG_FILENAMES]
+    candidates += [
+        directory / OPENCODE_ALT_DIRNAME / name for name in OPENCODE_CONFIG_FILENAMES
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
 def opencode_plugins(path: Path) -> list[str]:
     """读取并校验 OpenCode 配置中的 plugin 字符串数组。"""
-    document = read_json(path)
+    document = read_opencode_config(path)
     if not isinstance(document, dict):
         raise ValueError(f"OpenCode config must contain a JSON object: {path}")
     plugins = document.get("plugin", [])
@@ -362,7 +440,7 @@ def opencode_has_plugin(path: Path, prefix: str = "codekit@") -> bool:
 
 def add_opencode_plugin(path: Path, plugin: str) -> bool:
     """幂等地追加 OpenCode 插件，并以原子方式保存配置文件。"""
-    document = read_json(path, default={})
+    document = read_opencode_config(path)
     if not isinstance(document, dict):
         raise ValueError(f"OpenCode config must contain a JSON object: {path}")
     plugins = document.setdefault("plugin", [])
@@ -378,7 +456,7 @@ def add_opencode_plugin(path: Path, plugin: str) -> bool:
 
 def remove_opencode_plugins(path: Path, prefix: str = "codekit@") -> bool:
     """移除 OpenCode 配置中指定前缀的全部插件，保留其他插件。"""
-    document = read_json(path)
+    document = read_opencode_config(path)
     if not isinstance(document, dict):
         raise ValueError(f"OpenCode config must contain a JSON object: {path}")
     plugins = document.get("plugin")

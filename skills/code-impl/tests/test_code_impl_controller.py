@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+
+# os.chmod on Windows only maps the read-only bit, so st_mode never carries 0o600.
+POSIX_MODES = os.name != "nt"
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -357,6 +361,7 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaises(controller.ControllerError):
             controller._require_repo_root(self.repo / "README.md")
 
+    @unittest.skipUnless(POSIX_MODES, "os.chmod on Windows only maps the read-only bit")
     def test_atomic_json_writes_with_restricted_mode(self) -> None:
         """_atomic_json sets 0o600 by default so state files are private."""
         target = self.repo / ".codekit" / "probe.json"
@@ -364,6 +369,7 @@ class ControllerTests(unittest.TestCase):
         mode = target.stat().st_mode & 0o777
         self.assertEqual(mode, 0o600, f"expected 0o600, got {oct(mode)}")
 
+    @unittest.skipUnless(POSIX_MODES, "os.chmod on Windows only maps the read-only bit")
     def test_atomic_json_honours_explicit_mode(self) -> None:
         target = self.repo / ".codekit" / "probe2.json"
         controller._atomic_json(target, {"a": 1}, mode=0o644)

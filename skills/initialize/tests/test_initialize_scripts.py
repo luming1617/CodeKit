@@ -10,7 +10,7 @@ import tempfile
 import unittest
 import os
 import sys
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -33,7 +33,26 @@ reconcile = load_script("reconcile.py")
 validator = load_script("validate-result.py")
 controller = load_script("controller.py")
 gitnexus_runner = load_script("run-gitnexus.py")
+gitnexus_step = load_script("gitnexus-step.py")
 common = sys.modules["_common"]
+
+# Windows reports every writable file as 0o666: os.chmod only maps the read-only
+# bit, so POSIX permission bits are not observable there.
+POSIX_MODES = os.name != "nt"
+POSIX_MODE_REASON = "os.chmod on Windows only maps the read-only bit"
+# A clean Windows `python3` is the Microsoft Store alias stub: shutil.which finds
+# it, but it exits non-zero, so fixtures name the interpreter that really runs.
+VALIDATION_PYTHON = "py -3" if os.name == "nt" else "python3"
+
+
+def validation_python_runs() -> bool:
+    try:
+        completed = subprocess.run(
+            [*VALIDATION_PYTHON.split(), "-c", "pass"], capture_output=True, check=False
+        )
+    except OSError:
+        return False
+    return completed.returncode == 0
 
 
 def worker_result(task: str, *, changed=None, allowed=None, artifacts=None, run_id: str = "test-run") -> dict:
@@ -106,11 +125,51 @@ def scan_context(root: Path, commands: list[dict]) -> dict:
     }
 
 
+def write_fake_gitnexus(root: Path, *, status: str) -> Path:
+    """最小 GitNexus 替身：只回答 status，供「控制器执行 gitnexus」的流程用例使用。"""
+    fake = root / "fake-gitnexus.py"
+    fake.write_text(
+        "import json, sys\n"
+        "if sys.argv[1:2] == ['status']:\n"
+        f"    print(json.dumps({{'status': {status!r}}}))\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    return fake
+
+
+@contextmanager
+def isolated_gitnexus_home(root: Path, *, registered: bool = True):
+    """隔离 GitNexus 全局目录，并可预先登记 ``root``。
+
+    ``list``/``query``/``context``/``impact``/``trace``/``cypher``/``check``/
+    ``detect-changes`` 与 MCP 图查询只从 ``<GITNEXUS_HOME>/registry.json`` 解析仓库，
+    因此任何对完整 gitnexus result 的断言都必须控制该注册表，而不是读取开发机真实
+    全局目录。
+    """
+    with tempfile.TemporaryDirectory(prefix="gitnexus-home-") as home:
+        entries = (
+            [{"name": root.name, "path": str(root), "storagePath": str(root / ".gitnexus")}]
+            if registered else []
+        )
+        (Path(home) / "registry.json").write_text(json.dumps(entries), encoding="utf-8")
+        with patch.dict(os.environ, {"GITNEXUS_HOME": home}, clear=False):
+            yield Path(home)
+
+
 def drive_initialize_flow(
     root: Path, context: dict, *, run_id: str = "flow", commit: bool = False,
     before_finish=None, finish_args: list[str] | None = None,
+    gitnexus_via_step: bool = False, expect_reconcile_error: bool = False,
 ) -> tuple[int, dict]:
-    """Run start, gate, reconcile and finish, returning the exit code and final report."""
+    """Run start, gate, reconcile and finish, returning the exit code and final report.
+
+    ``gitnexus_via_step`` 用控制器 ``analyze`` 产出的 result 代替手写的 gitnexus
+    result，验证新架构下整条链路（gate/reconcile/finish）仍然成立。
+
+    ``expect_reconcile_error`` 在 gate 之后停在 reconcile，返回可恢复错误载荷，
+    用于断言契约错误发生在写入任何托管文件之前、锁仍然持有。
+    """
     git_repository(root)
     for name, body in {
         "README.md": "fixture\n",
@@ -120,63 +179,94 @@ def drive_initialize_flow(
         "check_bad.py": "raise SystemExit(3)\n",
     }.items():
         (root / name).write_text(body, encoding="utf-8")
+    fake = write_fake_gitnexus(root, status="current") if gitnexus_via_step else None
     subprocess.run(["git", "-C", str(root), "add", "."], check=True)
     subprocess.run(["git", "-C", str(root), "commit", "-qm", "init"], check=True)
+    # 门禁的注册校验走 <GITNEXUS_HOME>/registry.json，所以整条流程都要在该临时全局
+    # 目录下运行，并把 fixture 仓库登记进去。
+    with tempfile.TemporaryDirectory(prefix="gitnexus-home-") as gitnexus_home:
+        (Path(gitnexus_home) / "registry.json").write_text(json.dumps([
+            {"name": root.name, "path": str(root), "storagePath": str(root / ".gitnexus")},
+        ]), encoding="utf-8")
+        with patch.dict(os.environ, {"GITNEXUS_HOME": gitnexus_home}, clear=False):
+            return _drive_initialize_flow(
+                root, context, run_id=run_id, commit=commit, before_finish=before_finish,
+                finish_args=finish_args, fake=fake,
+                expect_reconcile_error=expect_reconcile_error,
+            )
 
+
+def _drive_initialize_flow(
+    root: Path, context: dict, *, run_id: str, commit: bool, before_finish,
+    finish_args: list[str] | None, fake: Path | None, expect_reconcile_error: bool,
+) -> tuple[int, dict]:
     start = ["start", "--root", str(root), "--language", "python", "--run-id", run_id]
     if commit:
         start.append("--commit")
-    with redirect_stdout(StringIO()):
-        assert controller.main(start) == 0
-    manifest = root / ".codekit" / "initialize" / run_id / "run-manifest.json"
+    runner_env = {"CODEKIT_GITNEXUS_RUNNER": f"{sys.executable} {fake}"} if fake else {}
+    with patch.dict(os.environ, runner_env, clear=False):
+        with redirect_stdout(StringIO()):
+            assert controller.main(start) == 0
+        manifest = root / ".codekit" / "initialize" / run_id / "run-manifest.json"
 
-    (root / ".gitnexus").mkdir()
-    (root / ".gitnexus/meta.json").write_text(json.dumps({"root": str(root)}), encoding="utf-8")
-    (root / "graphify-out").mkdir()
-    (root / "graphify-out/graph.json").write_text(
-        json.dumps({"nodes": [{"id": "n"}]}), encoding="utf-8",
-    )
-    (root / "graphify-out/manifest.json").write_text(json.dumps({"root": str(root)}), encoding="utf-8")
-    (root / "graphify-out/.graphify_root").write_text(str(root), encoding="utf-8")
+        (root / ".gitnexus").mkdir()
+        (root / ".gitnexus/meta.json").write_text(json.dumps({"root": str(root)}), encoding="utf-8")
+        (root / "graphify-out").mkdir()
+        (root / "graphify-out/graph.json").write_text(
+            json.dumps({"nodes": [{"id": "n"}]}), encoding="utf-8",
+        )
+        (root / "graphify-out/manifest.json").write_text(json.dumps({"root": str(root)}), encoding="utf-8")
+        (root / "graphify-out/.graphify_root").write_text(str(root), encoding="utf-8")
 
-    results = [
-        worker_result(
-            "gitnexus", run_id=run_id,
-            changed=[".gitnexus/meta.json"], allowed=[".gitnexus/"],
-            artifacts=[{"path": ".gitnexus/meta.json", "validation": "json-valid"}],
-        ),
-        worker_result(
-            "graphify", run_id=run_id,
-            changed=["graphify-out/graph.json", "graphify-out/manifest.json", "graphify-out/.graphify_root"],
-            allowed=["graphify-out/"],
-            artifacts=[
-                {"path": "graphify-out/graph.json", "validation": "json-nonempty-nodes"},
-                {"path": "graphify-out/manifest.json", "validation": "json-valid"},
-                {"path": "graphify-out/.graphify_root", "validation": "root-match"},
-            ],
-        ),
-        worker_result("context-scanner", run_id=run_id),
-    ]
-    result_paths = []
-    for result in results:
-        path = manifest.parent / f"{result['task']}.json"
-        path.write_text(json.dumps(result), encoding="utf-8")
-        result_paths.append(path)
-    context_path = manifest.parent / "context.json"
-    context_path.write_text(json.dumps(context), encoding="utf-8")
+        result_paths: list[Path] = []
+        if fake is not None:
+            with redirect_stdout(StringIO()):
+                assert controller.main(["analyze", "--manifest", str(manifest)]) == 0
+            result_paths.append(manifest.parent / "gitnexus-result.json")
+        else:
+            path = manifest.parent / "gitnexus.json"
+            path.write_text(json.dumps(worker_result(
+                "gitnexus", run_id=run_id,
+                changed=[".gitnexus/meta.json"], allowed=[".gitnexus/"],
+                artifacts=[{"path": ".gitnexus/meta.json", "validation": "json-valid"}],
+            )), encoding="utf-8")
+            result_paths.append(path)
+        for result in (
+            worker_result(
+                "graphify", run_id=run_id,
+                changed=["graphify-out/graph.json", "graphify-out/manifest.json", "graphify-out/.graphify_root"],
+                allowed=["graphify-out/"],
+                artifacts=[
+                    {"path": "graphify-out/graph.json", "validation": "json-nonempty-nodes"},
+                    {"path": "graphify-out/manifest.json", "validation": "json-valid"},
+                    {"path": "graphify-out/.graphify_root", "validation": "root-match"},
+                ],
+            ),
+            worker_result("context-scanner", run_id=run_id),
+        ):
+            path = manifest.parent / f"{result['task']}.json"
+            path.write_text(json.dumps(result), encoding="utf-8")
+            result_paths.append(path)
+        context_path = manifest.parent / "context.json"
+        context_path.write_text(json.dumps(context), encoding="utf-8")
 
     argv = ["--manifest", str(manifest)] + list(finish_args or [])
     if before_finish is not None:
         argv += list(before_finish(manifest.parent))
+    reconcile_argv = [
+        "reconcile", "--manifest", str(manifest), "--context", str(context_path),
+        *[part for path in result_paths for part in ("--worker-result", str(path))],
+    ]
     with redirect_stdout(StringIO()):
         assert controller.main([
             "gate", "--manifest", str(manifest),
             *[part for path in result_paths for part in ("--result", str(path))],
         ]) == 0
-        assert controller.main([
-            "reconcile", "--manifest", str(manifest), "--context", str(context_path),
-            *[part for path in result_paths for part in ("--worker-result", str(path))],
-        ]) == 0
+        if expect_reconcile_error:
+            with redirect_stderr(StringIO()) as context_error:
+                code = controller.main(reconcile_argv)
+            return code, json.loads(context_error.getvalue())
+        assert controller.main(reconcile_argv) == 0
         output = StringIO()
         with redirect_stdout(output):
             code = controller.main(["finish", *argv])
@@ -211,6 +301,9 @@ class ManagedBlockTests(unittest.TestCase):
         self.assertIs(prepare.snapshot_worker_scopes, validator.snapshot_worker_scopes)
         self.assertIs(reconcile.EXPECTED_TASKS, validator.EXPECTED_TASKS)
         self.assertIs(common.EXPECTED_TASKS, validator.EXPECTED_TASKS)
+        self.assertIs(reconcile.resolve_validation_command, validator.resolve_validation_command)
+        self.assertIs(reconcile.resolve_validation_command, common.resolve_validation_command)
+        self.assertIs(validator.ValidationProgramMissing, common.ValidationProgramMissing)
         self.assertIs(sys.modules["prepare.py"], controller.prepare)
         self.assertIs(sys.modules["reconcile.py"], controller.reconcile)
         self.assertIs(sys.modules["validate_result.py"], controller.validator)
@@ -247,32 +340,26 @@ class ManagedBlockTests(unittest.TestCase):
         for rule in rules:
             self.assertIn(f"\n{rule}\n", once)
 
-    def test_gitnexus_skill_directories_are_added_to_managed_gitignore(self):
+    def test_managed_gitignore_requires_the_frozen_gitnexus_mirror_globs(self):
+        """The block is frozen: mirrors are ignored by glob, user skills are not."""
+        self.assertIn(".claude/skills/gitnexus*/", common.MANAGED_GITIGNORE_ENTRIES)
+        self.assertIn(".agents/skills/gitnexus*/", common.MANAGED_GITIGNORE_ENTRIES)
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            skill = root / ".claude/skills/gitnexus-cli"
-            skill.mkdir(parents=True)
-            (skill / "SKILL.md").write_text("generated\n", encoding="utf-8")
-            ignore = root / ".gitignore"
-            ignore.write_text(
-                "user-rule\n"
-                "# codekit:initialize:ignore:start\n"
-                ".codekit/\n.gitnexus/\ngraphify-out/\n.graphifyignore\n"
-                "# codekit:initialize:ignore:end\n",
+            path = Path(directory) / ".gitignore"
+            path.write_text(
+                "user-rule\n" + prepare.replace_managed_block(
+                    "", common.IGNORE_START, common.IGNORE_END,
+                    list(common.MANAGED_GITIGNORE_ENTRIES),
+                ),
                 encoding="utf-8",
             )
-            result = worker_result(
-                "gitnexus",
-                changed=[".claude/skills/gitnexus-cli/SKILL.md"],
-                allowed=[".claude/skills/gitnexus-cli/"],
+            self.assertEqual([], validator.validate_managed_gitignore(path))
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(".claude/skills/gitnexus*/\n", ""),
+                encoding="utf-8",
             )
-            self.assertTrue(reconcile.update_gitignore_for_skills(root, result))
-            updated = ignore.read_text(encoding="utf-8")
-            self.assertIn(".claude/skills/gitnexus-cli/", updated)
-            self.assertNotIn("\n.claude/\n", updated)
-            self.assertNotIn("\n.agents/\n", updated)
-            self.assertIn("user-rule\n", updated)
-            self.assertFalse(reconcile.update_gitignore_for_skills(root, result))
+            errors = validator.validate_managed_gitignore(path)
+        self.assertIn(".claude/skills/gitnexus*/", " ".join(errors))
 
     def test_language_validation_rejects_duplicates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -284,19 +371,27 @@ class GraphifyCapabilityTests(unittest.TestCase):
     def test_graphify_capabilities_detect_flags_and_ast_process_pool(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            runner = root / "graphify"
-            runner.write_text(
-                f"#!{sys.executable}\n"
+            body = (
                 "import sys\n"
                 "if sys.argv[1:] == ['--version']:\n"
                 "    print('graphify 1.0')\n"
                 "elif sys.argv[1:] == ['--help']:\n"
                 "    print('extract --max-workers N')\n"
+                "    print('hook install            install post-commit git hooks')\n"
                 "elif sys.argv[1:] == ['extract', '--help']:\n"
-                "    print('--code-only --max-workers')\n",
-                encoding="utf-8",
+                "    print('--code-only --max-workers')\n"
             )
-            runner.chmod(0o755)
+            if os.name == "nt":
+                # CreateProcess cannot exec an extension-less POSIX script.
+                (root / "graphify.py").write_text(body, encoding="utf-8")
+                runner = root / "graphify.cmd"
+                runner.write_text(
+                    f'@echo off\r\n"{sys.executable}" "%~dp0graphify.py" %*\r\n', encoding="utf-8"
+                )
+            else:
+                runner = root / "graphify"
+                runner.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
+                runner.chmod(0o755)
             with patch.object(
                 prepare.shutil,
                 "which",
@@ -308,6 +403,28 @@ class GraphifyCapabilityTests(unittest.TestCase):
             self.assertTrue(graphify["supports"]["max_workers"])
             self.assertTrue(graphify["supports"]["code_only"])
             self.assertTrue(graphify["supports"]["ast_process_pool"])
+            self.assertTrue(graphify["supports"]["git_hooks"])
+
+    def test_shebang_probe_resolves_the_venv_python_behind_a_cmd_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / "venvs" / "graphify" / "Scripts"
+            scripts.mkdir(parents=True)
+            (scripts / "python.exe").write_text("", encoding="utf-8")
+            launcher = root / "graphify.cmd"
+            launcher.write_text(
+                "@echo off\r\n"
+                f'"{scripts / "graphify.exe"}" %*\r\n'
+                "exit /b %ERRORLEVEL%\r\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([str(scripts / "python.exe")], prepare._shebang_python(launcher))
+
+    def test_shebang_probe_keeps_windows_backslashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = Path(directory) / "graphify"
+            runner.write_text(f"#!{sys.executable}\n", encoding="utf-8")
+            self.assertEqual([sys.executable], prepare._shebang_python(runner))
 
     def test_ast_process_pool_probe_uses_graphify_shebang_python(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -354,6 +471,631 @@ class GraphifyCapabilityTests(unittest.TestCase):
                 mode, warnings = prepare.gitnexus_skill_mode(root)
             self.assertEqual("community-only", mode)
             self.assertEqual(1, len(warnings))
+
+
+class GraphifyGitHookTests(unittest.TestCase):
+    """图谱钩子默认开：只在 initialize 期间刷新的图会在下一次提交后腐烂。"""
+
+    def manifest(
+        self,
+        *,
+        options=None,
+        status="success",
+        available=True,
+        supports=None,
+        runner="/usr/bin/graphify",
+    ):
+        merged_options = {"graph_git_hooks": True}
+        merged_options.update(options or {})
+        merged_supports = {"git_hooks": True}
+        merged_supports.update(supports or {})
+        return {
+            "options": merged_options,
+            "worker_results": {"graphify": {"status": status}},
+            "tools": {
+                "graphify": {
+                    "available": available,
+                    "runner": runner,
+                    "supports": merged_supports,
+                }
+            },
+        }
+
+    def test_plan_installs_by_default_including_legacy_manifests(self):
+        action, detail = validator.graphify_git_hook_plan(self.manifest())
+        self.assertEqual(("install", "/usr/bin/graphify"), (action, detail))
+        # 早期 run manifest 里没有这一位时按默认开启处理，不得静默跳过。
+        legacy = self.manifest()
+        legacy["options"] = {}
+        self.assertEqual("install", validator.graphify_git_hook_plan(legacy)[0])
+
+    def test_plan_skip_reasons(self):
+        missing_receipt = self.manifest()
+        missing_receipt.pop("worker_results")
+        cases = (
+            (self.manifest(options={"graph_git_hooks": False}), "disabled-by-flag"),
+            (self.manifest(status="skipped"), "graphify-skipped"),
+            (self.manifest(status="failed"), "graphify-failed"),
+            (missing_receipt, "graphify-missing"),
+            (self.manifest(available=False), "tool-missing"),
+            (self.manifest(runner=None), "tool-missing"),
+            (self.manifest(supports={"git_hooks": False}), "unsupported"),
+        )
+        for manifest, reason in cases:
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    ("skip", reason), validator.graphify_git_hook_plan(manifest)
+                )
+
+    def test_partial_graph_still_gets_the_refresh_hook(self):
+        self.assertEqual(
+            "install", validator.graphify_git_hook_plan(self.manifest(status="partial"))[0]
+        )
+
+    def completed(self, returncode: int, stdout: str = "", stderr: str = ""):
+        return subprocess.CompletedProcess([], returncode, stdout=stdout, stderr=stderr)
+
+    def test_install_invokes_the_runner_in_this_repository(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            runner = str(root / "graphify")
+
+            def fake_run(argv, **kwargs):
+                # 钩子按仓库落盘：argv 必须是 <runner> hook install，cwd 必须是本仓库。
+                self.assertEqual([runner, "hook", "install"], list(argv))
+                self.assertEqual(root, Path(kwargs["cwd"]))
+                (root / ".git" / "hooks" / "post-commit").write_text("#!/bin/sh\n", encoding="utf-8")
+                return self.completed(0, "post-commit: installed")
+
+            with patch.object(validator.subprocess, "run", side_effect=fake_run) as execute:
+                record, warnings, degraded = validator.install_graphify_git_hooks(
+                    root, self.manifest(runner=runner), 30
+                )
+            self.assertEqual(1, execute.call_count)
+            self.assertEqual("installed", record["status"])
+            self.assertEqual(0, record["exit_code"])
+            self.assertIn("post-commit: installed", record["output_tail"])
+            self.assertTrue((root / ".git" / "hooks" / "post-commit").is_file())
+            self.assertEqual(([], False), (warnings, degraded))
+
+    def test_failure_degrades_the_run_and_names_the_rollback(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            with patch.object(
+                validator.subprocess, "run",
+                return_value=self.completed(1, "", "No git repository found"),
+            ):
+                record, warnings, degraded = validator.install_graphify_git_hooks(
+                    root, self.manifest(runner=str(root / "graphify")), 30
+                )
+            self.assertEqual("failed", record["status"])
+            self.assertEqual(1, record["exit_code"])
+            self.assertIn("graphify hook uninstall", record["rollback"])
+            self.assertTrue(degraded)
+            self.assertEqual(1, len(warnings))
+            self.assertIn("graphify hook install", warnings[0])
+            self.assertIn("--no-git-hooks", warnings[0])
+
+    def test_unlaunchable_runner_degrades_instead_of_raising(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            with patch.object(
+                validator.subprocess, "run", side_effect=OSError("no such file")
+            ):
+                record, warnings, degraded = validator.install_graphify_git_hooks(
+                    root, self.manifest(runner=str(root / "graphify")), 30
+                )
+            self.assertEqual("failed", record["status"])
+            self.assertIn("error", record)
+            self.assertTrue(degraded)
+            self.assertEqual(1, len(warnings))
+
+    def test_skipped_step_never_touches_the_repository(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            hooks = root / ".git" / "hooks"
+            before = sorted(path.name for path in hooks.iterdir())
+            record, warnings, degraded = validator.install_graphify_git_hooks(
+                root, self.manifest(options={"graph_git_hooks": False}), 30
+            )
+            self.assertEqual("skipped", record["status"])
+            self.assertEqual("disabled-by-flag", record["reason"])
+            self.assertEqual(([], False), (warnings, degraded))
+            self.assertEqual(before, sorted(path.name for path in hooks.iterdir()))
+
+    def test_unsupported_cli_warns_without_degrading(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            record, warnings, degraded = validator.install_graphify_git_hooks(
+                root, self.manifest(supports={"git_hooks": False}), 30
+            )
+            self.assertEqual("skipped", record["status"])
+            self.assertEqual("unsupported", record["reason"])
+            self.assertFalse(degraded)
+            self.assertEqual(1, len(warnings))
+
+    def test_controller_forwards_the_flag_to_prepare(self):
+        with patch.object(controller.prepare, "main", return_value=0) as main:
+            controller.main(["start", "--root", "."])
+        self.assertNotIn("--no-git-hooks", main.call_args.args[0])
+        with patch.object(controller.prepare, "main", return_value=0) as main:
+            controller.main(["start", "--root", ".", "--no-git-hooks"])
+        self.assertIn("--no-git-hooks", main.call_args.args[0])
+
+
+class GitNexusRunnerResolutionTests(unittest.TestCase):
+    """runner 解析与模式判定：决定索引是否会每次全量重建。"""
+
+    def test_runner_resolution_never_falls_back_to_repo_shim(self):
+        # .gitnexus/run.cjs 按 gitnexus@latest 走 npx，会让分析器身份漂移。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".gitnexus").mkdir()
+            (root / ".gitnexus/run.cjs").write_text("// shim\n", encoding="utf-8")
+            with patch.object(prepare.shutil, "which", return_value=None), patch.dict(
+                os.environ, {"CODEKIT_GITNEXUS_RUNNER": ""}, clear=False
+            ):
+                command, runner = prepare.gitnexus_command()
+            self.assertEqual([], command)
+            self.assertEqual("unresolved", runner)
+
+    def test_explicit_runner_override_wins_over_path(self):
+        with patch.object(
+            prepare.shutil, "which", return_value="/usr/bin/gitnexus"
+        ), patch.dict(
+            os.environ, {"CODEKIT_GITNEXUS_RUNNER": "node /opt/gn/run.cjs"}, clear=False
+        ):
+            command, runner = prepare.gitnexus_command()
+        self.assertEqual(["node", "/opt/gn/run.cjs"], command)
+        self.assertEqual("override", runner)
+
+    def test_local_embedding_stack_is_detected_from_install_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pkg = Path(directory) / "node_modules" / "gitnexus"
+            cli = pkg / "dist" / "cli" / "index.js"
+            cli.parent.mkdir(parents=True)
+            (pkg / "package.json").write_text('{"name": "gitnexus"}', encoding="utf-8")
+            self.assertFalse(prepare.gitnexus_local_embeddings(cli))
+            (pkg / "node_modules" / "onnxruntime-node").mkdir(parents=True)
+            (pkg / "node_modules" / "@huggingface" / "transformers").mkdir(parents=True)
+            self.assertTrue(prepare.gitnexus_local_embeddings(cli))
+
+    def test_index_modes_read_pdg_and_embeddings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(
+                {"present": False, "pdg": None, "embeddings": 0, "branch": None},
+                prepare.gitnexus_index_modes(root),
+            )
+            (root / ".gitnexus").mkdir()
+            (root / ".gitnexus/meta.json").write_text(
+                json.dumps({"pdg": {"x": 1}, "branch": "main", "stats": {"embeddings": 12}}),
+                encoding="utf-8",
+            )
+            modes = prepare.gitnexus_index_modes(root)
+            self.assertTrue(modes["pdg"])
+            self.assertEqual(12, modes["embeddings"])
+            self.assertEqual("main", modes["branch"])
+
+    def test_embedding_plan_degrades_instead_of_failing(self):
+        index = {"present": True, "pdg": True, "embeddings": 1341, "branch": "main"}
+        mode, warnings = prepare.gitnexus_embedding_plan(index, False, False, False)
+        self.assertEqual("drop", mode)
+        self.assertTrue(warnings)
+        self.assertEqual(
+            ("preserve", []), prepare.gitnexus_embedding_plan(index, True, False, False)
+        )
+        mode, warnings = prepare.gitnexus_embedding_plan(index, False, False, True)
+        self.assertEqual("install-authorized", mode)
+        self.assertTrue(warnings)
+        self.assertEqual(
+            ("preserve", []),
+            prepare.gitnexus_embedding_plan({"embeddings": 0}, False, False, False),
+        )
+
+    def test_requested_embeddings_require_authorized_install(self):
+        with self.assertRaises(prepare.PrepareError):
+            prepare.gitnexus_embedding_plan({"embeddings": 0}, False, True, False)
+        mode, _ = prepare.gitnexus_embedding_plan({"embeddings": 0}, False, True, True)
+        self.assertEqual("install-authorized", mode)
+
+    def test_authorized_run_writes_the_real_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "gitnexus-home"
+            home.mkdir()
+            fake = root / "fake-gitnexus.py"
+            fake.write_text(
+                "import os\n"
+                "from pathlib import Path\n"
+                "path = Path(os.environ['GITNEXUS_HOME']) / 'registry.json'\n"
+                "path.write_text('{}', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts/run-gitnexus.py"),
+                 "--root", str(root), "--use-global-registry", "--",
+                 sys.executable, str(fake)],
+                text=True, capture_output=True, check=False,
+                env={**os.environ, "GITNEXUS_HOME": str(home)},
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertTrue((home / "registry.json").is_file())
+            self.assertNotIn("disposable GITNEXUS_HOME", completed.stderr)
+
+
+class GitNexusRegistrationTests(unittest.TestCase):
+    """GitNexus 只在全局 registry 里解析仓库：缺注册时索引有效但查询全废。"""
+
+    def fixture(self, root: Path) -> Path:
+        git_repository(root)
+        return write_fake_gitnexus(root, status="current")
+
+    def run_prepare(self, root: Path, fake: Path, *extra: str):
+        # runner 覆盖串要带引号：shlex.split 会吃掉未加引号的 Windows 路径分隔符。
+        with patch.dict(
+            os.environ,
+            {"CODEKIT_GITNEXUS_RUNNER": f'"{sys.executable}" "{fake}"'},
+            clear=False,
+        ):
+            with redirect_stdout(StringIO()):
+                return prepare.main([
+                    "--root", str(root), "--language", "python", "--run-id", "registry",
+                    *extra,
+                ])
+
+    def manifest(self, root: Path) -> dict:
+        return json.loads(
+            (root / ".codekit" / "initialize" / "registry" / "run-manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def test_unregistered_repository_requires_a_global_write_decision(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            fake = self.fixture(root)
+            with isolated_gitnexus_home(root, registered=False):
+                with self.assertRaises(prepare.PrepareError) as caught:
+                    self.run_prepare(root, fake)
+            self.assertIn("registry.json", str(caught.exception))
+            # 判定与 embedding 前提一样发生在任何写入之前。
+            self.assertFalse((root / ".codekit").exists())
+
+    def test_allow_partial_accepts_the_degraded_registration(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            fake = self.fixture(root)
+            with isolated_gitnexus_home(root, registered=False):
+                self.assertEqual(0, self.run_prepare(root, fake, "--allow-partial"))
+                manifest = self.manifest(root)
+            self.assertFalse(manifest["gitnexus_registry"]["registered"])
+            self.assertTrue(
+                any("registry-missing" in warning for warning in manifest["warnings"])
+            )
+
+    def test_allow_global_writes_authorizes_registration(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            fake = self.fixture(root)
+            with isolated_gitnexus_home(root, registered=False):
+                self.assertEqual(0, self.run_prepare(root, fake, "--allow-global-writes"))
+                manifest = self.manifest(root)
+            self.assertTrue(manifest["options"]["allow_global_writes"])
+            self.assertEqual([], manifest["warnings"])
+
+    def test_registered_repository_needs_no_decision(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            fake = self.fixture(root)
+            with isolated_gitnexus_home(root):
+                self.assertEqual(0, self.run_prepare(root, fake))
+                manifest = self.manifest(root)
+            self.assertTrue(manifest["gitnexus_registry"]["registered"])
+            self.assertEqual([], manifest["warnings"])
+
+    def test_complete_result_requires_registration(self):
+        """门禁自己重测注册：只校验 .gitnexus/meta.json 会放过死索引。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".gitnexus").mkdir()
+            (root / ".gitnexus/meta.json").write_text("{}", encoding="utf-8")
+            manifest = {"run_id": "test-run", "tools": {}}
+            result = worker_result(
+                "gitnexus", allowed=[".gitnexus/"],
+                artifacts=[{"path": ".gitnexus/meta.json", "validation": "json-valid"}],
+            )
+            with isolated_gitnexus_home(root, registered=False):
+                errors = validator.validate_worker(result, manifest, root)
+            self.assertIn("not registered", " ".join(errors))
+            with isolated_gitnexus_home(root):
+                errors = validator.validate_worker(result, manifest, root)
+            self.assertEqual([], errors)
+
+
+class GitNexusStepTests(unittest.TestCase):
+    """controller.py analyze：gitnexus 由确定性步骤执行，产物必须能过 gate。"""
+
+    def step_manifest(self, root: Path, tool: dict, **overrides) -> tuple[dict, Path]:
+        run_dir = root / ".codekit" / "initialize" / "step-run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        path = run_dir / "run-manifest.json"
+        lock = run_dir / "initialize.lock"
+        manifest = {
+            "schema_version": 1,
+            "run_id": "step-run",
+            "root": str(root),
+            "state_run_dir": str(run_dir),
+            "manifest_path": str(path),
+            "lock_path": str(lock),
+            "phase": "prepared",
+            "options": {
+                "embeddings": False, "force": False, "allow_partial": False,
+                "commit": False, "allow_global_writes": False,
+            },
+            "tools": {"gitnexus": tool},
+            "gitnexus_index": {"present": False, "pdg": None, "embeddings": 0, "branch": None},
+            "gitnexus_embedding_mode": "preserve",
+            "gitnexus_skill_mode": "full",
+            "baseline_status": {},
+            "baseline_files": {},
+            "worker_tree_roots": [".gitnexus", ".claude/skills", ".agents/skills"],
+            "worker_scope_baseline": {},
+        }
+        manifest.update(overrides)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        # 控制器按锁校验运行身份，夹具必须提供同 run 的锁。
+        lock.write_text(json.dumps({
+            "schema_version": 1,
+            "run_id": manifest["run_id"],
+            "root": str(root),
+            "manifest": str(path),
+            "created_at": "2026-01-01T00:00:00Z",
+        }), encoding="utf-8")
+        return manifest, path
+
+    def fake_runner(self, root: Path, *, status: str) -> Path:
+        """最小 GitNexus 替身：status 报 status，analyze/index 落 meta 与全局注册。
+
+        注册写到 ``GITNEXUS_HOME``：真实 CLI 也用同一处 registry 解析仓库，所以
+        「授权 → 落在真实目录」「未授权 → 落进一次性目录后被删除」都能被复现。
+        """
+        fake = root / "fake-gitnexus.py"
+        register = (
+            "    home = os.environ.get('GITNEXUS_HOME')\n"
+            "    if home:\n"
+            "        registry = Path(home)\n"
+            "        registry.mkdir(parents=True, exist_ok=True)\n"
+            "        (registry / 'registry.json').write_text(\n"
+            "            json.dumps([{'name': Path(os.getcwd()).name, 'path': os.getcwd()}]),\n"
+            "            encoding='utf-8')\n"
+        )
+        fake.write_text(
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "if args[:1] == ['status']:\n"
+            f"    print(json.dumps({{'status': {status!r}}}))\n"
+            "    raise SystemExit(0)\n"
+            "if args[:1] == ['analyze']:\n"
+            "    target = Path(os.getcwd()) / '.gitnexus'\n"
+            "    target.mkdir(exist_ok=True)\n"
+            "    (target / 'meta.json').write_text(json.dumps({'root': os.getcwd()}), encoding='utf-8')\n"
+            "    (Path(os.getcwd()) / 'analyze-called').write_text('1', encoding='utf-8')\n"
+            + register +
+            "    raise SystemExit(0)\n"
+            "if args[:1] == ['index']:\n"
+            "    (Path(os.getcwd()) / 'index-called').write_text('1', encoding='utf-8')\n"
+            + register +
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(0)\n",
+            encoding="utf-8",
+        )
+        return fake
+
+    def run_step(self, root: Path, manifest_path: Path) -> dict:
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            self.assertEqual(0, controller.main(["analyze", "--manifest", str(manifest_path)]))
+        return json.loads((manifest_path.parent / "gitnexus-result.json").read_text(encoding="utf-8"))
+
+    def test_missing_runner_skips_without_falling_back(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            tool = {
+                "available": False, "runner": "unresolved", "command": [],
+                "supports": {}, "resolution_hint": "请把 npm 前缀/bin 加入 PATH",
+            }
+            manifest, path = self.step_manifest(root, tool)
+            result = self.run_step(root, path)
+
+            self.assertEqual("skipped", result["status"])
+            self.assertIsNone(result["exit_code"])
+            self.assertEqual("tool-missing", result["error"]["code"])
+            self.assertIn("请把 npm 前缀/bin 加入 PATH", result["warnings"])
+            self.assertEqual([], validator.validate_worker(result, manifest, root))
+
+    def test_current_index_reuses_without_running_analyze(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            fake = self.fake_runner(root, status="current")
+            # status 说 current 就意味着已有索引，artifact 必须存在。
+            (root / ".gitnexus").mkdir()
+            (root / ".gitnexus/meta.json").write_text("{}", encoding="utf-8")
+            tool = {
+                "available": True, "runner": "override", "command": [sys.executable, str(fake)],
+                "supports": {"skills": False}, "identity_stable": True, "local_embeddings": False,
+            }
+            manifest, path = self.step_manifest(root, tool)
+            with isolated_gitnexus_home(root):
+                result = self.run_step(root, path)
+                self.assertEqual([], validator.validate_worker(result, manifest, root))
+
+            self.assertEqual("skipped", result["status"])
+            self.assertEqual("index-current", result["error"]["code"])
+            self.assertEqual(
+                [{"path": ".gitnexus/meta.json", "validation": "json-valid"}], result["artifacts"]
+            )
+            self.assertTrue(result["registry"]["registered"])
+            # 复用索引就必须真的不跑 analyze，也已注册时不必补注册。
+            self.assertFalse((root / "analyze-called").exists())
+            self.assertFalse((root / "index-called").exists())
+
+    def test_unregistered_reuse_registers_the_index_when_authorized(self):
+        """复用路径最容易漏注册：analyze 不跑，注册必须在 analyze 步骤里补。"""
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            fake = self.fake_runner(root, status="current")
+            (root / ".gitnexus").mkdir()
+            (root / ".gitnexus/meta.json").write_text("{}", encoding="utf-8")
+            tool = {
+                "available": True, "runner": "override", "command": [sys.executable, str(fake)],
+                "supports": {"skills": False}, "identity_stable": True, "local_embeddings": False,
+            }
+            manifest, path = self.step_manifest(root, tool, options={
+                "embeddings": False, "force": False, "allow_partial": False,
+                "commit": False, "allow_global_writes": True,
+            })
+            with isolated_gitnexus_home(root, registered=False):
+                result = self.run_step(root, path)
+                self.assertEqual([], validator.validate_worker(result, manifest, root))
+                self.assertTrue(common.gitnexus_registry_state(root)["registered"])
+
+            self.assertEqual("skipped", result["status"])
+            self.assertEqual("index-current", result["error"]["code"])
+            self.assertEqual("1", (root / "index-called").read_text(encoding="utf-8"))
+            self.assertFalse((root / "analyze-called").exists())
+            self.assertTrue(any("补注册" in warning for warning in result["warnings"]))
+
+    def test_unregistered_reuse_without_authorization_is_partial(self):
+        """未授权时不写全局注册表，但绝不能把「查不到的索引」记成 success。"""
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            fake = self.fake_runner(root, status="current")
+            (root / ".gitnexus").mkdir()
+            (root / ".gitnexus/meta.json").write_text("{}", encoding="utf-8")
+            tool = {
+                "available": True, "runner": "override", "command": [sys.executable, str(fake)],
+                "supports": {"skills": False}, "identity_stable": True, "local_embeddings": False,
+            }
+            manifest, path = self.step_manifest(root, tool)
+            with isolated_gitnexus_home(root, registered=False):
+                result = self.run_step(root, path)
+                self.assertEqual([], validator.validate_worker(result, manifest, root))
+
+            self.assertEqual("partial", result["status"])
+            self.assertEqual("registry-missing", result["error"]["code"])
+            self.assertEqual(0, result["exit_code"])
+            self.assertFalse(result["registry"]["registered"])
+            self.assertEqual("partial", validator.aggregate_status([result]))
+            self.assertFalse((root / "index-called").exists())
+            self.assertTrue(any("No indexed repositories" in warning for warning in result["warnings"]))
+
+    def test_authorized_registration_that_does_not_land_fails(self):
+        """已授权却仍没注册时必须失败：否则等于把「索引有效但查询全废」记成成功。"""
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            fake = root / "fake-gitnexus.py"
+            fake.write_text(
+                "import json, sys\n"
+                "if sys.argv[1:2] == ['status']:\n"
+                "    print(json.dumps({'status': 'current'}))\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(3)\n",
+                encoding="utf-8",
+            )
+            (root / ".gitnexus").mkdir()
+            (root / ".gitnexus/meta.json").write_text("{}", encoding="utf-8")
+            tool = {
+                "available": True, "runner": "override", "command": [sys.executable, str(fake)],
+                "supports": {"skills": False}, "identity_stable": True, "local_embeddings": False,
+            }
+            manifest, path = self.step_manifest(root, tool, options={
+                "embeddings": False, "force": False, "allow_partial": False,
+                "commit": False, "allow_global_writes": True,
+            })
+            with isolated_gitnexus_home(root, registered=False):
+                result = self.run_step(root, path)
+
+            self.assertEqual("failed", result["status"])
+            self.assertEqual(3, result["exit_code"])
+            self.assertEqual("execution-failed", result["error"]["code"])
+            self.assertFalse(result["registry"]["registered"])
+            self.assertEqual("failed", validator.aggregate_status([result]))
+
+    def test_analyze_declares_writes_and_passes_the_gate(self):
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            fake = self.fake_runner(root, status="stale")
+            tool = {
+                "available": True, "runner": "override", "command": [sys.executable, str(fake)],
+                "supports": {"skills": False}, "identity_stable": True, "local_embeddings": False,
+            }
+            manifest, path = self.step_manifest(root, tool, options={
+                "embeddings": False, "force": False, "allow_partial": False,
+                "commit": False, "allow_global_writes": True,
+            })
+            with isolated_gitnexus_home(root, registered=False):
+                result = self.run_step(root, path)
+                self.assertTrue(common.gitnexus_registry_state(root)["registered"])
+                self.assertEqual([], validator.validate_worker(result, manifest, root))
+
+            self.assertEqual("success", result["status"])
+            self.assertEqual(0, result["exit_code"])
+            self.assertEqual(
+                [{"path": ".gitnexus/meta.json", "validation": "json-valid"}], result["artifacts"]
+            )
+            self.assertTrue(result["changed_files"])
+            for changed in result["changed_files"]:
+                self.assertTrue(
+                    validator.path_allowed(changed, result["allowed_paths"]), changed
+                )
+            # 步骤不得自行推进阶段：推进由 gate 负责。
+            self.assertEqual("prepared", json.loads(path.read_text(encoding="utf-8"))["phase"])
+
+    def test_analyze_argv_mirrors_the_recorded_index_modes(self):
+        manifest = {
+            "tools": {"gitnexus": {"command": ["gitnexus"], "supports": {"skip_skills": True}}},
+            "gitnexus_index": {"present": True, "pdg": True, "embeddings": 5, "branch": "main"},
+            "options": {"embeddings": True, "force": True, "allow_global_writes": False},
+            "gitnexus_skill_mode": "community-only",
+        }
+        argv, warnings = gitnexus_step.analyze_argv(manifest, "preserve")
+        self.assertEqual(["gitnexus", "analyze", "--skills", "--skip-agents-md", "--verbose"], argv[:5])
+        self.assertIn("--pdg", argv)
+        self.assertIn("--embeddings", argv)
+        self.assertIn("--force", argv)
+        self.assertIn("--skip-skills", argv)
+        self.assertTrue(warnings)
+
+        fresh = {"tools": {"gitnexus": {"command": ["gitnexus"], "supports": {}}},
+                 "gitnexus_index": {"present": False, "pdg": None},
+                 "options": {}, "gitnexus_skill_mode": "full"}
+        argv, warnings = gitnexus_step.analyze_argv(fresh, "preserve")
+        # 新索引不得主动引入 --pdg/--embeddings，否则会改变默认模式。
+        for flag in ("--pdg", "--embeddings", "--force", "--drop-embeddings", "--skip-skills"):
+            self.assertNotIn(flag, argv)
+        self.assertEqual([], warnings)
+
+    def test_drop_embeddings_mode_is_declared(self):
+        manifest = {
+            "tools": {"gitnexus": {"command": ["gitnexus"], "supports": {}}},
+            "gitnexus_index": {"present": True, "pdg": False, "embeddings": 9},
+            "options": {}, "gitnexus_skill_mode": "full",
+        }
+        argv, warnings = gitnexus_step.analyze_argv(manifest, "drop")
+        self.assertIn("--drop-embeddings", argv)
+        self.assertTrue(any("drop-embeddings" in warning for warning in warnings))
 
 
 class WorkerContractTests(unittest.TestCase):
@@ -512,14 +1254,28 @@ class WorkerContractTests(unittest.TestCase):
     def test_old_gitnexus_help_is_detected_without_assuming_flags(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            runner = root / "gitnexus-old"
-            runner.write_text(
-                "#!/bin/sh\n"
-                "if [ \"$1\" = \"--version\" ]; then echo 'gitnexus 1.0'; exit 0; fi\n"
-                "echo 'usage: gitnexus analyze --skills'\n",
-                encoding="utf-8",
-            )
-            runner.chmod(0o755)
+            if os.name == "nt":
+                # CreateProcess cannot exec an extension-less POSIX script.
+                runner = root / "gitnexus-old.cmd"
+                runner.write_text(
+                    "@echo off\r\n"
+                    'if "%~1"=="--version" goto version\r\n'
+                    "echo usage: gitnexus analyze --skills\r\n"
+                    "exit /b 0\r\n"
+                    ":version\r\n"
+                    "echo gitnexus 1.0\r\n"
+                    "exit /b 0\r\n",
+                    encoding="utf-8",
+                )
+            else:
+                runner = root / "gitnexus-old"
+                runner.write_text(
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = \"--version\" ]; then echo 'gitnexus 1.0'; exit 0; fi\n"
+                    "echo 'usage: gitnexus analyze --skills'\n",
+                    encoding="utf-8",
+                )
+                runner.chmod(0o755)
             capability = prepare.probe([str(runner)], root)
             self.assertFalse(capability["supports"]["skip_agents_md"])
             self.assertFalse(capability["supports"]["index_only"])
@@ -647,7 +1403,10 @@ class RepositoryBoundaryTests(unittest.TestCase):
             root.mkdir()
             outside.mkdir()
             subprocess.run(["git", "init", "-q", str(root)], check=True)
-            os.symlink(outside, root / ".standard", target_is_directory=True)
+            try:
+                os.symlink(outside, root / ".standard", target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
             with self.assertRaises(prepare.PrepareError):
                 prepare.main(["--root", str(root), "--language", "python", "--run-id", "escape"])
             self.assertEqual([], list(outside.rglob("*.md")))
@@ -660,7 +1419,10 @@ class RepositoryBoundaryTests(unittest.TestCase):
             (root / ".standard/02-stack").mkdir(parents=True)
             outside.mkdir()
             (outside / "rule.md").write_text("external\n", encoding="utf-8")
-            os.symlink(outside, root / ".standard/02-stack/evil", target_is_directory=True)
+            try:
+                os.symlink(outside, root / ".standard/02-stack/evil", target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             with self.assertRaises(prepare.PrepareError):
                 prepare.main(["--root", str(root), "--language", "python", "--run-id", "escape"])
@@ -721,12 +1483,13 @@ class EndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             subprocess.run(["git", "init", "-q", str(root)], check=True)
-            with redirect_stdout(StringIO()):
+            with isolated_gitnexus_home(root), redirect_stdout(StringIO()):
                 self.assertEqual(0, controller.main([
                     "start", "--root", str(root), "--language", "python", "--run-id", "repairable"
                 ]))
             manifest_path = root / ".codekit/initialize/repairable/run-manifest.json"
-            self.assertEqual(0o600, stat.S_IMODE(manifest_path.stat().st_mode))
+            if POSIX_MODES:
+                self.assertEqual(0o600, stat.S_IMODE(manifest_path.stat().st_mode))
             outside_result = root.parent / "repairable-result.json"
             outside_result.write_text("{}", encoding="utf-8")
             with redirect_stderr(StringIO()) as error_output:
@@ -742,7 +1505,8 @@ class EndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             subprocess.run(["git", "init", "-q", str(root)], check=True)
-            with redirect_stdout(StringIO()):
+            # Phase 0 需要 GitNexus 注册前提的明确取舍；该用例只验证锁的释放。
+            with isolated_gitnexus_home(root), redirect_stdout(StringIO()):
                 self.assertEqual(0, controller.main([
                     "start", "--root", str(root), "--language", "python", "--run-id", "test-run"
                 ]))
@@ -766,7 +1530,7 @@ class EndToEndTests(unittest.TestCase):
             self.assertFalse((git_dir / "codekit-initialize.lock").exists())
 
     def test_controller_runs_complete_first_build_and_is_idempotent(self):
-        with git_scratch_directory() as directory:
+        with git_scratch_directory() as directory, isolated_gitnexus_home(Path(directory)):
             root = Path(directory)
             git_repository(root)
             (root / "README.md").write_text("fixture\n", encoding="utf-8")
@@ -822,7 +1586,7 @@ class EndToEndTests(unittest.TestCase):
                 "structure": [{"path": "README.md", "description": "Fixture documentation"}],
                 "commands": [{
                     "purpose": "Check",
-                    "command": "python3 -c pass",
+                    "command": f"{VALIDATION_PYTHON} -c pass",
                     "evidence": "missing.py",
                     "required_for_initialize": True,
                 }],
@@ -883,8 +1647,17 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(0, finish_code, finish_output.getvalue())
             self.assertFalse((git_dir / "codekit-initialize.lock").exists())
             self.assertFalse((root / ".codekit").exists())
-            self.assertIn("user agents", (root / "AGENTS.md").read_text(encoding="utf-8"))
-            self.assertIn("codekit:initialize:project-context:start", (root / "AGENTS.md").read_text(encoding="utf-8"))
+            agents_text = (root / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("user agents", agents_text)
+            self.assertIn("codekit:initialize:project-context:start", agents_text)
+            # 仓库级回复语言锚点：目标仓库里只用 @skill 触发、本轮没有自然语言时，
+            # 这是唯一会被加载的语言信号。
+            self.assertIn("回复语言", agents_text)
+            self.assertIn("回复语言", (root / "CLAUDE.md").read_text(encoding="utf-8"))
+            self.assertIn(
+                "回复语言",
+                (root / ".standard/01-global/00-instructions.md").read_text(encoding="utf-8"),
+            )
 
             managed_before = {
                 path.relative_to(root).as_posix(): path.read_bytes()
@@ -939,7 +1712,7 @@ class EndToEndTests(unittest.TestCase):
                 "structure": [{"path": "README.md", "description": "Fixture documentation"}],
                 "commands": [{
                     "purpose": "Check",
-                    "command": "python3 -c pass",
+                    "command": f"{VALIDATION_PYTHON} -c pass",
                     "evidence": "README.md",
                     "required_for_initialize": True,
                 }],
@@ -960,6 +1733,75 @@ class EndToEndTests(unittest.TestCase):
                 if path.is_file() and ".git" not in path.parts
             }
             self.assertEqual(managed_before, managed_after)
+
+
+class RepeatInitializeTests(unittest.TestCase):
+    """同一仓库重复 initialize：遗留锁可回收，仍可能活跃的 run 不被抢占。"""
+
+    def held_lock(self, root: Path, run_id: str, manifest: dict) -> tuple[Path, Path]:
+        manifest_path = root / ".codekit" / "initialize" / run_id / "run-manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        lock_path = root / ".codekit" / "initialize.lock"
+        lock_path.write_text(json.dumps({
+            "schema_version": 1,
+            "run_id": run_id,
+            "root": str(root),
+            "manifest": str(manifest_path),
+            "created_at": "2026-09-08T00:00:00Z",
+        }), encoding="utf-8")
+        return manifest_path, lock_path
+
+    def start(self, root: Path, run_id: str) -> int:
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            return controller.main([
+                "start", "--root", str(root), "--language", "python", "--run-id", run_id
+            ])
+
+    def test_leftover_lock_from_a_terminal_run_is_reclaimed(self):
+        with git_scratch_directory() as directory, isolated_gitnexus_home(Path(directory)):
+            root = Path(directory)
+            git_repository(root)
+            _, lock_path = self.held_lock(
+                root, "stale", {"phase": "aborted", "started_at": "2026-09-08T00:00:00Z"}
+            )
+            self.assertEqual(0, self.start(root, "repeat"))
+            self.assertEqual("repeat", json.loads(lock_path.read_text(encoding="utf-8"))["run_id"])
+            manifest = json.loads(
+                (root / ".codekit/initialize/repeat/run-manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(
+                any("reclaimed the stale initialize lock" in warning for warning in manifest["warnings"]),
+                manifest["warnings"],
+            )
+            # 回收只针对锁本身，遗留 run 的目录仍是失败证据。
+            self.assertTrue((root / ".codekit/initialize/stale").is_dir())
+
+    def test_unreadable_lock_is_reclaimed(self):
+        with git_scratch_directory() as directory, isolated_gitnexus_home(Path(directory)):
+            root = Path(directory)
+            git_repository(root)
+            (root / ".codekit").mkdir()
+            lock_path = root / ".codekit" / "initialize.lock"
+            lock_path.write_text("not json", encoding="utf-8")
+            self.assertEqual(0, self.start(root, "repeat"))
+            self.assertEqual("repeat", json.loads(lock_path.read_text(encoding="utf-8"))["run_id"])
+
+    def test_possibly_live_lock_stops_with_the_reclaim_command(self):
+        with git_scratch_directory() as directory, isolated_gitnexus_home(Path(directory)):
+            root = Path(directory)
+            git_repository(root)
+            manifest_path, lock_path = self.held_lock(
+                root, "live", {"phase": "prepared", "started_at": "2026-09-08T00:00:00Z"}
+            )
+            with self.assertRaises(prepare.PrepareError) as caught:
+                self.start(root, "intruder")
+            message = str(caught.exception)
+            self.assertIn("may still be active", message)
+            self.assertIn("abort --manifest", message)
+            self.assertIn(str(manifest_path), message)
+            self.assertEqual("live", json.loads(lock_path.read_text(encoding="utf-8"))["run_id"])
+            self.assertFalse((root / ".codekit/initialize/intruder").exists())
 
 
 class IgnoredScopeTests(unittest.TestCase):
@@ -1028,6 +1870,112 @@ class IgnoredScopeTests(unittest.TestCase):
         self.assertEqual(set(), validator.changed_since_baseline(self.manifest, self.root))
 
 
+class BaselineVisibilityTests(unittest.TestCase):
+    """Phase 0 rewriting its own ignore file must not look like a foreign write."""
+
+    def test_prepare_rewrite_keeps_mirror_visibility_unchanged(self):
+        """An older run's concrete per-skill entries must not create a false write.
+
+        The pre-run block carries concrete ``gitnexus-*`` entries instead of the
+        mirror glob, so the mirrors are ignored at baseline.  Rewriting the block
+        down to the canonical list must not un-ignore them; when it did, the
+        barrier reported every mirror file as an unreported change while all
+        three workers had done nothing to them.  ``prepare.py`` re-stripped those
+        entries on every run, so the failure returned every other run.
+        """
+        directory = git_scratch_directory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        git_repository(root)
+        (root / "README.md").write_text("fixture\n", encoding="utf-8")
+        mirrors = {
+            ".agents/skills/gitnexus-area-action/SKILL.md": ".agents/skills/gitnexus-area-action/",
+            ".claude/skills/gitnexus-cli/SKILL.md": ".claude/skills/gitnexus-cli/",
+        }
+        for relative in mirrors:
+            path = root / relative
+            path.parent.mkdir(parents=True)
+            path.write_text("generated\n", encoding="utf-8")
+        (root / ".gitignore").write_text(
+            "# codekit:initialize:ignore:start\n"
+            + "".join(f"{entry}\n" for entry in (
+                ".codekit/", ".gitnexus/", "graphify-out/", ".graphifyignore",
+                *mirrors.values(),
+            ))
+            + "# codekit:initialize:ignore:end\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(root), "add", ".gitignore"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-qm", "base"], check=True)
+
+        with isolated_gitnexus_home(root), redirect_stdout(StringIO()):
+            self.assertEqual(0, prepare.main([
+                "--root", str(root), "--language", "python", "--run-id", "converge",
+            ]))
+        manifest = json.loads(
+            (root / ".codekit/initialize/converge/run-manifest.json").read_text(encoding="utf-8")
+        )
+        # The frozen block keeps the mirrors ignored, so nothing becomes visible.
+        delta = manifest["controller_visibility_delta"]
+        for relative in mirrors:
+            self.assertNotIn(relative, delta)
+        for relative in mirrors:
+            self.assertTrue(validator.ignored_by_git(root, relative))
+        block = (root / ".gitignore").read_text(encoding="utf-8")
+        for stale_entry in mirrors.values():
+            self.assertNotIn(stale_entry, block)
+        # A tracked file Phase 0 really wrote stays a change, so ``--commit``
+        # still picks up the rewritten managed block.
+        self.assertIn(".gitignore", validator.changed_since_baseline(manifest, root))
+        self.assertEqual(
+            set(),
+            validator.uncovered_paths(
+                validator.changed_since_baseline(manifest, root),
+                set(manifest["prepared_changed_files"]),
+            ),
+        )
+
+    def test_controller_visibility_delta_is_not_reported_as_a_change(self):
+        """Only the paths Phase 0 un-ignored are excused; other writes still trip."""
+        directory = git_scratch_directory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        git_repository(root)
+        (root / "controller-unignored.txt").write_text("x\n", encoding="utf-8")
+        (root / "stray.txt").write_text("x\n", encoding="utf-8")
+        manifest = analyze_manifest(root)
+        self.assertEqual(
+            {"controller-unignored.txt", "stray.txt"},
+            validator.changed_since_baseline(manifest, root),
+        )
+        manifest["controller_visibility_delta"] = ["controller-unignored.txt"]
+        self.assertEqual(
+            {"stray.txt"},
+            validator.changed_since_baseline(manifest, root),
+        )
+
+    def test_directory_declaration_covers_the_files_git_reports(self):
+        """A declared directory covers its descendants, never a sibling prefix."""
+        self.assertEqual(
+            set(),
+            validator.uncovered_paths(
+                {".agents/skills/gitnexus-area-action/SKILL.md"},
+                {".agents/skills/gitnexus-area-action"},
+            ),
+        )
+        self.assertEqual(
+            {".agents/skills/gitnexus-area-action-old/SKILL.md"},
+            validator.uncovered_paths(
+                {".agents/skills/gitnexus-area-action-old/SKILL.md"},
+                {".agents/skills/gitnexus-area-action"},
+            ),
+        )
+        self.assertEqual(
+            {".gitnexus/meta.json.bak"},
+            validator.uncovered_paths({".gitnexus/meta.json.bak"}, {".gitnexus/meta.json"}),
+        )
+
+
 class WorkerPathClaimTests(unittest.TestCase):
     """Malformed Worker path claims are contract errors, not gate crashes."""
 
@@ -1056,20 +2004,35 @@ class WorkerPathClaimTests(unittest.TestCase):
         self.assertTrue(any("unsafe repository-relative path" in message for message in errors))
 
 
-@unittest.skipIf(shutil.which("python3") is None, "python3 is an allowed validation program")
+@unittest.skipUnless(
+    validation_python_runs(), f"{VALIDATION_PYTHON} must run as an allowed validation program"
+)
 class ValidationExecutionTests(unittest.TestCase):
     """Commit evidence must come from commands the controller executed itself."""
+
+    def test_controller_produced_gitnexus_result_drives_the_whole_flow(self):
+        # gitnexus 不再由 subagent 产出后，控制器写的 result 必须仍能通过
+        # gate/reconcile/finish，并且按 index-current 记为完整复用。
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            code, report = drive_initialize_flow(
+                root, scan_context(root, []), gitnexus_via_step=True,
+            )
+            self.assertEqual(0, code, report["errors"])
+            self.assertEqual("success", report["status"])
 
     def test_controller_executes_required_validations(self):
         with git_scratch_directory() as directory:
             root = Path(directory)
             code, report = drive_initialize_flow(root, scan_context(root, [
-                {"purpose": "Check", "command": "python3 check_ok.py",
+                {"purpose": "Check", "command": f"{VALIDATION_PYTHON} check_ok.py",
                  "evidence": "check_ok.py", "required_for_initialize": True},
             ]))
             self.assertEqual(0, code, report["errors"])
             self.assertEqual("executed", report["validation_source"])
-            self.assertEqual("python3 check_ok.py", report["validations"][0]["command"])
+            self.assertEqual(
+                f"{VALIDATION_PYTHON} check_ok.py", report["validations"][0]["command"]
+            )
             self.assertEqual(0, report["validations"][0]["exit_code"])
             self.assertEqual(1, commit_count(root))
 
@@ -1077,11 +2040,13 @@ class ValidationExecutionTests(unittest.TestCase):
         with git_scratch_directory() as directory:
             root = Path(directory)
             code, report = drive_initialize_flow(root, scan_context(root, [
-                {"purpose": "Check", "command": "python3 check_ok.py",
+                {"purpose": "Check", "command": f"{VALIDATION_PYTHON} check_ok.py",
                  "evidence": "check_ok.py", "required_for_initialize": True},
             ]), commit=True)
             self.assertEqual(0, code, report["errors"])
             self.assertEqual("committed", report["commit_status"])
+            self.assertTrue(report["restart_required"])
+            self.assertIn("需要重启 Agent 应用以生效", report["restart_notice"])
             self.assertEqual(2, commit_count(root))
             committed = subprocess.run(
                 ["git", "-C", str(root), "show", "--pretty=format:", "--name-only", "HEAD"],
@@ -1094,12 +2059,16 @@ class ValidationExecutionTests(unittest.TestCase):
         with git_scratch_directory() as directory:
             root = Path(directory)
             code, report = drive_initialize_flow(root, scan_context(root, [
-                {"purpose": "Check", "command": "python3 check_bad.py",
+                {"purpose": "Check", "command": f"{VALIDATION_PYTHON} check_bad.py",
                  "evidence": "check_bad.py", "required_for_initialize": True},
             ]), commit=True)
             self.assertEqual(1, code)
-            self.assertIn("repository validation failed: python3 check_bad.py", report["errors"])
+            self.assertIn(
+                f"repository validation failed: {VALIDATION_PYTHON} check_bad.py", report["errors"]
+            )
             self.assertFalse(report["commit_allowed"])
+            self.assertFalse(report["restart_required"])
+            self.assertIsNone(report["restart_notice"])
             self.assertEqual(1, commit_count(root))
             manifest = json.loads(
                 (root / ".codekit/initialize/flow/run-manifest.json").read_text(encoding="utf-8")
@@ -1159,10 +2128,102 @@ class ValidationExecutionTests(unittest.TestCase):
                     with self.assertRaisesRegex(validator.ValidationError, expectation):
                         validator.resolve_validation_command(root, command)
 
+    def test_uninstalled_allow_listed_program_raises_a_dedicated_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(common.shutil, "which", lambda program: None):
+                with self.assertRaises(validator.ValidationProgramMissing):
+                    validator.resolve_validation_command(root, "gradle build")
+
+    def test_windows_python_launcher_is_allow_listed(self):
+        # Windows 只能用 `py -3`（干净 Windows 的 python3 是商店别名桩）；POSIX 上
+        # 通常不存在 py，会走 skipped 而不是被拒。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def which(program: str) -> str | None:
+                return r"C:\Windows\py.exe" if program == "py" else None
+
+            with patch.object(common.shutil, "which", which):
+                self.assertEqual(
+                    [r"C:\Windows\py.exe", "-3", "-m", "pytest"],
+                    validator.resolve_validation_command(root, "py -3 -m pytest"),
+                )
+                with self.assertRaises(validator.ValidationProgramMissing):
+                    validator.resolve_validation_command(root, "python3 -m pytest")
+
+    def test_flow_skips_uninstalled_allow_listed_validation_and_blocks_commit(self):
+        # 白名单内但本机未安装（Java 仓库的 gradle/mvn 常见）不得让已完成的运行失败。
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            real_which = shutil.which
+            with patch.object(
+                common.shutil, "which",
+                lambda program: None if program == "gradle" else real_which(program),
+            ):
+                code, report = drive_initialize_flow(root, scan_context(root, [
+                    {"purpose": "Check", "command": "gradle build",
+                     "evidence": "README.md", "required_for_initialize": True},
+                ]), commit=True)
+            self.assertEqual(0, code, report["errors"])
+            self.assertEqual("partial", report["status"])
+            self.assertEqual("skipped", report["validations"][0]["status"])
+            self.assertEqual("tool-missing", report["validations"][0]["reason"])
+            self.assertTrue(report["validation_warnings"])
+            self.assertFalse(report["commit_allowed"])
+            self.assertEqual("blocked-skipped-validations", report["commit_status"])
+            self.assertTrue(report["restart_required"])
+            self.assertEqual(1, commit_count(root))
+
+    def test_flow_rejects_non_allow_listed_required_command_before_writing(self):
+        # Scanner 可能把宿主工具当成仓库验证命令（例如它自己跑过的 git status）。
+        # 这类命令必须在写任何托管文件之前以可恢复契约错误被拒绝，并在修复
+        # context 后允许重试同一个 run。
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            context = scan_context(root, [{
+                "purpose": "Check", "command": "git status --porcelain",
+                "evidence": "README.md", "required_for_initialize": True,
+            }])
+            code, payload = drive_initialize_flow(
+                root, context, run_id="allow-list", expect_reconcile_error=True,
+            )
+            self.assertEqual(2, code)
+            self.assertEqual("input-error", payload["status"])
+            self.assertTrue(payload["recoverable"])
+            self.assertEqual("held", payload["lock"])
+            self.assertIn("not allowed: git", payload["message"])
+            self.assertEqual("user agents\n", (root / "AGENTS.md").read_text(encoding="utf-8"))
+            self.assertEqual("user claude\n", (root / "CLAUDE.md").read_text(encoding="utf-8"))
+            run_dir = root / ".codekit" / "initialize" / "allow-list"
+            manifest_path = run_dir / "run-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual("gated", manifest["phase"])
+            self.assertNotIn("validation_commands", manifest)
+
+            context["commands"][0]["command"] = f"{VALIDATION_PYTHON} check_ok.py"
+            context["commands"][0]["evidence"] = "check_ok.py"
+            (run_dir / "context.json").write_text(json.dumps(context), encoding="utf-8")
+            with redirect_stdout(StringIO()):
+                self.assertEqual(0, controller.main([
+                    "reconcile", "--manifest", str(manifest_path),
+                    "--context", str(run_dir / "context.json"),
+                    *[part for name in ("gitnexus", "graphify", "context-scanner")
+                      for part in ("--worker-result", str(run_dir / f"{name}.json"))],
+                ]))
+                output = StringIO()
+                with redirect_stdout(output):
+                    code = controller.main(["finish", "--manifest", str(manifest_path)])
+            report = json.loads(output.getvalue())
+            self.assertEqual(0, code, report["errors"])
+            self.assertEqual("success", report["status"])
+            self.assertEqual("executed", report["validation_source"])
+
 
 class AtomicWriteModeTests(unittest.TestCase):
     """Managed files must not silently lose their permission bits."""
 
+    @unittest.skipUnless(POSIX_MODES, POSIX_MODE_REASON)
     def test_existing_mode_is_preserved_and_new_files_are_readable(self):
         for module in (prepare, reconcile, validator):
             with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as directory:
@@ -1217,6 +2278,46 @@ class ContextContractTests(unittest.TestCase):
         ])
         with self.assertRaisesRegex(reconcile.ContextContractError, "evidence"):
             reconcile.validate_context(context, self.root)
+
+    def test_required_command_outside_the_allow_list_is_rejected(self):
+        context = scan_context(self.root, [{
+            "purpose": "Check", "command": "git status --porcelain",
+            "evidence": "README.md", "required_for_initialize": True,
+        }])
+        with self.assertRaisesRegex(reconcile.ContextContractError, "not allowed: git"):
+            reconcile.validate_context(context, self.root)
+
+    def test_required_command_with_uninstalled_program_is_tolerated(self):
+        # 白名单内但未安装由 finish 记为 skipped，不是契约错误。
+        context = scan_context(self.root, [{
+            "purpose": "Check", "command": "gradle build",
+            "evidence": "README.md", "required_for_initialize": True,
+        }])
+        with patch.object(common.shutil, "which", lambda program: None):
+            reconcile.validate_context(context, self.root)
+
+    def test_documented_allow_list_matches_the_controller(self):
+        text = (SKILL_DIR / "references" / "context-files.md").read_text(encoding="utf-8")
+        parts = text.split("```")
+        documented: set[str] | None = None
+        for index in range(1, len(parts), 2):
+            block = parts[index]
+            if "VALIDATION_PROGRAMS" not in block:
+                continue
+            # ``split("```")`` keeps the info string joined to the first content line.
+            lines = block.splitlines()[1:]
+            documented = {
+                line.strip() for line in lines
+                if line.strip() and not line.strip().startswith("#")
+            }
+            break
+        self.assertIsNotNone(
+            documented, "context-files.md must publish the validation allow-list"
+        )
+        self.assertEqual(set(common.VALIDATION_PROGRAMS), documented)
+        scanner = (SKILL_DIR / "agents" / "initialize-context-scanner.md").read_text(encoding="utf-8")
+        self.assertIn("VALIDATION_PROGRAMS", scanner)
+        self.assertIn("context-files.md", scanner)
 
     def test_single_string_evidence_is_accepted(self):
         context = scan_context(self.root, [

@@ -4,21 +4,33 @@
 The shell writes a tab-separated component manifest and this program owns all
 terminal rendering and key handling.  The final selection is emitted as a
 single machine-readable line on stdout; the UI itself is written to /dev/tty.
+
+Rendering is platform-independent and stays available everywhere (`--render`);
+only the interactive mode needs POSIX terminal control, so `termios`/`tty` are
+imported defensively instead of crashing the module on Windows.
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import shutil
 import signal
 import sys
-import termios
-import tty
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, List, Optional, Tuple
+
+try:  # POSIX-only; only the interactive mode needs these.
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - Windows
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
+
+import installer_platform as platform_layer  # noqa: E402
 
 
 ESC = "\033["
@@ -27,6 +39,23 @@ BOLD = f"{ESC}1m"
 GREEN = f"{ESC}0;32m"
 RED = f"{ESC}0;31m"
 CYAN = f"{ESC}0;36m"
+
+# 进入/退出备用屏幕并隐藏/恢复光标；两个平台的后端共用同一组序列。
+ENTER_ALT_SCREEN = f"{ESC}?1049h{ESC}?25l"
+LEAVE_ALT_SCREEN = f"{ESC}?25h{ESC}?1049l"
+
+# 单字符按键到逻辑事件的映射；两个后端归一化到同一组事件，状态机因此共用。
+KEY_ALIASES = {
+    " ": "toggle",
+    "a": "all",
+    "A": "all",
+    "n": "none",
+    "N": "none",
+    "p": "path",
+    "P": "path",
+    "q": "quit",
+    "Q": "quit",
+}
 
 
 @dataclass
@@ -168,7 +197,7 @@ def render(
 
 
 def read_key(stream: BinaryIO) -> str:
-    """读取一个终端按键，并将 ANSI 方向键和控制键归一化为逻辑事件。"""
+    """读取一个 POSIX 终端按键，并将 ANSI 方向键和控制键归一化为逻辑事件。"""
     first = stream.read(1)
     if first == b"":
         raise EOFError
@@ -182,88 +211,233 @@ def read_key(stream: BinaryIO) -> str:
             third = stream.read(1)
             return {b"A": "up", b"B": "down"}.get(third, "other")
         return "other"
-    return {
-        b" ": "toggle",
-        b"a": "all",
-        b"A": "all",
-        b"n": "none",
-        b"N": "none",
-        b"p": "path",
-        b"P": "path",
-        b"q": "quit",
-        b"Q": "quit",
-    }.get(first, "other")
+    return KEY_ALIASES.get(first.decode("ascii", "replace"), "other")
+
+
+class TerminalBackend:
+    """选择器需要的终端能力：写画面、读按键、问尺寸、声明可注册的信号。"""
+
+    def open(self) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+    def write(self, text: str) -> None:
+        raise NotImplementedError
+
+    def read_key(self) -> str:
+        raise NotImplementedError
+
+    def size(self) -> Tuple[int, int]:
+        raise NotImplementedError
+
+    def signals(self) -> Tuple[int, ...]:
+        raise NotImplementedError
+
+
+class PosixTerminal(TerminalBackend):
+    """POSIX 后端：直接打开 /dev/tty，用 termios 进 raw 模式。"""
+
+    def open(self) -> None:
+        self._fd = os.open("/dev/tty", os.O_RDWR)
+        self._stream = os.fdopen(self._fd, "r+b", buffering=0)
+        self._saved_attrs = termios.tcgetattr(self._fd)
+        tty.setraw(self._fd)
+        self.write(ENTER_ALT_SCREEN)
+
+    def close(self) -> None:
+        try:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved_attrs)
+            self.write(LEAVE_ALT_SCREEN)
+        finally:
+            self._stream.close()
+
+    def write(self, text: str) -> None:
+        self._stream.write(text.encode())
+        self._stream.flush()
+
+    def read_key(self) -> str:
+        return read_key(self._stream)
+
+    def size(self) -> Tuple[int, int]:
+        try:
+            size = os.get_terminal_size(self._fd)
+            return size.columns, size.lines
+        except OSError:
+            fallback = shutil.get_terminal_size(fallback=(80, 40))
+            return fallback.columns, fallback.lines
+
+    def signals(self) -> Tuple[int, ...]:
+        return (signal.SIGTERM, signal.SIGHUP)
+
+
+class WindowsConsole(TerminalBackend):
+    """Windows 后端：CONOUT$ 写画面 + msvcrt 取键，并显式开启 ANSI 转义。
+
+    Windows 没有 /dev/tty，但 ``CONOUT$`` 与它等价：始终指向真实控制台，因此画面
+    不会被调用方的管道吞掉，stdout 仍然只留给机器可读的结果行。PowerShell/cmd
+    默认不解释 ANSI 转义，必须自己开 ENABLE_VIRTUAL_TERMINAL_PROCESSING。
+    """
+
+    ENABLE_PROCESSED_OUTPUT = 0x0001
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+    ENABLE_WRAP_AT_EOL_OUTPUT = 0x0008
+
+    def open(self) -> None:
+        import msvcrt
+
+        self._msvcrt = msvcrt
+        self._stream = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._handle = ctypes.c_void_p(msvcrt.get_osfhandle(self._stream.fileno()))
+        self._saved_mode = self._enable_virtual_terminal()
+        self.write(ENTER_ALT_SCREEN)
+
+    def _enable_virtual_terminal(self) -> Optional[int]:
+        """开启 ANSI 转义解释并返回原模式；系统不支持时返回 None。"""
+        try:
+            mode = ctypes.c_uint()
+            if not self._kernel32.GetConsoleMode(self._handle, ctypes.byref(mode)):
+                return None
+            original = mode.value
+            wanted = (
+                original
+                | self.ENABLE_PROCESSED_OUTPUT
+                | self.ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                | self.ENABLE_WRAP_AT_EOL_OUTPUT
+            )
+            if not self._kernel32.SetConsoleMode(self._handle, wanted):
+                return None
+        except (AttributeError, OSError, ValueError):
+            return None
+        return original
+
+    def close(self) -> None:
+        try:
+            self.write(LEAVE_ALT_SCREEN)
+            if self._saved_mode is not None and self._handle is not None:
+                self._kernel32.SetConsoleMode(self._handle, self._saved_mode)
+        finally:
+            self._stream.close()
+
+    def write(self, text: str) -> None:
+        """经 WriteConsoleW 写宽字符。
+
+        不能用 ``open("CONOUT$", "w", encoding="utf-8")`` 直接写：那样是往控制台
+        句柄送 UTF-8 字节，而控制台按自身代码页（中文系统是 GBK）解释，中文会变
+        乱码。WriteConsoleW 走 Unicode 通道，同时 ANSI 转义仍会被 VT 解析。
+        """
+        if self._handle is not None:
+            written = ctypes.c_ulong()
+            buffer = ctypes.create_unicode_buffer(text)
+            if self._kernel32.WriteConsoleW(
+                self._handle, buffer, len(text), ctypes.byref(written), None
+            ):
+                return
+        # 没有可用控制台句柄时退回普通文本流。
+        self._stream.write(text)
+        self._stream.flush()
+
+    def read_key(self) -> str:
+        """读取一个按键；方向键在 Windows 上是前导字节 + 扫描码两字节。"""
+        char = self._msvcrt.getwch()
+        if char == "\x03":
+            raise KeyboardInterrupt
+        if char in ("\x00", "\xe0"):
+            return {"H": "up", "P": "down"}.get(self._msvcrt.getwch(), "other")
+        if char in ("\r", "\n"):
+            return "confirm"
+        return KEY_ALIASES.get(char, "other")
+
+    def size(self) -> Tuple[int, int]:
+        fallback = shutil.get_terminal_size(fallback=(80, 40))
+        return fallback.columns, fallback.lines
+
+    def signals(self) -> Tuple[int, ...]:
+        names = ["SIGTERM"]
+        if hasattr(signal, "SIGBREAK"):
+            names.append("SIGBREAK")
+        return tuple(getattr(signal, name) for name in names)
+
+
+def open_backend() -> Optional[TerminalBackend]:
+    """打开当前平台可用的终端后端；没有可用终端时返回 None。"""
+    if termios is not None and tty is not None and os.path.exists("/dev/tty"):
+        candidates: List[TerminalBackend] = [PosixTerminal()]
+    elif platform_layer.is_windows():
+        candidates = [WindowsConsole()]
+    else:
+        candidates = []
+    for backend in candidates:
+        try:
+            backend.open()
+        except OSError:
+            continue
+        return backend
+    return None
 
 
 def interactive_select(
-    components: List[Component], mode: str, path_selected: bool, shell_config: str
+    components: List[Component],
+    mode: str,
+    path_selected: bool,
+    shell_config: str,
+    backend: TerminalBackend,
 ) -> Optional[Tuple[List[int], bool]]:
-    """在备用屏幕和 raw 模式下循环处理选择，退出前恢复终端和信号处理器。"""
-    tty_fd = os.open("/dev/tty", os.O_RDWR)
-    with os.fdopen(tty_fd, "r+b", buffering=0) as terminal:
-        descriptor = terminal.fileno()
-        original = termios.tcgetattr(descriptor)
-        previous_handlers = {
-            sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP)
-        }
+    """在备用屏幕上循环处理选择，退出前恢复信号处理器。
 
-        def interrupt(_signum, _frame) -> None:
-            """把终止信号转换为统一的 KeyboardInterrupt 清理路径。"""
-            raise KeyboardInterrupt
+    终端本身的进入/退出由后端负责（见 ``open_backend``/``close``），这里只跑键盘
+    状态机，因此同一份渲染与交互逻辑在 POSIX 与 Windows 上完全共用。
+    """
+    previous_handlers = {sig: signal.getsignal(sig) for sig in backend.signals()}
 
-        cursor = 1
-        try:
-            for sig in previous_handlers:
-                signal.signal(sig, interrupt)
-            tty.setraw(descriptor)
-            terminal.write(f"{ESC}?1049h{ESC}?25l".encode())
-            terminal.flush()
-            while True:
-                try:
-                    height = os.get_terminal_size(descriptor).lines
-                except OSError:
-                    height = shutil.get_terminal_size(fallback=(80, 40)).lines
-                frame = render(
-                    components,
-                    mode,
-                    cursor,
+    def interrupt(_signum, _frame) -> None:
+        """把终止信号转换为统一的 KeyboardInterrupt 清理路径。"""
+        raise KeyboardInterrupt
+
+    cursor = 1
+    try:
+        for sig in previous_handlers:
+            signal.signal(sig, interrupt)
+        while True:
+            _columns, height = backend.size()
+            frame = render(
+                components,
+                mode,
+                cursor,
+                path_selected,
+                shell_config,
+                show_banner=height >= 31,
+            )
+            # raw 模式与备用屏幕下没有 ONLCR 转换；必须显式回车，否则只有 LF 会
+            # 导致光标下移但不回到行首，后续每一行都会逐步向右漂移。
+            backend.write(f"{ESC}2J{ESC}H" + frame.replace("\n", "\r\n") + "\r\n")
+            key = backend.read_key()
+            if key == "up":
+                cursor = max(1, cursor - 1)
+            elif key == "down":
+                cursor = min(len(components), cursor + 1)
+            elif key == "toggle":
+                components[cursor - 1].selected = not components[cursor - 1].selected
+            elif key == "all":
+                for component in components:
+                    component.selected = True
+            elif key == "none":
+                for component in components:
+                    component.selected = False
+            elif key == "path" and mode == "install":
+                path_selected = not path_selected
+            elif key == "confirm":
+                return (
+                    [component.index for component in components if component.selected],
                     path_selected,
-                    shell_config,
-                    show_banner=height >= 31,
                 )
-                # tty.setraw() 关闭了输出的 ONLCR 转换；必须显式回车，否则只有 LF
-                # 会导致光标下移但不回到行首，后续每一行都会逐步向右漂移。
-                frame_with_crlf = frame.replace("\n", "\r\n")
-                terminal.write(f"{ESC}2J{ESC}H{frame_with_crlf}\r\n".encode())
-                terminal.flush()
-                key = read_key(terminal)
-                if key == "up":
-                    cursor = max(1, cursor - 1)
-                elif key == "down":
-                    cursor = min(len(components), cursor + 1)
-                elif key == "toggle":
-                    components[cursor - 1].selected = not components[cursor - 1].selected
-                elif key == "all":
-                    for component in components:
-                        component.selected = True
-                elif key == "none":
-                    for component in components:
-                        component.selected = False
-                elif key == "path" and mode == "install":
-                    path_selected = not path_selected
-                elif key == "confirm":
-                    return (
-                        [component.index for component in components if component.selected],
-                        path_selected,
-                    )
-                elif key == "quit":
-                    return None
-        finally:
-            termios.tcsetattr(descriptor, termios.TCSADRAIN, original)
-            terminal.write(f"{ESC}?25h{ESC}?1049l".encode())
-            terminal.flush()
-            for sig, handler in previous_handlers.items():
-                signal.signal(sig, handler)
+            elif key == "quit":
+                return None
+    finally:
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
 
 
 def parse_args() -> argparse.Namespace:
@@ -283,6 +457,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     """加载清单并执行单帧渲染或交互选择，输出机器可读的选择结果。"""
+    # 渲染帧含 `▶`/`╔` 等字符，Windows 默认的 ANSI 代码页编码不了它们；
+    # 与此同时调用方一律按 UTF-8 读取本脚本的 stdout。
+    platform_layer.configure_stdout_encoding()
     args = parse_args()
     try:
         components = load_components(args.manifest)
@@ -302,19 +479,28 @@ def main() -> int:
             )
         )
         return 0
-    if not os.path.exists("/dev/tty"):
-        print("selector: /dev/tty is unavailable", file=sys.stderr)
+    # 交互模式需要真实终端：POSIX 走 /dev/tty，Windows 走 CONOUT$ + msvcrt。
+    # 拿不到终端时返回受控错误码，由调用方决定是否降级。
+    backend = open_backend()
+    if backend is None:
+        print(
+            "selector: interactive selection is unavailable on this platform "
+            "(no usable terminal); use --render for a plain-text frame",
+            file=sys.stderr,
+        )
         return 2
 
     try:
         result = interactive_select(
-            components, args.mode, path_selected, args.shell_config
+            components, args.mode, path_selected, args.shell_config, backend
         )
     except (KeyboardInterrupt, EOFError):
         return 130
     except OSError as exc:
         print(f"selector: could not use terminal: {exc}", file=sys.stderr)
         return 2
+    finally:
+        backend.close()
     if result is None:
         return 10
     selected, path_selected = result

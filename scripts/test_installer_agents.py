@@ -17,18 +17,44 @@ import subprocess  # noqa: E402,F401
 
 import installer_agents as agents  # noqa: E402
 import installer_config as config  # noqa: E402
+import installer_platform as platform_layer  # noqa: E402
 import installer_state as detector  # noqa: E402
 from installer import Installer, RunResult  # noqa: E402
 
 REPO_DIR = SCRIPT_DIR.parent
 
 
+# 宿主若导出了 QODER*_CONFIG_DIR，共享配置根会被覆盖，断言就会指向真实用户目录
+# 而不是临时目录。整模块运行期间先移除它们，tearDown 时再恢复。
+_AMBIENT_ENV_PATCH = None
+
+
+def setUpModule() -> None:
+    """隔离宿主导出的 Qoder 根目录覆盖。"""
+    global _AMBIENT_ENV_PATCH
+    _AMBIENT_ENV_PATCH = patch.dict(os.environ, {}, clear=False)
+    _AMBIENT_ENV_PATCH.start()
+    for key in ("QODER_CONFIG_DIR", "QODERCN_CONFIG_DIR"):
+        os.environ.pop(key, None)
+
+
+def tearDownModule() -> None:
+    """恢复本模块运行前的环境。"""
+    global _AMBIENT_ENV_PATCH
+    if _AMBIENT_ENV_PATCH is not None:
+        _AMBIENT_ENV_PATCH.stop()
+        _AMBIENT_ENV_PATCH = None
+
+
 def build_installer(home: Path) -> Installer:
     """装配一次只有 CLI 安装所需字段的安装会话。"""
     installer = Installer.__new__(Installer)
     installer.home = home
-    installer.os_name = "Linux"
+    # 固定为 Linux 适配对象：用例不应随宿主平台改变行为。
+    installer.platform = platform_layer.platform_for("Linux")
+    installer.os_name = installer.platform.os_name
     installer.npm_prefix = home / ".npm-global"
+    installer.npm_bin_dir = installer.npm_prefix / "bin"
     installer.bin_dir = home / ".local" / "bin"
     installer.logger = Mock()
     installer.changed_paths = []
@@ -309,6 +335,80 @@ class AgentPresenceTests(unittest.TestCase):
                 home / ".claude" / "agents" / "tech-critic.md"
             ).read_text(encoding="utf-8")
         self.assertIn("tools: Read, Grep, Glob\n", content)
+
+    def test_installed_agents_carry_the_output_language_rule(self) -> None:
+        # 角色 Subagent 的 system prompt 只有自己的角色文件 + 派发正文，
+        # SKILL.md 的语言约束对它不可见；四个宿主的安装产物都必须自带该条款，
+        # 且重复安装不叠加。
+        heading = "## 输出语言（CodeKit 统一规范）"
+        rule = "面向用户和主 Agent 的一切自然语言"
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            helper = SCRIPT_DIR / "manage-global-agents.py"
+            shared_root = home / ".qoder-cn"
+            shared_root.mkdir()
+            for tools, extra in (
+                (("--tool", "claude", "--tool", "codex", "--tool", "opencode"), []),
+                (("--tool", "qodercn"), ["--config-root", str(shared_root)]),
+            ):
+                installed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(helper),
+                        "install",
+                        "--home",
+                        str(home),
+                        *tools,
+                        *extra,
+                        "--source",
+                        str(REPO_DIR / "skills"),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(installed.returncode, 0, installed.stdout)
+            artifacts = (
+                home / ".claude" / "agents" / "tech-critic.md",
+                shared_root / "agents" / "tech-critic.md",
+                home / ".codex" / "agents" / "tech-critic.toml",
+                home / ".config" / "opencode" / "agents" / "tech-critic.md",
+            )
+            for artifact in artifacts:
+                text = artifact.read_text(encoding="utf-8")
+                self.assertIn(heading, text, str(artifact))
+                self.assertIn(rule, text, str(artifact))
+                self.assertNotIn(
+                    "主 Agent 派发时必须在任务正文中显式携带",
+                    text,
+                    f"{artifact}: 主 Agent 的派发纪律不得注入角色正文",
+                )
+            claude_file = artifacts[0]
+            before = claude_file.read_text(encoding="utf-8")
+            again = subprocess.run(
+                [
+                    sys.executable,
+                    str(helper),
+                    "install",
+                    "--home",
+                    str(home),
+                    "--tool",
+                    "claude",
+                    "--source",
+                    str(REPO_DIR / "skills"),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(again.returncode, 0, again.stdout)
+            self.assertIn("0 files changed", again.stdout)
+            self.assertEqual(before, claude_file.read_text(encoding="utf-8"))
+            self.assertEqual(
+                1, claude_file.read_text(encoding="utf-8").count(heading)
+            )
 
     def test_preflight_continues_and_only_warns_when_no_cli_exists(self) -> None:
         installer = Installer.__new__(Installer)

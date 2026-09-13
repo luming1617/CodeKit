@@ -19,6 +19,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_agents as agents  # noqa: E402
+import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 
 
@@ -54,6 +55,37 @@ OPENCODE_TOOLS = (
     "lsp",
     "skill",
 )
+
+# 角色 Subagent 的 system prompt 只有自己的角色文件 + 主 Agent 传入的正文，
+# SKILL.md 里的语言约束对它不可见，故安装时把共享规则注入角色正文。
+OUTPUT_LANGUAGE_FILE = Path("_shared") / "prompts" / "output-language.md"
+OUTPUT_LANGUAGE_RULES = "## 规则"
+OUTPUT_LANGUAGE_MAIN_AGENT_SECTION = "## Subagent 附加要求"
+OUTPUT_LANGUAGE_HEADING = "## 输出语言（CodeKit 统一规范）"
+
+
+def output_language_clause(source: Path) -> str:
+    """从共享规范取出输出语言规则段，作为注入角色正文的条款。
+
+    只取「## 规则」，不取「Subagent 附加要求」：后者是给主 Agent 的派发纪律，
+    注入角色正文会让只读子代理误以为自己必须再派发下一级而返回 BLOCKED。
+    """
+    path = source / OUTPUT_LANGUAGE_FILE
+    if not path.is_file():
+        raise ValueError(f"missing shared output language rules: {path}")
+    text = path.read_text(encoding="utf-8")
+    if OUTPUT_LANGUAGE_RULES not in text:
+        raise ValueError(f"{path} has no {OUTPUT_LANGUAGE_RULES!r} section")
+    rules = text.split(OUTPUT_LANGUAGE_RULES, 1)[1]
+    rules = rules.split(OUTPUT_LANGUAGE_MAIN_AGENT_SECTION, 1)[0].strip()
+    return f"{OUTPUT_LANGUAGE_HEADING}\n\n{rules}\n"
+
+
+def with_output_language(text: str, clause: str) -> str:
+    """把输出语言条款追加到角色正文尾部；已含条款时原样返回，避免重复叠加。"""
+    if OUTPUT_LANGUAGE_HEADING in text:
+        return text
+    return text.rstrip("\n") + "\n\n" + clause
 
 
 def agent_files(source: Path) -> list[Path]:
@@ -212,14 +244,19 @@ def install(
     parsed = collect_agents(source)
     if not parsed:
         raise ValueError(f"no agent Markdown files found in {source}")
+    clause = output_language_clause(source)
 
     target_dirs = destinations(home, tools, config_root)
-    backup_root = home / ".local" / "state" / "CodeKit" / "agent-backups"
+    # 备份根与安装器的状态目录保持一致：Windows 是 %LOCALAPPDATA%\CodeKit，
+    # 不能沿用 POSIX 的 ~/.local/state。
+    backup_root = platform_layer.platform_for().state_dir(home) / "agent-backups"
     changed = 0
     # 同一份 Markdown 是事实源：Codex 转成等价 TOML，OpenCode 转成
-    # 布尔工具映射，其余工具直接沿用 canonical Markdown。
+    # 布尔工具映射，其余工具直接沿用 canonical Markdown。三条路径共用同一份
+    # 注入后的正文，避免某个宿主的角色静默丢掉语言约束。
     for source_file, name, description, body in parsed:
-        markdown = source_file.read_text(encoding="utf-8")
+        markdown = with_output_language(source_file.read_text(encoding="utf-8"), clause)
+        body = with_output_language(body, clause)
         for tool in tools:
             if tool == "codex":
                 destination = target_dirs[tool] / f"{name}.toml"

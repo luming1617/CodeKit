@@ -63,11 +63,38 @@
 在**本仓库根目录**执行（脚本以当前仓库作为插件市场源）：
 
 ```bash
+# macOS / Linux
 bash install.sh install [-y]
 bash uninstall.sh [-y]
 ```
 
+```bat
+:: Windows（CMD；也可直接调用 install.ps1 / uninstall.ps1）
+install.cmd install [-y]
+uninstall.cmd [-y]
+```
+
 `install.sh` 和 `uninstall.sh` 都依赖同仓库的 Python 安装/卸载编排器及组件辅助脚本，不再支持只传输单个脚本的 `curl ... | bash` 模式；需要远程安装或卸载时，请先克隆或下载完整仓库再执行。
+
+### Windows 入口说明
+
+四个 Windows 入口与 `install.sh` / `uninstall.sh` 职责完全对称：`install.ps1` / `uninstall.ps1`
+只做 preflight 检测，然后转交 `scripts/installer.py` / `scripts/uninstaller.py`；`.cmd` 只是
+PowerShell 的 CMD 包装（供 CMD 与双击使用）。
+
+| 事项 | 说明 |
+|------|------|
+| Python 启动方式 | `py -3`（其次 `python`）。**不使用 `python3`**：干净 Windows 上该名字是微软商店别名桩，执行后无输出 |
+| 编码 | 入口脚本传 `-X utf8`；安装器内部再 `sys.stdout.reconfigure(encoding="utf-8")` 兜底。GBK 无法编码 `▶` / `╔`，不处理会直接抛 `UnicodeEncodeError` |
+| 文件编码 | `.ps1` 必须 UTF-8 **with BOM**（PowerShell 5.1 对无 BOM 文件按 ANSI 解析，中文会乱码）；`.ps1` / `.cmd` 保持 CRLF |
+| 依赖探测 | `curl` 按「真实可执行文件」解析：PowerShell 5.1 内置 `curl` 别名指向 `Invoke-WebRequest`，按别名调用会绕过安装器需要的 `curl.exe` |
+| Git Bash | 在 Git Bash 里执行 `install.sh` 会被显式拒绝并提示改用 `install.cmd`；Windows 不走 MSYS/MINGW 的 POSIX 入口 |
+| 交互选择器 | 可用。后端按平台切换：POSIX 用 `/dev/tty` + `termios`，Windows 用 `CONOUT$` + `msvcrt` 并开启 ANSI 转义。拿不到终端时选择器返回退出码 2，安装器显式降级为默认选择并打印清单，**不会静默采用默认值** |
+
+> Windows 的路径与命令入口差异（npm 前缀、`Scripts\`、`.cmd` 转发、状态目录、文件语义）
+> 统一由 `scripts/installer_platform.py` 承担，完整对照表见
+> [INSTALL-STRATEGY.md §8](INSTALL-STRATEGY.md)。
+
 
 ---
 
@@ -93,22 +120,24 @@ bash uninstall.sh [-y]
 
 | 检查项 | 要求 | 失败处理 |
 |--------|------|----------|
-| Node.js | >= 24.0.0 | 未安装或版本不足即**汇总后退出（非 0）**，提示 brew / nvm / fnm / NodeSource 等安装方式 |
+| Node.js | >= 24.0.0 | 未安装或版本不足即**汇总后退出（非 0）**，提示 brew / nvm / fnm / NodeSource 等安装方式（Windows 提示 `winget install OpenJS.NodeJS.LTS` 与 nvm-windows） |
 | npm | 存在即可 | 同上 |
-| Python3 | >= 3.10 | 同上（graphify 要求 Python >= 3.10） |
-| git | 存在即可（**不校验版本**） | 同上 |
-| curl / wget | 任一存在 | 同上 |
+| Python3 | >= 3.10 | 同上（graphify 要求 Python >= 3.10）。**Windows 用 `py -3` 探测，不用 `python3`**（后者是微软商店别名桩） |
+| git | 存在即可（**不校验版本**） | 同上（Windows 提示 `winget install Git.Git`） |
+| curl / wget | 任一存在 | 同上。**Windows 由 `install.ps1` 检查 `curl.exe`**；PowerShell 的 `curl` 别名不算 |
 | 编程智能体 | `preflight_agents` 只探测 Claude / Codex / OpenCode / Qoder / Qoder CN 的 **CLI 本体** | 五者 CLI 均不存在时只提示并**继续流程**（退出码 0）；勾选某个平台插件时先安装该平台 CLI |
 
 > 安装器不再自动安装 Homebrew / git / Node.js / Python3 / curl；Homebrew 仅在已安装时作为可选安装通道使用。
 > git 的历史门槛 `>= 2.50.1` 随 git-ai 组件下线一并取消。
+> macOS/Linux 的 preflight 由 `install.sh` 承担（bash），Windows 由 `install.ps1` 承担（PowerShell），
+> 两者检查同一组门槛，只是探测命令与手动安装指引按平台给出。
 
 
 ---
 
 ## 5. 安装组件清单
 
-组件的唯一注册源是 `scripts/component-registry.py` 中的 `COMPONENTS` 和 `GROUPS`。每个 `Component` 同时声明 `command` / `version_args` / `channels` / `requires`：`channels` 就是该组件的安装策略（`npm`/`brew`/`brew_cask`/`apt`/`pipx`/`venv`/`script`/`release`），全平台按 `CHANNEL_ORDER` 统一探测。详细规则见 [INSTALL-STRATEGY.md](INSTALL-STRATEGY.md)。`installer_state.py` 在启动时校验组件 ID、重复项、分组引用、分组顺序、通道合法性（npm 目标必须在官方白名单内）及 TSV 安全性；`installer.py` 的 `install_component` 与 `uninstaller.py` 的 `uninstall_component` 各用一张分发表把组件 ID 映射到对应的 `install_*` / `uninstall_*` 处理器，覆盖性由 `scripts/test_installer_contracts.py` 断言（注册表、安装分发、卸载分发、版本记录四方必须一致）。
+组件的唯一注册源是 `scripts/component-registry.py` 中的 `COMPONENTS` 和 `GROUPS`。每个 `Component` 同时声明 `command` / `version_args` / `channels` / `requires`：`channels` 就是该组件的安装策略（`npm`/`brew`/`brew_cask`/`apt`/`winget`/`pipx`/`venv`/`release`/`script`/`powershell`），全平台按 `CHANNEL_ORDER` 统一探测；其中 `winget` 与 `powershell` 是 Windows 专用通道，在其他平台可用性恒为假。详细规则见 [INSTALL-STRATEGY.md](INSTALL-STRATEGY.md)。`installer_state.py` 在启动时校验组件 ID、重复项、分组引用、分组顺序、通道合法性（npm 目标必须在官方白名单内）及 TSV 安全性；`installer.py` 的 `install_component` 与 `uninstaller.py` 的 `uninstall_component` 各用一张分发表把组件 ID 映射到对应的 `install_*` / `uninstall_*` 处理器，覆盖性由 `scripts/test_installer_contracts.py` 断言（注册表、安装分发、卸载分发、版本记录四方必须一致）。
 
 | # | 组件 ID           | 展示名称                          | 分组     |
 |---|-------------------|-----------------------------------|----------|
@@ -144,10 +173,10 @@ bash uninstall.sh [-y]
 | `codex_plugin`      | 当前仓库根目录生成的兼容市场源（重建旧版 `plugins/codekit` 布局）       | 清理旧散装 `~/.agents/skills/keel-*` → `codex plugin marketplace add <兼容市场源>` →（已装且市场源为 Git 地址时 `codex plugin marketplace upgrade co-daming`）→ `codex plugin add codekit@co-daming` → `record_marketplace_sha`；本地源为空即提示跳过，无回退 | 插件缓存 `~/.codex/plugins/cache/`，启用状态写 `~/.codex/config.toml`                           |
 | `qoder_plugin`      | 安装状态目录生成的 Qoder 插件源（`qoder-source/codekit`，仅 `.qoder-plugin/` + `skills/`） | CLI 具备 `plugins install --scope user --json` 时执行 `<cli> --config-dir ~/.qoder plugins install <源> --scope user --json`；否则直接写共享注册表与缓存（Desktop-only 兜底） | `~/.qoder/plugins/installed_plugins_v2.json`、`~/.qoder/settings.json`、`~/.qoder/agents/` |
 | `qodercn_plugin`    | 安装状态目录生成的 Qoder 插件源（`qoder-source/codekit`，与 Qoder 共用同一份构建） | 同上，命令换为 `qodercn`、配置根换为 `~/.qoder-cn` | `~/.qoder-cn/plugins/installed_plugins_v2.json`、`~/.qoder-cn/settings.json`、`~/.qoder-cn/agents/` |
-| `gitnexus`          | 官方 npm 渠道包 `gitnexus`（无 Homebrew formula）                          | `set_npm`（前缀指向 `~/.npm-global`，并注入 `npm_config_registry` 镜像源）→ `npm install -g gitnexus@latest`（用户态、免 sudo）→ 成功后 `gitnexus setup`；无回退                                                                                | `~/.npm-global/bin/gitnexus`                                                                  |
+| `gitnexus`          | 官方 npm 渠道包 `gitnexus`（无 Homebrew formula）                          | `set_npm`（前缀指向 `~/.npm-global`，并注入 `npm_config_registry` 镜像源）→ `npm install -g gitnexus@latest`（用户态、免 sudo）→ 成功后 `gitnexus setup` → **CodeKit 追加 Qoder 注册**：`gitnexus setup` 的 Qoder MCP 目标落在没有读者的 `~/.qoder.json`（Qoder 只从配置根的 `settings.json` 读 `mcpServers`），而它的 hook 目标表里根本没有 Qoder，所以安装器自己往每个已存在的 Qoder 配置根写 `mcpServers.gitnexus` 与 Claude 同构的 `hooks` 条目，并把包内 `hooks/claude/*` 复制到 `<配置根>/hooks/gitnexus/`；补注册失败即组件失败（宿主看不见等同没装），成功后删除死文件 `~/.qoder.json`（仅当其中只有 gitnexus 一条时）；无回退 | `~/.npm-global/bin/gitnexus`、`<Qoder 配置根>/settings.json`、`<Qoder 配置根>/hooks/gitnexus/`  |
 | `dingtalk_cli`      | npm 包 `dingtalk-workspace-cli`（官方 DingTalk Workspace CLI）              | 安装前检查 `unzip`，缺失时先通过当前平台包管理器安装 → `set_npm`（前缀指向 `~/.npm-global`，并注入 `npm_config_registry` 镜像源）→ `npm install -g dingtalk-workspace-cli@latest`；无自动认证配置                                                                                                                 | `~/.npm-global/bin/dws`                                                                       |
 | `feishu_cli`        | npm 包 `@larksuite/cli`（官方 Lark/Feishu CLI）                              | `set_npm`（前缀指向 `~/.npm-global`，并注入 `npm_config_registry` 镜像源）→ `npm install -g @larksuite/cli@latest` → `npx skills add larksuite/cli -y -g --agent <已安装的智能体>`；显式限定 Claude Code、Codex、OpenCode，避免 PromptScript 导致整批失败                                                                 | `~/.npm-global/bin/lark-cli`                                                                  |
-| `graphify`          | 官方 PyPI 渠道包 `graphifyy`（无 Homebrew formula）                          | `pipx install graphifyy`（已装则 `pipx upgrade graphifyy`）→ 失败回退独立 venv：`python3 -m venv` + `bin/pip install -U graphifyy` + 软链到 `~/.local/bin` → 按已检测智能体执行 `graphify install --platform <agent>` → `graphify hook install` | pipx 托管环境，或 `~/.local/share/CodeKit/venvs/graphify` + `~/.local/bin/graphify`             |
+| `graphify`          | 官方 PyPI 渠道包 `graphifyy`（无 Homebrew formula）                          | `pipx install graphifyy`（已装则 `pipx upgrade graphifyy`）→ 失败回退独立 venv：`python3 -m venv` + `bin/pip install -U graphifyy` + 软链到 `~/.local/bin` → 按已检测智能体执行 `graphify install --platform <agent>`，**并固定追加 `--platform agents`**（21 个平台目标里只有它不改写 `CLAUDE.md`、不装 agent 钩子，落点 `~/.agents/skills/graphify` 正是 Qoder 桌面 IDE 扫描的共享技能目录）→ 把该产物镜像进每个已存在的 `<Qoder 配置根>/skills/graphify`（Qoder CLI 只读 `<配置根>/skills` 与插件技能，两端都要可见就得双写）→ `graphify hook install` | pipx 托管环境，或 `~/.local/share/CodeKit/venvs/graphify` + `~/.local/bin/graphify`；技能在 `~/.agents/skills/graphify` 与各 `<Qoder 配置根>/skills/graphify` |
 | `gh`                | `brew`/`apt`/GitHub release（`cli/cli`）                                     | `brew_install_or_upgrade gh`（命中中科大镜像；非 brew 安装时让位） → `apt install gh`（sudo，源中无包则跳过）→ GitHub release 二进制（优先 gh-proxy、失败回退直连，SHA-256 校验）                                                                             | brew/apt 的 bin 目录，或 `~/.local/bin/gh`                                                    |
 | `glab`              | `brew`/`apt`/GitLab release（`34675721`）                                    | `brew_install_or_upgrade glab`（命中中科大镜像；非 brew 安装时让位） → `apt install glab`（sudo，源中无包则跳过）→ GitLab release 二进制                                                                                                          | brew/apt 的 bin 目录，或 `~/.local/bin/glab`                                                  |
 
@@ -241,7 +270,7 @@ render_recap           # 打印卸载结果汇总
 
 `preflight_agents` 只探测五平台 **CLI 本体**：Desktop 应用、Linux 启动器与 Qoder 共享配置根**不计入 CLI 前置**，而是在 Qoder 平台可用性判断与后续提示中使用。如果五者 CLI 均不存在，只打印醒目提示并继续流程，不再中断插件安装（缺少的 CLI 由用户勾选对应插件后自动补装）。强依赖（Node.js ≥ 24 / npm / Python3 ≥ 3.10 / git / curl-wget）已由 `install.sh` 在进入 Python 安装器前检测，不满足时根本不会进入本阶段。Qoder 与 Qoder CN 的 CLI 和桌面 IDE 共用同一个用户级配置根。全局 agent 在选择对应的 Claude、OpenCode、Codex 或 Qoder 插件时同步安装（先于插件写入注册表，避免半安装状态）；该阶段只在 install 执行，卸载不执行。
 
-全局 subagent 的统一源文件位于各 Skill 的 `skills/<skill>/agents/*.md`。Claude Code 原样安装到 `~/.claude/agents/`，OpenCode 原样安装到 `~/.config/opencode/agents/`，Codex 则生成同名的 `~/.codex/agents/*.toml`（正文映射到 `developer_instructions`），Qoder / Qoder CN 原样安装到与桌面 IDE 共享的 `<配置根>/agents/`（裸名，CLI 与 IDE 两端都能调度）。`initialize` 随插件安装 `initialize-gitnexus`、`initialize-graphify`、`initialize-context-scanner`，运行时由 `SKILL.md` 强制调用。安装器具备幂等性；同名非 CodeKit 文件会先备份到 `~/.local/state/CodeKit/agent-backups/`。
+全局 subagent 的统一源文件位于各 Skill 的 `skills/<skill>/agents/*.md`。Claude Code 原样安装到 `~/.claude/agents/`，OpenCode 原样安装到 `~/.config/opencode/agents/`，Codex 则生成同名的 `~/.codex/agents/*.toml`（正文映射到 `developer_instructions`），Qoder / Qoder CN 原样安装到与桌面 IDE 共享的 `<配置根>/agents/`（裸名，CLI 与 IDE 两端都能调度）。`initialize` 随插件安装 `initialize-graphify`、`initialize-context-scanner`，运行时由 `SKILL.md` 强制派发；它的 GitNexus 一路由确定性控制器 `controller.py analyze` 执行，不安装全局角色。安装器具备幂等性；同名非 CodeKit 文件会先备份到 `~/.local/state/CodeKit/agent-backups/`。
 
 > 各 Skill 与 `SKILL.md` 同级的 `openai.yaml` **不是** subagent 源，也不参与上述全局安装：它是 Codex 的技能界面元数据，随技能目录整体分发，路径换算见第 10 章。
 
@@ -252,7 +281,7 @@ render_recap           # 打印卸载结果汇总
 `load_states` 遍历 `COMPONENTS`，调用 `installer_state.detect_component` 逐组件探测状态并缓存为 `self.states`（`ComponentState`：`status` / `installed_version` / `latest_version`）。每个组件：
 
 1. 判断组件是否已安装；
-2. 读取当前版本（统一走 `installer_state.component_version`）；
+2. 读取当前版本（统一走 `installer_state.component_version`）；CLI 输出会归一化为三段版本号（`gh version 2.60.0` / `lark-cli version 1.0.95` → `2.60.0` / `1.0.95`），提取不到版本号时保留原文；
 3. 尽力查询最新版本（npm / PyPI / GitLab API / GitHub API；marketplace 版本取**本地仓库 `HEAD`**，无本地仓库源时为空并由调用方兜底）；
 4. 比对得出状态：
    - 未安装 → `not_installed`
@@ -347,8 +376,8 @@ render_recap           # 打印卸载结果汇总
 | `opencode_plugin` | 写入 `opencode.json` 的 plugin 数组 | — | 条目为 `codekit@file://<安装状态目录>/opencode-source`（兼容 npm 包入口）；用 node（优先）或 python3 编辑 JSON |
 | `codex_plugin` | `codex plugin marketplace add <安装状态目录>/marketplace-source/codekit`（兼容市场根） | — | 官方插件市场机制；`codex plugin add codekit@co-daming` |
 | `qoder_plugin` / `qodercn_plugin` | Qoder CLI `plugins install <源> --scope user --json` | 直写共享配置根（注册表 + 缓存 + `enabledPlugins`） | CLI 与桌面 IDE 共用同一个根，安装一次两端生效；只支持 `user` 作用域 |
-| `gitnexus` | npm 用户态安装（`npm install -g gitnexus@latest`，镜像由 `set_npm` 注入） | — | 无 Homebrew formula，走官方 npm 渠道；装好后执行 `gitnexus setup` |
-| `graphify` | pipx（`pipx install graphifyy`） | 独立 venv + 软链 | 无 Homebrew formula，走官方 PyPI 渠道（包名 `graphifyy`）；venv 位于 `~/.local/share/CodeKit/venvs/graphify`。不使用裸 `pip install`，因 brew python 受 PEP 668 保护会拒绝直接写入系统环境 |
+| `gitnexus` | npm 用户态安装（`npm install -g gitnexus@latest`，镜像由 `set_npm` 注入） | — | 无 Homebrew formula，走官方 npm 渠道；装好后执行 `gitnexus setup`，随后由 CodeKit 追加 Qoder 注册（`mcpServers` + Claude 同构 `hooks` 写进 `<Qoder 配置根>/settings.json`，hook 脚本复制到 `<配置根>/hooks/gitnexus/`）——上游的 Qoder MCP 目标写在没有读者的 `~/.qoder.json`，hook 目标表里则完全没有 Qoder；这一步失败即组件失败，卸载时按 needle 对称回收 |
+| `graphify` | pipx（`pipx install graphifyy`） | 独立 venv + 软链 | 无 Homebrew formula，走官方 PyPI 渠道（包名 `graphifyy`）；venv 位于 `~/.local/share/CodeKit/venvs/graphify`。不使用裸 `pip install`，因 brew python 受 PEP 668 保护会拒绝直接写入系统环境。注册命令（`install --platform <agent>`、`hook install`）按「项目」落盘，安装器显式指定工作目录：启动目录在仓库内即用该仓库根目录，否则用 `<状态目录>/graphify-project`，**不继承启动位置**（双击 `install.cmd` 时 cwd 可能是 `C:\Windows`，会因不可写且无仓库而整体失败）；注册平台固定追加 `agents`（唯一不改写 `CLAUDE.md` 的目标，落点 `~/.agents/skills` 是 Qoder IDE 的共享技能目录）并把产物镜像进每个 `<Qoder 配置根>/skills`（Qoder CLI 不读 `~/.agents/skills`），卸载对称删除两处；`hook install` 只在仓库内执行，仓库外跳过并提示——`initialize` 的 `finish` 阶段现在会默认替目标仓库补上这一步（`--no-git-hooks` 关闭） |
 | `gh` | `brew`（中科大镜像 + 关闭自动更新） | `apt`（sudo，源中无包则跳过）→ GitHub release | release 资产优先 gh-proxy、失败回退直连，经 SHA-256 校验 |
 | `glab` | `brew` | `apt`（sudo，源中无包则跳过）→ GitLab release | |
 | `dingtalk_cli` | npm 用户态安装（`npm install -g dingtalk-workspace-cli@latest`，镜像由 `set_npm` 注入） | — | 命令为 `dws`；卸载时同时清理用户态和默认 npm 前缀 |
@@ -437,6 +466,7 @@ Qoder（国际版）与 Qoder CN 是两个独立发行版，各有各的用户�
 
 > 说明：
 > - **不卸载**智能体本体（Claude/Codex/OpenCode/Qoder/Qoder CN）与依赖（git/Homebrew/curl/Python3/Node.js），仅卸载插件与可选组件。
+> - **Windows 上 npm 全局包被运行中进程占用**时（典型是 `gitnexus` 的原生模块 `lbugjs.node` 被宿主 IDE 拉起的 `gitnexus mcp` 进程映射），Windows 不允许改名删除该包目录，`npm uninstall -g` 只会以 EBUSY（终端显示退出码 4294963214）失败。卸载器会列出占用进程的 PID 与命令行：交互终端询问用户后再终止它们并重试（拒绝则只提示），非交互（`-y` 或无终端）会话只报告并给出手动命令，**绝不擅自结束用户进程**。占用进程的角色是宿主里的 MCP / 智能体，因此需要用户决定是否中断。
 > - `${CodeKit_STATE_DIR}` 与 `~/.npm-global` 目录会保留，需手动删除。
 
 ---

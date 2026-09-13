@@ -5,7 +5,7 @@
 只能通过 `scripts/controller.py start` 启动。任何写入前完成并记录：
 
 1. `git rev-parse --show-toplevel` 的绝对仓库根。
-2. 已规范化的语言集合与 `--embeddings`、`--force`、`--allow-partial`、`--commit`。
+2. 已规范化的语言集合与 `--embeddings`、`--force`、`--allow-partial`、`--commit`、`--no-git-hooks`（冻结为 `options.graph_git_hooks`，默认 `true`）。
 3. `HEAD` SHA、branch，以及 staged、unstaged、untracked 的 NUL-safe 状态快照。
 4. 所有可能托管文件的存在性、内容摘要和运行前 dirty 状态。
 5. 本地 GitNexus runner、全局 GitNexus、Graphify Agent Skill/CLI 的版本和 help 能力。
@@ -13,16 +13,18 @@
 
 托管集合至少包括 `.gitignore`、`.graphifyignore`、`AGENTS.md`、`CLAUDE.md`、将复制或更新的 `.standard/**/*.md`；Worker 后续申报的路径加入本次 managed set。
 
-锁文件内容必须包含 schema、run-id、root、创建时间和运行清单路径。用独占创建取得锁；已有锁即停止并报告，不覆盖。结束时只有锁内 run-id 与当前清单一致才可释放。崩溃遗留锁由用户确认后人工恢复。
+锁文件内容必须包含 schema、run-id、root、创建时间和运行清单路径。用独占创建取得锁；结束时只有锁内 run-id 与当前清单一致才可释放。同一仓库允许重复 initialize：每次 `start` 重新冻结基线，渲染后内容未变的托管文件跳过落盘，所以无变更的重复执行不产生新 diff。
+
+锁冲突不是无条件停止。控制器读取锁内 manifest，按持有者是否可能仍在工作分类：manifest 缺失、不可解析或已处于 `finished`/`aborted` 终态时，该 run 不可能再触碰锁（所有退出路径都先释放锁再写终态 phase），遗留锁自动回收，回收事实写入 stderr 与新 manifest 的 `warnings`。phase 仍是中间态时该 run 可能活着，不抢占：停止并给出 owning run-id、`started_at`、manifest 路径与可执行的 `controller.py abort --manifest <path> --reason "release stale initialize lock"`，由用户确认后回收。
 
 ## Phase 1 容量规划
 
-- 可用并发槽位不少于 3：同时启动 `initialize-gitnexus`、`initialize-graphify`、`initialize-context-scanner`。
-- 只有 2 个可用槽位：先并行两个长任务；主 Agent在等待窗口或 Barrier 前完成扫描。
-- 只有 1 个可用槽位：按顺序创建三个指定名称的独立 Subagent，前一路返回后再创建下一路；不能改由主 Agent代做。
+- GitNexus 由控制器同步执行（`controller.py analyze`），不占用子 Agent 槽位：先在等待窗口内运行它，或先派发两个 Sub-agent 再运行。
+- 可用并发槽位不少于 2：同时启动 `initialize-graphify`、`initialize-context-scanner`。
+- 只有 1 个可用槽位：按顺序创建两个指定名称的独立 Subagent，前一路返回后再创建下一路；不能改由主 Agent代做。
 - 无法创建指定名称的 Subagent：状态为 `BLOCKED`，不得以主 Agent扫描、普通工具摘要或自然语言结果替代。
 
-不要为了凑固定 DAG 创建额外 Worker。三个角色定义位于 `../agents/`，必须使用它们的名称和独立会话；不要让任何分析器与 Phase 3 的上下文写入并发。
+不要为了凑固定 DAG 创建额外 Worker。`initialize-graphify` 与 `initialize-context-scanner` 的角色定义位于 `../agents/`，必须使用它们的名称和独立会话；不要让任何分析器与 Phase 3 的上下文写入并发。
 
 ## 阶段状态
 

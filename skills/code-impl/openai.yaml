@@ -1,4 +1,4 @@
 interface:
   display_name: "编排式编码交付"
   short_description: "按 PRD/TDD/RPD 编排规划、编码、验证与独立审查"
-  default_prompt: "使用 $code-impl，参数传当前需求目录 <feature-directory>（必须已包含 product-doc.md、technical-doc.md、release-doc.md），调度 Planner、Implementer、Debugger 完成编码与本地验证，最后交给 codekit:code-review 独立审查。"
+  default_prompt: "使用 $code-impl，参数传当前需求目录 <feature-directory>（必须已包含 product-doc.md、technical-doc.md、release-doc.md），调度 Planner、Implementer、Debugger 完成编码与本地验证，最后交给 codekit:code-review 独立审查。面向用户的回报从第一句起全程使用简体中文，代码、命令、路径与状态字面量保持原文。"

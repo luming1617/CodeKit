@@ -19,9 +19,11 @@ Channels are expressed as ``kind -> target``:
 * ``brew``       target is a Homebrew formula;
 * ``brew_cask``  target is a Homebrew cask;
 * ``apt``        target is a Debian/Ubuntu package name;
+* ``winget``     target is a winget package id (Windows only);
 * ``pipx``       target is a PyPI distribution installed with pipx;
 * ``venv``       target is a PyPI distribution installed into a private venv;
-* ``script``     target is an official installer-script URL;
+* ``script``     target is an official installer-script URL, run with sh;
+* ``powershell`` target is a Windows-only PowerShell installer-script URL;
 * ``release``    target is resolved from ``Component.release`` (release assets).
 """
 
@@ -45,15 +47,20 @@ REQUIREMENT = re.compile(r"^[a-z][a-z0-9_-]*(>=[0-9]+(\.[0-9]+)*)?$")
 # ``release`` precedes ``script``: a release asset is resolved by an exact file
 # name and verified against a digest, while ``script`` pipes a remote script
 # into a shell. When a component offers both, the verifiable path goes first.
+# ``winget`` and ``powershell`` are Windows-only channels; their availability
+# probes are false everywhere else, so they occupy the slot of the equivalent
+# native channel without affecting macOS/Linux ordering.
 CHANNEL_ORDER: tuple[str, ...] = (
     "npm",
     "brew",
     "brew_cask",
     "apt",
+    "winget",
     "pipx",
     "venv",
     "release",
     "script",
+    "powershell",
 )
 
 # Only these npm package names may ever be installed. The allowlist exists
@@ -130,18 +137,21 @@ COMPONENTS: Sequence[Component] = (
             "script": "https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh",
         },
         version_source="github:rtk-ai/rtk",
-        # 官方脚本下载的资产名就是 `rtk-<Rust target triple>.tar.gz`（版本只出现在
+        # 官方脚本下载的资产名就是 `rtk-<Rust target triple>.<ext>`（版本只出现在
         # 下载路径的 v{version} 里），这里按同一命名直接取发布资产，省掉 `curl|bash`。
         release=ReleaseSpec(
             repo="github:rtk-ai/rtk",
-            asset="rtk-{target}.tar.gz",
+            asset="rtk-{target}.{ext}",
             binary="rtk",
             target_tokens={
                 "Darwin-arm64": "aarch64-apple-darwin",
                 "Darwin-x86_64": "x86_64-apple-darwin",
+                # x86_64 与 arm64 的 libc 不同名：前者 musl、后者 gnu（实测 v0.49.0 资产）。
                 "Linux-x86_64": "x86_64-unknown-linux-musl",
-                "Linux-arm64": "aarch64-unknown-linux-musl",
+                "Linux-arm64": "aarch64-unknown-linux-gnu",
+                "Windows-x86_64": "x86_64-pc-windows-msvc",
             },
+            ext_tokens={"Darwin": "tar.gz", "Linux": "tar.gz", "Windows": "zip"},
         ),
     ),
     Component("claude_plugin", "CodeKit Plugin (Claude)", "skills", plugin=True),
@@ -174,15 +184,15 @@ COMPONENTS: Sequence[Component] = (
         "third",
         command="gh",
         version_args=("--version",),
-        channels={"brew": "gh", "apt": "gh", "release": "github:cli/cli"},
+        channels={"brew": "gh", "apt": "gh", "winget": "GitHub.cli", "release": "github:cli/cli"},
         version_source="github:cli/cli",
         release=ReleaseSpec(
             repo="github:cli/cli",
             asset="gh_{version}_{os}_{arch}.{ext}",
             binary="gh",
-            os_tokens={"Darwin": "macOS", "Linux": "linux"},
+            os_tokens={"Darwin": "macOS", "Linux": "linux", "Windows": "windows"},
             arch_tokens={"x86_64": "amd64", "arm64": "arm64"},
-            ext_tokens={"Darwin": "zip", "Linux": "tar.gz"},
+            ext_tokens={"Darwin": "zip", "Linux": "tar.gz", "Windows": "zip"},
         ),
     ),
     Component(
@@ -191,15 +201,15 @@ COMPONENTS: Sequence[Component] = (
         "third",
         command="glab",
         version_args=("version",),
-        channels={"brew": "glab", "apt": "glab", "release": "gitlab:34675721"},
+        channels={"brew": "glab", "apt": "glab", "winget": "GLab.GLab", "release": "gitlab:34675721"},
         version_source="gitlab:34675721",
         release=ReleaseSpec(
             repo="gitlab:34675721",
             asset="glab_{version}_{os}_{arch}.{ext}",
             binary="glab",
-            os_tokens={"Darwin": "darwin", "Linux": "linux"},
+            os_tokens={"Darwin": "darwin", "Linux": "linux", "Windows": "windows"},
             arch_tokens={"x86_64": "amd64", "arm64": "arm64"},
-            ext_tokens={"Darwin": "tar.gz", "Linux": "tar.gz"},
+            ext_tokens={"Darwin": "tar.gz", "Linux": "tar.gz", "Windows": "zip"},
         ),
     ),
     Component(
@@ -209,7 +219,9 @@ COMPONENTS: Sequence[Component] = (
         command="dws",
         version_args=("version",),
         channels={"npm": "dingtalk-workspace-cli"},
-        requires=("unzip",),
+        # 解压工具的前置由 installer.ensure_unzip 负责，而不是这里的 requires：
+        # Windows 上钉钉的 install.js 改用 PowerShell 的 Expand-Archive，不需要
+        # unzip，写成静态 requires 会把整个组件在 Windows 上误判为不可安装。
     ),
     Component(
         "feishu_cli",
@@ -225,11 +237,22 @@ COMPONENTS: Sequence[Component] = (
 # Coding-agent CLIs are installed on demand as plugin prerequisites. They share
 # the same channel priority and table shape as the optional components.
 AGENT_CLI_CHANNELS: Dict[str, Mapping[str, str]] = {
-    "claude": {"npm": "@anthropic-ai/claude-code", "brew_cask": "claude-code"},
+    "claude": {
+        "npm": "@anthropic-ai/claude-code",
+        "brew_cask": "claude-code",
+        "winget": "Anthropic.ClaudeCode",
+    },
     "codex": {"npm": "@openai/codex", "brew_cask": "codex"},
     "opencode": {"npm": "opencode-ai", "brew": "opencode"},
-    "qoder": {"script": "https://qoder.com/install"},
-    "qodercn": {"script": "https://static.qoder.com.cn/qoder-cli-cn/install.sh"},
+    # Qoder 官方按平台分发：macOS/Linux 走 install.sh，Windows 走 install.ps1。
+    "qoder": {
+        "script": "https://qoder.com/install",
+        "powershell": "https://qoder.com/install.ps1",
+    },
+    "qodercn": {
+        "script": "https://static.qoder.com.cn/qoder-cli-cn/install.sh",
+        "powershell": "https://static.qoder.com.cn/qoder-cli-cn/install.ps1",
+    },
 }
 
 

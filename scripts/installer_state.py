@@ -31,6 +31,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 
 import installer_agents as agents  # noqa: E402
+import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 
 
@@ -53,6 +54,7 @@ CODEX_MARKETPLACE = "co-daming"
 CODEX_PLUGIN = "codekit"
 CLAUDE_MARKETPLACE = "co-daming"
 CLAUDE_PLUGIN = "codekit"
+OPENCODE_PLUGIN = "codekit"
 ANSI_RED = "\033[0;31m"
 ANSI_RESET = "\033[0m"
 
@@ -131,6 +133,9 @@ class ComponentState:
     status: str = "not_installed"
     installed_version: str = ""
     latest_version: str = ""
+    # 组件未被识别为已安装、但磁盘上还有 CodeKit 自有缓存目录时为 True：宿主
+    # 会把里面的文件当成待确认的残留，所以卸载器必须能看见并清掉它。
+    leftover: bool = False
 
     @property
     def state(self) -> str:
@@ -153,12 +158,12 @@ def run_command_capture(args: list[str], timeout: float = 15.0) -> tuple[int, st
     """静默执行探测命令，返回 (退出码, stdout, stderr)；异常与超时按失败处理。"""
     try:
         completed = subprocess.run(
-            args,
+            platform_layer.resolve_argv(args),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             timeout=timeout,
             check=False,
+            **platform_layer.text_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 1, "", str(exc)
@@ -429,9 +434,10 @@ def component_version(component: str, context: Context) -> str:
     definition = registry.component_by_id(component)
     if definition is not None and definition.command:
         value = command_version(definition.command, list(definition.version_args))
-        # `gh --version` includes the build date and platform after the
-        # semantic version.  Result pages only need the three-part version.
-        return config.extract_version(value) if component == "gh" else value
+        # CLI 的首行版本输出普遍是 "工具名 version 1.2.3 (构建信息)" 这类文本
+        # （`gh --version`、`lark-cli --version` 都是），结果页只需要三段版本号；
+        # 提取不到版本号时原样返回，避免把探测结果整条丢掉。
+        return config.extract_version(value) or value
     if component in {"claude_plugin", "opencode_plugin", "codex_plugin"}:
         return installed_plugin_version(component, context)
     qoder_platform = qoder.platform_for_component(component)
@@ -475,12 +481,40 @@ def present(component: str, context: Context) -> bool:
         return bool(listing) and has_line(listing, f"{CODEX_PLUGIN}@{CODEX_MARKETPLACE}") and platform_subagents_state(context, "codex") in {"installed", "up_to_date"}
     if component == "opencode_plugin":
         return config.opencode_has_plugin(
-            context.home / ".config" / "opencode" / "opencode.json"
+            config.opencode_config_file(context.home / ".config" / "opencode")
         ) and platform_subagents_state(context, "opencode") in {"installed", "up_to_date"}
     qoder_platform = qoder.platform_for_component(component)
     if qoder_platform is not None:
         return qoder_present(qoder_platform, context)
     return False
+
+
+def component_leftovers(component: str, context: Context) -> list[Path]:
+    """列出组件未被识别为已安装、但磁盘上仍有内容的 CodeKit 缓存目录。
+
+    插件 CLI 的卸载普遍是软删除：只清注册表条目、在缓存目录里写 ``.orphaned_at``，
+    目录本身留着（实测 ``qodercli plugins list`` 也不会回收）。所以「注册表里没有」
+    不等于磁盘上没有；残留只能以文件为准，否则汇总表会对着满目录的 skill 文件报
+    「已卸载」。空目录不算残留：它不会出现在宿主的待清理文件列表里。
+
+    Qoder 的缓存按 marketplace 分目录，历史安装可能同时留下多个副本，因此逐项
+    解析而不是拼一个固定路径。
+    """
+    qoder_platform = qoder.platform_for_component(component)
+    if qoder_platform is not None:
+        try:
+            root = qoder.resolve_config_root(qoder_platform, context.home)
+        except ValueError:
+            return []
+        candidates: tuple[Path, ...] = tuple(qoder.cached_copies(root))
+    else:
+        candidate = {
+            "claude_plugin": context.home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE,
+            "codex_plugin": context.home / ".codex" / "plugins" / "cache" / CODEX_MARKETPLACE,
+            "opencode_plugin": context.home / ".config" / "opencode" / "node_modules" / OPENCODE_PLUGIN,
+        }.get(component)
+        candidates = (candidate,) if candidate is not None else ()
+    return [path for path in candidates if platform_layer.has_contents(path)]
 
 
 def plugin_ready(component: str, context: Context) -> bool:
@@ -499,6 +533,9 @@ def detect_component(component: str, context: Context, latest: dict[str, str]) -
     """计算组件当前状态，并在可取得最新版本时区分已安装和可升级。"""
     state = ComponentState(component)
     if not plugin_ready(component, context):
+        # 组件不算已安装，但缓存里可能还留着上一轮卸载的残留：标记出来，让卸载器
+        # 能把它列进待清理项，而不是当作「未安装，已忽略」放过去。
+        state.leftover = bool(component_leftovers(component, context))
         return state
     state.installed_version = component_version(component, context)
 
@@ -686,12 +723,17 @@ def component_install_path(component: str, context: Context) -> str:
         path = shutil.which(definition.command)
         if path:
             return display_path(Path(path), context.home)
+        # 回退路径同样按平台解析：Windows 的 npm 全局目录是 %APPDATA%\npm，
+        # 而且入口文件带 .cmd / .exe 后缀，不能沿用 POSIX 的两段式路径。
+        platform = platform_layer.platform_for()
+        npm_dir = platform.npm_bin_dir(platform.npm_prefix(context.home))
+        codekit_dir = platform.bin_dir(context.home, npm_dir)
         fallback = {
-            "rtk": context.home / ".local" / "bin" / "rtk",
-            "gitnexus": context.home / ".npm-global" / "bin" / "gitnexus",
-            "dingtalk_cli": context.home / ".npm-global" / "bin" / "dws",
-            "feishu_cli": context.home / ".npm-global" / "bin" / "lark-cli",
-            "graphify": context.home / ".local" / "bin" / "graphify",
+            "rtk": codekit_dir / platform.binary_filename("rtk"),
+            "gitnexus": npm_dir / platform.shim_name("gitnexus"),
+            "dingtalk_cli": npm_dir / platform.shim_name("dws"),
+            "feishu_cli": npm_dir / platform.shim_name("lark-cli"),
+            "graphify": codekit_dir / platform.shim_name("graphify"),
         }.get(component)
         return display_path(fallback, context.home) if fallback else "—"
     qoder_platform = qoder.platform_for_component(component)
@@ -796,10 +838,16 @@ def render_recap(mode: str, records: Iterable[str], context: Context) -> None:
                 continue
             action, expected_ok = record_map[component]
             is_present, _version = recap_presence_version(component, context)
-            succeeded = expected_ok == "1" and not is_present
+            # 卸载是否真的干净必须以文件为准：插件 CLI 的卸载是软删除，注册表空
+            # 了磁盘上仍可能留着整个 skill 目录。
+            leftovers = component_leftovers(component, context)
+            succeeded = expected_ok == "1" and not is_present and not leftovers
             if succeeded:
                 note = "组件未安装，已忽略" if action == "absent" else "已卸载"
                 result = "成功"
+            elif leftovers:
+                note = f"仍有残留（{display_path(leftovers[0], context.home)}）"
+                result = "失败"
             else:
                 note = "仍有残留，建议手动检查"
                 result = "失败"
@@ -839,7 +887,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         home=args.home,
         marketplace_local=args.marketplace_local,
         version_file=args.version_file
-        or args.home / ".local" / "state" / "CodeKit" / "installed_versions",
+        or platform_layer.platform_for().state_dir(args.home) / "installed_versions",
     )
     try:
         if args.command == "detect":

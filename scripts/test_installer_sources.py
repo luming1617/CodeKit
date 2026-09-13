@@ -31,6 +31,8 @@ def build_repo(root: Path, *, with_qoder: bool = True) -> Path:
     """Create the smallest repository layout the source builder accepts."""
     repo = root / "repo"
     write(repo / "plugin-version.json", json.dumps({"version": VERSION}))
+    # Codex 只读 `.agents/plugins/marketplace.json`；`.codex-plugin/` 只是插件元数据。
+    write(repo / ".agents" / "plugins" / "marketplace.json", json.dumps({"name": "co-daming"}))
     for directory in (".claude-plugin", ".codex-plugin"):
         write(repo / directory / "plugin.json", json.dumps({"name": "codekit", "version": "0.0.1"}))
         write(repo / directory / "marketplace.json", json.dumps({"name": "co-daming"}))
@@ -81,6 +83,14 @@ class QoderStageTests(unittest.TestCase):
         self.assertFalse((self.qoder / "skills" / "demo" / "agents" / "openai.yaml").exists())
         self.assertTrue((self.market / "skills" / "demo" / "agents" / "openai.yaml").is_file())
 
+    def test_codex_marketplace_is_staged_at_the_path_codex_reads(self) -> None:
+        # Codex 0.154 只在 <root>/.agents/plugins/marketplace.json 找清单；放在
+        # `.codex-plugin/` 会被判为 "marketplace root does not contain a supported
+        # manifest"。
+        staged = self.market / ".agents" / "plugins" / "marketplace.json"
+        self.assertTrue(staged.is_file())
+        self.assertEqual(json.loads(staged.read_text(encoding="utf-8"))["name"], "co-daming")
+
     def test_rebuilding_replaces_the_stage_without_leftovers(self) -> None:
         write(self.qoder / "stale.txt", "left behind by an older build")
         again = sources.prepare(self.repo, self.state_dir)
@@ -103,6 +113,44 @@ class QoderStageTests(unittest.TestCase):
             )
             self.assertTrue((qoder / "skills").is_dir())
             self.assertFalse((qoder / "agents").exists())
+
+
+class StagingHygieneTests(unittest.TestCase):
+    """开发机上的缓存不属于插件载荷，不能装进宿主。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+
+    def test_development_debris_is_not_staged(self) -> None:
+        repo = build_repo(self.base)
+        demo = repo / "skills" / "demo"
+        write(demo / "tests" / "__pycache__" / "test_demo.cpython-314.pyc", "x")
+        write(demo / "scripts" / "state.pyc", "x")
+        write(demo / ".pytest_cache" / "CACHEDIR.TAG", "x")
+        write(demo / ".DS_Store", "x")
+        write(repo / "skills" / ".DS_Store", "x")
+        write(repo / ".claude-plugin" / "__pycache__" / "gen.pyc", "x")
+        # skills 自带可运行的测试套件：测试文件是载荷的一部分，只排除缓存。
+        write(demo / "tests" / "test_demo.py", "# real test\n")
+
+        market, opencode, qoder = sources.prepare(repo, self.base / "state")
+
+        for stage in (market, opencode, qoder):
+            names = {path.name for path in stage.rglob("*")}
+            self.assertNotIn("__pycache__", names)
+            self.assertNotIn(".pytest_cache", names)
+            self.assertNotIn(".DS_Store", names)
+            self.assertEqual(
+                [path for path in stage.rglob("*") if path.suffix in {".pyc", ".pyo"}],
+                [],
+            )
+        self.assertTrue((qoder / "skills" / "demo" / "tests" / "test_demo.py").is_file())
+        self.assertTrue((market / "skills" / "demo" / "tests" / "test_demo.py").is_file())
+        self.assertTrue(
+            (opencode / "plugins" / "codekit" / "skills" / "demo" / "tests" / "test_demo.py").is_file()
+        )
 
 
 class SourceValidationTests(unittest.TestCase):

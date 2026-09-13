@@ -1,4 +1,4 @@
 interface:
   display_name: "bug诊断与修复"
   short_description: "证据驱动的后端缺陷诊断与最小影响修复"
-  default_prompt: "使用 $bugfix，可选传当前需求目录 <feature-directory>；省略目录时仅传错误描述 <error-description>。先完成只读调查并输出根因与修复提案，等我明确批准该版本后再改代码。"
+  default_prompt: "使用 $bugfix，可选传当前需求目录 <feature-directory>；省略目录时仅传错误描述 <error-description>。先完成只读调查并输出根因与修复提案，等我明确批准该版本后再改代码。面向用户的回报从第一句起全程使用简体中文，代码、命令、路径与状态字面量保持原文。"

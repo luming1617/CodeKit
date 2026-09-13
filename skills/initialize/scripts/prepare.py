@@ -8,6 +8,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -23,9 +24,12 @@ from _common import (
     IGNORE_START,
     INDEX_END,
     INDEX_START,
+    MANAGED_GITIGNORE_ENTRIES,
+    REPLY_LANGUAGE_RULE,
     InitializeError,
     atomic_write,
     git_status,
+    gitnexus_registry_state,
     replace_managed_block,
     snapshot_trees,
     utc_now,
@@ -41,6 +45,43 @@ WORKER_TREE_ROOTS = [".gitnexus", "graphify-out", ".claude/skills", ".agents/ski
 PrepareError = InitializeError
 
 
+TERMINAL_LOCK_PHASES = {"finished", "aborted"}
+
+
+def inspect_conflicting_lock(lock_path: Path) -> tuple[bool, str]:
+    """判定冲突锁是否可回收，返回 ``(reclaimable, detail)``。
+
+    每一条正常退出路径都先释放锁再写终态 phase，所以「锁还在、manifest 已是终态
+    或已不可读」只可能是崩溃遗留的 unlink，回收它不会侵入仍在工作的 run。phase 仍
+    是中间态时该 run 可能活着，只能停止并给出精确的 ``abort`` 回收命令由人确认。
+    """
+    try:
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True, "the lock file is not readable JSON"
+    if not isinstance(lock, dict):
+        return True, "the lock file is not a JSON object"
+    run_id = lock.get("run_id") or "<unknown>"
+    manifest_raw = lock.get("manifest")
+    if not isinstance(manifest_raw, str) or not manifest_raw:
+        return True, f"run {run_id} did not record a run manifest path"
+    manifest_path = Path(manifest_raw)
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True, f"run {run_id} has no readable manifest left: {manifest_path}"
+    phase = manifest.get("phase") if isinstance(manifest, dict) else None
+    if phase in TERMINAL_LOCK_PHASES:
+        return True, f"run {run_id} already reached terminal phase '{phase}'"
+    created_at = manifest.get("started_at") or lock.get("created_at") or "unknown"
+    return False, (
+        f"run {run_id} (started {created_at}, phase '{phase or 'unknown'}') may still be "
+        f"active. Confirm no initialize is running, then release the lock with: "
+        f"controller.py abort --manifest {manifest_path} "
+        '--reason "release stale initialize lock"'
+    )
+
+
 def acquire_state_lock(root: Path, run_id: str) -> tuple[Path, Path, Path, bool, list[str], int]:
     """Create project-local state and acquire its exclusive initialize lock.
 
@@ -48,6 +89,13 @@ def acquire_state_lock(root: Path, run_id: str) -> tuple[Path, Path, Path, bool,
     the repository read-only, so EROFS/EACCES/EPERM is an explicit, visible
     downgrade to a private temporary state directory. FileExistsError remains
     a real concurrent-run conflict.
+
+    Repeated initialize is the supported path, so a conflicting lock is not
+    treated as a stop by itself: a lock whose run is already terminal or whose
+    manifest is gone is a crashed leftover and is reclaimed with a warning
+    (see ``inspect_conflicting_lock``). Only a run that may still be active
+    stops, and its error names the manifest and the ``abort`` command that
+    releases it.
     """
     preferred_root = root / ".codekit"
     preferred_parent = preferred_root / "initialize"
@@ -55,10 +103,31 @@ def acquire_state_lock(root: Path, run_id: str) -> tuple[Path, Path, Path, bool,
         require_repository_target(root, preferred_root)
         preferred_parent.mkdir(parents=True, exist_ok=True)
         lock_path = preferred_root / "initialize.lock"
-        try:
-            descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError as exc:
-            raise PrepareError(f"another initialize run holds {lock_path}") from exc
+        reclaimed: list[str] = []
+        for attempt in (1, 2):
+            try:
+                descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                break
+            except FileExistsError as exc:
+                reclaimable, detail = inspect_conflicting_lock(lock_path)
+                if not reclaimable:
+                    raise PrepareError(
+                        f"another initialize run holds {lock_path}: {detail}"
+                    ) from exc
+                if attempt == 2:
+                    raise PrepareError(
+                        f"another initialize run re-acquired {lock_path}: {detail}"
+                    ) from exc
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+                warning = (
+                    f"reclaimed the stale initialize lock {lock_path} left behind by "
+                    f"an interrupted run ({detail})."
+                )
+                print(f"initialize warning: {warning}", file=sys.stderr)
+                reclaimed.append(warning)
 
         run_dir = preferred_parent / run_id
         try:
@@ -73,7 +142,7 @@ def acquire_state_lock(root: Path, run_id: str) -> tuple[Path, Path, Path, bool,
             except OSError:
                 pass
             raise PrepareError(f"initialize run directory already exists: {run_dir}") from exc
-        return preferred_root, lock_path, run_dir, False, [], descriptor
+        return preferred_root, lock_path, run_dir, False, reclaimed, descriptor
     except OSError as exc:
         if exc.errno not in {errno.EROFS, errno.EACCES, errno.EPERM}:
             raise
@@ -195,14 +264,39 @@ def probe(command: list[str], root: Path) -> dict[str, object]:
     }
 
 
+def _batch_python_target(lines: list[str]) -> list[str]:
+    """Resolve the interpreter behind a Windows batch launcher (npm/venv shim).
+
+    ``graphify.CMD`` runs ``"<venv>\\Scripts\\graphify.exe" %*`` and carries no
+    shebang, so the entry-point exe names the venv that owns Graphify.
+    """
+    for line in lines:
+        for quoted, bare in re.findall(r'"([^"]+)"|([^\s"]+\.exe)', line, re.IGNORECASE):
+            target = (quoted or bare).strip()
+            if not target.lower().endswith(".exe") or not os.path.isabs(target):
+                continue
+            path = Path(target)
+            if path.name.lower().startswith("python"):
+                return [str(path)]
+            sibling_python = path.parent / "python.exe"
+            if path.parent.name.lower() == "scripts" and sibling_python.is_file():
+                return [str(sibling_python)]
+    return []
+
+
 def _shebang_python(graphify_path: Path) -> list[str] | None:
+    """Return the interpreter that actually runs Graphify, or None if undecidable."""
     try:
-        first_line = graphify_path.read_text(encoding="utf-8").splitlines()[0]
-        if not first_line.startswith("#!"):
-            return None
-        parts = shlex.split(first_line[2:].strip())
-    except (OSError, IndexError, ValueError):
+        lines = graphify_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
         return None
+    first_line = lines[0] if lines else ""
+    if first_line.startswith("#!"):
+        # posix=False so a Windows ``#!C:\...\python.exe`` keeps its backslashes;
+        # stripping quotes restores what POSIX mode would already have removed.
+        parts = [part.strip('"') for part in shlex.split(first_line[2:].strip(), posix=False)]
+    else:
+        parts = _batch_python_target(lines)
     if not parts:
         return None
 
@@ -259,16 +353,180 @@ def probe_graphify_ast_process_pool(graphify_path: Path, root: Path) -> bool:
         return False
 
 
+def gitnexus_command() -> tuple[list[str], str]:
+    """解析 GitNexus runner，返回 ``(argv 前缀, 类型)``。
+
+    只接受真实安装（显式覆盖或 ``PATH`` 上的 ``gitnexus``）。仓库内的
+    ``.gitnexus/run.cjs`` 是兜底 shim，在没有真实安装时按 ``gitnexus@latest``
+    走 npx/bunx/pnpm dlx：每次解析到的版本、Node 版本和依赖树都可能不同，
+    GitNexus 因而判定分析器身份变化并强制**全量重建**；那也违反「不通过
+    npx/dlx 下载」的约束。需要 shim 时用 ``CODEKIT_GITNEXUS_RUNNER`` 显式指定。
+    """
+    override = os.environ.get("CODEKIT_GITNEXUS_RUNNER", "").strip()
+    if override:
+        # posix=False so a Windows ``C:\...\python.exe`` keeps its backslashes.
+        parts = [part.strip('"') for part in shlex.split(override, posix=False)]
+        if parts:
+            return parts, "override"
+    installed = shutil.which("gitnexus")
+    if installed:
+        return [installed], "global"
+    return [], "unresolved"
+
+
+def gitnexus_cli_path(command: list[str]) -> Path | None:
+    """定位 runner 真正的 CLI 入口，用于找安装根和探测可选依赖。"""
+    if not command:
+        return None
+    if len(command) == 1:
+        return Path(command[0]).resolve()
+    for item in reversed(command[1:]):
+        candidate = Path(item)
+        if candidate.suffix in {".js", ".cjs", ".mjs"} or candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def gitnexus_install_root(cli: Path | None) -> Path | None:
+    """从 CLI 入口向上找 ``name == "gitnexus"`` 的包根。"""
+    if cli is None:
+        return None
+    for candidate in (cli, *list(cli.parents)[:6]):
+        try:
+            data = json.loads((candidate / "package.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and data.get("name") == "gitnexus":
+            return candidate
+    return None
+
+
+def gitnexus_local_embeddings(cli: Path | None) -> bool:
+    """探测 runner 自带的本地 embedding 栈。
+
+    这是可选依赖，安装时可能因为 onnxruntime 的 CUDA 下载被墙而被跳过；缺少它
+    时任何全量重建都会在「重算已有向量」这一步直接失败。
+    """
+    root = gitnexus_install_root(cli)
+    if root is None:
+        return False
+    modules = root / "node_modules"
+    return (modules / "onnxruntime-node").is_dir() and (
+        modules / "@huggingface" / "transformers"
+    ).is_dir()
+
+
+def gitnexus_index_modes(root: Path) -> dict[str, object]:
+    """读取现有索引记录的分析模式；重建时必须镜像，否则触发全量重建。"""
+    try:
+        data = json.loads((root / ".gitnexus" / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"present": False, "pdg": None, "embeddings": 0, "branch": None}
+    stats = data.get("stats")
+    stats = stats if isinstance(stats, dict) else {}
+    try:
+        embeddings = int(stats.get("embeddings") or 0)
+    except (TypeError, ValueError):
+        embeddings = 0
+    return {
+        "present": True,
+        "pdg": "pdg" in data,
+        "embeddings": embeddings,
+        "branch": data.get("branch") if isinstance(data.get("branch"), str) else None,
+    }
+
+
+def gitnexus_embedding_plan(
+    index: dict[str, object], local_embeddings: bool, requested: bool, authorized: bool
+) -> tuple[str, list[str]]:
+    """决定本次运行的 embedding 策略，返回 ``(模式, warnings)``。
+
+    索引里已有向量而 runner 缺 embedding 栈时，一次全量重建必然 exit 1；此时
+    要么按用户授权先安装，要么显式 ``--drop-embeddings`` 降级，不能撞上才失败。
+
+    - ``preserve``：正常分析，保留既有向量（GitNexus 默认行为）。
+    - ``drop``：追加 ``--drop-embeddings``，放弃语义检索以换取可完成的重建。
+    - ``install-authorized``：先执行 ``gitnexus embeddings install``（全局写入，
+      需用户显式授权）。
+    """
+    present = bool(index.get("embeddings"))
+    if requested and not local_embeddings:
+        if authorized:
+            return "install-authorized", [
+                "GitNexus 需要本地 embedding 栈；已获授权，将先安装再分析。"
+            ]
+        raise PrepareError(
+            "--embeddings 需要本地 embedding 栈，但当前 runner 未安装它；"
+            "请授权全局写入（--allow-global-writes）后重试，或去掉 --embeddings"
+        )
+    if not present or local_embeddings:
+        return "preserve", []
+    if authorized:
+        return "install-authorized", [
+            "索引含 embedding 而 runner 缺少本地 embedding 栈：已获授权，将先安装再分析。"
+        ]
+    return "drop", [
+        f"索引含 {index.get('embeddings')} 条 embedding，但当前 GitNexus runner 没有本地 "
+        "embedding 栈；全量重建会失败，因此本次追加 --drop-embeddings 降级"
+        "（语义检索失效，补齐 embedding 栈后可重新构建）。",
+    ]
+
+
+def gitnexus_registration_plan(
+    registry: dict[str, object], runner: object, authorized: bool, allow_partial: bool
+) -> list[str]:
+    """判定 GitNexus 全局注册前提，返回 warnings；未授权且未接受降级时报错。
+
+    查询类命令（``list``/``query``/``context``/``impact``/``trace``/``cypher``/
+    ``check``/``detect-changes``）与 MCP 图查询只从 ``<GITNEXUS_HOME>/registry.json``
+    解析仓库，所以注册不是可选优化：只写仓库内索引而不注册时，``status`` 一切正常，
+    查询却全部报 “No indexed repositories found”。与 embedding 前提一样，该判定在
+    任何写入之前完成：未获用户授权时零业务写入地失败，由主 Agent 询问后重跑。
+    """
+    if registry.get("registered") or runner in {None, "unresolved"} or authorized:
+        return []
+    if allow_partial:
+        return [
+            "已按 --allow-partial 接受 GitNexus 注册缺失：本次不写全局注册表 "
+            f"{registry.get('path')}，gitnexus 阶段记为 partial/registry-missing，"
+            "查询类命令与 MCP 图查询在注册前不可用。",
+        ]
+    raise PrepareError(
+        f"GitNexus 全局注册表 {registry.get('path')} 中没有本仓库："
+        "list/query/context/impact/trace/cypher/check/detect-changes 与 MCP 图查询"
+        "只能从该注册表解析仓库，缺少注册时索引虽然 status 正常但一律报 "
+        "“No indexed repositories found”。请询问用户是否允许在仓库之外写入注册表："
+        "允许则带 --allow-global-writes 重新运行；不允许则带 --allow-partial "
+        "明确接受 gitnexus 阶段降级为 partial/registry-missing。"
+    )
+
+
 def tool_capabilities(root: Path) -> dict[str, object]:
-    local = root / ".gitnexus" / "run.cjs"
-    if local.is_file() and shutil.which("node"):
-        gitnexus = probe(["node", str(local)], root)
-        gitnexus["runner"] = "local"
-    elif shutil.which("gitnexus"):
-        gitnexus = probe(["gitnexus"], root)
-        gitnexus["runner"] = "global"
+    command, runner = gitnexus_command()
+    cli = gitnexus_cli_path(command)
+    if command:
+        gitnexus = probe(command, root)
+        gitnexus["command"] = command
+        gitnexus["runner"] = runner
+        gitnexus["cli"] = str(cli) if cli else None
+        gitnexus["identity_stable"] = gitnexus_install_root(cli) is not None
+        gitnexus["local_embeddings"] = gitnexus_local_embeddings(cli)
     else:
-        gitnexus = {"available": False, "runner": None, "supports": {}}
+        gitnexus = {
+            "available": False,
+            "runner": runner,
+            "command": [],
+            "cli": None,
+            "identity_stable": False,
+            "local_embeddings": False,
+            "supports": {},
+            "resolution_hint": (
+                "未在 PATH 上找到 gitnexus，且不会回落到 .gitnexus/run.cjs "
+                "(它按 gitnexus@latest 走 npx，会让索引身份漂移并触发全量重建)。"
+                "请把 <npm 前缀>/bin 加入 PATH（安装器的 shell 配置步骤可自动完成），"
+                "或用 CODEKIT_GITNEXUS_RUNNER 显式指定 runner。"
+            ),
+        }
 
     graphify_path = shutil.which("graphify")
     if graphify_path:
@@ -288,6 +546,7 @@ def tool_capabilities(root: Path) -> dict[str, object]:
                 "code_only": "--code-only" in help_text,
                 "backend_selection": "--backend" in help_text,
                 "max_workers": "--max-workers" in help_text,
+                "git_hooks": "hook install" in help_text,
                 "ast_process_pool": probe_graphify_ast_process_pool(Path(graphify_path), root),
             },
         }
@@ -381,7 +640,8 @@ def update_standard_indexes(root: Path) -> list[str]:
         if not existing:
             existing = (
                 "这是规范索引，不是完整规范。规范优先级为：Security > Project > Stack > Global。\n\n"
-                "仅在任务进入对应场景时读取相关详细文件；不要预先加载全部规范。\n"
+                "仅在任务进入对应场景时读取相关详细文件；不要预先加载全部规范。\n\n"
+                f"{REPLY_LANGUAGE_RULE}\n"
             )
         entries = [
             f"- `{path.relative_to(root).as_posix()}`：进入与 `{path.stem}` 相关的场景时读取。"
@@ -401,6 +661,12 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--allow-partial", action="store_true")
     parser.add_argument("--commit", action="store_true")
+    parser.add_argument("--allow-global-writes", action="store_true")
+    parser.add_argument(
+        "--no-git-hooks",
+        action="store_true",
+        help="skip `graphify hook install` in this repository (git hooks are on by default)",
+    )
     parser.add_argument("--run-id", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
@@ -440,6 +706,23 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
     }
     head_result = run(["git", "rev-parse", "--verify", "HEAD"], root, check=False)
     tools = tool_capabilities(root)
+    # 索引模式与 embedding 前提在任何写入之前判定：不满足时零业务写入地失败。
+    index_modes = gitnexus_index_modes(root)
+    embedding_mode, embedding_warnings = gitnexus_embedding_plan(
+        index_modes,
+        bool(tools.get("gitnexus", {}).get("local_embeddings")),
+        args.embeddings,
+        args.allow_global_writes,
+    )
+    # 注册前提与 embedding 前提同样在任何写入之前判定：查询类命令与 MCP 图查询只
+    # 从全局 registry 解析仓库，缺注册时索引可用但查不到，必须由用户明确取舍。
+    registry = gitnexus_registry_state(root)
+    registry_warnings = gitnexus_registration_plan(
+        registry,
+        tools.get("gitnexus", {}).get("runner"),
+        args.allow_global_writes,
+        args.allow_partial,
+    )
     state_root, lock_path, run_dir, state_is_temporary, state_warnings, descriptor = acquire_state_lock(root, run_id)
     manifest_path = run_dir / "run-manifest.json"
     manifest: dict[str, object] = {
@@ -460,15 +743,21 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
             "force": args.force,
             "allow_partial": args.allow_partial,
             "commit": args.commit,
+            "allow_global_writes": args.allow_global_writes,
+            "graph_git_hooks": not args.no_git_hooks,
         },
         "baseline_status": baseline_status,
         "baseline_files": baseline_files,
+        "controller_visibility_delta": [],
         "worker_tree_roots": WORKER_TREE_ROOTS,
         "worker_scope_baseline": snapshot_worker_scopes(root, WORKER_TREE_ROOTS),
         "managed_paths": sorted(managed),
         "required_standard_paths": sorted(required_standard_paths),
         "tools": tools,
-        "warnings": state_warnings,
+        "gitnexus_index": index_modes,
+        "gitnexus_embedding_mode": embedding_mode,
+        "gitnexus_registry": registry,
+        "warnings": [*state_warnings, *embedding_warnings, *registry_warnings],
         "prepared_changed_files": [],
         "authorized_changed_paths": [],
         "phase": "preparing",
@@ -496,13 +785,24 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
         manifest["gitnexus_skill_mode"] = gitnexus_mode
         gitignore = root / ".gitignore"
         require_repository_target(root, gitignore)
-        if atomic_write(gitignore, replace_managed_block(gitignore.read_text(encoding="utf-8") if gitignore.exists() else "", IGNORE_START, IGNORE_END, [".codekit/", ".gitnexus/", "graphify-out/", ".graphifyignore"])):
+        if atomic_write(gitignore, replace_managed_block(gitignore.read_text(encoding="utf-8") if gitignore.exists() else "", IGNORE_START, IGNORE_END, list(MANAGED_GITIGNORE_ENTRIES))):
             changed.append(".gitignore")
         graphifyignore = root / ".graphifyignore"
         require_repository_target(root, graphifyignore)
         graphify_rules = [".codekit/", ".standard/", "AGENTS.md", "CLAUDE.md", ".gitnexus/", ".claude/", ".agents/", "graphify-out/"]
         if atomic_write(graphifyignore, replace_managed_block(graphifyignore.read_text(encoding="utf-8") if graphifyignore.exists() else "", GRAPHIFY_START, GRAPHIFY_END, graphify_rules)):
             changed.append(".graphifyignore")
+        # Rewriting the managed block can un-ignore paths an earlier run had
+        # ignored, which flips their git visibility without anyone writing them.
+        # Only untracked paths can be affected: ignore rules never apply to a
+        # tracked file, so a tracked path that appears here was genuinely
+        # written and stays a declared change.  Recorded so the barrier does not
+        # report the un-ignored files as unreported changes.
+        visibility_delta = sorted(
+            path
+            for path, status in status_entries(root).items()
+            if status == "??" and path not in baseline_status
+        )
 
         for source, target in mappings:
             require_repository_target(root, target)
@@ -517,6 +817,7 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
         manifest["prepared_changed_files"] = sorted(changed)
         manifest["managed_paths"] = sorted(managed | set(changed))
         manifest["authorized_changed_paths"] = sorted(changed)
+        manifest["controller_visibility_delta"] = visibility_delta
         manifest["phase"] = "prepared"
         atomic_write(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", mode=0o600)
     except Exception:
