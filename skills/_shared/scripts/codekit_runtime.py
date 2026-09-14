@@ -83,6 +83,13 @@ def runtime_root(home: Optional[Path] = None) -> Path:
 def runtime_python(home: Optional[Path] = None) -> Optional[Path]:
     """内置运行时的解释器，未安装或指针失效时返回 None。"""
     root = runtime_root(home)
+
+    def existing_file(path: Path) -> Optional[Path]:
+        try:
+            return path if path.is_file() else None
+        except OSError:
+            return None
+
     try:
         document = json.loads((root / "current.json").read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -92,14 +99,14 @@ def runtime_python(home: Optional[Path] = None) -> Optional[Path]:
     python = document.get("python")
     if isinstance(python, str) and python:
         candidate = Path(python)
-        if candidate.is_file():
+        if existing_file(candidate):
             return candidate
     tag = document.get("tag")
     if not isinstance(tag, str) or not tag:
         return None
     suffix = Path("python") / ("python.exe" if os.name == "nt" else "bin/python3")
     candidate = root / tag / suffix
-    return candidate if candidate.is_file() else None
+    return existing_file(candidate)
 
 
 def read_manifest(home: Optional[Path] = None) -> dict:
