@@ -80,6 +80,32 @@ def worker_result(task: str, *, changed=None, allowed=None, artifacts=None, run_
     }
 
 
+@contextmanager
+def denied_stat(prefix: Path):
+    """让 ``prefix`` 下的路径在 ``stat`` 时抛 EACCES，复现沙箱的按路径拒绝。
+
+    实测形态是**按路径拒绝文件系统访问**（``WinError 5``），而 ``PATH`` 里的用户级条目
+    是全的。解析层因此按显式 ``stat`` 的 errno 分类，模拟也必须拦在 ``os.stat`` 上：
+    只拦 ``Path.is_file``（旧实现的做法）已经测不到任何东西，因为 CPython 会把那里的
+    ``OSError`` 吞掉返回 ``False``，于是「被拒绝」与「不存在」无法区分。
+    """
+    original = os.stat
+    prefix_text = str(prefix)
+
+    def guarded(path, *args, **kwargs):
+        if str(path).startswith(prefix_text):
+            raise PermissionError(errno.EACCES, "Access is denied")
+        return original(path, *args, **kwargs)
+
+    with patch.object(common.runtime.os, "stat", guarded):
+        yield
+
+
+def no_ambient_manifest():
+    """隔离宿主机真实安装写出的 ``toolchain.json``，让解析只看到用例给定的输入。"""
+    return patch.object(common.runtime, "read_manifest", return_value={})
+
+
 def git_repository(root: Path) -> None:
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.invalid"], check=True)
@@ -641,12 +667,93 @@ class GitNexusRunnerResolutionTests(unittest.TestCase):
             root = Path(directory)
             (root / ".gitnexus").mkdir()
             (root / ".gitnexus/run.cjs").write_text("// shim\n", encoding="utf-8")
-            with patch.object(prepare.shutil, "which", return_value=None), patch.dict(
+            # 候选目录与清单都清空，让用例与宿主机的真实安装无关。
+            with patch.object(prepare.shutil, "which", return_value=None), patch.object(
+                common.runtime, "toolchain_paths", return_value=[]
+            ), no_ambient_manifest(), patch.dict(
                 os.environ, {"CODEKIT_GITNEXUS_RUNNER": ""}, clear=False
             ):
                 command, runner = prepare.gitnexus_command()
             self.assertEqual([], command)
             self.assertEqual("unresolved", runner)
+
+    def test_declared_install_directory_supplies_the_runner(self):
+        # 受限宿主的沙箱按路径拒绝访问，安装器落在工具链根里的入口按名字找不到，
+        # 但按绝对路径可读可执行，必须解析成功。
+        with tempfile.TemporaryDirectory() as directory:
+            declared = Path(directory)
+            target = declared / common.executable_names("gitnexus")[0]
+            target.write_text("", encoding="utf-8")
+            with patch.object(prepare.shutil, "which", return_value=None), patch.object(
+                common.runtime, "toolchain_paths", return_value=[declared]
+            ), no_ambient_manifest(), patch.dict(
+                os.environ, {"CODEKIT_GITNEXUS_RUNNER": ""}, clear=False
+            ):
+                command, runner = prepare.gitnexus_command()
+            self.assertEqual([str(target)], command)
+            self.assertEqual("declared", runner)
+
+    def test_manifest_runner_outranks_a_path_hit(self):
+        # 清单优先于 PATH 是刻意的：即使会话里恰好有个能用的旧 shim，也按安装器写出的
+        # 绝对 argv 执行，结果才跨宿主确定。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            node = root / "node.exe"
+            node.write_text("", encoding="utf-8")
+            cli = root / "cli.js"
+            cli.write_text("", encoding="utf-8")
+            with patch.object(prepare.shutil, "which", return_value="/usr/bin/gitnexus"), patch.object(
+                common.runtime, "read_manifest",
+                return_value={"schema_version": 1, "tools": {"gitnexus": {"state": "ok", "runner": [str(node), str(cli)]}}},
+            ):
+                command, runner = prepare.gitnexus_command()
+            self.assertEqual("toolchain", runner)
+            self.assertEqual([str(node), str(cli)], command)
+
+    def test_path_hit_still_wins_over_the_declared_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            on_path = Path(directory) / "bin"
+            on_path.mkdir()
+            hit = on_path / "gitnexus"
+            hit.write_text("", encoding="utf-8")
+            declared = Path(directory) / "declared"
+            declared.mkdir()
+            (declared / "gitnexus").write_text("", encoding="utf-8")
+            with patch.object(
+                prepare.shutil, "which", return_value=str(hit)
+            ), patch.object(common.runtime, "toolchain_paths", return_value=[declared]), no_ambient_manifest():
+                command, runner = prepare.gitnexus_command()
+            self.assertEqual([str(hit)], command)
+            self.assertEqual("path", runner)
+
+    def test_cmd_shim_is_folded_into_the_real_cli_entry(self):
+        # npm 的 gitnexus.cmd 只有一句 node "%dp0%\node_modules\...\index.js"：
+        # 不折叠成真实入口就会误判「分析器身份不稳定 + 缺 embedding 栈」。
+        with tempfile.TemporaryDirectory() as directory:
+            npm = Path(directory)
+            package = npm / "node_modules" / "gitnexus"
+            cli = package / "dist" / "cli" / "index.js"
+            cli.parent.mkdir(parents=True)
+            cli.write_text("// cli\n", encoding="utf-8")
+            (package / "package.json").write_text('{"name": "gitnexus"}', encoding="utf-8")
+            (package / "node_modules" / "onnxruntime-node").mkdir(parents=True)
+            (package / "node_modules" / "@huggingface" / "transformers").mkdir(parents=True)
+            shim = npm / "gitnexus.cmd"
+            shim.write_text(
+                "@ECHO off\r\n"
+                'node "%dp0%\\node_modules\\gitnexus\\dist\\cli\\index.js" %*\r\n',
+                encoding="utf-8",
+            )
+            resolved = prepare.gitnexus_cli_path([str(shim)])
+            self.assertEqual(cli.resolve(), resolved)
+            self.assertIsNotNone(prepare.gitnexus_install_root(resolved))
+            self.assertTrue(prepare.gitnexus_local_embeddings(resolved))
+
+    def test_shim_without_a_resolvable_entry_keeps_its_own_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            shim = Path(directory) / "gitnexus.cmd"
+            shim.write_text("@echo off\r\nnode missing.js %*\r\n", encoding="utf-8")
+            self.assertEqual(shim.resolve(), prepare.gitnexus_cli_path([str(shim)]))
 
     def test_explicit_runner_override_wins_over_path(self):
         with patch.object(
@@ -803,6 +910,23 @@ class GitNexusRegistrationTests(unittest.TestCase):
             self.assertTrue(manifest["gitnexus_registry"]["registered"])
             self.assertEqual([], manifest["warnings"])
 
+    def test_unrunnable_runner_needs_no_registration_decision(self):
+        """入口解析到了但跑不起来时，问用户要一次全局写入授权只是白问。"""
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            broken = root / "broken-gitnexus.py"
+            broken.write_text("raise SystemExit(3)\n", encoding="utf-8")
+            with isolated_gitnexus_home(root, registered=False):
+                self.assertEqual(0, self.run_prepare(root, broken))
+                manifest = self.manifest(root)
+            tool = manifest["tools"]["gitnexus"]
+            self.assertFalse(tool["available"])
+            self.assertFalse(manifest["gitnexus_registry"]["registered"])
+            self.assertEqual([], manifest["warnings"])
+            self.assertEqual("preserve", manifest["gitnexus_embedding_mode"])
+            self.assertIn("跑不起来", tool["resolution_hint"])
+
     def test_complete_result_requires_registration(self):
         """门禁自己重测注册：只校验 .gitnexus/meta.json 会放过死索引。"""
         with tempfile.TemporaryDirectory() as directory:
@@ -923,6 +1047,29 @@ class GitNexusStepTests(unittest.TestCase):
             self.assertEqual("tool-missing", result["error"]["code"])
             self.assertIn("请把 npm 前缀/bin 加入 PATH", result["warnings"])
             self.assertEqual([], validator.validate_worker(result, manifest, root))
+
+    def test_unrunnable_runner_skips_as_tool_missing(self):
+        """入口解析到了但探测失败：这是本机跑不起来，不是工具坏了。"""
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            broken = root / "broken-gitnexus.py"
+            broken.write_text("raise SystemExit(3)\n", encoding="utf-8")
+            tool = {
+                "available": False, "runner": "installed",
+                "command": [sys.executable, str(broken)],
+                "supports": {}, "resolution_hint": "请以已授权/提权（非沙箱）的会话重跑",
+            }
+            manifest, path = self.step_manifest(root, tool)
+            result = self.run_step(root, path)
+
+            self.assertEqual("skipped", result["status"])
+            self.assertIsNone(result["exit_code"])
+            self.assertEqual("tool-missing", result["error"]["code"])
+            self.assertIn("请以已授权/提权（非沙箱）的会话重跑", result["warnings"])
+            self.assertEqual([], validator.validate_worker(result, manifest, root))
+            # 没有真的去跑 status/analyze。
+            self.assertFalse((root / "analyze-called").exists())
 
     def test_current_index_reuses_without_running_analyze(self):
         with git_scratch_directory() as directory:
@@ -2117,9 +2264,10 @@ class ValidationExecutionTests(unittest.TestCase):
     def test_validation_commands_are_constrained(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            program = "python" if os.name == "nt" else "python3"
             self.assertEqual(
-                [shutil.which("python3"), "check_ok.py"],
-                validator.resolve_validation_command(root, "python3 check_ok.py"),
+                [shutil.which(program), "check_ok.py"],
+                validator.resolve_validation_command(root, f"{program} check_ok.py"),
             )
             cases = {
                 'python3 -c "print(1)"': "forbidden shell syntax",
@@ -2135,7 +2283,7 @@ class ValidationExecutionTests(unittest.TestCase):
     def test_uninstalled_allow_listed_program_raises_a_dedicated_error(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch.object(common.shutil, "which", lambda program: None):
+            with patch.object(shutil, "which", lambda program: None):
                 with self.assertRaises(validator.ValidationProgramMissing):
                     validator.resolve_validation_command(root, "gradle build")
 
@@ -2144,13 +2292,20 @@ class ValidationExecutionTests(unittest.TestCase):
         # 通常不存在 py，会走 skipped 而不是被拒。
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            launcher = root / "Launcher"
+            launcher.mkdir()
+            py = launcher / "py.exe"
+            py.write_text("", encoding="utf-8")
 
             def which(program: str) -> str | None:
-                return r"C:\Windows\py.exe" if program == "py" else None
+                return str(py) if program == "py" else None
 
-            with patch.object(common.shutil, "which", which):
+            # 候选目录清空，只留 PATH 这一条通路，用例才与宿主机的真实安装无关。
+            with patch.object(shutil, "which", which), patch.object(
+                common.runtime, "toolchain_paths", return_value=[]
+            ), no_ambient_manifest():
                 self.assertEqual(
-                    [r"C:\Windows\py.exe", "-3", "-m", "pytest"],
+                    [str(py), "-3", "-m", "pytest"],
                     validator.resolve_validation_command(root, "py -3 -m pytest"),
                 )
                 with self.assertRaises(validator.ValidationProgramMissing):
@@ -2162,7 +2317,7 @@ class ValidationExecutionTests(unittest.TestCase):
             root = Path(directory)
             real_which = shutil.which
             with patch.object(
-                common.shutil, "which",
+                shutil, "which",
                 lambda program: None if program == "gradle" else real_which(program),
             ):
                 code, report = drive_initialize_flow(root, scan_context(root, [
@@ -2297,7 +2452,7 @@ class ContextContractTests(unittest.TestCase):
             "purpose": "Check", "command": "gradle build",
             "evidence": "README.md", "required_for_initialize": True,
         }])
-        with patch.object(common.shutil, "which", lambda program: None):
+        with patch.object(shutil, "which", lambda program: None):
             reconcile.validate_context(context, self.root)
 
     def test_documented_allow_list_matches_the_controller(self):
@@ -2518,6 +2673,502 @@ class CollabProbeTests(unittest.TestCase):
                     finally:
                         os.chdir(previous)
                     self.assertEqual(list(cwd.iterdir()), [])
+
+
+class GraphifyRunnerResolutionTests(unittest.TestCase):
+    """Graphify runner 与 GitNexus 对称：覆盖变量 → PATH → 已知安装目录。"""
+
+    def test_runner_override_wins_over_path(self):
+        with patch.dict(
+            os.environ, {"CODEKIT_GRAPHIFY_RUNNER": '"C:\\venv\\graphify.exe"'}, clear=False
+        ), patch.object(prepare.shutil, "which", return_value="/usr/bin/graphify"):
+            command, runner = prepare.graphify_command()
+        self.assertEqual(["C:\\venv\\graphify.exe"], command)
+        self.assertEqual("override", runner)
+
+    def test_declared_install_directory_supplies_the_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            declared = Path(directory)
+            target = declared / common.executable_names("graphify")[0]
+            target.write_text("", encoding="utf-8")
+            with patch.object(prepare.shutil, "which", return_value=None), patch.object(
+                common.runtime, "toolchain_paths", return_value=[declared]
+            ), no_ambient_manifest(), patch.dict(
+                os.environ, {"CODEKIT_GRAPHIFY_RUNNER": ""}, clear=False
+            ):
+                command, runner = prepare.graphify_command()
+            self.assertEqual([str(target)], command)
+            self.assertEqual("declared", runner)
+
+    def test_capabilities_record_the_declared_runner_and_its_support_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            declared = root / "npm"
+            declared.mkdir()
+            runner = declared / common.executable_names("graphify")[0]
+            runner.write_text("", encoding="utf-8")
+            completed = subprocess.CompletedProcess(
+                [], 0, stdout="--max-workers\n--code-only\nhook install\n", stderr=""
+            )
+            with patch.object(prepare.shutil, "which", return_value=None), patch.object(
+                common.runtime, "toolchain_paths", return_value=[declared]
+            ), patch.object(prepare, "run", return_value=completed), patch.object(
+                prepare, "probe_graphify_ast_process_pool", return_value=True
+            ), no_ambient_manifest(), patch.dict(
+                os.environ, {"CODEKIT_GRAPHIFY_RUNNER": ""}, clear=False
+            ):
+                graphify = prepare.tool_capabilities(root)["graphify"]
+            self.assertTrue(graphify["available"])
+            self.assertEqual(str(runner), graphify["runner"])
+            self.assertEqual("declared", graphify["runner_type"])
+            self.assertEqual([str(runner)], graphify["command"])
+            self.assertTrue(graphify["supports"]["max_workers"])
+            self.assertTrue(graphify["supports"]["git_hooks"])
+
+    def test_unresolved_runner_carries_an_actionable_hint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(prepare.shutil, "which", return_value=None), patch.object(
+                common.runtime, "toolchain_paths", return_value=[]
+            ), no_ambient_manifest(), patch.dict(
+                os.environ, {"CODEKIT_GRAPHIFY_RUNNER": ""}, clear=False
+            ):
+                capabilities = prepare.tool_capabilities(root)
+            graphify = capabilities["graphify"]
+            self.assertFalse(graphify["available"])
+            self.assertEqual("unresolved", graphify["runner_type"])
+            self.assertIn("CODEKIT_GRAPHIFY_RUNNER", graphify["resolution_hint"])
+            self.assertIn("CODEKIT_GITNEXUS_RUNNER", capabilities["gitnexus"]["resolution_hint"])
+
+
+class KnownToolDirectoryTests(unittest.TestCase):
+    """已知安装目录与入口文件名：宿主丢掉用户级 PATH 时的兜底来源。"""
+
+    def test_windows_entry_names_prefer_directly_executable_files(self):
+        if os.name != "nt":
+            self.skipTest("Windows 入口命名")
+        self.assertEqual(
+            ["rtk.exe", "rtk.cmd", "rtk.bat", "rtk"], common.executable_names("rtk")
+        )
+
+    def test_windows_candidates_cover_the_npm_and_python_directories(self):
+        if os.name != "nt":
+            self.skipTest("Windows 目录布局")
+        appdata = r"C:\Users\me\AppData\Roaming"
+        local = r"C:\Users\me\AppData\Local"
+        with patch.dict(
+            os.environ, {"APPDATA": appdata, "LOCALAPPDATA": local}, clear=False
+        ):
+            directories = [str(path) for path in common.known_tool_dirs()]
+        self.assertIn(r"C:\Users\me\AppData\Roaming\npm", directories)
+        self.assertIn(r"C:\Users\me\AppData\Local\Programs\Python\Launcher", directories)
+
+    def test_toolchain_root_candidates_come_first(self):
+        # 正是不再让历史落点排在前面，受限宿主里才会优先命中工具链根内的副本。
+        directories = common.known_tool_dirs()
+        self.assertEqual(common.runtime.toolchain_root() / "npm", directories[0])
+
+    def test_which_with_fallback_prefers_a_path_hit(self):
+        # 新解析层会校验候选真的可读：PATH 命中一个不存在的路径不再算解析成功。
+        with tempfile.TemporaryDirectory() as directory:
+            on_path = Path(directory) / "python3"
+            on_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            with patch.object(
+                shutil, "which", return_value=str(on_path)
+            ), patch.object(common.runtime, "toolchain_paths", return_value=[Path("/nope")]):
+                self.assertEqual(str(on_path), common.which_with_fallback("python3"))
+
+    def test_store_alias_stub_is_not_treated_as_usable(self):
+        # %LOCALAPPDATA%\Microsoft\WindowsApps\python3.EXE 这类商店别名桩 stat 能过、
+        # open 抛 EINVAL，是「存在但不可用」，既不是「未安装」也不是「被拒绝读取」。
+        with tempfile.TemporaryDirectory() as directory:
+            stub = Path(directory) / "python3"
+            stub.write_text("", encoding="utf-8")
+            with patch.object(
+                Path, "open", side_effect=OSError(22, "Invalid argument")
+            ), patch.object(shutil, "which", return_value=str(stub)), patch.object(
+                common.runtime, "toolchain_paths", return_value=[]
+            ):
+                self.assertIsNone(common.which_with_fallback("python3"))
+
+    def test_candidate_scan_survives_a_denied_enumeration(self):
+        with patch.object(
+            Path, "iterdir", side_effect=PermissionError(5, "Access is denied")
+        ):
+            directories = common.known_tool_dirs()
+        self.assertTrue(directories)
+        if os.name == "nt":
+            # 写死路径的候选不依赖列目录能力，仍然可用。
+            appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+            self.assertIn(Path(appdata) / "npm", directories)
+            local = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+            self.assertIn(local / "Programs" / "Python" / "Launcher", directories)
+        else:
+            self.assertIn(Path.home() / ".local" / "bin", directories)
+
+    def test_empty_candidate_scan_degrades_instead_of_raising(self):
+        # 候选目录扫不出任何东西只能退化成「解析失败」，不能变成内部错误。
+        with patch.object(shutil, "which", return_value=None), patch.object(
+            common.runtime, "toolchain_paths", return_value=[]
+        ), no_ambient_manifest():
+            self.assertIsNone(common.which_with_fallback("gitnexus"))
+            self.assertIsNone(common.declared_tool_path("graphify"))
+
+    def test_empty_candidate_scan_still_maps_to_a_recorded_skip(self):
+        # 同上：白名单内但解析不到的程序记为可恢复的 skipped，而不是把运行拖进失败。
+        with patch.object(shutil, "which", return_value=None), patch.object(
+            common.runtime, "toolchain_paths", return_value=[]
+        ), no_ambient_manifest():
+            with self.assertRaises(common.ValidationProgramMissing):
+                common.resolve_validation_command(Path("."), "python -m pytest")
+
+    def test_hint_survives_a_denied_stat(self):
+        with patch.object(
+            Path, "is_dir", side_effect=PermissionError(5, "Access is denied")
+        ):
+            self.assertEqual("本机没有已存在的候选目录", prepare.known_tool_dir_hint())
+
+    def test_capabilities_survive_an_empty_candidate_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(prepare.shutil, "which", return_value=None), patch.object(
+                common.runtime, "toolchain_paths", return_value=[root / "absent"]
+            ), no_ambient_manifest(), patch.dict(
+                os.environ,
+                {"CODEKIT_GITNEXUS_RUNNER": "", "CODEKIT_GRAPHIFY_RUNNER": ""},
+                clear=False,
+            ):
+                capabilities = prepare.tool_capabilities(root)
+            self.assertFalse(capabilities["gitnexus"]["available"])
+            self.assertEqual("unresolved", capabilities["gitnexus"]["runner"])
+            self.assertEqual(common.runtime.NOT_INSTALLED, capabilities["gitnexus"]["state"])
+            self.assertFalse(capabilities["graphify"]["available"])
+            self.assertEqual("unresolved", capabilities["graphify"]["runner_type"])
+
+    def test_candidate_scan_continues_past_a_denied_candidate(self):
+        # 一个候选撞到 EACCES 不能中断整轮扫描：Codex 沙箱拒绝 %APPDATA%\npm，
+        # 但同机的 venv 目录可读，可读的那个必须还能被发现。
+        with tempfile.TemporaryDirectory() as directory:
+            denied_root = Path(directory) / "denied"
+            readable = Path(directory) / "readable"
+            readable.mkdir()
+            target = readable / common.executable_names("graphify")[0]
+            target.write_text("", encoding="utf-8")
+            with denied_stat(denied_root), patch.object(
+                common.runtime, "toolchain_paths", return_value=[denied_root, readable]
+            ):
+                path, state = common.declared_tool_scan("graphify")
+                self.assertEqual(str(target), common.declared_tool_path("graphify"))
+            self.assertEqual(str(target), path)
+            self.assertEqual(common.runtime.OK, state)
+
+    def test_all_absent_candidates_report_not_installed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(
+                common.runtime, "toolchain_paths", return_value=[Path(directory)]
+            ):
+                self.assertEqual(
+                    (None, common.runtime.NOT_INSTALLED),
+                    common.declared_tool_scan("graphify"),
+                )
+
+    def test_unresolved_hint_says_installed_but_unreadable_when_denied(self):
+        # 沙箱拒绝读取候选目录时，结论必须是「已安装但读不到」而不是「未安装」：
+        # 后者会让用户去重装一个其实装好的工具。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            absent = root / "npm"
+            with patch.object(prepare.shutil, "which", return_value=None), patch.object(
+                common.runtime, "toolchain_paths", return_value=[absent]
+            ), denied_stat(absent), no_ambient_manifest(), patch.dict(
+                os.environ,
+                {"CODEKIT_GITNEXUS_RUNNER": "", "CODEKIT_GRAPHIFY_RUNNER": ""},
+                clear=False,
+            ):
+                capabilities = prepare.tool_capabilities(root)
+            for tool in ("gitnexus", "graphify"):
+                hint = capabilities[tool]["resolution_hint"]
+                self.assertIn("可能已安装但当前会话读不到", hint)
+                self.assertIn("用安装器重跑并勾选该组件", hint)
+                self.assertNotIn("确认不存在", hint)
+
+    def test_unresolved_hint_says_absent_when_nothing_is_denied(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(prepare.shutil, "which", return_value=None), patch.object(
+                common.runtime, "toolchain_paths", return_value=[root / "absent"]
+            ), no_ambient_manifest(), patch.dict(
+                os.environ,
+                {"CODEKIT_GITNEXUS_RUNNER": "", "CODEKIT_GRAPHIFY_RUNNER": ""},
+                clear=False,
+            ):
+                capabilities = prepare.tool_capabilities(root)
+            for tool in ("gitnexus", "graphify"):
+                hint = capabilities[tool]["resolution_hint"]
+                self.assertIn("确认不存在", hint)
+                self.assertNotIn("可能已安装但当前会话读不到", hint)
+
+    def test_resolved_but_unrunnable_runner_reports_a_hint(self):
+        # 能 stat 到入口但跑不起来（沙箱拒绝读取）不是「未安装」：提示要指向重装到
+        # 工具链根，且 available=False 让 gitnexus 阶段如实按 tool-missing 跳过。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            broken = root / "broken-gitnexus.py"
+            broken.write_text("raise SystemExit(3)\n", encoding="utf-8")
+            with patch.object(prepare.shutil, "which", return_value=None), patch.object(
+                common.runtime, "toolchain_paths", return_value=[root]
+            ), no_ambient_manifest(), patch.dict(
+                os.environ,
+                {
+                    "CODEKIT_GITNEXUS_RUNNER": f'"{sys.executable}" "{broken}"',
+                    "CODEKIT_GRAPHIFY_RUNNER": "",
+                },
+                clear=False,
+            ):
+                capabilities = prepare.tool_capabilities(root)
+            gitnexus = capabilities["gitnexus"]
+            self.assertFalse(gitnexus["available"])
+            self.assertEqual("override", gitnexus["runner"])
+            self.assertEqual(common.runtime.NOT_EXECUTABLE, gitnexus["state"])
+            self.assertFalse(common.tool_runnable(gitnexus))
+            self.assertIn("跑不起来", gitnexus["resolution_hint"])
+            self.assertNotIn("未在 CODEKIT_GITNEXUS_RUNNER", gitnexus["resolution_hint"])
+
+    def test_runnable_snapshot_requires_a_successful_probe(self):
+        self.assertFalse(common.tool_runnable({"runner": "unresolved", "command": []}))
+        self.assertFalse(common.tool_runnable({"runner": "declared", "command": [], "available": False}))
+        self.assertFalse(common.tool_runnable({
+            "runner": "declared", "command": ["C:/npm/gitnexus.cmd"], "available": False,
+        }))
+        self.assertTrue(common.tool_runnable({
+            "runner": "declared", "command": ["C:/npm/gitnexus.cmd"], "available": True,
+        }))
+        # 早期 manifest 没有 state 这一位时按可用处理，不得因此把工具判死。
+        self.assertTrue(common.tool_runnable({"runner": "override", "command": ["gitnexus"]}))
+        # 实测状态非 ok 时一律不可用，哪怕 available 因为旧字段仍是真。
+        self.assertFalse(common.tool_runnable({
+            "runner": "declared", "command": ["C:/npm/gitnexus.cmd"],
+            "available": True, "state": common.runtime.NOT_READABLE,
+        }))
+
+
+class ValidationCommandFallbackTests(unittest.TestCase):
+    """仓库验证命令的程序解析：PATH 之外还要查已知安装目录。"""
+
+    def test_program_is_found_in_a_declared_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            declared = Path(directory)
+            program = "py" if os.name == "nt" else "python3"
+            target = declared / common.executable_names(program)[0]
+            target.write_text("", encoding="utf-8")
+            with patch.object(shutil, "which", return_value=None), patch.object(
+                common.runtime, "toolchain_paths", return_value=[declared]
+            ):
+                argv = common.resolve_validation_command(
+                    Path(directory), f"{program} -m pytest"
+                )
+            self.assertEqual([str(target), "-m", "pytest"], argv)
+
+    def test_program_missing_everywhere_still_records_a_skip(self):
+        with patch.object(shutil, "which", return_value=None), patch.object(
+            common.runtime, "toolchain_paths", return_value=[]
+        ), no_ambient_manifest():
+            with self.assertRaises(common.ValidationProgramMissing):
+                common.resolve_validation_command(Path("."), "python -m pytest")
+
+
+def drive_gate(
+    root: Path,
+    *,
+    gitnexus: dict,
+    graphify: dict | None = None,
+    start_args: list[str] | None = None,
+) -> tuple[int, dict]:
+    """跑到 gate 为止，返回 ``(退出码, manifest)``。
+
+    只驱动 start + gate：降级语义是门禁的职责，把 reconcile/finish 一起拉进来只会让
+    断言淹没在无关步骤里。
+
+    整个流程在「两个工具都解析不到」的环境下运行——那正是要复现的场景，也顺带让
+    start 不再被 GitNexus 的注册硬前提拦住（本机真装了 gitnexus 时会要求先授权）。
+    """
+    git_repository(root)
+    (root / "README.md").write_text("fixture\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "init"], check=True)
+    run_id = "gate"
+    tools_absent = (
+        patch.object(shutil, "which", return_value=None),
+        patch.object(common.runtime, "toolchain_paths", return_value=[]),
+        patch.object(common.runtime, "read_manifest", return_value={}),
+        patch.dict(
+            os.environ,
+            {"CODEKIT_GITNEXUS_RUNNER": "", "CODEKIT_GRAPHIFY_RUNNER": ""},
+            clear=False,
+        ),
+    )
+    with tools_absent[0], tools_absent[1], tools_absent[2], tools_absent[3]:
+        with redirect_stdout(StringIO()):
+            assert controller.main([
+                "start", "--root", str(root), "--language", "python", "--run-id", run_id,
+                *(start_args or []),
+            ]) == 0
+        manifest_path = root / ".codekit" / "initialize" / run_id / "run-manifest.json"
+        (root / ".gitnexus").mkdir(exist_ok=True)
+        (root / ".gitnexus/meta.json").write_text(
+            json.dumps({"root": str(root)}), encoding="utf-8"
+        )
+        (root / "graphify-out").mkdir(exist_ok=True)
+        (root / "graphify-out/graph.json").write_text(
+            json.dumps({"nodes": [{"id": "n"}]}), encoding="utf-8",
+        )
+        (root / "graphify-out/manifest.json").write_text(
+            json.dumps({"root": str(root)}), encoding="utf-8",
+        )
+        (root / "graphify-out/.graphify_root").write_text(str(root), encoding="utf-8")
+
+        paths: list[Path] = []
+        gitnexus = dict(gitnexus)
+        gitnexus.setdefault("changed_files", [".gitnexus/meta.json"])
+        gitnexus.setdefault("allowed_paths", [".gitnexus/"])
+        gitnexus.setdefault(
+            "artifacts", [{"path": ".gitnexus/meta.json", "validation": "json-valid"}]
+        )
+        gitnexus.setdefault("run_id", run_id)
+        for payload, name in (
+            (gitnexus, "gitnexus.json"),
+            (
+                graphify
+                or worker_result(
+                    "graphify", run_id=run_id,
+                    changed=[
+                        "graphify-out/graph.json",
+                        "graphify-out/manifest.json",
+                        "graphify-out/.graphify_root",
+                    ],
+                    allowed=["graphify-out/"],
+                    artifacts=[
+                        {"path": "graphify-out/graph.json", "validation": "json-nonempty-nodes"},
+                        {"path": "graphify-out/manifest.json", "validation": "json-valid"},
+                        {"path": "graphify-out/.graphify_root", "validation": "root-match"},
+                    ],
+                ),
+                "graphify.json",
+            ),
+            (worker_result("context-scanner", run_id=run_id), "context-scanner.json"),
+        ):
+            path = manifest_path.parent / name
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            paths.append(path)
+        with redirect_stdout(StringIO()):
+            code = controller.main([
+                "gate", "--manifest", str(manifest_path),
+                *[part for path in paths for part in ("--result", str(path))],
+            ])
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return code, document
+
+
+def skipped_tool_result(task: str, *, code: str = "tool-missing", hint: str = "分辨率提示") -> dict:
+    """一个工具不可用导致的 skipped 结果，形状与控制器实际写出的完全一致。"""
+    result = worker_result(task, run_id="gate")
+    result.update(
+        {
+            "status": "skipped",
+            "command": [],
+            "exit_code": None,
+            "warnings": [hint],
+            "error": {"code": code, "message": "runner 不可用"},
+        }
+    )
+    return result
+
+
+class ToolDegradationGateTests(unittest.TestCase):
+    """工具不可用造成的 partial：自动降级跑完，不再要求 --allow-partial 二次运行。
+
+    这是用户反复重跑的直接来源：barrier 判 partial → 未传 --allow-partial 就 abort 释放
+    锁 → 只能重跑一次。工具不可用是环境事实，不是需要用户授权的降级。
+    """
+
+    def test_tool_missing_keeps_the_run_gated_instead_of_aborting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            code, manifest = drive_gate(
+                root,
+                gitnexus=skipped_tool_result("gitnexus"),
+                graphify=skipped_tool_result("graphify", hint="graphify 分辨率提示"),
+            )
+            self.assertEqual(0, code, manifest.get("worker_gate"))
+            self.assertEqual("partial", manifest["worker_gate"]["status"])
+            self.assertEqual([], manifest["worker_gate"]["errors"])
+            self.assertEqual("gated", manifest["phase"])
+            self.assertTrue(manifest["worker_gate"]["tool_only_degradation"])
+            self.assertEqual(
+                {"gitnexus", "graphify"},
+                {item["task"] for item in manifest["worker_gate"]["degradations"]},
+            )
+            # 报告要能逐条点名，附上原文提示。
+            hint_by_task = {
+                item["task"]: item["hint"] for item in manifest["worker_gate"]["degradations"]
+            }
+            self.assertEqual("graphify 分辨率提示", hint_by_task["graphify"])
+            # 锁必须保留：降级运行要继续走 reconcile/finish，释放锁才是逼用户重跑的那一步。
+            self.assertTrue(Path(manifest["lock_path"]).is_file())
+
+    def test_registry_missing_alone_also_degrades(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gitnexus = skipped_tool_result("gitnexus", code="registry-missing")
+            gitnexus["status"] = "partial"
+            code, manifest = drive_gate(root, gitnexus=gitnexus)
+            self.assertEqual(0, code, manifest.get("worker_gate"))
+            self.assertEqual("gated", manifest["phase"])
+            self.assertEqual("partial", manifest["worker_gate"]["status"])
+
+    def test_a_real_failure_alongside_a_degradation_still_needs_consent(self):
+        # Graphify chunk 失败是真实失败，不能被「同时有个工具缺失」赦免。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            graphify = worker_result(
+                "graphify", run_id="gate",
+                changed=[
+                    "graphify-out/graph.json",
+                    "graphify-out/manifest.json",
+                    "graphify-out/.graphify_root",
+                ],
+                allowed=["graphify-out/"],
+                artifacts=[
+                    {"path": "graphify-out/graph.json", "validation": "json-nonempty-nodes"},
+                    {"path": "graphify-out/manifest.json", "validation": "json-valid"},
+                    {"path": "graphify-out/.graphify_root", "validation": "root-match"},
+                ],
+            )
+            graphify.update(
+                {
+                    "status": "partial",
+                    "error": {"code": "chunk-failures", "message": "过半 chunk 失败"},
+                }
+            )
+            code, manifest = drive_gate(
+                root, gitnexus=skipped_tool_result("gitnexus"), graphify=graphify
+            )
+            self.assertNotEqual(0, code)
+            self.assertEqual("aborted", manifest["phase"])
+            self.assertFalse(manifest["worker_gate"]["tool_only_degradation"])
+            self.assertIn("--allow-partial", " ".join(manifest["worker_gate"]["errors"]))
+
+    def test_strict_tools_restores_the_fail_closed_behaviour(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            code, manifest = drive_gate(
+                root,
+                gitnexus=skipped_tool_result("gitnexus"),
+                start_args=["--strict-tools"],
+            )
+            self.assertNotEqual(0, code)
+            self.assertEqual("aborted", manifest["phase"])
+            self.assertIn("--allow-partial", " ".join(manifest["worker_gate"]["errors"]))
 
 
 if __name__ == "__main__":

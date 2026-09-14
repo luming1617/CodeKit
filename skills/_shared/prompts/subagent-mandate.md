@@ -11,6 +11,8 @@ CodeKit 的角色文件**不通过 plugin manifest 分发**：`.claude-plugin/pl
 | Claude Code | `~/.claude/agents/<name>.md` |
 | OpenCode | `~/.config/opencode/agents/<name>.md` |
 | Codex | `~/.codex/agents/<name>.toml` |
+| Qoder | `~/.qoder/agents/<name>.md`（CLI 与桌面 IDE 共享同一个配置根） |
+| Qoder CN | `~/.qoder-cn/agents/<name>.md` |
 
 因此：角色标识就是裸名 `<name>`（例如 `tech-context`）。**不存在 `@agent-<plugin>:<name>` 这类插件作用域角色名**，不要按它派发，也不要声称“若来自插件则改用作用域名”。
 
@@ -21,6 +23,8 @@ Skill 自身的调用名按宿主区分：
 | Claude Code | `/codekit:<skill> <args>` |
 | Codex | `$<skill> <args>` |
 | OpenCode | `/<skill> <args>` |
+| Qoder | `/codekit:<skill> <args>` |
+| Qoder CN | `/codekit:<skill> <args>` |
 
 ## 硬性门禁
 
@@ -63,6 +67,7 @@ Skill 自身的调用名按宿主区分：
   - 能力是否存在只看**模型可见的派发工具**：`codex features list` 可以在工具面为空时仍报 `multi_agent stable true`，宿主自述同理。工具面缺失即 `collab-unavailable`，按各 Skill 的阻断路径停止，不得改由主 Agent 代做。
   - 补齐该能力有两条路：**安装器**在勾选 Codex 插件时自动开启（一次/机器，之后技能侧探测直接得到 `available`）；技能侧则必须先取得用户授权，再用 `probe-collab.py --enable` 写入。两条路都改变不了"宿主只在启动时读配置"这一点——本轮改完仍拿不到工具，所以写完只能停下提示重启，不得当作已经修好。
 - **OpenCode：** 通过命令或调度入口指定 `agent: "<name>"` 并显式设置 `subagent: true`，强制创建后台子会话；旧版仅支持 `subtask: true` 时使用该兼容字段。仅依赖 `mode: subagent` 或在当前主会话内执行，不满足强制调用要求。
+- **Qoder / Qoder CN：** 派发工具由宿主内置，用宿主的子代理/任务能力创建独立会话，并把 `subagent_type`（或等价字段）填成全局安装的裸名 `<name>`；两个发行版共用同一套角色安装路径（`<配置根>/agents/<name>.md`，配置根分别是 `~/.qoder` 与 `~/.qoder-cn`），所以语法一致。`--enable` 对它们返回 `refused`：没有可写的开关，不要为它们编造配置项。
 
 ## 复用与轮次
 

@@ -24,13 +24,16 @@ REPO_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_agents as agents  # noqa: E402
+import installer as installer_module  # noqa: E402
 import installer_codex as codex  # noqa: E402
 import installer_config as config  # noqa: E402
 import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 import installer_state as detector  # noqa: E402
+import installer_toolchain as toolchain  # noqa: E402
 from installer import Installer, InstallerError, RunResult  # noqa: E402
 from uninstaller import Uninstaller  # noqa: E402
+import uninstaller as uninstaller_module  # noqa: E402
 
 HELPER_SCRIPT = SCRIPT_DIR / "manage-global-agents.py"
 SELECTOR_SCRIPT = SCRIPT_DIR / "component-selector.py"
@@ -71,17 +74,38 @@ def bare_installer(home: Path) -> Installer:
     installer.logger = Mock()
     installer.marketplace_local = None
     installer.changed_paths = []
+    installer.selected = []
+    # __init__ 会建这个快照；绕过 __init__ 的夹具必须自己补上，否则任何走到
+    # requirements_met / toolchain_python 的路径都会 AttributeError。
+    installer.toolchain = toolchain.RuntimeState()
     return installer
 
 
 def bare_uninstaller(home: Path) -> Uninstaller:
-    """装配仅含卸载所需字段的卸载会话；平台对象用 Mock，便于逐例控制交互能力。"""
+    """装配仅含卸载所需字段的卸载会话；平台对象用 Mock，便于逐例控制交互能力。
+
+    路径助手接回真实的平台对象：卸载要删工具链根与 venv，用 Mock 会让 rmtree 拿到
+    一个非路径对象并抛 TypeError，用例就测不到清理逻辑。交互能力仍由 Mock 控制。
+    """
     uninstaller = Uninstaller.__new__(Uninstaller)
     uninstaller.home = home
+    paths = platform_layer.platform_for("Windows")
     uninstaller.platform = Mock(can_interact=Mock(return_value=True))
+    for helper in (
+        "toolchain_root",
+        "npm_prefix_private",
+        "venv_dir",
+        "venv_exe",
+        "shim_name",
+        "binary_filename",
+        "state_dir",
+    ):
+        setattr(uninstaller.platform, helper, getattr(paths, helper))
     uninstaller.os_name = "Windows"
     uninstaller.bin_dir = home / ".local" / "bin"
     uninstaller.logger = Mock()
+    uninstaller.purge = False
+    uninstaller.toolchain_purged = False
     return uninstaller
 
 
@@ -144,10 +168,15 @@ class HelperContractTests(unittest.TestCase):
                 "installer_codex.py",
                 "installer_config.py",
                 "installer_platform.py",
+                "installer_preflight.py",
                 "installer_qoder.py",
                 "installer_sources.py",
                 "installer_state.py",
+                "installer_toolchain.py",
                 "manage-global-agents.py",
+                # 技能侧共享脚本：Codex 的 TOML 读写与探测只有那一份实现，
+                # installer_codex 按路径加载它，因此它也是安装器的硬依赖。
+                "../skills/_shared/scripts/probe-collab.py",
             },
         )
 
@@ -1013,10 +1042,9 @@ class WindowsPlatformAdapterTests(unittest.TestCase):
                 # npm 的 shim 直接落在前缀根目录，Windows 上没有 bin/ 子目录。
                 self.assertEqual(windows.npm_bin_dir(prefix), prefix)
                 self.assertEqual(windows.bin_dir(home, prefix), prefix)
-                # 没有可写的 shell 配置，也没有 SIGHUP。
+                # 没有可写的 shell 配置。
                 self.assertIsNone(windows.shell_config(home))
                 self.assertEqual(windows.shell_rc_files(home), ())
-                self.assertEqual(windows.signal_names(), ("SIGTERM",))
 
     def test_windows_probed_npm_prefix_wins_over_the_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1858,13 +1886,26 @@ class GitNexusQoderRegistrationTests(unittest.TestCase):
         installer.run_command = Mock(return_value=RunResult(0))
         return installer
 
+    def _resolving_gitnexus_to(self, shim: Path):
+        """只把 ``gitnexus`` 的解析指向伪造 shim，其余命令照常解析。
+
+        整体替换 ``resolve_exe`` 会连带打断 node 的解析（``command_version`` 也走
+        它），于是 node 版本读成空、依赖门禁先失败，用例就测不到注册逻辑了。
+        """
+        real_resolve = platform_layer.resolve_exe
+
+        def resolve(name: str):
+            return str(shim) if name == "gitnexus" else real_resolve(name)
+
+        return patch.object(platform_layer, "resolve_exe", side_effect=resolve)
+
     def test_install_registers_mcp_and_hooks_in_the_shared_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = self._home(directory)
             root = home / ".qoder-cn"
             shim = self._fake_install(home)
             installer = self._installer(home)
-            with patch.object(platform_layer, "resolve_exe", return_value=str(shim)):
+            with self._resolving_gitnexus_to(shim):
                 self.assertTrue(installer.install_gitnexus())
             document = qoder.read_settings(root)
             self.assertEqual(
@@ -1898,7 +1939,7 @@ class GitNexusQoderRegistrationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             installer = self._installer(home)
-            with patch.object(platform_layer, "resolve_exe", return_value=str(shim)):
+            with self._resolving_gitnexus_to(shim):
                 self.assertTrue(installer.install_gitnexus())
             self.assertFalse(dead.exists(), "Qoder 从不读取这个文件")
 
@@ -1915,7 +1956,7 @@ class GitNexusQoderRegistrationTests(unittest.TestCase):
             (home / "npm").mkdir()
             installer = self._installer(home)
             shim = home / "npm" / "gitnexus.cmd"
-            with patch.object(platform_layer, "resolve_exe", return_value=str(shim)):
+            with self._resolving_gitnexus_to(shim):
                 self.assertFalse(installer.install_gitnexus())
             self.assertTrue(installer.logger.error.called)
             self.assertEqual(qoder.read_settings(home / ".qoder-cn"), {})
@@ -1926,8 +1967,15 @@ class GitNexusQoderRegistrationTests(unittest.TestCase):
             root = home / ".qoder-cn"
             shim = self._fake_install(home)
             installer = self._installer(home)
-            with patch.object(platform_layer, "resolve_exe", return_value=str(shim)):
+            with self._resolving_gitnexus_to(shim):
                 installer.install_gitnexus()
+            # 安装期的两个落点：私有 npm 前缀副本，以及 bin_dir 里的转发垫片。
+            private = installer.platform.npm_prefix_private(home)
+            private.mkdir(parents=True, exist_ok=True)
+            forwarded = installer.bin_dir / "gitnexus.cmd"
+            forwarded.parent.mkdir(parents=True, exist_ok=True)
+            forwarded.write_text("", encoding="utf-8")
+
             qoder.register_mcp_server(root, "other", {"command": "other"})
             uninstaller = bare_uninstaller(home)
             uninstaller.command_exists = Mock(return_value=False)
@@ -1937,6 +1985,10 @@ class GitNexusQoderRegistrationTests(unittest.TestCase):
             self.assertEqual(document["mcpServers"], {"other": {"command": "other"}})
             self.assertNotIn("hooks", document)
             self.assertFalse(qoder.hook_script_dir(root).exists())
+            self.assertFalse(private.exists(), "私有前缀副本必须一并清掉")
+            self.assertFalse(
+                forwarded.exists(), "转发垫片留在 PATH 上会让后续卸载误判成没卸干净"
+            )
 
 
 class GraphifyQoderVisibilityTests(unittest.TestCase):
@@ -2111,9 +2163,7 @@ class CodexMultiAgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             installer = self._installer(home, ["claude_plugin", "opencode_plugin", "qoder_plugin"])
-            with patch.object(Installer, "enable_codex_multi_agent") as enable, patch.object(
-                Installer, "agent_role_count", return_value=26
-            ):
+            with patch.object(Installer, "enable_codex_multi_agent") as enable:
                 installer.configure_agent_capabilities()
             self.assertFalse(enable.called)
             self.assertEqual(
@@ -2122,18 +2172,39 @@ class CodexMultiAgentTests(unittest.TestCase):
             )
             self.assertFalse((home / ".codex").exists())
 
-    def test_notice_lists_every_platform_and_demands_a_restart(self) -> None:
+    def test_enabled_notice_is_one_line_of_at_most_ten_characters(self) -> None:
+        # 静默开启：整条链路只留一行提示，不再有汇总框与三行重启说明。
         with tempfile.TemporaryDirectory() as directory:
             installer = self._installer(Path(directory), ["codex_plugin", "claude_plugin"])
-            with patch.object(Installer, "enable_codex_multi_agent", return_value="enabled"), patch.object(
-                Installer, "agent_role_count", return_value=26
-            ):
+            with patch.object(Installer, "enable_codex_multi_agent", return_value="enabled"):
                 installer.configure_agent_capabilities()
-            box = "\n".join(call.args[0] for call in installer.logger.info.call_args_list)
-            self.assertIn("需要重启 Agent 应用", box)
-            self.assertIn("Codex", box)
-            self.assertIn("Claude Code", box)
-            self.assertIn("无 multi_agent 开关", box)
+            printed = "\n".join(call.args[0] for call in installer.logger.info.call_args_list)
+            self.assertEqual(installer.MULTI_AGENT_NOTICE, printed)
+            self.assertLessEqual(len(printed), 10)
+            self.assertIn("重启", printed)
+            self.assertFalse(installer.logger.warn.called)
+            self.assertNotIn("无 multi_agent 开关", printed)
+
+    def test_already_on_is_silent(self) -> None:
+        # 已开启是每次重跑都会出现的常态结论：不需要用户做任何事，就不该占版面。
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(Path(directory), ["codex_plugin"])
+            with patch.object(Installer, "enable_codex_multi_agent", return_value="already-on"):
+                installer.configure_agent_capabilities()
+            self.assertFalse(installer.logger.info.called)
+            self.assertFalse(installer.logger.warn.called)
+            self.assertFalse(installer.logger.success.called)
+
+    def test_unconfirmed_capability_warns_once_without_a_box(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(Path(directory), ["codex_plugin"])
+            with patch.object(Installer, "enable_codex_multi_agent", return_value="unknown"):
+                installer.configure_agent_capabilities()
+            self.assertFalse(installer.logger.info.called)
+            self.assertEqual(1, installer.logger.warn.call_count)
+            text = str(installer.logger.warn.call_args.args[0])
+            self.assertIn("Codex", text)
+            self.assertIn("未确认", text)
 
     def test_nothing_printed_without_a_plugin_component(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2141,6 +2212,197 @@ class CodexMultiAgentTests(unittest.TestCase):
             installer.configure_agent_capabilities()
             self.assertEqual(installer.agent_capabilities, [])
             self.assertFalse(installer.logger.info.called)
+
+
+class CodexDesktopDetectionTests(unittest.TestCase):
+    """``[desktop]`` 段是区分桌面版与 CLI 的配置痕迹。"""
+
+    def test_desktop_table_is_detected(self) -> None:
+        text = 'model = "gpt"\n\n[desktop]\n  integratedTerminalShell = "powershell"\n'
+        self.assertTrue(codex.desktop_app_present(text))
+
+    def test_desktop_subtable_is_detected(self) -> None:
+        self.assertTrue(codex.desktop_app_present("[desktop.window]\nsize = 1\n"))
+
+    def test_config_without_the_desktop_section_is_a_cli_config(self) -> None:
+        text = '[features]\n  multi_agent_v2 = true\n\n[mcp_servers.gitnexus]\n  command = "gitnexus"\n'
+        self.assertFalse(codex.desktop_app_present(text))
+
+    def test_commented_header_does_not_count(self) -> None:
+        self.assertFalse(codex.desktop_app_present("# [desktop]\nmodel = 'gpt'\n"))
+
+
+class ToolchainHealthTests(unittest.TestCase):
+    """工具链落点的自检按清单实测状态报告，不再用「是否只在用户级 PATH」。
+
+    那个旧判据已被实测证伪：受限宿主的 PATH 里用户级条目是全的，真正被拒绝的是对
+    这些目录的文件系统访问，所以「把目录加进 PATH」永远解决不了问题。
+    """
+
+    def _installer(self, home: Path, tools: dict) -> Installer:
+        installer = bare_installer(home)
+        installer.selected = sorted(tools)
+        installer.toolchain_manifest = {"tools": tools}
+        return installer
+
+    def test_healthy_entries_warn_about_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(
+                Path(directory),
+                {"gitnexus": {"state": "ok"}, "graphify": {"state": "ok"}},
+            )
+            installer.report_toolchain_health()
+            self.assertEqual(
+                [("gitnexus", "ok"), ("graphify", "ok")], installer.toolchain_health
+            )
+            self.assertFalse(installer.logger.warn.called)
+
+    def test_not_readable_names_the_state_and_refuses_the_path_advice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(
+                Path(directory), {"gitnexus": {"state": "not-readable"}}
+            )
+            installer.report_toolchain_health()
+            self.assertEqual(1, installer.logger.warn.call_count)
+            text = str(installer.logger.warn.call_args[0][0])
+            self.assertIn("not-readable", text)
+            # 提示必须点明「不是未安装」，并给出真正的出路。
+            self.assertIn("不是未安装", text)
+            self.assertIn("install.sh install", text)
+            self.assertIn("只改 PATH 无效", text)
+
+    def test_not_executable_points_at_the_venv_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(
+                Path(directory), {"graphify": {"state": "not-executable"}}
+            )
+            installer.report_toolchain_health()
+            text = str(installer.logger.warn.call_args[0][0])
+            self.assertIn("基础解释器", text)
+            self.assertIn("内置运行时", text)
+
+    def test_absent_entry_asks_for_a_reinstall_with_that_component(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(
+                Path(directory), {"gitnexus": {"state": "not-installed"}}
+            )
+            installer.report_toolchain_health()
+            text = str(installer.logger.warn.call_args[0][0])
+            self.assertIn("未安装", text)
+            self.assertIn("install.sh install", text)
+
+    def test_missing_manifest_entry_is_skipped_rather_than_blamed(self) -> None:
+        # 清单里没有该组件，说明这次安装没接管它；报「未安装」是错的。
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(Path(directory), {})
+            installer.selected = ["gitnexus"]
+            installer.report_toolchain_health()
+            self.assertEqual([], installer.toolchain_health)
+            self.assertFalse(installer.logger.warn.called)
+
+
+class UninstallerPurgeTests(unittest.TestCase):
+    """``--purge`` 才移除工具链根：默认保留，因为同机多仓库共用那一份运行时。
+
+    默认保留不是保守，是实测约束：根里是可读可执行的唯一一份内置运行时，删掉会让其它
+    仓库的 ``codekit:initialize`` 立刻降级成 partial，而技能侧无权把它装回来。
+    """
+
+    def _uninstaller(self, home: Path, *, purge: bool) -> Uninstaller:
+        uninstaller = bare_uninstaller(home)
+        uninstaller.purge = purge
+        return uninstaller
+
+    def _seed_root(self, home: Path) -> Path:
+        root = platform_layer.platform_for("Windows").toolchain_root(home)
+        (root / "runtime" / "20260901" / "python").mkdir(parents=True)
+        (root / "toolchain.json").write_text("{}", encoding="utf-8")
+        return root
+
+    def test_default_keeps_the_toolchain_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            root = self._seed_root(home)
+            uninstaller = self._uninstaller(home, purge=False)
+            uninstaller.purge_toolchain()
+            self.assertTrue(root.is_dir())
+            self.assertFalse(uninstaller.toolchain_purged)
+
+    def test_purge_removes_the_toolchain_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            root = self._seed_root(home)
+            uninstaller = self._uninstaller(home, purge=True)
+            uninstaller.purge_toolchain()
+            self.assertFalse(root.exists())
+            self.assertTrue(uninstaller.toolchain_purged)
+
+    def test_purging_an_absent_root_is_not_reported_as_a_removal(self) -> None:
+        # 幂等卸载会重复跑：不能把「本来就没有」写成「已移除」。
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            uninstaller = self._uninstaller(home, purge=True)
+            uninstaller.purge_toolchain()
+            self.assertFalse(uninstaller.toolchain_purged)
+            self.assertFalse(uninstaller.logger.warn.called)
+
+    def test_purge_flag_reaches_the_cli(self) -> None:
+        self.assertTrue(uninstaller_module.parse_args(["--purge"]).purge)
+        self.assertFalse(uninstaller_module.parse_args(["-y"]).purge)
+
+
+class CodexRtkRegistrationTests(unittest.TestCase):
+    """桌面版 shell 看不到用户级 rtk 时，不要写入做不到的前缀约束。"""
+
+    def _installer(self, home: Path, config_text: "str | None") -> Installer:
+        installer = bare_installer(home)
+        if config_text is not None:
+            path = codex.config_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(config_text, encoding="utf-8")
+        return installer
+
+    def test_desktop_host_without_machine_visible_rtk_skips_the_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(Path(directory), "[desktop]\nwindow = 1\n")
+            with patch.object(installer, "visible_without_user_path", return_value=False):
+                self.assertFalse(installer.codex_can_run_rtk())
+
+    def test_desktop_host_with_machine_visible_rtk_keeps_the_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(Path(directory), "[desktop]\nwindow = 1\n")
+            with patch.object(installer, "visible_without_user_path", return_value=True):
+                self.assertTrue(installer.codex_can_run_rtk())
+
+    def test_cli_only_host_keeps_the_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(Path(directory), "[features]\n")
+            with patch.object(installer, "visible_without_user_path", return_value=False):
+                self.assertTrue(installer.codex_can_run_rtk())
+
+    def test_missing_config_keeps_the_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(Path(directory), None)
+            with patch.object(installer, "visible_without_user_path", return_value=False):
+                self.assertTrue(installer.codex_can_run_rtk())
+
+    def test_configure_rtk_skips_only_the_codex_step(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            installer.command_exists = Mock(return_value=True)
+            installer.codex_can_run_rtk = Mock(return_value=False)
+            with patch.object(installer, "run_command", return_value=RunResult(0)) as run:
+                self.assertTrue(installer.configure_rtk())
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertIn(["rtk", "init", "-g", "--auto-patch"], commands)
+            self.assertNotIn(["rtk", "init", "-g", "--codex"], commands)
+            self.assertIn(["rtk", "init", "-g", "--opencode", "--auto-patch"], commands)
+            self.assertTrue(installer.logger.warn.called)
+
+    def test_machine_path_entries_is_empty_off_windows(self) -> None:
+        if os.name == "nt":
+            self.skipTest("非 Windows 用例")
+        self.assertEqual((), platform_layer.machine_path_entries())
 
 
 if __name__ == "__main__":

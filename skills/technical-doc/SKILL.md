@@ -55,6 +55,8 @@ flowchart LR
 | Claude Code | `/codekit:technical-doc <feature-directory>` |
 | Codex | `$technical-doc <feature-directory>` |
 | OpenCode | `/technical-doc <feature-directory>` |
+| Qoder | `/codekit:technical-doc <feature-directory>` |
+| Qoder CN | `/codekit:technical-doc <feature-directory>` |
 
 唯一输入参数是当前仓库内的 `<feature-directory>`（例如 `docs/2026-09-09-order-note-sync`）。依赖文档不从参数接收路径，只在该目录按固定文件名查找：输入 PRD `product-doc.md`，输出 TDD `technical-doc.md`；RPD `release-doc.md` 由后续 `release-doc` 生成。
 
@@ -69,9 +71,11 @@ flowchart LR
 阶段 0 的第一件事是初始化运行目录，后续每一步都用控制器的退出码判定，而不是用主 Agent 的自述：
 
 ```bash
-STATE=$(<PYTHON> "$SKILL_DIR/scripts/tech_doc_controller.py" init \
-  --repo-root "$PWD" --feature-directory "$feature_directory" --run-id "$run_id")
+<PYTHON> "$SKILL_DIR/scripts/tech_doc_controller.py" init \
+  --repo-root "<仓库根的绝对路径>" --feature-directory "$feature_directory" --run-id "$run_id"
 ```
+
+`init` 会在 stdout 输出一行 `STATE=<运行状态文件的绝对路径>`。**不要用 `$(...)` / `$PWD` 之类的 shell 特性去接它**：`cmd.exe` 与 PowerShell 都不支持，Skill 会在 Windows 上直接坏掉。从这一行读出路径，替换掉后文命令里的 `<state 的绝对路径>` 即可。
 
 | 命令 | 用途 |
 |------|------|
@@ -163,7 +167,7 @@ PRD 当前版本中用户最新明确的方案和逻辑优先于旧 PRD、旧 TD
 写入 `<feature-directory>/technical-doc.md`（文件名固定；目录不存在则创建），包含方案正文、ADR、风险登记与工作量评估、审查闭环记录、Finding 处置映射、`review_round` 与最终评审状态，以及（变更时）历史版本索引。
 
 ```bash
-<PYTHON> "$SKILL_DIR/scripts/tech_doc_controller.py" gate --state "$STATE" \
+<PYTHON> "$SKILL_DIR/scripts/tech_doc_controller.py" gate --state "<state 的绝对路径>" \
   --tdd-file "$feature_directory/technical-doc.md"
 ```
 

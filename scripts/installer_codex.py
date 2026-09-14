@@ -6,113 +6,67 @@ exists when ``[features] multi_agent_v2`` is on.  ``codex features list`` is not
 evidence for this: it can report ``multi_agent stable true`` while the
 model-visible prompt carries zero agent tools.  So the probe reads the prompt
 dump itself, which costs no tokens because it never reaches a model call.
+
+The TOML reader/writer and the probe classifier are not reimplemented here: the
+skills own that logic in ``skills/_shared/scripts/probe-collab.py`` and call it
+directly, so this module loads that single implementation by path and re-exports
+it under the names the installer uses.  Keeping a second copy meant two files
+that had to be edited in lockstep, which is exactly how they drift apart.
 """
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
 
-FEATURES_TABLE = "features"
-MULTI_AGENT_KEY = "multi_agent_v2"
-# The dispatch surface CodeKit's subagent mandate depends on.
-COLLAB_TOOLS = (
-    "spawn_agent",
-    "list_agents",
-    "wait_agent",
-    "send_message",
-    "interrupt_agent",
-)
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_DIR = SCRIPT_DIR.parent
 
-AVAILABLE = "available"
-UNAVAILABLE = "unavailable"
-UNKNOWN = "unknown"
+# 技能侧共享脚本是安装器的真实依赖（安装器本来就要求检出里有 skills/）。缺了它是
+# 残缺检出，要以单行受控错误结束，而不是让下游在运行期抛 AttributeError。
+_SHARED_PROBE = REPO_DIR / "skills" / "_shared" / "scripts" / "probe-collab.py"
+if not _SHARED_PROBE.is_file():
+    raise ValueError(f"installer helper missing: {_SHARED_PROBE}")
 
+import installer_config as config  # noqa: E402
 
-def config_path(home: Path) -> Path:
-    """Codex 用户级配置文件；桌面版与 CLI 在同一 OS 上共享这一份。"""
-    return home / ".codex" / "config.toml"
+_probe = config.load_module(_SHARED_PROBE, "codekit_probe_collab")
+
+AVAILABLE = _probe.AVAILABLE
+UNAVAILABLE = _probe.UNAVAILABLE
+UNKNOWN = _probe.UNKNOWN
+MULTI_AGENT_KEY = _probe.MULTI_AGENT_KEY
+
+# 桌面版写入的配置段；CLI 不会写它。桌面版的 shell 只继承机器级 PATH，而 CLI 从终端
+# 启动时继承完整 PATH，两者共用这一份配置，所以能力判定需要区分它们。
+DESKTOP_TABLE = "desktop"
+
+config_path = _probe.config_path
+enable_multi_agent = _probe.enable_multi_agent
+write_config = _probe.write_config
 
 
 def probe_command() -> list[str]:
     """导出模型可见 prompt 的本地命令；配置改动即时生效，无需重启。"""
-    return ["codex", "debug", "prompt-input", "hi"]
-
-
-def exposed_tools(output: str) -> Tuple[str, ...]:
-    return tuple(
-        tool for tool in COLLAB_TOOLS if re.search(rf"\b{re.escape(tool)}\b", output)
-    )
+    return list(_probe.probe_command("codex") or [])
 
 
 def classify_probe(returncode: int, output: str) -> str:
     """只有「命令跑通且工具面为空」才算不可用；跑不通一律 unknown，不据此阻断。"""
-    if returncode != 0:
-        return UNKNOWN
-    return AVAILABLE if exposed_tools(output) else UNAVAILABLE
+    return _probe.classify(returncode, output)
 
 
-def _split_terminator(line: str) -> Tuple[str, str]:
-    body = line.rstrip("\r\n")
-    return body, line[len(body):]
+def desktop_app_present(text: str) -> bool:
+    """这份配置是否由桌面版写过（存在 ``[desktop]`` 或它的子表）。
 
-
-def _table_range(lines: Sequence[str]) -> Optional[Tuple[int, int]]:
-    """返回 ``[features]`` 表体的 [起始, 结束) 行区间；表头本身是 start-1。"""
-    header: Optional[int] = None
-    for index, raw in enumerate(lines):
-        body, _ = _split_terminator(raw)
-        text = body.strip()
-        if not text or text.startswith("#"):
+    桌面版与 CLI 共用 ``config.toml``，但只有桌面版会写 ``[desktop]``。判定「用户级
+    命令在这个宿主里能不能执行」需要它：桌面版的 shell 只继承机器级 PATH，同样的
+    命令在从终端启动的 CLI 里可见。
+    """
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line.startswith("[") or line.startswith("[["):
             continue
-        is_header = text.startswith("[")
-        if header is not None and is_header:
-            return header + 1, index
-        if is_header and not text.startswith("[[") and text.endswith("]"):
-            if text[1:-1].strip() == FEATURES_TABLE:
-                header = index
-    return (header + 1, len(lines)) if header is not None else None
-
-
-def read_value(text: str, key: str) -> Optional[str]:
-    """读取 ``[features]`` 表内某个键的原始字面量；不存在时返回 None。"""
-    lines = text.splitlines(keepends=True)
-    table = _table_range(lines)
-    if table is None:
-        return None
-    pattern = re.compile(rf"^\s*{re.escape(key)}\s*=\s*(.+?)\s*$")
-    for raw in lines[table[0]:table[1]]:
-        body, _ = _split_terminator(raw)
-        match = pattern.match(body.split("#", 1)[0])
-        if match:
-            return match.group(1)
-    return None
-
-
-def enable_multi_agent(text: str) -> Tuple[str, bool]:
-    """把 ``[features] multi_agent_v2 = true`` 写进 TOML，其余内容逐字节保留。"""
-    newline = "\r\n" if "\r\n" in text else "\n"
-    lines = text.splitlines(keepends=True)
-    table = _table_range(lines)
-    if table is not None:
-        key_pattern = re.compile(
-            rf"^(\s*){re.escape(MULTI_AGENT_KEY)}\s*=\s*[^#]*?(\s*#.*)?$"
-        )
-        for index in range(table[0], table[1]):
-            body, terminator = _split_terminator(lines[index])
-            match = key_pattern.match(body)
-            if not match:
-                continue
-            if read_value(text, MULTI_AGENT_KEY) == "true":
-                return text, False
-            lines[index] = f"{match.group(1)}{MULTI_AGENT_KEY} = true{match.group(2) or ''}{terminator}"
-            return "".join(lines), True
-        _, header_term = _split_terminator(lines[table[0] - 1])
-        lines.insert(table[0], f"{MULTI_AGENT_KEY} = true{header_term or newline}")
-        return "".join(lines), True
-
-    prefix = "" if not text or text.endswith(("\n", "\r")) else newline
-    separator = newline if text else ""
-    block = f"{prefix}{separator}[{FEATURES_TABLE}]{newline}{MULTI_AGENT_KEY} = true{newline}"
-    return text + block, True
+        name = line[1:-1].strip() if line.endswith("]") else ""
+        if name == DESKTOP_TABLE or name.startswith(f"{DESKTOP_TABLE}."):
+            return True
+    return False

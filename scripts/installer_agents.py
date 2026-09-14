@@ -15,7 +15,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Mapping, Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -197,19 +197,6 @@ def channel_plan(entry: AgentCLI) -> list[tuple[str, str]]:
         for kind in registry.CHANNEL_ORDER
         if kind in entry.channels
     ]
-
-
-def install_plan(entry: AgentCLI, os_name: Optional[str] = None) -> list[Sequence[str]]:
-    """Return install commands for an agent CLI, ordered by the channel table."""
-    plan: list[Sequence[str]] = []
-    for kind, target in channel_plan(entry):
-        if kind == "npm":
-            plan.append(("npm", "install", "-g", f"{target}@latest"))
-        elif kind == "brew":
-            plan.append(("brew", "install", target))
-        elif kind == "brew_cask":
-            plan.append(("brew", "install", "--cask", target))
-    return plan
 
 
 def supports_install(entry: AgentCLI, os_name: Optional[str] = None) -> bool:

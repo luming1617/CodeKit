@@ -27,11 +27,11 @@ allowed-tools: 'Bash, Read, Agent, Grep'
 
 本 Skill 的独立角色使用全局 agents：`review-context`、`review-traceability`、`review-specialist`、`review-evidence`、`review-failure`，规范源文件位于 `skills/code-review/agents/`。步骤 10 和步骤 18 的 Evidence Verifier 必须使用两个不同的新实例。
 
-## Subagent 强制调用规则（Claude Code / Codex / OpenCode）
+## Subagent 强制调用规则（Claude Code / Codex / OpenCode / Qoder / Qoder CN）
 
 所有列出的 Reviewer 都是硬性阶段门禁，不是可选建议。进入对应步骤前，主 Agent 必须创建指定名称的独立只读 Sub-agent，并记录调用名称、输入快照、独立会话标识和返回状态；主 Agent 自己审查、普通串行自检或只写“建议调用”均不合规。步骤 10 与步骤 18 的 `review-evidence` 必须是两个不同的新实例。无法创建指定 Sub-agent 时，阶段状态必须为 `BLOCKED`，不得伪造独立 Finding 或继续通过门禁。**该门禁只约束主 Agent（Orchestrator）：被派发的只读 Reviewer Sub-agent 一律不再派发下一级 Sub-agent，也绝不因自身缺少派发能力而返回 `BLOCKED`；它只需按自己的角色契约完成本步骤并返回结构化结果。**
 
-按宿主派发的方式（Claude Code / Codex / OpenCode 的角色标识与语法差异、“不得把派发指令注入子代理”的纪律、以及 Skill 在各宿主下的调用名）见 `$SKILLS_ROOT/_shared/prompts/subagent-mandate.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。进入任何派发阶段前必须读取该文件；角色由 `manage-global-agents.py`（仓库安装脚本）安装为**全局裸名**，不存在 `@agent-<plugin>:<name>` 这类插件作用域角色名。
+按宿主派发的方式（Claude Code / Codex / OpenCode / Qoder / Qoder CN 的角色标识与语法差异、“不得把派发指令注入子代理”的纪律、以及 Skill 在各宿主下的调用名）见 `$SKILLS_ROOT/_shared/prompts/subagent-mandate.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。进入任何派发阶段前必须读取该文件；角色由 `manage-global-agents.py`（仓库安装脚本）安装为**全局裸名**，不存在 `@agent-<plugin>:<name>` 这类插件作用域角色名。
 
 Skill 接受可选的 `feature-directory` 参数。
 如果参数 `<feature-directory>` 非空，必须指向当前仓库中的本次需求专用工作目录，例如 `docs/YYYY-MM-DD-<feature-name>`。依赖文档不从参数中接收路径，只在该目录按固定文件名查找：PRD 为 `product-doc.md`，TDD 为 `technical-doc.md`，RPD 为 `release-doc.md`。省略该参数时不阻塞执行，按步骤 01 的降级规则解析文档。

@@ -7,7 +7,7 @@
 只能通过 `scripts/controller.py start` 启动。任何写入前完成并记录：
 
 1. `git rev-parse --show-toplevel` 的绝对仓库根。
-2. 已规范化的语言集合与 `--embeddings`、`--force`、`--allow-partial`、`--commit`、`--no-git-hooks`（冻结为 `options.graph_git_hooks`，默认 `true`）。
+2. 已规范化的语言集合与 `--embeddings`、`--force`、`--allow-partial`、`--strict-tools`、`--commit`、`--no-git-hooks`（冻结为 `options.graph_git_hooks`，默认 `true`）。
 3. `HEAD` SHA、branch，以及 staged、unstaged、untracked 的 NUL-safe 状态快照。
 4. 所有可能托管文件的存在性、内容摘要和运行前 dirty 状态。
 5. 本地 GitNexus runner、全局 GitNexus、Graphify Agent Skill/CLI 的版本和 help 能力。
@@ -50,7 +50,9 @@ preparing -> prepared -> gated -> reconciled -> finished
 | context-generation | 是 | 阻断验证/提交 |
 | validation | 是 | 阻断提交 |
 
-工具不存在时对应分析 Worker 返回 `skipped`，整体为 `partial`。只有 `--allow-partial` 可以继续 Phase 3；partial 永远不是 success，默认不得提交。协作会话不可用时 Worker 必须返回 `status: skipped`、`required: true`、`error.code: collab-unavailable`，整体为 `blocked`；该状态不可由 `--allow-partial` 放行。
+工具不可用时对应分析 Worker 返回 `skipped`，整体为 `partial`，**门禁自动接受并保留锁**：这种情况不需要 `--allow-partial` 也能继续 Phase 3（`--strict-tools` 可恢复 fail-closed）。需要 `--allow-partial` 的只剩全局注册/embedding 这类前提性降级；partial 永远不是 success，默认不得提交。协作会话不可用时 Worker 必须返回 `status: skipped`、`required: true`、`error.code: collab-unavailable`，整体为 `blocked`；该状态不可由 `--allow-partial` 放行。
+
+「工具不存在」包含四态，处置不同（判据见 [tool-adapters.md](tool-adapters.md)）：`ok`、本机确实未安装（`not-installed`）、已安装但当前会话读不到（`not-readable`，宿主按路径拒绝访问）、可读但跑不起来（`not-executable`，例如 venv 的基础解释器落在读不到的目录）。后两态在 Codex 桌面端是常态，且**改 `PATH` 无效**——它的沙箱是按路径拒绝文件系统访问，不是缺 `PATH`。所以不要把这类 partial 直接当结论交付：主 Agent 必须先按 `resolution_hint` 说明属于哪一态，并给出真出路（重跑安装器把工具物化到 CodeKit 工具链根，或用 `CODEKIT_GITNEXUS_RUNNER` / `CODEKIT_GRAPHIFY_RUNNER` 指定当前会话真能执行的 runner）。**但不要因此中止运行**：这类降级由门禁自动接受、锁保留，流程继续到 finish 并如实报告缺口；用户不需要为了继续而重跑一次。
 
 ## 恢复与停止
 

@@ -845,6 +845,9 @@ def build_installer(home: Path, stage: Path | None) -> Installer:
     installer.marketplace_local = REPO_DIR
     installer.changed_paths = []
     installer.qoder_source_dir = stage
+    installer.context = detector.Context(
+        home=home, marketplace_local=REPO_DIR, version_file=home / "installed_versions"
+    )
     return installer
 
 
@@ -878,7 +881,7 @@ class InstallFlowTests(unittest.TestCase):
         with patch.object(qoder, "capable_cli", return_value=capable):
             with patch.object(self.installer, "install_platform_agents", return_value=agents_ok) as agents:
                 self.calls = agents
-                return self.installer.install_qoder_plugin("qodercn")
+                return self.installer.install_plugin_component("qodercn_plugin")
 
     def test_cli_without_plugin_support_writes_the_shared_registry(self) -> None:
         # CLI 存在但太旧、不支持 plugins install 时，安装器直接写共享注册表。
@@ -904,7 +907,7 @@ class InstallFlowTests(unittest.TestCase):
             with patch.object(self.installer, "install_platform_agents", return_value=True):
                 with patch.object(qoder, "capable_cli", return_value=""):
                     with self.assertRaises(InstallerError):
-                        self.installer.install_qoder_plugin("qodercn")
+                        self.installer.install_plugin_component("qodercn_plugin")
 
     def test_unsynchronized_global_agents_abort_the_component(self) -> None:
         self.assertFalse(self.install("", agents_ok=False))
@@ -914,12 +917,12 @@ class InstallFlowTests(unittest.TestCase):
 
     def test_missing_staged_source_is_rejected_before_touching_the_root(self) -> None:
         installer = build_installer(self.home, None)
-        self.assertFalse(installer.install_qoder_plugin("qodercn"))
+        self.assertFalse(installer.install_plugin_component("qodercn_plugin"))
 
     def test_platform_without_a_cli_is_skipped_with_a_warning(self) -> None:
         # 自动安装 CLI 失败（无 CLI）时不写共享注册表，也不继续装插件。
         with patch.object(self.installer, "ensure_agent_cli", return_value=False):
-            self.assertFalse(self.installer.install_qoder_plugin("qodercn"))
+            self.assertFalse(self.installer.install_plugin_component("qodercn_plugin"))
         self.assertFalse(qoder.plugin_entries(qoder.read_registry(self.root)))
 
     def test_misconfigured_shared_root_raises_an_actionable_error(self) -> None:
@@ -930,13 +933,15 @@ class InstallFlowTests(unittest.TestCase):
     def test_both_platforms_are_dispatchable(self) -> None:
         for key in ("qoder", "qodercn"):
             component = qoder.PLATFORMS[key].component_id
-            with patch.object(self.installer, "install_qoder_plugin", return_value=True) as called:
-                self.assertTrue(self.installer.install_component(component))
+            with patch.object(self.installer, "install_platform_agents", return_value=True):
+                with patch.object(self.installer, "_register_qoder_plugin", return_value=True) as called:
+                    self.assertTrue(self.installer.install_component(component))
             called.assert_called_once_with(key)
 
     def test_dispatched_failures_stay_contained(self) -> None:
-        with patch.object(self.installer, "install_qoder_plugin", side_effect=InstallerError("boom")):
-            self.assertFalse(self.installer.install_component("qodercn_plugin"))
+        with patch.object(self.installer, "install_platform_agents", return_value=True):
+            with patch.object(self.installer, "_register_qoder_plugin", side_effect=InstallerError("boom")):
+                self.assertFalse(self.installer.install_component("qodercn_plugin"))
         self.installer.logger.error.assert_called_once()
 
 
@@ -964,18 +969,18 @@ class UninstallFlowTests(unittest.TestCase):
 
     def test_shared_root_and_global_agents_are_removed_together(self) -> None:
         with patch.object(self.uninstaller, "uninstall_platform_agents", return_value=True):
-            self.assertTrue(self.uninstaller.uninstall_qoder_plugin("qodercn"))
+            self.assertTrue(self.uninstaller._uninstall_qoder_plugin("qodercn"))
         self.assertFalse(self.target.exists())
         self.assertFalse(qoder.plugin_entries(qoder.read_registry(self.root)))
 
     def test_leftover_agents_keep_the_component_failing(self) -> None:
         with patch.object(self.uninstaller, "uninstall_platform_agents", return_value=False):
-            self.assertFalse(self.uninstaller.uninstall_qoder_plugin("qodercn"))
+            self.assertFalse(self.uninstaller.uninstall_plugin_component("qodercn_plugin"))
 
     def test_unusable_registry_is_reported_instead_of_raising(self) -> None:
         with patch.object(qoder, "uninstall", side_effect=qoder.QoderError("unreadable registry")):
             with patch.object(self.uninstaller, "uninstall_platform_agents", return_value=True):
-                self.assertFalse(self.uninstaller.uninstall_qoder_plugin("qodercn"))
+                self.assertFalse(self.uninstaller._uninstall_qoder_plugin("qodercn"))
         self.uninstaller.logger.error.assert_called_once()
 
     def test_claude_cache_and_agents_are_cleaned_without_a_cli(self) -> None:
@@ -985,7 +990,7 @@ class UninstallFlowTests(unittest.TestCase):
         cache.mkdir(parents=True)
         with patch.object(shutil, "which", return_value=None):
             with patch.object(self.uninstaller, "uninstall_platform_agents", return_value=True):
-                self.assertTrue(self.uninstaller.uninstall_claude_plugin())
+                self.assertTrue(self.uninstaller.uninstall_plugin_component("claude_plugin"))
         self.assertFalse((self.home / ".claude" / "plugins" / "cache" / "co-daming").exists())
 
     def test_leftover_only_component_is_offered_for_cleanup(self) -> None:

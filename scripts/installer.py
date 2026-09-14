@@ -24,7 +24,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence, Union
+from typing import Callable, Optional, Sequence, Union
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
@@ -43,14 +43,20 @@ except ValueError as exc:
 import installer_agents as agents  # noqa: E402
 import installer_codex as codex  # noqa: E402
 import installer_platform as platform_layer  # noqa: E402
+import installer_preflight as preflight  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 import installer_sources as source_builder  # noqa: E402
 import installer_state as detector  # noqa: E402
+import installer_toolchain as toolchain  # noqa: E402
 
 CODEX_MARKETPLACE = "co-daming"
 CODEX_PLUGIN = "codekit"
 CLAUDE_MARKETPLACE = "co-daming"
 CLAUDE_PLUGIN = "codekit"
+
+# 由 CodeKit 自持工具链根接管落点的组件：它们的命令必须能被受限宿主（沙箱按路径
+# 拒绝访问）在会话里读到并启动，因此安装位置与启动表达式都由 toolchain.json 描述。
+TOOLCHAIN_COMPONENTS = ("gitnexus", "graphify")
 
 
 class InstallerError(RuntimeError):
@@ -175,6 +181,8 @@ class Installer:
         self.states: dict[str, detector.ComponentState] = {}
         self.selected: list[str] = []
         self.install_records: list[tuple[str, str, str]] = []
+        # 内置 Python 运行时的结论，由 setup_toolchain 填写；venv 通道与技能侧都读它。
+        self.toolchain: toolchain.RuntimeState = toolchain.RuntimeState()
         self.marketplace_local = self._detect_marketplace()
         self.market_dir: Optional[Path] = None
         self.opencode_source_dir: Optional[Path] = None
@@ -247,6 +255,212 @@ class Installer:
             os.environ["npm_config_prefix"] = str(self.npm_prefix)
         os.environ["npm_config_registry"] = config.NPM_REGISTRY
         self.prepend_path(self.npm_bin_dir)
+
+    # ---- CodeKit 自持工具链根 ------------------------------------------
+
+    def toolchain_components(self) -> list[str]:
+        """本次选中的、由工具链根接管的组件 ID。"""
+        return [component_id for component_id in self.selected if component_id in TOOLCHAIN_COMPONENTS]
+
+    def toolchain_component_installed(self, component_id: str) -> bool:
+        """该组件在本机是否已经装过（不区分装在哪）。"""
+        definition = self.component(component_id)
+        command = getattr(definition, "command", "") if definition is not None else ""
+        if command and self.command_exists(command):
+            return True
+        if component_id == "graphify":
+            venv = self.platform.venv_dir(self.home, "graphify")
+            return (Path(venv) / "pyvenv.cfg").is_file()
+        return False
+
+    def toolchain_component_is_local(self, component_id: str) -> bool:
+        """落点是否已经在工具链根内、并且指向根内的解释器。
+
+        这是「迁移是否已完成」的判据：gitnexus 看清单条目能否解析，graphify 看
+        ``pyvenv.cfg`` 的 ``home`` 是否落在工具链根里——旧安装的 venv 指向
+        ``%LOCALAPPDATA%\\Programs\\Python``，在受限宿主里启动必失败（实测 rc=101）。
+        """
+        root = self.platform.toolchain_root(self.home)
+        if component_id == "gitnexus":
+            return toolchain.gitnexus_entry(self).get("state") == "ok"
+        venv = self.platform.venv_dir(self.home, "graphify")
+        base = toolchain.venv_base_state(venv)
+        if base["state"] != "ok":
+            return False
+        home_value = base["values"].get("home", "")
+        if not home_value:
+            return False
+        try:
+            Path(home_value).resolve().relative_to(root.resolve())
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def toolchain_migration_targets(self) -> list[str]:
+        """已装、但落点不在工具链根内的工具链组件。
+
+        自动迁移是刻意的：只对**已经装过**的组件生效——安装器不该凭空装上用户从来没要
+        的组件；但它必须把「CodeKit 装过、而宿主沙箱读不到」的落点搬到可读可执行的根
+        里。没有这一步，「重跑安装器」这句修复建议对已装用户不成立，而那正是最初的问题：
+        用户重跑安装器只勾了插件，于是工具链根始终是空的。
+        """
+        return [
+            component_id
+            for component_id in TOOLCHAIN_COMPONENTS
+            if self.toolchain_component_installed(component_id)
+            and not self.toolchain_component_is_local(component_id)
+        ]
+
+    def toolchain_targets(self) -> list[str]:
+        """本次要物化到工具链根的组件：选中的 + 需要迁移的已装组件。"""
+        targets = list(self.toolchain_components())
+        for component_id in getattr(self, "toolchain_migration", []):
+            if component_id not in targets:
+                targets.append(component_id)
+        return targets
+
+    def needs_bundled_runtime(self) -> bool:
+        """是否有目标组件依赖 venv 通道；只有它需要内置解释器。"""
+        for component_id in self.toolchain_targets():
+            definition = self.component(component_id)
+            channels = getattr(definition, "channels", None) or {}
+            if "venv" in channels:
+                return True
+        return False
+
+    def setup_toolchain(self) -> None:
+        """准备工具链根，并在需要时物化内置 Python 运行时。
+
+        没有目标组件时不下载运行时（约 45MB），但工具链根照常维护：技能侧读的是实测
+        状态，缺了清单就只能退回猜路径。
+        """
+        self.platform.toolchain_root(self.home).mkdir(parents=True, exist_ok=True)
+        selected = self.toolchain_components()
+        self.toolchain_migration = [
+            component_id
+            for component_id in self.toolchain_migration_targets()
+            if component_id not in selected
+        ]
+        if self.toolchain_migration:
+            self.logger.info(
+                "检测到已安装、但落点不在 CodeKit 工具链根内的组件："
+                + "、".join(self.toolchain_migration)
+                + f"。将重新物化到 {self.platform.toolchain_root(self.home)}"
+                "（受限宿主如 Codex 桌面端只在该根内可读可执行）。"
+            )
+        if not self.needs_bundled_runtime():
+            self.toolchain = toolchain.RuntimeState(
+                reason="本次没有需要 Python 运行时的工具链组件，未获取内置运行时"
+            )
+            return
+        self.toolchain = toolchain.ensure_runtime(self)
+        for warning in self.toolchain.warnings:
+            self.logger.warn(warning)
+        if self.toolchain.usable:
+            self.logger.info(
+                f"内置 Python {self.toolchain.version or '?'} 就绪：{self.toolchain.python}"
+            )
+            return
+        self.logger.warn(
+            "内置 Python 运行时不可用（"
+            + (self.toolchain.reason or "原因未知")
+            + "）；需要 Python 的组件将退回系统 Python 或 pipx，"
+            "这样产出的工具在受限沙箱（如 Codex 桌面端）里可能无法启动。"
+        )
+
+    def toolchain_python(self) -> str:
+        """建 venv 用的解释器：内置运行时优先，缺失时退回当前进程的解释器。
+
+        退回不是等价替代：系统 Python 可能落在沙箱读不到的目录，用它建出的 venv
+        在会话里起不来（``pyvenv.cfg`` 的 ``home`` 指向被拒绝的路径）。退回只保证
+        安装器能把剩余步骤跑完并如实报告。
+        """
+        if self.toolchain.usable and self.toolchain.python is not None:
+            return str(self.toolchain.python)
+        return sys.executable
+
+    def python_dependency_version(self) -> str:
+        """比对 ``python>=x`` 依赖时使用的版本。
+
+        该依赖的语义是「能建出可用的 venv」，而真正会被使用的解释器是内置运行时，
+        所以优先用它比对，而不是当前进程的解释器。
+        """
+        if self.toolchain.usable and self.toolchain.version:
+            return self.toolchain.version
+        return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+    def write_toolchain_manifest(self) -> None:
+        """写出技能侧读取的 ``toolchain.json``，并留给报告渲染使用。"""
+        targets = self.toolchain_targets()
+        if not targets:
+            return
+        path = toolchain.write_manifest(self, self.toolchain, selected=targets)
+        if path is None:
+            self.logger.warn("工具链根不可写，未能写出 toolchain.json。")
+            return
+        self.toolchain_manifest_path = path
+        self.toolchain_manifest = toolchain.read_manifest(path)
+
+    def report_toolchain_health(self) -> None:
+        """按清单实测每个托管工具的 read/exec 状态，并把出路写清楚。
+
+        取代原先「命令是否只靠用户级 PATH 可见」的自检：那个判据已被实测证伪——
+        PATH 里用户级条目是全的，真正被拒绝的是对这些目录的文件系统访问。
+        """
+        document = getattr(self, "toolchain_manifest", None) or {}
+        entries = document.get("tools") if isinstance(document, dict) else None
+        entries = entries if isinstance(entries, dict) else {}
+        self.toolchain_health = []
+        for component_id in self.toolchain_targets():
+            entry = entries.get(component_id)
+            if not isinstance(entry, dict):
+                continue
+            state = str(entry.get("state", ""))
+            self.toolchain_health.append((component_id, state))
+            if state == "ok":
+                continue
+            self.logger.warn(
+                f"{component_id} 落点不可用（{state}）：{self._toolchain_state_hint(state)}"
+            )
+
+    def _toolchain_state_hint(self, state: str) -> str:
+        """把实测状态翻成一句可执行的出路。"""
+        command = "install.cmd install" if self.platform.is_windows else "install.sh install"
+        if state == "not-readable":
+            return (
+                "当前会话被拒绝读取该目录（不是未安装）。用提权/非沙箱会话重跑安装器"
+                f"（{command}）会重建到 CodeKit 工具链根；只改 PATH 无效。"
+            )
+        if state == "not-executable":
+            return (
+                "入口存在但本会话启动不起来（多见于 venv 的基础解释器落在读不到的目录）。"
+                f"重跑安装器（{command}）可用内置运行时重建。"
+            )
+        return f"未安装；运行安装器（{command}）并勾选该组件。"
+
+    def install_npm_package_into_prefix(self, prefix: Path, package: str, command: str) -> bool:
+        """把全局 CLI 装进 CodeKit 私有 npm 前缀并让本进程可见。
+
+        与默认路径分开而不是加参数，是为了让既有组件（钉钉/飞书 CLI 等）的调用与
+        行为完全不变：私有前缀只服务于必须在受限宿主里可读可执行的 gitnexus。
+        """
+        prefix = Path(prefix)
+        previous = os.environ.get("npm_config_prefix")
+        os.environ["npm_config_prefix"] = str(prefix)
+        os.environ["npm_config_registry"] = config.NPM_REGISTRY
+        try:
+            result = self.run_command(
+                ["npm", "install", "-g", "--prefix", str(prefix), f"{package}@latest"]
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("npm_config_prefix", None)
+            else:
+                os.environ["npm_config_prefix"] = previous
+        if result.returncode != 0:
+            return False
+        self.prepend_path(self.platform.npm_bin_dir(prefix))
+        return self.command_exists(command)
 
     @staticmethod
     def _resolve_command(command: Sequence[str]) -> list[str]:
@@ -368,6 +582,38 @@ class Installer:
         if added:
             self.logger.info(f"PATH 已刷新，新增 {len(added)} 个目录：{added[0]}")
 
+    def machine_path(self) -> Optional[str]:
+        """机器级 PATH；非 Windows 上不存在这个区分，返回 None。"""
+        entries = platform_layer.machine_path_entries()
+        return os.pathsep.join(entries) if entries else None
+
+    def visible_without_user_path(self, command: str) -> bool:
+        """命令是否只靠机器级 PATH 也能解析到。
+
+        非 Windows 或读不到机器级 Path 时返回 True：这条自检只用来发现「宿主
+        shell 看不到用户级 PATH」，读不到数据时不能报假警。
+        """
+        machine_path = self.machine_path()
+        if machine_path is None:
+            return True
+        return shutil.which(command, path=machine_path) is not None
+
+    def codex_can_run_rtk(self) -> bool:
+        """Codex 会话能否执行 ``rtk``：只有桌面端会丢掉用户级 PATH。
+
+        装了桌面版且 ``rtk`` 不在机器级 PATH 上时，``rtk init -g --codex`` 写出的
+        ``RTK.md`` 前缀约束在 Codex 里永远无法执行；CLI 从终端启动时会继承完整
+        PATH，因此不跳过它的注册。
+        """
+        path = codex.config_path(self.home)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return True
+        if not codex.desktop_app_present(text):
+            return True
+        return self.visible_without_user_path("rtk")
+
     def set_brew_mirror(self) -> None:
         """把 Homebrew 切到中科大镜像并关闭自动更新。
 
@@ -412,12 +658,9 @@ class Installer:
         return True
 
     def linux_package_manager(self) -> Optional[str]:
-        """返回 Linux 包管理器；入口传入的环境变量优先。"""
+        """返回本机的 Linux 包管理器；非 Linux 一律返回 None。"""
         if self.os_name != "Linux":
             return None
-        configured = os.environ.get("CODEKIT_PACKAGE_MANAGER", "")
-        if configured in {"apt-get", "dnf", "yum", "pacman", "zypper", "apk"}:
-            return configured
         for candidate in ("apt-get", "dnf", "yum", "pacman", "zypper", "apk"):
             if shutil.which(candidate):
                 return candidate
@@ -765,7 +1008,7 @@ class Installer:
                     return False, f"需要 Node.js >= {minimum}，当前 {current or '未安装'}"
                 continue
             if name == "python":
-                current = f"{sys.version_info.major}.{sys.version_info.minor}"
+                current = self.python_dependency_version()
                 if not separator or not config.version_greater_or_equal(current, minimum):
                     return False, f"需要 Python >= {minimum}，当前 {current}"
                 continue
@@ -792,8 +1035,13 @@ class Installer:
                 or self.linux_package_manager() is not None
             )
         if kind == "venv":
+            # 内置运行时才是会被使用的那一个：用系统 Python 建出的 venv 在受限宿主里
+            # 起不来（pyvenv.cfg 的 home 落在读不到的目录）。运行时不可用时诚实返回
+            # False，让通道优先级把组件交给 pipx，而不是产出跑不起来的 venv。
+            if not self.toolchain.usable:
+                return False
             return self.run_capture(
-                [sys.executable, "-c", "import venv, ensurepip"]
+                [self.toolchain_python(), "-c", "import venv, ensurepip"]
             ).returncode == 0
         if kind == "script":
             # 官方 .sh 安装脚本只在类 Unix 环境里跑。Git for Windows 也会把 bash 放进
@@ -847,10 +1095,29 @@ class Installer:
         if "winget" in channels:
             return f"winget install --id {channels['winget']} --exact"
         if "brew" in channels:
-            return f"brew install {channels['brew']}（建议先按 INSTALL.md 配置中科大镜像）"
+            return f"brew install {channels['brew']}（建议先按 INSTALL-STRATEGY.md §2.3 配置中科大镜像）"
         if "apt" in channels:
             return f"sudo apt-get install -y {channels['apt']}"
         return "请参考官方文档"
+
+    def channel_order(self, component) -> tuple[str, ...]:
+        """通道优先级；工具链托管的组件在内置运行时可用时把 venv 提到 pipx 之前。
+
+        可达性优先于「不需要符号链接权限」：pipx 的 shim 落在工具链根之外，受限宿主
+        （Codex 桌面端）读不到，装上了也等于没装。venv 通道现在一律用内置运行时创建，
+        落点在工具链根内，所以它才是那个能真正生效的通道。
+        """
+        order = list(detector.registry.CHANNEL_ORDER)
+        component_id = getattr(component, "component_id", "")
+        if (
+            component_id in TOOLCHAIN_COMPONENTS
+            and self.toolchain.usable
+            and "venv" in order
+            and "pipx" in order
+        ):
+            order.remove("venv")
+            order.insert(order.index("pipx"), "venv")
+        return tuple(order)
 
     def install_via_channels(self, component_id: str) -> bool:
         """按全局通道优先级，选用第一个可用通道安装组件。"""
@@ -861,7 +1128,22 @@ class Installer:
         if not met:
             self.logger.error(f"{component.description} 已跳过：{reason}")
             return False
-        for kind in detector.registry.CHANNEL_ORDER:
+        # 工具链托管的组件只能落在 CodeKit 工具链根内：受限宿主（Codex 桌面端）读不到
+        # 根外的落点，pipx 装出来的 shim 在会话里起不来，等于没装。运行时不可用时如实
+        # 失败，不退到 pipx 去产出一份宿主看不见的副本。
+        if (
+            component_id in TOOLCHAIN_COMPONENTS
+            and "venv" in component.channels
+            and not self.toolchain.usable
+        ):
+            self.logger.error(
+                f"{component.description} 已跳过：内置 Python 运行时不可用"
+                f"（{self.toolchain.reason or '原因未知'}）。"
+                f"它的落点必须在 {self.platform.toolchain_root(self.home)} 内"
+                "才能在受限宿主里启动；修复网络后重跑安装器。"
+            )
+            return False
+        for kind in self.channel_order(component):
             if kind == "release":
                 if component.release is None:
                     continue
@@ -995,12 +1277,19 @@ class Installer:
         return result.returncode == 0 and self.command_exists(command)
 
     def install_venv_package(self, package: str, command: str) -> bool:
-        """把 PyPI 包装进独立 venv，并把它的命令暴露到用户 bin 目录。"""
+        """把 PyPI 包装进独立 venv，并把它的命令暴露到用户 bin 目录。
+
+        venv 一律用内置运行时创建，并加 ``--copies``：用系统 Python 建出的 venv 会把
+        ``pyvenv.cfg`` 的 ``home`` 指向可能被沙箱拒绝的目录，入口存在却启动不起来；
+        实体解释器留在 venv 内则不受符号链接解析的限制。
+        """
         venv = self.platform.venv_dir(self.home, command)
         if venv.exists():
             platform_layer.rmtree(venv, ignore_errors=True)
         pip = self.platform.venv_pip(venv)
-        if self.run_command([sys.executable, "-m", "venv", str(venv)]).returncode != 0:
+        if self.run_command(
+            [self.toolchain_python(), "-m", "venv", "--copies", str(venv)]
+        ).returncode != 0:
             return False
         if not pip.exists() or self.run_command([str(pip), "install", "-U", package]).returncode != 0:
             return False
@@ -1177,9 +1466,19 @@ class Installer:
         if self.command_exists("claude"):
             results.append(self.run_command(["rtk", "init", "-g", "--auto-patch"]))
         if self.command_exists("codex"):
-            # Codex 使用 AGENTS.md/RTK.md 指令集，不支持 Claude 的
-            # --auto-patch 模式；必须使用 rtk 的独立 Codex 初始化模式。
-            results.append(self.run_command(["rtk", "init", "-g", "--codex"]))
+            if self.codex_can_run_rtk():
+                # Codex 使用 AGENTS.md/RTK.md 指令集，不支持 Claude 的
+                # --auto-patch 模式；必须使用 rtk 的独立 Codex 初始化模式。
+                results.append(self.run_command(["rtk", "init", "-g", "--codex"]))
+            else:
+                self.logger.warn(
+                    "跳过 codex 侧 rtk 注册：检测到 Codex 桌面版，而它的 shell 只继承机器级 "
+                    "PATH，rtk 不在其中。此时写出的 RTK.md 前缀约束在 Codex 会话里无法执行，"
+                    "只会让每次会话都多出一条做不到的约束。注意只把 rtk 所在目录加入机器级 "
+                    "PATH 往往还不够——Codex 桌面版的沙箱会在命令层面拒绝读取用户级目录；"
+                    "确认 rtk 真的能在 Codex 会话里跑起来之后再重跑安装即可。只想消除该约束"
+                    "时删除 ~/.codex/AGENTS.md 里的 @RTK.md 引用。"
+                )
         if self.command_exists("opencode"):
             results.append(self.run_command(["rtk", "init", "-g", "--opencode", "--auto-patch"]))
         return all(result.returncode == 0 for result in results)
@@ -1192,9 +1491,39 @@ class Installer:
         return self.configure_rtk()
 
     def install_gitnexus(self) -> bool:
-        """按策略表安装 gitnexus（npm），并执行其初始化命令。"""
-        if not self.install_via_channels("gitnexus"):
+        """把 gitnexus 装进 CodeKit 私有 npm 前缀，并执行其初始化命令。
+
+        不装 npm 全局目录：受限宿主（Codex 桌面端）拒绝读取 ``%APPDATA%\\npm`` 下的
+        任何文件，装在那里的 gitnexus 在会话里连 stat 都失败。私有前缀落在工具链根
+        内（实测可读可执行），安装后把私有 bin 目录补进本进程 PATH，让安装期的
+        ``gitnexus setup`` 与 Qoder 注册都能正常解析它。
+        """
+        component = self.component("gitnexus")
+        met, reason = self.requirements_met(component)
+        if not met:
+            self.logger.error(f"GitNexus 已跳过：{reason}")
             return False
+        if not self.channel_available("npm"):
+            self.logger.error("未找到 npm，无法安装 gitnexus。")
+            return False
+        prefix = self.platform.npm_prefix_private(self.home)
+        if not self.install_npm_package_into_prefix(prefix, "gitnexus", "gitnexus"):
+            return False
+        # 仍给人类 shell 留一份转发入口（正常终端里 PATH 能看见它）；它在受限宿主里
+        # 读不到，所以 CodeKit 自己的代码路径一律不依赖它，只走 toolchain.json 的绝对
+        # argv。建不出来不影响工具本身，因此只是 warning：POSIX 下需要符号链接能力，
+        # Windows 上没有开发者模式/管理员权限时必然失败。
+        try:
+            self.platform.expose_command(
+                self.bin_dir,
+                "gitnexus",
+                self.platform.npm_bin_dir(prefix) / self.platform.shim_name("gitnexus"),
+            )
+        except OSError as exc:
+            self.logger.warn(
+                f"未能为交互式 shell 暴露 gitnexus 转发入口（{exc}）；"
+                "不影响 CodeKit 使用它，CodeKit 走 toolchain.json 里的绝对 argv。"
+            )
         if self.run_command(["gitnexus", "setup"]).returncode != 0:
             return False
         return self.register_gitnexus_for_qoder()
@@ -1248,6 +1577,19 @@ class Installer:
             f"已删除 {path}：Qoder 不读这个文件，MCP 已注册进共享配置根的 settings.json。"
         )
 
+    def gitnexus_mcp_argv(self) -> list[str]:
+        """启动 GitNexus MCP 的 argv：优先私有前缀里的 ``[<node>, <cli.js>]``。
+
+        MCP server 是宿主在**会话里**拉起的，正是 npm 垫片不可达的那个环境，所以注册
+        进宿主配置的必须是绝对可执行 + 绝对脚本，而不是 ``gitnexus`` 这个名字。
+        """
+        entry = toolchain.gitnexus_entry(self)
+        runner = entry.get("runner") if isinstance(entry, dict) else None
+        if entry.get("state") == "ok" and isinstance(runner, list) and runner:
+            return [str(item) for item in runner]
+        resolved = platform_layer.resolve_exe("gitnexus")
+        return [str(resolved)] if resolved else []
+
     def register_gitnexus_for_qoder(self) -> bool:
         """把 GitNexus 注册到 Qoder 真正加载的位置（MCP 与 hooks）。
 
@@ -1258,11 +1600,11 @@ class Installer:
         roots = qoder.existing_roots(qoder.PLATFORMS.values(), self.home)
         if not roots:
             return True
-        resolved = platform_layer.resolve_exe("gitnexus")
-        if not resolved:
+        mcp_argv = self.gitnexus_mcp_argv()
+        if not mcp_argv:
             self.logger.error(
-                "gitnexus 不在 PATH 上，无法为 Qoder 注册 MCP 与 hooks；"
-                "请确认 npm 全局 bin 目录已加入 PATH 后重新安装。"
+                "无法解析 gitnexus 的启动命令，无法为 Qoder 注册 MCP 与 hooks；"
+                "请重新安装 gitnexus 后重试。"
             )
             return False
         source = self.gitnexus_hook_source()
@@ -1278,7 +1620,7 @@ class Installer:
                 qoder.register_mcp_server(
                     root,
                     qoder.GITNEXUS_MCP_NAME,
-                    {"command": str(resolved), "args": ["mcp"]},
+                    {"command": mcp_argv[0], "args": [*mcp_argv[1:], "mcp"]},
                 )
                 script = qoder.install_gitnexus_hook_scripts(root, source)
                 qoder.register_gitnexus_hooks(root, script)
@@ -1574,16 +1916,55 @@ class Installer:
             f"{detector.component_description(component_id)} v{version} 已安装（{path}）"
         )
 
-    def install_claude_plugin(self) -> bool:
-        """注册本地 Claude marketplace，并按已安装状态执行插件安装或更新。"""
-        if not self.market_dir:
+    # 每个插件组件的构建产物属性名：为空说明 prepare_sources 没产出对应源，注册表不能
+    # 继续写，否则会留下指向不存在源的注册项。
+    PLUGIN_SOURCE_ATTR = {
+        "claude": "market_dir",
+        "codex": "market_dir",
+        "opencode": "opencode_source_dir",
+        "qoder": "qoder_source_dir",
+        "qodercn": "qoder_source_dir",
+    }
+
+    def install_plugin_component(self, component_id: str) -> bool:
+        """插件组件的统一安装骨架：CLI 前置 → 全局 subagent → 平台注册 → 播报。
+
+        四个平台的差别只在 `_register_<platform>_plugin` 这一段，其余顺序与前置检查
+        完全一致。抄四遍的结果是任何一处新增前置都要记得改四个地方。
+        """
+        entry = agents.component_agent(component_id)
+        if entry is None:
+            return False
+        source_attr = self.PLUGIN_SOURCE_ATTR.get(entry.key)
+        if source_attr is None or not getattr(self, source_attr, None):
+            return False
+        registrar = self._plugin_registrar(entry.key)
+        if registrar is None:
             return False
         # 勾选插件但缺少 CLI 时先自动安装 CLI，再安装插件。
-        if not self.ensure_agent_cli("claude"):
+        if not self.ensure_agent_cli(entry.key):
             return False
-        # 先同步全局 subagent：失败即中止，避免“插件已写入并启用、组件却上报失败”的半安装状态。
-        if not self.install_platform_agents("claude"):
+        # 先同步全局 subagent：失败即中止且不写注册表，避免“插件已写入并启用、组件却
+        # 上报失败”的半安装状态。
+        if not self.install_platform_agents(entry.key):
             return False
+        if not registrar():
+            return False
+        self.announce_plugin_install(component_id)
+        return True
+
+    def _plugin_registrar(self, tool: str) -> Optional[Callable[[], bool]]:
+        """按平台键取注册实现；Qoder 两个发行版共用同一份（共享配置根）。"""
+        if tool in qoder.PLATFORMS:
+            return lambda: self._register_qoder_plugin(tool)
+        return {
+            "claude": self._register_claude_plugin,
+            "codex": self._register_codex_plugin,
+            "opencode": self._register_opencode_plugin,
+        }.get(tool)
+
+    def _register_claude_plugin(self) -> bool:
+        """注册本地 Claude marketplace，并按已安装状态执行插件安装或更新。"""
         if self.run_command(["claude", "plugin", "marketplace", "add", str(self.market_dir)]).returncode != 0:
             return False
         self.track(self.home / ".claude" / "plugins" / "known_marketplaces.json")
@@ -1595,17 +1976,10 @@ class Installer:
             return False
         self.track(self.home / ".claude" / "plugins" / "installed_plugins.json")
         self.record_marketplace_sha()
-        self.announce_plugin_install("claude_plugin")
         return True
 
-    def install_opencode_plugin(self) -> bool:
+    def _register_opencode_plugin(self) -> bool:
         """把本地 OpenCode 插件源写入全局配置；已存在时尝试强制刷新插件。"""
-        if not self.opencode_source_dir:
-            return False
-        if not self.ensure_agent_cli("opencode"):
-            return False
-        if not self.install_platform_agents("opencode"):
-            return False
         # 写 opencode 自己解析到的那份配置：它按 opencode.json → opencode.jsonc
         # 的顺序取第一个存在的文件，写错文件会让同一个插件出现在两份配置里。
         path = config.opencode_config_file(self.home / ".config" / "opencode")
@@ -1623,17 +1997,10 @@ class Installer:
         if result.returncode != 0:
             return False
         self.track(path)
-        self.announce_plugin_install("opencode_plugin")
         return True
 
-    def install_codex_plugin(self) -> bool:
+    def _register_codex_plugin(self) -> bool:
         """注册本地 Codex marketplace，清理旧技能残留后添加 CodeKit 插件。"""
-        if not self.market_dir:
-            return False
-        if not self.ensure_agent_cli("codex"):
-            return False
-        if not self.install_platform_agents("codex"):
-            return False
         # 旧版本可能把兼容技能放进 ~/.agents；安装前清掉旧生成物，避免重复加载。
         for path in (self.home / ".agents" / "skills").glob("keel-*"):
             if path.is_dir():
@@ -1648,7 +2015,37 @@ class Installer:
         if result.returncode != 0:
             return False
         self.record_marketplace_sha()
-        self.announce_plugin_install("codex_plugin")
+        return True
+
+    def _register_qoder_plugin(self, platform_key: str) -> bool:
+        """把插件写进 Qoder 的共享配置根，并确认注册表里确实已安装且启用。"""
+        descriptor = qoder.PLATFORMS[platform_key]
+        try:
+            root = qoder.resolve_config_root(descriptor, self.home)
+        except ValueError as exc:
+            raise InstallerError(str(exc)) from exc
+        if qoder.foreign_os_roots(descriptor) and not (root / "plugins").is_dir():
+            self.logger.warn(
+                "Qoder keeps a separate configuration root per OS; this install "
+                f"only reaches {root}, so a Qoder running on Windows stays unaware."
+            )
+        command = qoder.capable_cli(descriptor)
+        try:
+            if command:
+                qoder.install_via_cli(command, root, self.qoder_source_dir, runner=self.qoder_run)
+            else:
+                # Desktop-only machines get the same registry the CLI would write.
+                qoder.install_direct(root, self.qoder_source_dir, self.plugin_version)
+            self.track(qoder.registry_path(root))
+            self.track(qoder.settings_path(root))
+            state = qoder.inspect(descriptor, self.home)
+        except ValueError as exc:
+            raise InstallerError(str(exc)) from exc
+        if not state.installed or not state.enabled:
+            raise InstallerError(
+                f"{qoder.PLUGIN_ID} is not enabled in {qoder.registry_path(state.root)} "
+                "after install; the shared Qoder registry was not updated"
+            )
         return True
 
     def codex_collab_verdict(self) -> tuple[str, str]:
@@ -1660,13 +2057,8 @@ class Installer:
         return codex.classify_probe(result.returncode, result.stdout), result.stdout
 
     def write_codex_config(self, path: Path, payload: bytes) -> None:
-        """同目录临时文件 + os.replace 落盘，避免半写状态；新文件按 600 收紧。"""
-        temporary = path.with_name(f"{path.name}.codekit-tmp")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary.write_bytes(payload)
-        if os.name != "nt":
-            os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
+        """落盘 Codex 用户级配置；实现与技能侧共用同一份（见 installer_codex）。"""
+        codex.write_config(path, payload)
 
     def apply_codex_multi_agent(self, path: Path) -> bool:
         """备份 → 只改一个键 → 复验 → 失败即回滚；复验用同一次零 token 探测。"""
@@ -1694,11 +2086,10 @@ class Installer:
             self.logger.warn(f"无法写入 {path}：{exc}")
             return False
         self.track(path)
+        # 写成功不在这里播报：唯一需要用户动作的结论（下一次启动才生效）由
+        # report_agent_capabilities 统一输出一行 10 字提示，在这里再说一句长文案
+        # 只会把那条真信息埋掉。
         if self.codex_collab_verdict()[0] == codex.AVAILABLE:
-            self.logger.success(
-                f"已在 {path} 写入 [features] {codex.MULTI_AGENT_KEY} = true。"
-                "必须完全退出并重启 Codex：正在运行的会话不会获得子代理工具。"
-            )
             return True
         try:
             if original is None:
@@ -1717,18 +2108,18 @@ class Installer:
         )
         return False
 
-    # 只有 Codex 有可开启的多代理 feature flag；其余平台的派发工具由宿主内置，
-    # 真正的前置是全局角色文件已装到该平台目录，没有键可写。
-    PLUGIN_COMPONENT_TO_TOOL = {
-        "claude_plugin": "claude",
-        "codex_plugin": "codex",
-        "opencode_plugin": "opencode",
-        "qoder_plugin": "qoder",
-        "qodercn_plugin": "qodercn",
+    # 多代理能力的结论分级：无需用户动作的结论不占版面（`enabled` 只给一行 10 字提示；
+    # `already-on` 与「宿主自带开关」完全静默），`rolled-back` 也归入不必再报的一类，
+    # 因为写入失败与回滚已由写回现场当场 warn。只有下面两种不确定结论各打一条 warn。
+    # 唯一需要用户动作的成功结论：写入只对下一次启动生效。
+    MULTI_AGENT_NOTICE = "已开启多代理，需重启"
+    MULTI_AGENT_UNCONFIRMED = {
+        "unknown": "探测未正常返回，未改动配置",
+        "no-cli": "未找到 codex 命令，未做探测",
     }
 
     def enable_codex_multi_agent(self) -> str:
-        """探测 Codex 子代理工具面，缺失就直接开启并复验；返回结论供提示框汇总。"""
+        """探测 Codex 子代理工具面，缺失就直接开启并复验；返回结论供分级报告使用。"""
         if not self.command_exists("codex"):
             return "no-cli"
         verdict, _ = self.codex_collab_verdict()
@@ -1740,14 +2131,6 @@ class Installer:
             return "enabled"
         return "rolled-back"
 
-    def agent_role_count(self, tool: str) -> int:
-        """该平台已安装的全局 subagent 角色数；目录无法解析时返回 -1。"""
-        try:
-            _, directory = agents.global_agent_plan(tool, self.home)
-        except ValueError:
-            return -1
-        return len(list(directory.glob("*.toml" if tool == "codex" else "*.md")))
-
     def configure_agent_capabilities(self) -> None:
         """勾选了哪个平台的 CodeKit 插件，就为哪个平台确认 subagent 派发能力。
 
@@ -1756,105 +2139,53 @@ class Installer:
         """
         self.agent_capabilities = []
         for component_id in self.selected:
-            tool = self.PLUGIN_COMPONENT_TO_TOOL.get(component_id)
-            if tool is None:
+            entry = agents.component_agent(component_id)
+            if entry is None:
                 continue
-            outcome = self.enable_codex_multi_agent() if tool == "codex" else "no-switch"
-            self.agent_capabilities.append(
-                {"platform": tool, "outcome": outcome, "roles": self.agent_role_count(tool)}
-            )
+            # 只有 Codex 有可开启的多代理 feature flag；其余平台的派发工具由宿主内置，
+            # 真正的前置是全局角色文件已装到该平台目录，没有键可写。
+            outcome = self.enable_codex_multi_agent() if entry.key == "codex" else "no-switch"
+            self.agent_capabilities.append({"platform": entry.key, "outcome": outcome})
         self.report_agent_capabilities()
 
     def report_agent_capabilities(self) -> None:
-        """把每个平台的探测与处置结论渲染成一次醒目提示，而不是散落的日志行。"""
+        """按结论分级报告：无需动作时最多一行 10 字，不确定时才 warn。
+
+        原实现无论结果都打印一个 7 行汇总框加三行重启说明，每次安装/升级都会刷一遍，
+        把「确实需要重启」这条真信息埋掉了。重启本身不需要在安装器里预告：技能侧在
+        派发失败时会自己判定 collab-unavailable 并说明。
+        """
         if not self.agent_capabilities:
             return
-        labels = {
-            "claude": "Claude Code",
-            "codex": "Codex",
-            "opencode": "OpenCode",
-            "qoder": "Qoder",
-            "qodercn": "Qoder CN",
-        }
-        outcomes = {
-            "enabled": "已写入 [features] multi_agent_v2 = true，复验已看到派发工具",
-            "already-on": "多代理能力已开启（模型可见派发工具在位）",
-            "unknown": "探测未成功（codex debug prompt-input 未正常返回），未改动配置",
-            "no-cli": "未找到 codex 命令，未做探测",
-            "rolled-back": "写入后复验仍看不到派发工具，已回滚配置",
-            "no-switch": "实测无 multi_agent 开关，派发工具由宿主内置",
-        }
-        lines = ["多代理能力（CodeKit 技能派发 subagent 的前置）"]
+        if any(entry["outcome"] == "enabled" for entry in self.agent_capabilities):
+            self.logger.info(self.MULTI_AGENT_NOTICE)
         for entry in self.agent_capabilities:
-            detail = outcomes.get(entry["outcome"], entry["outcome"])
-            if entry["outcome"] == "no-switch":
-                detail += f"；全局角色 {entry['roles']} 个"
-            lines.append(f"  · {labels.get(entry['platform'], entry['platform'])}：{detail}")
-        lines.append("")
-        lines.append("★ 需要重启 Agent 应用才能生效：请完全退出并重新打开上表涉及的智能体应用。")
-        lines.append("  宿主只在启动时读取配置与角色文件，正在运行的会话不会获得新的派发工具，")
-        lines.append("  重启前直接运行 CodeKit 技能会停在 collab-unavailable。")
-        self.logger.info("\n" + self.agent_notice_box(lines))
+            detail = self.MULTI_AGENT_UNCONFIRMED.get(entry["outcome"])
+            if detail is None:
+                continue
+            label = self._agent_label(entry["platform"])
+            self.logger.warn(f"{label} 多代理能力未确认：{detail}")
+
+    @staticmethod
+    def _agent_label(platform_key: str) -> str:
+        """平台键的展示名；平台键本身来自 installer_agents，这里不另存一份对照表。"""
+        entry = agents.agent_cli(platform_key)
+        return entry.display_name if entry is not None else platform_key
 
     def qoder_run(self, args: Sequence[str], timeout: float = 20.0) -> tuple[int, str]:
         """执行 Qoder CLI 命令；到期即终止子进程，避免安装/卸载无限阻塞。"""
         result = self.run_command(args, timeout=timeout)
         return result.returncode, result.stdout
 
-    def install_qoder_plugin(self, platform_key: str) -> bool:
-        """安装 Qoder 插件；CLI 与 Desktop 共享配置根，一次安装两端生效。"""
-        descriptor = qoder.PLATFORMS[platform_key]
-        stage = self.qoder_source_dir
-        if not stage or not stage.is_dir():
-            return False
-        # 插件以 CLI 为前置：CLI 缺失时先自动安装，再写共享注册表。
-        if not self.ensure_agent_cli(platform_key):
-            return False
-        try:
-            root = qoder.resolve_config_root(descriptor, self.home)
-        except ValueError as exc:
-            raise InstallerError(str(exc)) from exc
-        if qoder.foreign_os_roots(descriptor) and not (root / "plugins").is_dir():
-            self.logger.warn(
-                "Qoder keeps a separate configuration root per OS; this install "
-                f"only reaches {root}, so a Qoder running on Windows stays unaware."
-            )
-        # 先同步全局 subagent：失败即中止且不写注册表，避免出现
-        # “插件已写入并启用、但组件上报失败”的半安装状态。
-        if not self.install_platform_agents(platform_key):
-            return False
-        command = qoder.capable_cli(descriptor)
-        try:
-            if command:
-                qoder.install_via_cli(command, root, stage, runner=self.qoder_run)
-            else:
-                # Desktop-only machines get the same registry the CLI would write.
-                qoder.install_direct(root, stage, self.plugin_version)
-            self.track(qoder.registry_path(root))
-            self.track(qoder.settings_path(root))
-            state = qoder.inspect(descriptor, self.home)
-        except ValueError as exc:
-            raise InstallerError(str(exc)) from exc
-        if not state.installed or not state.enabled:
-            raise InstallerError(
-                f"{qoder.PLUGIN_ID} is not enabled in {qoder.registry_path(state.root)} "
-                "after install; the shared Qoder registry was not updated"
-            )
-        self.logger.success(
-            f"{descriptor.display_name} v{state.version} is available to both the "
-            f"Qoder CLI and the Qoder desktop IDE ({detector.display_path(state.root, self.home)})"
-        )
-        return True
-
     def install_component(self, component_id: str) -> bool:
         """按组件注册 ID 分发安装处理器，并隔离单个组件的失败。"""
         handlers = {
             "rtk": self.install_rtk,
-            "claude_plugin": self.install_claude_plugin,
-            "opencode_plugin": self.install_opencode_plugin,
-            "codex_plugin": self.install_codex_plugin,
-            "qoder_plugin": lambda: self.install_qoder_plugin("qoder"),
-            "qodercn_plugin": lambda: self.install_qoder_plugin("qodercn"),
+            "claude_plugin": lambda: self.install_plugin_component("claude_plugin"),
+            "opencode_plugin": lambda: self.install_plugin_component("opencode_plugin"),
+            "codex_plugin": lambda: self.install_plugin_component("codex_plugin"),
+            "qoder_plugin": lambda: self.install_plugin_component("qoder_plugin"),
+            "qodercn_plugin": lambda: self.install_plugin_component("qodercn_plugin"),
             "gitnexus": self.install_gitnexus,
             "dingtalk_cli": self.install_dingtalk_cli,
             "feishu_cli": self.install_feishu_cli,
@@ -1872,7 +2203,7 @@ class Installer:
             return False
 
     def run_installs(self) -> None:
-        """按用户选择逐项执行安装/升级/重装。"""
+        """按用户选择逐项执行安装/升级/重装，并补齐需要迁移的已装组件。"""
         for component_id in self.selected:
             status = self.states[component_id].status
             action = "安装" if status == "not_installed" else "升级" if status == "installed" else "重装"
@@ -1885,6 +2216,17 @@ class Installer:
             else:
                 self.logger.error(f"{label}未完成，请查看日志：{self.logger.log_path}")
             self.install_records.append((component_id, action, "1" if ok else "0"))
+        for component_id in getattr(self, "toolchain_migration", []):
+            label = detector.component_description(component_id)
+            self.logger.section(f"迁移到工具链根：{label}")
+            ok = self.install_component(component_id)
+            if ok:
+                self.logger.success(
+                    f"{label} 已重新物化到 {self.platform.toolchain_root(self.home)}"
+                )
+            else:
+                self.logger.error(f"{label} 迁移未完成，请查看日志：{self.logger.log_path}")
+            self.install_records.append((component_id, "迁移", "1" if ok else "0"))
 
     def configure_git(self) -> None:
         """写入 CodeKit 需要的全局 Git 选项，并记录 Git 配置文件路径。"""
@@ -1955,6 +2297,18 @@ class Installer:
             )
         if self.command_exists("gitnexus"):
             rows.append(("仓库根目录执行：gitnexus analyze --embeddings --skills --verbose", "对当前仓库建立gitnexus索引"))
+        # 工具链落点的实测结论：非 ok 的组件给出一步就能照做的修复。
+        repair = "install.cmd install" if self.platform.is_windows else "install.sh install"
+        for component_id, state in getattr(self, "toolchain_health", []):
+            if state == "ok":
+                continue
+            rows.append(
+                (
+                    f"{repair}（重新安装 {component_id}）",
+                    f"{component_id} 的落点实测为 {state}；"
+                    "codekit:initialize 会如实降级为 partial 并在报告里点明这一条",
+                )
+            )
         if self.command_exists("claude"):
             rows.append(("Claude 中输入：/codekit:initialize", "初始化当前仓库"))
         if self.command_exists("opencode"):
@@ -1986,13 +2340,6 @@ class Installer:
                     "初始化当前仓库",
                 )
             )
-        # if qoder_labels:
-        #     rows.append(
-        #         (
-        #             "重启 " + "、".join(qoder_labels) + " 的 CLI 与 IDE",
-        #             "让新安装的插件和全局 subagent 被重新加载",
-        #         )
-        #     )
 
         if self.command_exists("gh"):
             rows.append(("gh auth login", "推荐浏览器登录；Git 操作选择 HTTPS，并确认使用 GitHub 凭据"))
@@ -2016,6 +2363,9 @@ class Installer:
         self.logger.info(f"\n \n === CodeKit Plugin Install v{self.plugin_version} ===")
         if self.os_name not in {"Darwin", "Linux", "Windows"}:
             raise InstallerError(f"Unsupported OS: {self.os_name}. Only macOS/Linux/Windows.")
+        # 系统依赖检查在所有组件动作之前，且三平台共用同一份实现（installer_preflight）。
+        if not preflight.check(self):
+            return 1
         detector.registry.validate_registry()
         self.ensure_user_bin()
         if not self.marketplace_local:
@@ -2032,7 +2382,12 @@ class Installer:
             except (OSError, ValueError, RuntimeError) as exc:
                 self.logger.warn(f"Could not render installation recap: {exc}")
             return 0
+        # 工具链根必须在 run_installs 之前就绪：venv 通道要用内置运行时建 venv，装配
+        # 阶段也会依据它判断通道可用性。
+        self.setup_toolchain()
         self.run_installs()
+        self.write_toolchain_manifest()
+        self.report_toolchain_health()
         self.configure_git()
         self.save_versions()
         if getattr(self, "setup_path_selected", False):
@@ -2049,7 +2404,16 @@ class Installer:
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """解析安装器命令行参数，并拒绝已合并到 install 的旧 upgrade 命令。"""
     parser = argparse.ArgumentParser(description="CodeKit Plugin installer")
-    parser.add_argument("action", nargs="?", default="install", choices=("install", "upgrade"))
+    parser.add_argument(
+        "action",
+        nargs="?",
+        default="install",
+        choices=("install", "upgrade"),
+        # `upgrade` 只为拦住旧命令并给出受控提示，不属于可见的用法，所以在帮助里
+        # 只显示 install 这个动作名。
+        metavar="install",
+        help="install or upgrade selected components",
+    )
     parser.add_argument("-y", "--yes", action="store_true", help="proceed with default selections")
     args = parser.parse_args(argv)
     if args.action == "upgrade":
@@ -2061,6 +2425,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """作为进程入口运行安装器，并将取消或预期异常转换为退出码。"""
     args = parse_args(argv)
     try:
+        config.require_python()
         return Installer(args.yes).run()
     except KeyboardInterrupt:
         print("\nCancelled.", file=sys.stderr)

@@ -30,7 +30,7 @@ CodeKit 是一套基于 Claude / OpenCode / Codex / Qoder 的 AI 开发套件，
 bash install.sh
 ```
 
-安装内容：rtk（节省 token 60-90%）、GitNexus（代码智能）、Graphify（知识图谱）、gh（GitHub CLI）、glab（GitLab CLI）、钉钉 CLI（`dws`）、飞书 CLI（`lark-cli`）、CodeKit 插件（Claude + OpenCode + Codex + Qoder + Qoder CN，插件分别包含对应平台的全局 subagent；Qoder 插件同时服务其 CLI 与桌面 IDE）。安装前脚本只**检测** git（存在即可）、Node.js ≥ 24、Python3 ≥ 3.10、npm 与 curl/wget，任一不满足即醒目列出并中止，不代装。编程智能体 CLI 不在此阶段强制准备：没有可用 CLI 时只提示，勾选平台插件后才自动安装对应 CLI。
+安装内容：rtk（节省 token 60-90%）、GitNexus（代码智能）、Graphify（知识图谱）、gh（GitHub CLI）、glab（GitLab CLI）、钉钉 CLI（`dws`）、飞书 CLI（`lark-cli`）、CodeKit 插件（Claude + OpenCode + Codex + Qoder + Qoder CN，插件分别包含对应平台的全局 subagent；Qoder 插件同时服务其 CLI 与桌面 IDE）。安装器在装任何组件之前只**检测** git（存在即可）、Node.js ≥ 24、Python3 ≥ 3.10、npm 与 curl/wget，任一不满足即醒目列出并中止，不代装；这套检测三平台共用一份实现，入口脚本只解析解释器。编程智能体 CLI 不在此阶段强制准备：没有可用 CLI 时只提示，勾选平台插件后才自动安装对应 CLI。
 
 > CodeKit 的 7 个技能同时支持 **Claude**、**OpenCode**、**Codex**、**Qoder** 和 **Qoder CN**，可以同时安装，互不冲突。可选组件统一按 `npm → brew → apt → pipx/venv → 发布包/官方脚本` 的优先级探测（rtk 在 brew 之外优先取 `rtk-<target triple>.tar.gz` 发布资产，而不是 `curl | bash`）：Claude、Codex、OpenCode 优先走 npm（统一 `registry.npmmirror.com` 镜像源），macOS 可回退 Homebrew/cask（Homebrew 统一走**中科大镜像**并关闭其自动更新）；Qoder 与 Qoder CN 使用官方安装脚本。脚本与 release 这类 GitHub 下载统一走 `gh-proxy`，GitHub 版本探测也只走该代理。Qoder 与 Qoder CN 的 CLI 和桌面 IDE 共用同一个用户级配置根，安装一次两端生效。
 >
@@ -46,6 +46,10 @@ bash install.sh
 
 # 卸载
 bash uninstall.sh
+
+# 卸载并一并移除工具链根（内置运行时 / 私有 npm 前缀 / venv / toolchain.json）
+# 仅在没有其它仓库还要用 codekit:initialize 时执行
+bash uninstall.sh --purge
 ```
 
 ### 手动安装 OpenCode 插件
@@ -256,7 +260,8 @@ AI 会跨越业务日志、进程状态、中间件指标、源代码等多个�
 | `plugin add` 失败 | 确认在本仓库根目录运行安装脚本（本地源）；改用远端地址安装的，确认 SSH Key 已配置：`ssh -T git@<your-git-host>` |
 | `glab` 认证失败 | `glab auth login --hostname <your-git-host>` |
 | `gh` 认证失败 | `gh auth login` |
-| rtk 未生效（token 未减少） | Claude/OpenCode 运行 `rtk init -g --show`；Codex 运行 `rtk init -g --codex`；重启对应 AI 工具 |
+| rtk 未生效（token 未减少） | Claude/OpenCode 运行 `rtk init -g --show`；Codex 运行 `rtk init -g --codex`；重启对应 AI 工具。Codex 桌面版下 `rtk` 若不在它可见的路径上，安装器会跳过 codex 侧注册，先按「Codex 里 initialize 报工具不可用」一条处理再重跑安装 |
+| Codex 里 initialize 报工具不可用（GitNexus / Graphify） | **不是缺 PATH**：实测受限宿主的 `PATH` 里用户级条目是全的（含 `%APPDATA%\Roaming\npm` 与 Python 目录），被拒绝的是对这些路径的文件系统访问——`%APPDATA%\npm` 下的入口连 `stat` 都拿不到（EACCES），`%LOCALAPPDATA%\Programs\Python` 整个目录不可达；graphify 的 venv 还会因为基础解释器在那个目录里而启动失败（rc=101）。所以**改 `PATH` 永远无效**。正确解法是让工具落在 CodeKit 自持工具链根 `<home>/.local/share/CodeKit/`（实测该根可读可执行，仅写入被拒）：**重跑安装器**（`install.cmd install`）——它会把 gitnexus 物化到私有 npm 前缀、用内置 Python 运行时重建 graphify venv，并写出 `toolchain.json` 供技能直接读。**已装过的组件不需要再手动勾选**：安装器检测到它们已装但落点不在工具链根内时会自动迁移（首次下载约 45MB 运行时并重建 graphify venv，之后幂等）。兜底可用 `CODEKIT_GITNEXUS_RUNNER` / `CODEKIT_GRAPHIFY_RUNNER` 指向当前会话真能执行的 runner。诊断：`python skills/_shared/scripts/resolve-runner.py --tool gitnexus --json`，退出码 `0`/`3`/`4`/`5` 对应 `ok` / 未安装 / 读不到 / 跑不起来。工具不可用只会把结果降级为 `partial`，运行会跑完并在报告里点名，**不需要你再重跑一次**（要 fail-closed 用 `--strict-tools`） |
 | 命令找不到（Claude） | `claude plugin list` 确认 CodeKit 插件已安装 |
 | 命令找不到（OpenCode） | 检查 `~/.config/opencode/opencode.json` 中 `plugin` 数组是否包含 CodeKit |
 | OpenCode 插件未生效 | 修改 opencode.json 后需重启 OpenCode |

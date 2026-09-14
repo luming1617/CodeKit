@@ -80,17 +80,20 @@ class AgentCliInstallTests(unittest.TestCase):
                 self.assertTrue(agents.supports_install(entry, "Linux"))
                 self.assertTrue(agents.supports_install(entry, "Darwin"))
 
-    def test_install_plan_follows_the_global_channel_order(self) -> None:
-        # npm 是全局第一优先通道，brew/cask 只在其后；install_plan 只按
-        # CHANNEL_ORDER 列出已声明通道，可用性由调用方探测，因此与平台无关。
+    def test_channel_plan_follows_the_global_channel_order(self) -> None:
+        # npm 是全局第一优先通道，其后依次是 brew_cask 与 Windows 专用的 winget；
+        # channel_plan 只按 CHANNEL_ORDER 列出已声明通道，可用性由调用方探测，
+        # 因此与平台无关（winget 在这里也列出来，能不能用由 channel_available 判）。
         # 镜像源由 set_npm 注入环境变量，命令本身不再附加 --registry。
         claude = agents.agent_cli("claude")
-        expected = [
-            ("npm", "install", "-g", "@anthropic-ai/claude-code@latest"),
-            ("brew", "install", "--cask", "claude-code"),
-        ]
-        self.assertEqual(agents.install_plan(claude, "Darwin"), expected)
-        self.assertEqual(agents.install_plan(claude, "Linux"), expected)
+        self.assertEqual(
+            [
+                ("npm", "@anthropic-ai/claude-code"),
+                ("brew_cask", "claude-code"),
+                ("winget", "Anthropic.ClaudeCode"),
+            ],
+            agents.channel_plan(claude),
+        )
 
     def test_set_npm_injects_the_user_prefix_and_mirror(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

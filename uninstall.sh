@@ -1,99 +1,33 @@
 #!/usr/bin/env bash
-# CodeKit Plugin 独立卸载入口。
-# 卸载只调用独立卸载编排器，不准备 Homebrew、Node.js 等安装依赖。
+# CodeKit Plugin uninstall entry point (macOS / Linux).
+#
+# 与 install.sh 同形：找到一个系统 Python，转发给 scripts/uninstaller.py。卸载不做依赖
+# 预检——它只删东西，不需要 Node.js 或包管理器。
 
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)"
 OS_NAME="$(uname -s 2>/dev/null || printf 'Unknown')"
-XDG_STATE_HOME="${XDG_STATE_HOME:-${HOME}/.local/state}"
-STATE_DIR="${XDG_STATE_HOME}/CodeKit"
-LOG_FILE="${STATE_DIR}/install.log"
-mkdir -p "${STATE_DIR}" 2>/dev/null || true
-
-# 记录卸载引导阶段的错误；日志不可写时仍允许 Python 卸载流程继续执行。
-_log() {
-  [ -d "${STATE_DIR}" ] || return 0
-  printf '%s\n' "$*" 2>/dev/null >>"${LOG_FILE}" || true
-}
-
-# 输出错误信息到 stderr，并和安装流程共用同一个日志文件。
-error() {
-  printf '  ✗  %s\n' "$*" >&2
-  _log "[ERROR] $*"
-}
-# 输出平台分支信息，并写入卸载日志。
-info() {
-  printf '%s\n' "$*"
-  _log "[INFO]  $*"
-}
-# 输出可继续执行的卸载告警，并写入卸载日志。
-warn() {
-  printf '  ⚠  %s\n' "$*"
-  _log "[WARN]  $*"
-}
-
-# 打印独立卸载脚本支持的参数。
-usage() {
-  printf '%s\n' \
-    "Usage: bash uninstall.sh [-y|--yes]" \
-    "" \
-    "  -y, --yes   skip confirmation and use default selections" \
-    "  -h, --help  show this help"
-}
-
-run_python_uninstall() {
-  # 卸载不自动安装 Python；缺少 Python 时明确提示用户手动补齐后重试。
-  if ! command -v python3 >/dev/null 2>&1; then
-    error "Python3 is required to uninstall CodeKit Plugin."
-    return 1
-  fi
-
-  # 辅助模块清单的唯一来源是 scripts/installer_config.py：uninstaller.py 在导入期
-  # 自检并在缺失时输出单行受控错误，因此这里不再维护第二份清单。
-  python3 "${SCRIPT_DIR}/scripts/uninstaller.py" "$@"
-}
-
-# 卸载脚本不接受 install/uninstall 子命令，避免把动作参数重复传给 Python。
-for arg in "$@"; do
-  case "${arg}" in
-    -y|--yes) ;;
-    -h|--help) usage; exit 0 ;;
-    *) error "Unknown option: ${arg}"; usage >&2; exit 2 ;;
-  esac
-done
-
-# macOS 的 brew 组件由 Python 卸载器直接处理；这里明确标记平台，供组件分支使用。
-uninstall_macos() {
-  export CODEKIT_PLATFORM="macos"
-  export CODEKIT_PACKAGE_MANAGER="brew"
-  run_python_uninstall "$@"
-}
-
-# Linux 组件优先由发行版包管理器处理；没有包管理器时仍可卸载用户态插件和工具。
-uninstall_linux() {
-  local manager
-  for manager in apt-get dnf yum pacman zypper apk; do
-    if command -v "${manager}" >/dev/null 2>&1; then
-      export CODEKIT_PACKAGE_MANAGER="${manager}"
-      break
-    fi
-  done
-  export CODEKIT_PLATFORM="linux"
-  if [ -n "${CODEKIT_PACKAGE_MANAGER:-}" ]; then
-    info "Linux uninstall branch: ${CODEKIT_PACKAGE_MANAGER}"
-  else
-    warn "No supported Linux package manager found; continuing with user-level cleanup."
-  fi
-  run_python_uninstall "$@"
-}
 
 case "${OS_NAME}" in
-  Darwin) uninstall_macos "$@"; exit $? ;;
-  Linux) uninstall_linux "$@"; exit $? ;;
+  Darwin|Linux) ;;
   MINGW*|MSYS*|CYGWIN*)
-    error "Windows 请使用 uninstall.cmd（或 uninstall.ps1），不要用 Git Bash 运行 uninstall.sh。"
+    printf '  ✗  Windows 请使用 uninstall.cmd（或 uninstall.ps1），不要用 Git Bash 运行 uninstall.sh。\n' >&2
     exit 1
     ;;
-  *) error "Unsupported OS: ${OS_NAME}. Only macOS/Linux/Windows are supported."; exit 1 ;;
+  *)
+    printf '  ✗  Unsupported OS: %s. Only macOS/Linux/Windows.\n' "${OS_NAME}" >&2
+    exit 1
+    ;;
 esac
+
+ENTRYPOINT="${SCRIPT_DIR}/scripts/entrypoint.sh"
+if [ ! -f "${ENTRYPOINT}" ]; then
+  printf '  ✗  残缺检出：缺少 %s\n' "${ENTRYPOINT}" >&2
+  exit 1
+fi
+# shellcheck source=scripts/entrypoint.sh
+. "${ENTRYPOINT}"
+
+CODEKIT_PYTHON="$(codekit_python)" || exit 1
+exec "${CODEKIT_PYTHON}" "${SCRIPT_DIR}/scripts/uninstaller.py" "$@"

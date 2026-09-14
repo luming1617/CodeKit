@@ -49,7 +49,9 @@ def main(argv: list[str] | None = None) -> int:
     ) == "1"
     if authorized:
         if likely_writable(original_dir):
-            completed = subprocess.run(command, cwd=args.root, text=True)
+            completed = subprocess.run(
+                command, cwd=args.root, text=True, encoding="utf-8", errors="replace"
+            )
             return completed.returncode
         print(
             "initialize warning: --use-global-registry was requested but "
@@ -68,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"GITNEXUS_HOME={fallback}",
                 file=sys.stderr,
             )
-            completed = subprocess.run(command, cwd=args.root, text=True, env=env)
+            completed = subprocess.run(command, cwd=args.root, text=True, encoding="utf-8", errors="replace", env=env)
             return completed.returncode
     except OSError as error:
         print(

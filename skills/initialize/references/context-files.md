@@ -89,7 +89,7 @@ yarn
 zig
 ```
 
-Python 启动方式按宿主区分，与安装器入口（`INSTALL.md`）的规则一致：macOS/Linux 用 `python3 …`，Windows 用 `py -3 …`。**干净 Windows 上 `python3` 是微软商店别名桩**：`which` 能找到它，但执行后以非零码退出，会被记为 `validation failed` 而不是 `skipped`，所以 Windows 上不要发 `python3 …`。
+Python 启动方式按宿主区分，与安装器入口（见 `INSTALL-STRATEGY.md` §8.1）的规则一致：macOS/Linux 用 `python3 …`，Windows 用 `py -3 …`。**干净 Windows 上 `python3` 是微软商店别名桩**：`which` 能找到它，但执行后以非零码退出，会被记为 `validation failed` 而不是 `skipped`，所以 Windows 上不要发 `python3 …`。
 
 Scanner 在标记 `required_for_initialize: true` 之前必须先用 `command -v <program>` 自检（Windows 用 `Get-Command`）：程序不在白名单或本机未安装时，保留命令但把该字段置为 `false`。reconcile 用同一白名单预检每个 required 命令，程序不在白名单、含禁用 shell 语法或仓库脚本缺失时以可恢复的契约错误在写入任何托管文件之前中止（修复 context 后重试同一个 run）；白名单内但未安装的程序在 finish 记为 `skipped` 并写入 `validation_warnings`，整体降级为 `partial` 且禁止提交。
 

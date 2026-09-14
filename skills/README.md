@@ -48,6 +48,19 @@ Markdown 角色文件。安装时：
 
 安装器 `scripts/manage-global-agents.py` 只匹配 `*/agents/*.md`，`openai.yaml` 不参与全局安装。
 
+## _shared/：跨技能共享内容
+
+`skills/_shared/` 不是技能，不参与技能校验与选择器；它是各技能按相对路径引用的共享素材（引用必须写成
+`_shared/...` 形式，`scripts/validate-skill-layout.py` 校验引用目标存在）：
+
+- `prompts/`：共享提示片段（`path-convention.md` 的 `PYTHON` 与工具解析规则、`subagent-mandate.md`、
+  `output-language.md`），由各技能 `SKILL.md` 引用。
+- `scripts/codekit_runtime.py`：技能侧的确定性解析层——工具四态（`ok` / `not-installed` /
+  `not-readable` / `not-executable`）、`toolchain.json` 校验、固定解析顺序（`CODEKIT_<TOOL>_RUNNER`
+  → `toolchain.json` → `PATH` → 已知目录）。各技能用 `importlib` 按路径加载，不做包导入。
+- `scripts/resolve-runner.py`：上述解析层的诊断 CLI（`--tool gitnexus|graphify`、`--json`、`--explain`）。
+- `tests/`：共享层单测（`py -3 -m unittest discover -s skills/_shared/tests`）。
+
 ## 角色清单
 
 | Skill         | 全局 agent                                                                              |

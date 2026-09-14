@@ -55,7 +55,7 @@ def now() -> str:
 
 def git(root: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(root), *args], capture_output=True, text=True, check=False,
+        ["git", "-C", str(root), *args], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
     )
     if result.returncode != 0:
         raise StateError(f"git {' '.join(args)} 失败：{result.stderr.strip() or result.stdout.strip()}")
@@ -94,7 +94,7 @@ def is_under(path: str, prefix: str | None) -> bool:
 
 def head_sha(root: Path) -> str:
     result = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, check=False,
+        ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
     )
     return result.stdout.strip() if result.returncode == 0 else ""
 
@@ -149,7 +149,7 @@ def capture_snapshot(root: Path, documents: list[Path], exclude: str | None = No
     if base:
         result = subprocess.run(
             ["git", "-C", str(root), "diff", "--binary", "HEAD"],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
         )
         diff = result.stdout
     document_snapshots = []
@@ -460,7 +460,7 @@ def cmd_run_validation(args: argparse.Namespace) -> int:
     timed_out = False
     try:
         completed = subprocess.run(
-            argv, capture_output=True, text=True, cwd=str(root), timeout=args.timeout, check=False,
+            argv, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(root), timeout=args.timeout, check=False,
         )
         exit_code: int | None = completed.returncode
         output = (completed.stdout or "") + (completed.stderr or "")

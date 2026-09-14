@@ -280,7 +280,13 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
         raise ReconcileError("worker gate is not complete")
     if set(gate.get("tasks", [])) != EXPECTED_TASKS or gate.get("errors"):
         raise ReconcileError("worker gate does not contain the required validated tasks")
-    if gate.get("status") == "partial" and not manifest.get("options", {}).get("allow_partial"):
+    # 门禁已经做过「这个 partial 是否可接受」的判定：工具不可用属环境事实，接受它不需要
+    # 二次授权。这里只兜住「门禁放行 partial 但没记录原因」的异常状态。
+    if (
+        gate.get("status") == "partial"
+        and not manifest.get("options", {}).get("allow_partial")
+        and not gate.get("tool_only_degradation")
+    ):
         raise ReconcileError("partial worker gate requires --allow-partial")
 
     verified_results = manifest.get("worker_results", {})

@@ -323,6 +323,33 @@ def refresh_process_path(environ: Optional[dict] = None) -> Tuple[str, ...]:
     return tuple(added)
 
 
+def machine_path_entries() -> Tuple[str, ...]:
+    """只返回机器级（HKLM）PATH 的目录；非 Windows 返回空元组。
+
+    判断某个命令「无需用户级 PATH 也能被找到」只能看注册表的机器级 Path：当前
+    进程的 ``PATH`` 已经把用户级与机器级合并了，从它看不出命令的来源。Codex
+    桌面端的 shell 只继承机器级 PATH，因此安装器的落地自检需要这份数据。
+    """
+    if not is_windows():
+        return ()
+    import winreg
+
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ) as handle:
+            value, _ = winreg.QueryValueEx(handle, "Path")
+    except OSError:
+        return ()
+    entries = []
+    for raw in str(value).split(os.pathsep):
+        entry = os.path.expandvars(raw.strip())
+        if entry:
+            entries.append(entry)
+    return tuple(entries)
+
+
 def probe_npm_prefix(timeout: float = 15) -> str:
     """读取 npm 自己的全局前缀；失败时返回空字符串。
 
@@ -405,9 +432,55 @@ class Platform:
             return Path(npm_bin)
         return Path(home) / ".local" / "bin"
 
+    def toolchain_root(self, home: Path) -> Path:
+        """CodeKit 自持工具链根：运行期唯一必须可读（并在沙箱内可执行）的目录。
+
+        宿主沙箱是按路径拒绝访问的：Codex 桌面版拒绝 `%APPDATA%` 与
+        `%LOCALAPPDATA%\\Programs`，却放行用户数据目录下的这一处（已实测）。因此
+        凡是要被技能在会话里启动的东西，都必须落在这里，而不是 npm 全局目录或
+        系统 Python 的安装目录。
+        """
+        return Path(home) / ".local" / "share" / "CodeKit"
+
+    def runtime_root(self, home: Path) -> Path:
+        """内置 Python 运行时的存放根；各版本按 tag 并列保留，便于回退。"""
+        return self.toolchain_root(home) / "runtime"
+
+    def runtime_dir(self, home: Path, tag: str) -> Path:
+        """某个 tag 的运行时的落地目录。"""
+        return self.runtime_root(home) / tag
+
+    def runtime_current(self, home: Path) -> Path:
+        """记录当前生效 tag 的指针文件；与 ``toolchain.json`` 相互校验。"""
+        return self.runtime_root(home) / "current.json"
+
+    def runtime_python(self, runtime_dir: Path) -> Path:
+        """运行时里的解释器规范位置。
+
+        python-build-standalone 的 ``install_only`` 包解开后顶层是 ``python/``，
+        Windows 直接在该目录下，POSIX 在 ``bin/``。解包代码负责归一成这个形状，
+        这里只描述「应该在哪」。
+        """
+        if self.is_windows:
+            return Path(runtime_dir) / "python" / "python.exe"
+        return Path(runtime_dir) / "python" / "bin" / "python3"
+
+    def npm_prefix_private(self, home: Path) -> Path:
+        """CodeKit 私有 npm 前缀。
+
+        gitnexus 只装在 ``%APPDATA%\\npm`` 时在沙箱内既不可读也不可执行（实测
+        stat 即 EACCES），因此改用它自己的前缀：目录落在可读根下，启动时用
+        ``<绝对 node> <绝对 cli.js>``，不再依赖 npm 生成的 ``.cmd`` 垫片。
+        """
+        return self.toolchain_root(home) / "npm"
+
+    def toolchain_manifest(self, home: Path) -> Path:
+        """安装器写给技能读的工具链清单。"""
+        return self.toolchain_root(home) / "toolchain.json"
+
     def venv_dir(self, home: Path, command: str) -> Path:
         """私有 venv 的落地目录。"""
-        return Path(home) / ".local" / "share" / "CodeKit" / "venvs" / command
+        return self.toolchain_root(home) / "venvs" / command
 
     def venv_pip(self, venv: Path) -> Path:
         """venv 内的 pip 可执行文件。"""
@@ -472,27 +545,6 @@ class Platform:
         静默失效（用户以为在选择，其实用了默认值）。
         """
         return bool(sys.stdin.isatty() and sys.stdout.isatty())
-
-    def signal_names(self) -> Tuple[str, ...]:
-        """可安全注册的终止信号名；Windows 没有 SIGHUP。"""
-        return ("SIGTERM",) if self.is_windows else ("SIGTERM", "SIGHUP")
-
-    @property
-    def supports_symlinks(self) -> bool:
-        """创建符号链接是否需要额外的管理员/开发者模式权限。"""
-        return not self.is_windows
-
-    def preferred_pypi_channel(self, declared: Mapping[str, str]) -> str:
-        """从组件声明的 PyPI 通道里挑首选通道。
-
-        Windows 上优先 pipx：它在用户目录生成 shim，不依赖创建符号链接所需的
-        管理员或开发者模式。
-        """
-        order = ("pipx", "venv") if self.is_windows else ("venv", "pipx")
-        for kind in order:
-            if kind in declared:
-                return kind
-        return ""
 
     def shell_config(self, home: Path, environ: Optional[Mapping[str, str]] = None) -> Optional[Tuple[Path, str]]:
         """需要写入 PATH 的 shell 配置文件与配置行。

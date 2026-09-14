@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -29,6 +29,7 @@ except ValueError as exc:
     print(f"  ✗  {exc}", file=sys.stderr)
     raise SystemExit(1)
 
+import installer_agents as agents  # noqa: E402
 import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 import installer_state as detector  # noqa: E402
@@ -51,9 +52,11 @@ NPM_LOCK_MARKERS = ("EBUSY", "resource busy or locked")
 class Uninstaller(Installer):
     """执行 CodeKit 组件选择、卸载和全局配置清理。"""
 
-    def __init__(self, auto_yes: bool) -> None:
+    def __init__(self, auto_yes: bool, *, purge: bool = False) -> None:
         super().__init__(auto_yes)
         self.uninstall_records: list[tuple[str, str, str]] = []
+        self.purge = purge
+        self.toolchain_purged = False
 
     def component_tag(self, component_id: str) -> str:
         """生成卸载组件选择器中的状态提示。"""
@@ -150,7 +153,31 @@ class Uninstaller(Installer):
         """随对应插件移除该平台的全局 subagent。"""
         return self.run_platform_agents("uninstall", tool)
 
-    def uninstall_claude_plugin(self) -> bool:
+    def uninstall_plugin_component(self, component_id: str) -> bool:
+        """插件组件的统一卸载骨架：平台登记清理 → 该平台全局 subagent。
+
+        与安装侧同样只有「平台清理」这一段不同；先清登记再删缓存，登记清不掉时不碰
+        文件（插件可能仍被宿主加载，删缓存等于毁掉一份在用的安装）。
+        """
+        entry = agents.component_agent(component_id)
+        if entry is None:
+            return False
+        teardown = self._plugin_teardown(entry.key)
+        if teardown is None:
+            return False
+        return bool(teardown()) and self.uninstall_platform_agents(entry.key)
+
+    def _plugin_teardown(self, tool: str) -> Optional[Callable[[], bool]]:
+        """按平台键取清理实现；Qoder 两个发行版共用同一份（共享配置根）。"""
+        if tool in qoder.PLATFORMS:
+            return lambda: self._uninstall_qoder_plugin(tool)
+        return {
+            "claude": self._uninstall_claude_plugin,
+            "codex": self._uninstall_codex_plugin,
+            "opencode": self._uninstall_opencode_plugin,
+        }.get(tool)
+
+    def _uninstall_claude_plugin(self) -> bool:
         """卸载 Claude 插件及其 marketplace 注册；CLI 缺失时也清理共享缓存。"""
         plugin_ok = True
         if self.command_exists("claude"):
@@ -167,18 +194,36 @@ class Uninstaller(Installer):
         platform_layer.rmtree(
             self.home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE, ignore_errors=True
         )
-        return plugin_ok and self.uninstall_platform_agents("claude")
+        return plugin_ok
 
-    def uninstall_opencode_plugin(self) -> bool:
+    def _uninstall_opencode_plugin(self) -> bool:
         """从 OpenCode 配置中删除 CodeKit 插件，并再次读取配置确认删除结果。"""
         path = config.opencode_config_file(self.home / ".config" / "opencode")
         try:
-            plugin_ok = True
-            if config.opencode_has_plugin(path):
-                config.remove_opencode_plugins(path)
-                plugin_ok = not config.opencode_has_plugin(path)
-            return plugin_ok and self.uninstall_platform_agents("opencode")
+            if not config.opencode_has_plugin(path):
+                return True
+            config.remove_opencode_plugins(path)
+            return not config.opencode_has_plugin(path)
         except ValueError:
+            return False
+
+    def _uninstall_codex_plugin(self) -> bool:
+        """移除 Codex 中的 CodeKit 插件和 marketplace，并删除旧版兼容技能目录。"""
+        if self.command_exists("codex"):
+            self.run_command(["codex", "plugin", "remove", f"{CODEX_PLUGIN}@{CODEX_MARKETPLACE}"])
+            self.run_command(["codex", "plugin", "marketplace", "remove", CODEX_MARKETPLACE])
+        for path in (self.home / ".agents" / "skills").glob("keel-*"):
+            if path.is_dir():
+                platform_layer.rmtree(path, ignore_errors=True)
+        return True
+
+    def _uninstall_qoder_plugin(self, platform_key: str) -> bool:
+        """移除 Qoder 共享配置根中的插件；CLI 可用时先走 CLI 登记。"""
+        descriptor = qoder.PLATFORMS[platform_key]
+        try:
+            return qoder.uninstall(descriptor, self.home, runner=self.qoder_run)
+        except ValueError as exc:
+            self.logger.error(str(exc))
             return False
 
     def uninstall_rtk(self) -> bool:
@@ -271,10 +316,22 @@ class Uninstaller(Installer):
             platform_layer.rmtree(qoder.hook_script_dir(root), ignore_errors=True)
 
     def uninstall_gitnexus(self) -> bool:
-        """清理 gitnexus 自身配置，并同时卸载用户 npm 前缀和默认 npm 前缀中的包。"""
+        """清理 gitnexus 自身配置，并删除私有前缀副本与人类 shell 的转发入口。
+
+        安装期 gitnexus 落在 CodeKit 私有 npm 前缀里（受限宿主读不到 npm 全局目录），
+        所以只在全局前缀里卸载是空操作；bin_dir 里的转发垫片也必须一并清掉——它留在
+        PATH 上会让 ``command_exists`` 一直为真，把「已卸干净」误判成「没卸干净」。
+        """
         if self.command_exists("gitnexus"):
             self.run_command(["gitnexus", "uninstall", "--force"])
         self.unregister_gitnexus_from_qoder()
+        platform_layer.rmtree(
+            self.platform.npm_prefix_private(self.home), ignore_errors=True
+        )
+        for name in dict.fromkeys(
+            (self.platform.shim_name("gitnexus"), self.platform.binary_filename("gitnexus"))
+        ):
+            (self.bin_dir / name).unlink(missing_ok=True)
         return self.uninstall_npm_component("gitnexus")
 
     def uninstall_npm_component(self, component_id: str) -> bool:
@@ -438,28 +495,6 @@ class Uninstaller(Installer):
             (self.bin_dir / name).unlink(missing_ok=True)
         return True
 
-    def uninstall_codex_plugin(self) -> bool:
-        """移除 Codex 中的 CodeKit 插件和 marketplace，并删除旧版兼容技能目录。"""
-        if self.command_exists("codex"):
-            self.run_command(["codex", "plugin", "remove", f"{CODEX_PLUGIN}@{CODEX_MARKETPLACE}"])
-            self.run_command(["codex", "plugin", "marketplace", "remove", CODEX_MARKETPLACE])
-        for path in (self.home / ".agents" / "skills").glob("keel-*"):
-            if path.is_dir():
-                platform_layer.rmtree(path, ignore_errors=True)
-        return self.uninstall_platform_agents("codex")
-
-    def uninstall_qoder_plugin(self, platform_key: str) -> bool:
-        """移除 Qoder 共享配置根中的插件与全局 subagent；CLI 可用时先走 CLI 登记。"""
-        descriptor = qoder.PLATFORMS[platform_key]
-        try:
-            plugin_ok = qoder.uninstall(
-                descriptor, self.home, runner=self.qoder_run
-            )
-        except ValueError as exc:
-            self.logger.error(str(exc))
-            plugin_ok = False
-        return plugin_ok and self.uninstall_platform_agents(platform_key)
-
     def clear_leftovers(self, component_id: str) -> bool:
         """物理删除组件仍留在磁盘上的插件缓存，返回是否已清空。
 
@@ -482,11 +517,11 @@ class Uninstaller(Installer):
         """按组件注册 ID 分发卸载处理器，并把单项异常转换为失败结果。"""
         handlers = {
             "rtk": self.uninstall_rtk,
-            "claude_plugin": self.uninstall_claude_plugin,
-            "opencode_plugin": self.uninstall_opencode_plugin,
-            "codex_plugin": self.uninstall_codex_plugin,
-            "qoder_plugin": lambda: self.uninstall_qoder_plugin("qoder"),
-            "qodercn_plugin": lambda: self.uninstall_qoder_plugin("qodercn"),
+            "claude_plugin": lambda: self.uninstall_plugin_component("claude_plugin"),
+            "opencode_plugin": lambda: self.uninstall_plugin_component("opencode_plugin"),
+            "codex_plugin": lambda: self.uninstall_plugin_component("codex_plugin"),
+            "qoder_plugin": lambda: self.uninstall_plugin_component("qoder_plugin"),
+            "qodercn_plugin": lambda: self.uninstall_plugin_component("qodercn_plugin"),
             "gitnexus": self.uninstall_gitnexus,
             "dingtalk_cli": self.uninstall_dingtalk_cli,
             "feishu_cli": self.uninstall_feishu_cli,
@@ -525,6 +560,25 @@ class Uninstaller(Installer):
     def shell_rcs(self) -> Iterable[Path]:
         """返回卸载时需要检查的 shell 配置文件集合；Windows 上没有。"""
         return self.platform.shell_rc_files(self.home)
+
+    def purge_toolchain(self) -> None:
+        """``--purge`` 时移除整个工具链根，未指定时原样保留。
+
+        默认保留是刻意的：根里是内置 Python 运行时、私有 npm 前缀与各 venv，同机多仓库
+        共用一份，删掉会让其它仓库的 ``codekit:initialize`` 立刻降级。只有显式要求才动它，
+        并在结果里说清下一次使用前要重跑安装器。
+        """
+        if not self.purge:
+            return
+        root = self.platform.toolchain_root(self.home)
+        if not root.exists():
+            return
+        platform_layer.rmtree(root, ignore_errors=True)
+        if root.exists():
+            self.logger.warn(f"工具链根未能完全删除：{root}")
+            return
+        self.toolchain_purged = True
+        self.logger.info(f"已移除工具链根 {root}（内置 Python 运行时、私有 npm 前缀与 venv）")
 
     def remove_matching_lines(self, path: Path, fragment: str) -> None:
         """从 shell 配置中删除包含指定片段的行，并在有变化时原子保存。"""
@@ -592,13 +646,31 @@ class Uninstaller(Installer):
         self.select_components()
         if not self.selected:
             self.logger.info("No components selected. Nothing to uninstall.")
+            self.purge_toolchain()
             try:
                 detector.render_recap("uninstall", (), self.context)
             except (OSError, ValueError, RuntimeError) as exc:
                 self.logger.warn(f"Could not render uninstall recap: {exc}")
             return 0
         self.run_uninstalls()
-        self.logger.info(f"Note: {self.state_dir} and {self.npm_prefix} remain.")
+        self.purge_toolchain()
+        root = self.platform.toolchain_root(self.home)
+        if self.toolchain_purged:
+            toolchain_note = (
+                f"{root} was removed by --purge; re-run the installer before the next "
+                "codekit:initialize."
+            )
+        elif root.exists():
+            toolchain_note = (
+                f"{root} also remains: it holds the bundled Python runtime and "
+                "toolchain.json, so remove it by hand only once no repository still runs "
+                "codekit:initialize (or re-run this uninstaller with --purge)."
+            )
+        else:
+            toolchain_note = f"{root} is already gone."
+        self.logger.info(
+            f"Note: {self.state_dir} and {self.npm_prefix} remain. {toolchain_note}"
+        )
         try:
             detector.render_recap("uninstall", ("\t".join(row) for row in self.uninstall_records), self.context)
         except (OSError, ValueError, RuntimeError) as exc:
@@ -610,6 +682,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """解析独立卸载器命令行参数。"""
     parser = argparse.ArgumentParser(description="CodeKit Plugin uninstaller")
     parser.add_argument("-y", "--yes", action="store_true", help="proceed with default selections")
+    parser.add_argument(
+        "--purge",
+        action="store_true",
+        help=(
+            "also remove the CodeKit toolchain root (bundled Python runtime, "
+            "private npm prefix, venvs and toolchain.json)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -617,7 +697,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """作为进程入口运行卸载器，并将取消或预期异常转换为退出码。"""
     args = parse_args(argv)
     try:
-        return Uninstaller(args.yes).run()
+        config.require_python()
+        return Uninstaller(args.yes, purge=args.purge).run()
     except KeyboardInterrupt:
         print("\nCancelled.", file=sys.stderr)
         return 130

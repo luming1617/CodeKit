@@ -358,15 +358,6 @@ def remove_mcp_server(root: Path, name: str) -> bool:
     return _write_json(settings_path(root), document)
 
 
-def mcp_server(root: Path, name: str) -> dict[str, Any]:
-    """Return the effective ``mcpServers`` entry for a name, if any."""
-    servers = read_settings(root).get("mcpServers")
-    if not isinstance(servers, dict):
-        return {}
-    entry = servers.get(name)
-    return dict(entry) if isinstance(entry, dict) else {}
-
-
 def _hook_map(document: dict[str, Any], root: Path) -> dict[str, Any]:
     """Return the mutable ``hooks`` object, rejecting a document of the wrong shape."""
     hooks = document.get("hooks")
@@ -971,8 +962,3 @@ def foreign_os_roots(descriptor: Platform) -> list[Path]:
         if candidate.is_dir():
             roots.append(candidate)
     return roots
-
-
-def supported_platform_keys() -> Iterable[str]:
-    """Return the platform keys the installer knows how to drive."""
-    return tuple(PLATFORMS)

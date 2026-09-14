@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import argparse
 import os
 import shutil
 import tempfile
@@ -244,28 +243,3 @@ def prepare(source: Path, state_dir: Path) -> tuple[Path, Path, Path]:
         raise
 
     return market_stage, opencode_stage, qoder_stage
-
-
-def build_parser() -> argparse.ArgumentParser:
-    """构建兼容插件源生成器的命令行解析器。"""
-    parser = argparse.ArgumentParser(description="Build CodeKit Plugin compatibility sources")
-    parser.add_argument("command", choices=("prepare",))
-    parser.add_argument("--source", required=True, type=Path)
-    parser.add_argument("--state-dir", required=True, type=Path)
-    return parser
-
-
-def main() -> int:
-    """执行 prepare 子命令并将构建失败转换为非零退出码。"""
-    args = build_parser().parse_args()
-    try:
-        market_stage, opencode_stage, qoder_stage = prepare(args.source, args.state_dir)
-    except (OSError, ValueError) as exc:
-        print(f"installer sources: {exc}", file=os.sys.stderr)
-        return 1
-    print(f"{market_stage}\t{opencode_stage}\t{qoder_stage}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

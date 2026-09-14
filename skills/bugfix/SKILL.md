@@ -32,11 +32,11 @@ allowed-tools: 'Bash, Read, Write, Agent, Grep, Skill'
 - 调查阶段使用 [assets/bugfix-proposal-template.md](assets/bugfix-proposal-template.md)；实施完成后使用 [assets/bugfix-delivery-report-template.md](assets/bugfix-delivery-report-template.md)。
 - 确定性门禁脚本：`scripts/validate_bugfix_proposal.py`（提案结构与审批语义校验）和 `scripts/bugfix_state.py`（快照冻结、提案记录、审批绑定、越界检查与验证执行）；两者都按 `SKILL_DIR` 解析路径调用，不得用 Agent 自述替代其退出码。
 
-## Subagent 强制调用规则（Claude Code / Codex / OpenCode）
+## Subagent 强制调用规则（Claude Code / Codex / OpenCode / Qoder / Qoder CN）
 
 `bugfix-investigator`、`bugfix-challenger` 和获批后使用的 `bugfix-implementer` 都是硬性阶段门禁，不是可选建议。进入对应阶段前，主 Agent 必须创建指定名称的独立 Sub-agent，并记录调用名称、输入快照、独立会话标识和返回状态；主 Agent 自己完成该阶段、普通串行自检或只写“建议调用”均不合规。无法创建指定 Sub-agent 时，阶段状态必须为 `BLOCKED`，不得伪造角色产出或继续通过门禁。**该门禁只约束主 Agent（Orchestrator）：被派发的角色 Sub-agent 一律不再派发下一级 Sub-agent，也绝不因自身缺少派发能力而返回 `BLOCKED`；它只需按自己的角色契约完成本阶段并返回结构化结果。**
 
-按宿主派发的方式（Claude Code / Codex / OpenCode 的角色标识与语法差异、“不得把派发指令注入子代理”的纪律、以及 Skill 在各宿主下的调用名）见 `$SKILLS_ROOT/_shared/prompts/subagent-mandate.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。进入任何派发阶段前必须读取该文件；角色由 `manage-global-agents.py`（仓库安装脚本）安装为**全局裸名**，不存在 `@agent-<plugin>:<name>` 这类插件作用域角色名。
+按宿主派发的方式（Claude Code / Codex / OpenCode / Qoder / Qoder CN 的角色标识与语法差异、“不得把派发指令注入子代理”的纪律、以及 Skill 在各宿主下的调用名）见 `$SKILLS_ROOT/_shared/prompts/subagent-mandate.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。进入任何派发阶段前必须读取该文件；角色由 `manage-global-agents.py`（仓库安装脚本）安装为**全局裸名**，不存在 `@agent-<plugin>:<name>` 这类插件作用域角色名。
 
 ## 下游 Skill 强制调用：`code-review`
 

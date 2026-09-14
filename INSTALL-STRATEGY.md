@@ -14,13 +14,16 @@
 强依赖是操作系统级工具，安装器**不会**替用户安装（不再自动装 Homebrew、Node、Python、git、curl），
 只打印缺失项、当前版本、要求版本和各平台安装方式。
 
+这套检测三平台共用一份实现（`scripts/installer_preflight.py`，由 `Installer.run` 在组件动作
+之前调用）。入口脚本只做一件无法委托的事：解析出一个满足下限的系统 Python 再转发过去。
+
 ### 1.1 Preflight 门槛
 
 | 依赖 | 门槛 | 说明 |
 |---|---|---|
 | Node.js | **>= 24.0.0** | 全局门槛取 24 LTS 主版本；gitnexus 另做组件级校验（见 §4） |
 | npm | 存在即可 | 随 Node 提供，是绝大多数组件的首选通道 |
-| python3 | **>= 3.10** | 安装器自身运行为 Python；graphify 要求 Python >= 3.10 |
+| python3 | **>= 3.10** | 只用于运行安装器本身（首次安装由它写下内置运行时，见 §4.2）。下限由 `installer.py` 自身的代码决定；组件侧已与系统 Python 脱钩，graphify 的 `python>=3.10` 依赖比对的是内置运行时的版本 |
 | git | **存在即可** | 不再校验版本；仅用于读取 marketplace 提交号与写入全局 git 配置 |
 | curl / wget | **任一存在** | 用于脚本与发布包下载 |
 
@@ -56,6 +59,8 @@ npm  →  brew  →  brew_cask  →  apt  →  winget  →  pipx  →  venv  →
 `winget` 与 `powershell` 是 Windows 专用通道，可用性探测在其他平台恒为假，因此只是占住
 对应原生通道的位置，不改变 macOS/Linux 的选择结果。
 
+**例外**：由 CodeKit 工具链根接管的组件（`gitnexus` / `graphify`，见 §4.2）在**内置运行时可用时把 `venv` 提到 `pipx` 之前**——pipx 的 shim 落在工具链根之外，受限宿主（Codex 桌面端）读不到它，装上也跑不起来。运行时不可用时顺序不变，诚实退回 pipx。
+
 | 通道 | target | 可用性判定 | 安装 / 升级语义 |
 |---|---|---|---|
 | `npm` | 官方 npm 包名（白名单） | `npm` 存在 | `npm install -g <pkg>@latest`（含升级） |
@@ -64,7 +69,7 @@ npm  →  brew  →  brew_cask  →  apt  →  winget  →  pipx  →  venv  →
 | `apt` | 发行版包名 | Linux 且有包管理器 | `apt-get install -y`（需 sudo，见 §3）；包不存在则跳到下一通道 |
 | `winget` | winget 包 ID | **Windows 且 `winget` 存在** | 语义与 `brew` 对齐：命令缺失才 `winget install`；命令已存在时先用 `winget list` 确认由 winget 管理，再由 `winget upgrade` 升级，**"已是最新"返回非零（实测 `0x8A15002B`）不算失败**，否则会降级到 release 装出第二份；不在 winget 管理下则让位给下一通道。非交互必须带 `--accept-package-agreements --accept-source-agreements --silent --disable-interactivity`，否则 winget 会挂起等待输入 |
 | `pipx` | PyPI 发行名 | `pipx` 存在（缺失则先按 apt→brew 装 pipx） | `pipx install` / `pipx upgrade` |
-| `venv` | PyPI 发行名 | `python3 -m venv` 可用 | 独立 venv + 用户级命令入口，始终可重装 |
+| `venv` | PyPI 发行名 | **内置运行时可用且能建 venv**（`<运行时> -c "import venv, ensurepip"`） | 用内置运行时 `-m venv --copies` 建到 `<工具链根>/venvs/<命令>`，再 `pip install -U <发行名>`；始终可重装 |
 | `release` | `Component.release` | `curl` 或 `wget` 存在 | 解析最新版 → 按模板展开资产名 → 下载 → 校验（如可）→ 解包 → 安装到用户 bin 目录；GitHub 地址优先走 gh-proxy。模板除 `{version}/{os}/{arch}/{ext}` 外还支持按 Rust target triple 命名的 `{target}` |
 | `script` | 官方安装脚本 URL | **非 Windows** 且存在可用的 POSIX shell | 下载后经 stdin 交给 shell 执行；GitHub 地址优先走 gh-proxy（见 §2.3）。Windows 上禁用该通道：Git for Windows 会把 `bash` 放进 PATH，只判断"有没有 shell"会让安装器用 Git Bash 跑 Unix 脚本（见 §8.3） |
 | `powershell` | Windows 专用 `.ps1` URL | **Windows 且存在 powershell** | 下载后经 stdin 交给 PowerShell 执行（`-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command -`） |
@@ -152,6 +157,22 @@ Windows 侧的三处差异：
 由于 npm 默认**只把 engines 当警告**，安装器必须在调用 npm 之前显式校验：Node 24.0–24.10 直接跳过
 gitnexus 并提示升级到 24.11+，其余组件照常安装。
 
+### 4.2 工具链根与内置运行时（gitnexus / graphify）
+
+`gitnexus` 与 `graphify` 的落点不遵循「装到用户级默认目录」的惯例，而是**由 CodeKit 自持工具链根接管**（`installer.py` 的 `TOOLCHAIN_COMPONENTS`）。原因是受限宿主（实测 Codex 桌面端）的沙箱**按路径拒绝访问**——`%APPDATA%\npm` 下的入口连 `stat` 都拿不到（EACCES），`%LOCALAPPDATA%\Programs\Python` 整个目录不可达，而 `<home>/.local/share/CodeKit` 可读可执行（仅写入被拒）。
+
+| 关注点 | 规则 |
+|---|---|
+| 根路径 | `<home>/.local/share/CodeKit`，三系统同一路径（`installer_platform.toolchain_root`），根内布局全部由它派生 |
+| 内置运行时 | python-build-standalone 的 `install_only` 资产，按 OS/arch 固定 tag 与 sha256，解到 `runtime/<tag>/` 并原子发布；发布前必须通过「`import venv, ensurepip` + 建一次 venv」冒烟 |
+| gitnexus | 装进**私有 npm 前缀** `<根>/npm`（`npm_config_prefix` 临时指向该前缀再还原），运行表达式记为绝对 `[<node>, <cli.js>]`；人类 shell 另留一份转发垫片，CodeKit 代码路径不依赖它 |
+| graphify | venv 建在 `<根>/venvs/graphify`，**基础解释器必须是内置运行时**（`--copies`）；系统 Python 建出的 venv 其 `pyvenv.cfg` 会指向被拒绝的目录，启动必失败（实测 rc=101）。运行时不可用时该组件**如实失败**，不退到 pipx 产出一份宿主读不到的副本 |
+| 清单 | `<根>/toolchain.json`（POSIX 下 `0600`）由安装器独占写入，记录每个工具的实测态与绝对 argv；它是**提示而非权威**，技能侧逐条复验后才采信（解析顺序与复验规则见 `skills/_shared/scripts/codekit_runtime.py` 的 `resolve_tool`） |
+| 自动迁移 | 安装器检测到「已装但落点不在根内」的组件会就地重物化，**不需要用户重新勾选**；重建会让旧 venv 与 `graphify-out/` 缓存作废 |
+| 升级 | 运行时按 tag 并列保留上一个可用版本；tag 升级 = 一次新下载 + 重建全部 venv，属 CodeKit 的维护职责（改 `RUNTIME_SPECS` 的 pin），不是重跑安装器的副作用 |
+| 卸载 | 默认保留工具链根（同机多仓库共用一份运行时），`uninstall.sh --purge` / `uninstall.cmd --purge` 才移除 |
+| 引导限制 | 系统 Python 只用来运行安装器，且**安装器不复用内置运行时运行自己**（运行时正是要修复的对象，自引用会让它损坏后无法修复） |
+
 ## 5. 智能体 CLI 通道
 
 | 平台 | 组件 | npm | brew / cask | winget | script（sh） | powershell |
@@ -194,8 +215,8 @@ Qoder 系官方按平台分发安装脚本（macOS/Linux 是 `install.sh`，Wind
 ## 7. 卸载
 
 卸载按同一张表反向执行：npm 用 `npm uninstall -g`，brew/apt 用对应包管理器移除，
-`winget uninstall` 移除 winget 接管的组件，pipx/venv 用 `pipx uninstall` 并删除私有 venv
-与命令入口。卸载是幂等的：组件不存在时不调用破坏性操作。
+`winget uninstall` 移除 winget 接管的组件；graphify 删除私有 venv 与命令入口，并顺带清理
+历史版本用 pipx 装过的那一份（`pipx uninstall`）。卸载是幂等的：组件不存在时不调用破坏性操作。
 
 Windows 上的对应关系：包管理器分支为 `winget uninstall --id <id> --exact --silent
 --accept-source-agreements --disable-interactivity`；shell 配置清理为空（没有可写的 rc 文件）；
@@ -223,7 +244,10 @@ which does not exist"）：安装中断、用户手工改过、重复卸载都�
 
 `install.cmd` 只是 `install.ps1` 的 CMD 包装。`.ps1` 与 `.cmd` 在仓库中保持 **CRLF**，
 且 `.ps1` 必须带 **UTF-8 BOM**：PowerShell 5.1 会把无 BOM 的文件按 ANSI 解析，中文提示
-会变乱码。两者与 `install.sh` 职责对称，都只做 preflight 检测，然后转交 Python 编排器。
+会变乱码。两者与 `install.sh` 职责对称：只解析一个满足下限的系统 Python 并转发给 Python
+编排器。系统依赖预检、参数解析与用法说明都在 Python 侧（`installer_preflight.py` 与各
+编排器的 argparse），四个入口脚本共用 `scripts/entrypoint.sh` / `scripts/entrypoint.ps1`
+这一份解释器解析逻辑，不再各自实现一遍版本比较与指引文案。
 
 在 Git Bash 里跑 `install.sh` 会被显式拒绝，并提示改用 `install.cmd` —— Windows 不通过
 MSYS/MINGW 走 POSIX 入口，避免出现"能跑但 PATH / 前缀全是错的"半可用状态。
@@ -236,7 +260,9 @@ MSYS/MINGW 走 POSIX 入口，避免出现"能跑但 PATH / 前缀全是错的"�
 | 项目 | macOS / Linux | Windows |
 |---|---|---|
 | 状态与日志目录 | `$XDG_STATE_HOME/CodeKit` | `%LOCALAPPDATA%\CodeKit` |
-| npm 前缀 | `~/.npm-global`（避免 sudo 写系统目录） | 沿用 `npm prefix -g`，默认 `%APPDATA%\npm` |
+| **工具链根**（运行环境） | `<home>/.local/share/CodeKit` | 同左，**三系统同一路径**（见 §4.2） |
+| npm 前缀（历史组件：钉钉/飞书 CLI） | `~/.npm-global`（避免 sudo 写系统目录） | 沿用 `npm prefix -g`，默认 `%APPDATA%\npm` |
+| npm 私有前缀（工具链托管的 gitnexus） | `<工具链根>/npm` | 同左，与宿主平台无关 |
 | npm 可执行目录 | `<prefix>/bin` | `<prefix>` 本身（**没有 `bin/` 子目录**） |
 | CodeKit 命令目录 | `~/.local/bin` | 复用 npm 全局目录（已在 PATH 上，无需再改环境变量） |
 | venv 布局 | `bin/pip`、`bin/<cmd>` | `Scripts/pip.exe`、`Scripts/<cmd>.exe` |
@@ -244,8 +270,7 @@ MSYS/MINGW 走 POSIX 入口，避免出现"能跑但 PATH / 前缀全是错的"�
 | 临时目录 | `$TMPDIR` / `/tmp` | `tempfile.gettempdir()` |
 | shell 配置 | 写 `.bashrc` / `.zshrc` / fish | **不写**，改为校验 PATH 并打印指引 |
 | 特权判定 | `os.geteuid() == 0` | `IsUserAnAdmin` |
-| 终止信号 | `SIGTERM`、`SIGHUP` | 仅 `SIGTERM` |
-| PyPI 首选通道 | `venv` | `pipx`（避开符号链接权限） |
+| PyPI 通道 | 工具链托管的组件（graphify）在运行时可用时 **venv 优先于 pipx**，三平台一致（见 §4.2）；运行时不可用时该组件如实失败，不退到 pipx | 同左 |
 
 > Windows 上 CodeKit 不再自造 `~/.local/bin`：Node 安装包已经把 `%APPDATA%\npm` 写进
 > 用户 PATH，另起目录反而要多维护一份 PATH 配置。PowerShell profile 的路径是本地化的、

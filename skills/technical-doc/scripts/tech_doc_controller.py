@@ -155,7 +155,7 @@ def _git(root: Path, *args: str) -> str:
     try:
         result = subprocess.run(
             ["git", *args], cwd=root, check=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
         )
     except subprocess.CalledProcessError as exc:
         tail = " | ".join((exc.stderr or "").strip().splitlines()[-3:]) or "(no stderr)"
@@ -983,7 +983,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "init":
-            print(init_run(args.repo_root, args.feature_directory, args.run_id))
+            # 带 ``STATE=`` 前缀是为了让主 Agent 能直接读出状态文件路径：Skill 命令块
+            # 不能用 ``$(...)``/``$PWD`` 接 stdout（cmd.exe 与 PowerShell 都不支持），
+            # 所以输出必须自解释、可按行读取。
+            print(f"STATE={init_run(args.repo_root, args.feature_directory, args.run_id)}")
         elif args.command == "record-source":
             record_source(
                 args.state, args.source_id, args.kind, args.locator,

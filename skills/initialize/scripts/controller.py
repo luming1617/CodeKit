@@ -134,6 +134,10 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--commit", action="store_true")
     start.add_argument("--allow-global-writes", action="store_true")
     start.add_argument("--no-git-hooks", action="store_true")
+    start.add_argument(
+        "--strict-tools", action="store_true",
+        help="fail the gate when a tool is unavailable (default: degrade to partial)",
+    )
     start.add_argument("--run-id", help=argparse.SUPPRESS)
 
     gate = commands.add_parser("gate", help="validate and seal all worker results")
@@ -181,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
             ("--commit", args.commit),
             ("--allow-global-writes", args.allow_global_writes),
             ("--no-git-hooks", args.no_git_hooks),
+            ("--strict-tools", args.strict_tools),
         ):
             if enabled:
                 forwarded.append(flag)

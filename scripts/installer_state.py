@@ -3,13 +3,12 @@
 
 Package managers and vendor CLIs remain external commands.  This module owns
 the data model around them: detection, version state, presence checks, and
-recap rendering.  The installer shell uses the TSV output for compatibility
-with its existing terminal selector.
+recap rendering.  It is a library: the installer and uninstaller import it,
+and nothing runs this file as a program.
 """
 
 from __future__ import annotations
 
-import argparse
 import importlib.util
 import json
 import platform
@@ -33,6 +32,7 @@ if str(SCRIPT_DIR) not in sys.path:
 import installer_agents as agents  # noqa: E402
 import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
+import installer_toolchain as toolchain  # noqa: E402
 
 
 def load_module(path: Path, name: str) -> Any:
@@ -224,11 +224,6 @@ def agent_presence(name: str, home: Path, os_name: Optional[str] = None) -> str:
             if candidate.exists():
                 return str(candidate)
     return ""
-
-
-def agent_present(name: str, home: Path, os_name: Optional[str] = None) -> bool:
-    """判断 Claude、Codex 或 OpenCode 的 CLI/Desktop 是否可用。"""
-    return bool(agent_presence(name, home, os_name))
 
 
 def agent_cli_presence(
@@ -601,25 +596,6 @@ def all_states(context: Context) -> list[ComponentState]:
     ]
 
 
-def export_states(context: Context) -> None:
-    """以无颜色 TSV 输出状态，供 shell/Python 选择器之间稳定传递。"""
-    def tsv_field(value: str) -> str:
-        """清理 TSV 禁止字符，确保单个状态不会破坏行列结构。"""
-        return value.replace("\t", " ").replace("\r", " ").replace("\n", " ")
-
-    for state in all_states(context):
-        print(
-            "\t".join(
-                (
-                    tsv_field(state.component_id),
-                    tsv_field(state.status),
-                    tsv_field(state.installed_version),
-                    tsv_field(state.latest_version),
-                )
-            )
-        )
-
-
 def component_description(component_id: str) -> str:
     """根据注册表 ID 返回用户可读名称；未知 ID 原样返回。"""
     for component in registry.COMPONENTS:
@@ -716,10 +692,38 @@ def display_path(path: Path, home: Path) -> str:
         return str(path)
 
 
+def toolchain_recorded_path(component: str, context: Context) -> Optional[Path]:
+    """``toolchain.json`` 里该组件的实测落点；清单不可用或组件不受托管时返回 None。
+
+    工具链托管的组件装在私有 npm 前缀 / 私有 venv 里，只有清单知道确切位置。只采信
+    ``state == "ok"`` 的条目：非 ok 是「实测不可用」的记录，拿它当安装路径等于把一次
+    失败的安装展示成装好的。
+    """
+    platform = platform_layer.platform_for()
+    document = toolchain.read_manifest(platform.toolchain_manifest(context.home))
+    tools = document.get("tools")
+    entry = tools.get(component) if isinstance(tools, dict) else None
+    if not isinstance(entry, dict) or entry.get("state") != "ok":
+        return None
+    for key in ("package_root", "venv"):
+        value = entry.get(key)
+        if isinstance(value, str) and value:
+            return Path(value)
+    runner = entry.get("runner")
+    if isinstance(runner, list) and runner:
+        return Path(str(runner[0]))
+    return None
+
+
 def component_install_path(component: str, context: Context) -> str:
     """返回组件的实际安装路径或用户态安装的稳定回退路径。"""
     definition = registry.component_by_id(component)
     if definition is not None and definition.command:
+        # 清单先于 ``which``：按命令名解析可能命中一个根外的旧垫片，那不是会话里
+        # 真正会被启动的那一个。
+        recorded = toolchain_recorded_path(component, context)
+        if recorded is not None:
+            return display_path(recorded, context.home)
         path = shutil.which(definition.command)
         if path:
             return display_path(Path(path), context.home)
@@ -865,46 +869,3 @@ def render_recap(mode: str, records: Iterable[str], context: Context) -> None:
         print(f"\n本次共处理 {total} 个组件：全部成功")
     else:
         print(f"\n本次共处理 {total} 个组件：成功 {ok_count}，失败 {fail_count}")
-
-
-def build_parser() -> argparse.ArgumentParser:
-    """构建状态检测命令行解析器。"""
-    parser = argparse.ArgumentParser(description="CodeKit component state helpers")
-    parser.add_argument("command", choices=("detect", "present", "recap"))
-    parser.add_argument("--home", type=Path, default=Path.home())
-    parser.add_argument("--marketplace-local", type=Path, default=None)
-    parser.add_argument("--version-file", type=Path, required=False)
-    parser.add_argument("--component")
-    parser.add_argument("--mode", choices=("install", "uninstall"))
-    parser.add_argument("--record", action="append", default=[])
-    return parser
-
-
-def main(argv: Optional[list[str]] = None) -> int:
-    """分发 detect/present/recap 子命令，并统一处理输入错误。"""
-    args = build_parser().parse_args(argv)
-    context = Context(
-        home=args.home,
-        marketplace_local=args.marketplace_local,
-        version_file=args.version_file
-        or platform_layer.platform_for().state_dir(args.home) / "installed_versions",
-    )
-    try:
-        if args.command == "detect":
-            export_states(context)
-        elif args.command == "present":
-            if not args.component:
-                raise ValueError("--component is required for present")
-            raise SystemExit(0 if present(args.component, context) else 1)
-        else:
-            if not args.mode:
-                raise ValueError("--mode is required for recap")
-            render_recap(args.mode, args.record, context)
-    except (RuntimeError, ValueError, OSError) as exc:
-        print(f"installer state: {exc}", file=sys.stderr)
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
