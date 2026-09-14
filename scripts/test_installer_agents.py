@@ -339,6 +339,50 @@ class AgentPresenceTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
         self.assertIn("tools: Read, Grep, Glob\n", content)
 
+    def test_install_prunes_retired_managed_agents(self) -> None:
+        # 角色下线（如 initialize-graphify 改成控制器步骤）后，全局目录里的旧文件不会自己
+        # 消失：宿主仍能派发一个 Skill 已不再编排的角色，其正文还在指示它执行控制器的工作。
+        # 安装必须清掉它，同时不得碰用户自己的文件。
+        agent = (
+            "---\nname: {name}\ndescription: demo role\nmanaged-by: codekit\n---\n\nbody\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            source = home / "skills" / "demo" / "agents"
+            source.mkdir(parents=True)
+            rules = home / "skills" / "_shared" / "prompts"
+            rules.mkdir(parents=True)
+            (rules / "output-language.md").write_text(
+                "# 输出语言\n\n## 规则\n\n面向用户的过程说明使用简体中文。\n", encoding="utf-8"
+            )
+            (source / "alpha.md").write_text(agent.format(name="alpha"), encoding="utf-8")
+            helper = SCRIPT_DIR / "manage-global-agents.py"
+            target_dir = home / ".claude" / "agents"
+
+            def run_install() -> None:
+                completed = subprocess.run(
+                    [
+                        sys.executable, str(helper), "install",
+                        "--home", str(home), "--tool", "claude",
+                        "--source", str(home / "skills"),
+                    ],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stdout)
+
+            run_install()
+            retired = target_dir / "retired.md"
+            retired.write_text(agent.format(name="retired"), encoding="utf-8")
+            user_owned = target_dir / "my-own-agent.md"
+            user_owned.write_text("mine\n", encoding="utf-8")
+            self.assertTrue((target_dir / "alpha.md").is_file())
+
+            run_install()
+
+            self.assertTrue((target_dir / "alpha.md").is_file())
+            self.assertFalse(retired.exists())
+            self.assertTrue(user_owned.is_file())
+
     def test_installed_agents_carry_the_output_language_rule(self) -> None:
         # 角色 Subagent 的 system prompt 只有自己的角色文件 + 派发正文，
         # SKILL.md 的语言约束对它不可见；四个宿主的安装产物都必须自带该条款，

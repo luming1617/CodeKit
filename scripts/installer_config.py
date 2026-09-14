@@ -68,6 +68,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 MINIMUM_PYTHON = (3, 10)
 MINIMUM_PYTHON_TEXT = ".".join(str(part) for part in MINIMUM_PYTHON)
 
+# 插件身份：marketplace 名与插件名。安装、状态检测、卸载与 manifest 校验共用这一份——
+# 此前每个模块各抄一遍，还用 CODEX_/CLAUDE_ 前缀把同一个值写成两个名字。
+PLUGIN_NAME = "codekit"
+MARKETPLACE_NAME = "co-daming"
+
 # 安装器运行期依赖的辅助模块清单（含 installer.py，供卸载器复用）。
 # installer.py / uninstaller.py 在导入这些模块之前先调用 require_helper_files()：
 # 否则残缺检出会在模块加载期抛出原始 ModuleNotFoundError，而不是受控的单行错误。
@@ -119,7 +124,15 @@ def require_helper_files(directory: Optional[Path] = None) -> None:
 
 
 def load_module(path: Path, name: str) -> Any:
-    """按文件路径加载辅助模块，供需要读取策略表的模块共用同一实例。"""
+    """按文件路径加载辅助模块，供需要读取策略表的模块共用同一实例。
+
+    同名模块只执行一次：注册表与配置被两个调用方各加载一份时，``CHANNEL_ORDER``
+    这类常量在进程里就有两个身份，改一处判据在另一处不生效。路径型模块（文件名带
+    连字符，不能走普通 import）必须靠这里去重。
+    """
+    cached = sys.modules.get(name)
+    if cached is not None:
+        return cached
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"could not load helper module: {path}")
@@ -464,18 +477,20 @@ def remove_opencode_plugins(path: Path, prefix: str = "codekit@") -> bool:
 def write_versions(
     path: Path,
     values: Iterable[tuple[str, str]],
-    script_version: str,
     marketplace_sha: str = "",
 ) -> bool:
-    """生成安装版本状态文件，包含时间戳、组件版本、脚本版本和 marketplace SHA。"""
+    """生成安装版本状态文件。
+
+    只写有读者的字段：组件版本供人工核对，``marketplace_sha`` 是插件「有更新」判据
+    （见 installer_state.marketplace_changed）。生成时间留在文件头注释里，不再占用
+    一个从不被读取的键。
+    """
     timestamp = datetime.now().astimezone()
     lines = [
         "# CodeKit Plugin - Installed Versions",
         f"# Generated: {timestamp.strftime('%Y-%m-%dT%H:%M:%S%z')}",
-        f"install_timestamp={int(timestamp.timestamp())}",
     ]
     lines.extend(f"{key}={value}" for key, value in values)
-    lines.append(f"script_version={script_version}")
     if marketplace_sha:
         lines.append(f"marketplace_sha={marketplace_sha}")
     return atomic_write(path, "\n".join(lines) + "\n")

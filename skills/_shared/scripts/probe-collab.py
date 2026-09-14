@@ -24,12 +24,14 @@ unavailable, 2 for a bad invocation or an enable that could not be verified.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
 
@@ -48,6 +50,9 @@ COLLAB_TOOLS = (
     "send_message",
     "interrupt_agent",
 )
+# 「成组出现」的最小规模。技能自己的正文里最多出现过这族中的 1 个名字（spawn_agent），
+# 而 flag 打开时这一族是一起暴露的，所以 2 已经能把「文档提到」和「工具面存在」分开。
+MIN_TOOL_NAMES = 2
 FEATURES_TABLE = "features"
 MULTI_AGENT_KEY = "multi_agent_v2"
 PROBE_TIMEOUT = 45.0
@@ -112,10 +117,21 @@ def exposed_tools(output: str) -> Tuple[str, ...]:
 
 
 def classify(returncode: int, output: str) -> str:
-    """只有「命令跑通且工具面为空」才算 unavailable。"""
+    """只有「命令跑通且**成组**看到派发工具」才算 available。
+
+    单个名字命中不算：技能自己的 SKILL.md 与 prompt 正文里就会出现 ``spawn_agent``
+    （本仓库即有），一次词边界命中会把「文档提到了派发这件事」读成「宿主给了派发工具」，
+    后果是安装器静默判定 already-on、既不写开关也不提示一个字。``MIN_TOOL_NAMES``
+    要求至少这么多个不同名字同时出现——这族工具是一个 feature 一起暴露的，成组出现才是
+    工具面的形状。
+    """
     if returncode != 0:
         return UNKNOWN
-    return AVAILABLE if exposed_tools(output) else UNAVAILABLE
+    return (
+        AVAILABLE
+        if len(exposed_tools(output)) >= MIN_TOOL_NAMES
+        else UNAVAILABLE
+    )
 
 
 def _split_terminator(line: str) -> Tuple[str, str]:
@@ -274,17 +290,31 @@ def build_result(host: str, collab: str, evidence: dict, flag: Optional[str]) ->
     return result
 
 
+@contextlib.contextmanager
+def neutral_cwd():
+    """探测用的空目录。
+
+    ``codex debug prompt-input`` 会把**当前目录**的仓库上下文渲染进 prompt，而 CodeKit
+    自己的技能正文里就有 ``spawn_agent`` 这个词——在安装器/技能所在的仓库里直接探测，
+    测到的可能是文档而不是工具面。空目录里没有任何可注入的上下文。
+    """
+    with tempfile.TemporaryDirectory(prefix="codekit-collab-probe-") as directory:
+        yield directory
+
+
 def subprocess_runner(argv: Sequence[str], timeout: float) -> Tuple[int, str]:
     try:
-        completed = subprocess.run(
-            list(argv),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout,
-            check=False,
-            encoding="utf-8",
-            errors="replace",
-        )
+        with neutral_cwd() as directory:
+            completed = subprocess.run(
+                list(argv),
+                cwd=directory,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+                check=False,
+                encoding="utf-8",
+                errors="replace",
+            )
     except (OSError, subprocess.TimeoutExpired):
         return 1, ""
     return completed.returncode, completed.stdout or ""

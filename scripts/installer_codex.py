@@ -34,15 +34,19 @@ _probe = config.load_module(_SHARED_PROBE, "codekit_probe_collab")
 AVAILABLE = _probe.AVAILABLE
 UNAVAILABLE = _probe.UNAVAILABLE
 UNKNOWN = _probe.UNKNOWN
+ENABLED = _probe.ENABLED
+ROLLED_BACK = _probe.ROLLED_BACK
 MULTI_AGENT_KEY = _probe.MULTI_AGENT_KEY
+PROBE_TIMEOUT = _probe.PROBE_TIMEOUT
 
 # 桌面版写入的配置段；CLI 不会写它。桌面版的 shell 只继承机器级 PATH，而 CLI 从终端
 # 启动时继承完整 PATH，两者共用这一份配置，所以能力判定需要区分它们。
 DESKTOP_TABLE = "desktop"
 
+# 开启编排（读→改→写→复验→回滚）与探测用的空目录都在共享模块里，安装器只是调用方。
 config_path = _probe.config_path
-enable_multi_agent = _probe.enable_multi_agent
-write_config = _probe.write_config
+enable = _probe.enable
+neutral_cwd = _probe.neutral_cwd
 
 
 def probe_command() -> list[str]:

@@ -188,5 +188,9 @@ def check(installer) -> bool:
             "请按上面的「安装」提示补齐后重新运行。"
         )
         return False
-    installer.logger.success("系统依赖检查通过（git、Node.js >= 24、npm、curl/wget）。")
+    checks = "、".join(
+        f"{dependency.label} >= {dependency.minimum}" if dependency.minimum else dependency.label
+        for dependency in DEPENDENCIES
+    )
+    installer.logger.success(f"系统依赖检查通过（{checks}）。")
     return True

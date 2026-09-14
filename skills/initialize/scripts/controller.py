@@ -27,6 +27,7 @@ prepare = load_module("prepare.py")
 reconcile = load_module("reconcile.py")
 validator = load_module("validate-result.py")
 gitnexus_step = load_module("gitnexus-step.py")
+graphify_step = load_module("graphify-step.py")
 
 
 class RecoverableRunInputError(validator.ValidationError):
@@ -76,6 +77,20 @@ def require_run_file(manifest_path: Path, candidate: Path) -> None:
         validator.load_json(candidate)
     except (OSError, json.JSONDecodeError, validator.ValidationError) as exc:
         raise RecoverableRunInputError(f"run input is not valid JSON: {candidate}: {exc}") from exc
+
+
+def require_prior_step(manifest: dict, filename: str, step: str) -> None:
+    """Enforce the order between two controller steps without aborting the run.
+
+    Graphify 排在 GitNexus 之后是设计约定：图谱要建立在索引与 skills 镜像已落盘之后，
+    而先跑后跑都会让门禁的基线比较多背一批产物。顺序写错是可修的输入问题，不是真实
+    失败，所以这里报 recoverable 并保持当前 run 与锁。
+    """
+    run_dir = Path(manifest.get("state_run_dir", ""))
+    if not (run_dir / filename).is_file():
+        raise RecoverableRunInputError(
+            f"{filename} not found in {run_dir}: run `controller.py {step}` first"
+        )
 
 
 def report_recoverable_input_error(manifest_path: Path, error: Exception) -> int:
@@ -149,6 +164,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze.add_argument("--manifest", required=True, type=Path)
 
+    graphify = commands.add_parser(
+        "graphify",
+        help=(
+            "run the deterministic Graphify step and write its worker result "
+            "(requires analyze to have run first)"
+        ),
+    )
+    graphify.add_argument("--manifest", required=True, type=Path)
+
     context = commands.add_parser("reconcile", help="write context from a sealed worker gate")
     context.add_argument("--manifest", required=True, type=Path)
     context.add_argument("--context", required=True, type=Path)
@@ -221,6 +245,16 @@ def main(argv: list[str] | None = None) -> int:
             return gitnexus_step.main(["--manifest", str(args.manifest)], emit=True)
         except Exception:
             abort_safely(args.manifest, "gitnexus step raised an exception")
+            raise
+    if args.command == "graphify":
+        try:
+            manifest = validate_active_manifest(args.manifest)
+            require_prior_step(manifest, "gitnexus-result.json", "analyze")
+            return graphify_step.main(["--manifest", str(args.manifest)], emit=True)
+        except RecoverableRunInputError as error:
+            return report_recoverable_input_error(args.manifest, error)
+        except Exception:
+            abort_safely(args.manifest, "graphify step raised an exception")
             raise
     if args.command == "reconcile":
         try:

@@ -1,63 +1,74 @@
+# Git gates for this repository.
+#
+# Python entry: macOS/Linux run the gate scripts through `python3`, Windows through
+# `py -3`. lefthook has no per-OS command grouping — its config schema defines no `os`
+# key, and `skip`/`only` understand only git state, `ref` and `run` — so the choice is
+# made at run time by the shell lefthook drives every platform with (`sh -c`; on
+# Windows that `sh` comes from Git for Windows, never cmd.exe). The identical prologue
+# in each command below is that choice; it is the repo-wide <PYTHON> rule from
+# skills/_shared/prompts/path-convention.md. Do not "simplify" it back to a bare
+# `python3`: on a clean Windows box `python3` is the Microsoft Store alias stub, which
+# `which` finds but which prints nothing and exits non-zero (Git Bash 49), so the gate
+# would fail with no reason attached.
+
 pre-commit:
   parallel: false
   commands:
     # Synchronize the configurable plugin version into all package manifests.
     sync-plugin-version:
       run: |
-        python3 scripts/sync-plugin-version.py && \
-          git add plugin-version.json .claude-plugin/plugin.json .codex-plugin/plugin.json .opencode/package.json .qoder-plugin/plugin.json
+        case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) set -- py -3 ;; *) set -- python3 ;; esac
+        # TARGET_FILES in scripts/sync-plugin-version.py is the one authority for which
+        # manifests carry the version; the synchronizer reads that list, this `git add`
+        # list only mirrors it (plus the version source itself) because YAML cannot
+        # import Python. Add a platform in the script, then mirror it here — editing
+        # only this list never changes what gets synchronized.
+        "$@" scripts/sync-plugin-version.py && \
+          git add plugin-version.json \
+            .claude-plugin/plugin.json \
+            .codex-plugin/plugin.json \
+            .opencode/package.json \
+            .qoder-plugin/plugin.json
         echo "Plugin version synchronized"
     # Manifests must parse, agree on the plugin name, and point at files that exist.
+    # This command also proves presence for every manifest listed by TARGET_FILES, so no
+    # hook repeats an existence check of its own.
     validate-plugins:
-      run: python3 scripts/validate-plugin-manifests.py
+      run: |
+        case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) set -- py -3 ;; *) set -- python3 ;; esac
+        "$@" scripts/validate-plugin-manifests.py
       fail_text: "Plugin manifests are inconsistent (JSON syntax, plugin name, version source, or missing referenced files)."
 
 pre-push:
   parallel: false
   commands:
-    validate-marketplace:
-      run: |
-        if [ ! -f ".claude-plugin/marketplace.json" ]; then
-          echo "Missing Claude marketplace.json"
-          exit 1
-        fi
-        if [ ! -f ".codex-plugin/marketplace.json" ]; then
-          echo "Missing Codex marketplace.json"
-          exit 1
-        fi
-        if [ ! -f ".claude-plugin/plugin.json" ]; then
-          echo "Missing Claude plugin.json in repository root"
-          exit 1
-        fi
-        if [ ! -f ".codex-plugin/plugin.json" ]; then
-          echo "Missing Codex plugin.json in repository root"
-          exit 1
-        fi
-        if [ ! -f ".qoder-plugin/plugin.json" ]; then
-          echo "Missing Qoder plugin.json in repository root"
-          exit 1
-        fi
-        if ! ls skills/*/SKILL.md >/dev/null 2>&1; then
-          echo "No skills found in repository root (expected skills/<name>/SKILL.md)"
-          exit 1
-        fi
-        echo "All plugins valid"
+    # Marketplace/plugin presence and skill discovery used to be re-checked here with
+    # inline `[ -f ]` tests. They are gates of scripts/validate-plugin-manifests.py,
+    # which runs on every commit and covers strictly more (it also checks
+    # .opencode/package.json and the marketplace entries), so the duplicated tests are
+    # gone; skills/<name>/SKILL.md is additionally gated by validate-skill-layout below.
+
     # Every skill must ship a root-level openai.yaml with Chinese UI metadata.
     validate-skill-layout:
-      run: python3 scripts/validate-skill-layout.py
+      run: |
+        case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) set -- py -3 ;; *) set -- python3 ;; esac
+        "$@" scripts/validate-skill-layout.py
       fail_text: "Skill layout validation failed (expected skills/<name>/SKILL.md + skills/<name>/openai.yaml)."
     # Installer helpers are pure Python; their regressions gate every push.
     test-installer:
-      run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      run: |
+        case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) set -- py -3 ;; *) set -- python3 ;; esac
+        "$@" -m unittest discover -s scripts -p 'test_*.py'
       fail_text: "安装器脚本的回归测试未通过；先修 installer_qoder/installer_state 或其测试，不要推送。"
     # Deterministic skill gate scripts must stay verified: run every skills/<name>/tests suite.
     test-skill-scripts:
       run: |
+        case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) set -- py -3 ;; *) set -- python3 ;; esac
         status=0
         for tests in skills/*/tests; do
           [ -d "$tests" ] || continue
           echo "==> $tests"
-          python3 -m unittest discover -s "$tests" -p 'test_*.py' || status=1
+          "$@" -m unittest discover -s "$tests" -p 'test_*.py' || status=1
         done
         [ "$status" -eq 0 ] || exit 1
         echo "Skill test suites passed"

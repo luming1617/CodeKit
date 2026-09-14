@@ -42,10 +42,10 @@ TOOLCHAIN_STATES = (OK, NOT_INSTALLED, NOT_READABLE, NOT_EXECUTABLE)
 
 MANIFEST_SCHEMA_VERSION = 1
 RUNNER_ENV_TEMPLATE = "CODEKIT_{}_RUNNER"
-# 由 CodeKit 自持工具链根接管的工具。这是全仓唯一的一份：安装器侧的
-# ``TOOLCHAIN_COMPONENTS`` 与它的一致性由
-# ``scripts/test_installer_toolchain.py`` 的跨模块用例断言——两侧各自留一份实现是因为
-# 技能随插件分发、安装器独立，但「有哪些工具」这件事不能有两个答案。
+# 由 CodeKit 自持工具链根接管的工具。权威来源是 ``scripts/component-registry.py`` 的
+# ``entry_kind`` 字段（安装器侧的名单由它派生，不再有第二份清单）；这里保留一份字面量
+# 是因为技能随插件分发、不能导入 scripts/。两侧的一致性由
+# ``scripts/test_installer_toolchain.py`` 的跨模块用例断言。
 KNOWN_TOOLS = ("gitnexus", "graphify")
 # 可直接被 CreateProcess 启动的入口扩展名；Windows 上 npm 还会生成无扩展名的 POSIX
 # 脚本与 .ps1，那两份都不能直接启动，所以排在 .exe/.cmd 之后。

@@ -20,7 +20,27 @@ outside the root.
 
 `toolchain.json` is the other half: the installer is the only writer, and the
 skills read it instead of guessing paths.  It is a *hint*, never an authority --
-consumers re-validate every entry and fall back when it does not hold.
+consumers re-validate every entry and fall back when it does not hold.  The
+document carries only the fields a consumer actually reads (``schema_version``,
+and per tool ``state`` / ``runner`` / ``version`` plus the landing directory);
+everything else belongs in the install log, because a field nobody reads still
+has to be kept in sync forever.
+
+Two boundaries are deliberate, not gaps:
+
+* **The interpreter behind an ``npm-private`` tool is the host's Node.**  Only
+  Python is bundled, because a Python venv is the one artifact that re-execs a
+  base interpreter recorded outside itself and so cannot survive a
+  path-selective sandbox.  ``node`` + ``<abs>/cli.js`` has no such chain: the
+  host ``node.exe`` is reachable from the measured sandboxes, and gitnexus's
+  native modules are all N-API (``prebuilds/<platform>-<arch>``, ``bin/napi-v6``),
+  hence stable across Node majors.  Bundling Node later is a ``RUNTIME_SPECS``
+  entry away, not a redesign.
+* **What each host has registered is measured, not unified.**  ``gitnexus setup``
+  decides how it writes Claude's and Codex's MCP entry; CodeKit owns only the
+  Qoder registration.  The same tool can therefore carry a different launch
+  expression per host, so a report must quote what the host in question actually
+  got.  The manifest states CodeKit's own measured expression, nothing more.
 """
 
 from __future__ import annotations
@@ -36,7 +56,6 @@ import tempfile
 import urllib.parse
 import zipfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -47,16 +66,18 @@ if str(SCRIPT_DIR) not in sys.path:
 import installer_config as config  # noqa: E402
 import installer_platform as platform_layer  # noqa: E402
 
+# 与 installer_state 同一个模块名：注册表在进程里只有一份实例，「组件的 entry_kind
+# 与通道」在清单构建处和状态检测处才是同一件事。
+registry = config.load_module(SCRIPT_DIR / "component-registry.py", "codekit_component_registry")
+
 # python-build-standalone ships self-contained CPython builds.  Only the
 # ``install_only`` flavour is usable here: the Windows *embeddable* package has
 # no ``venv`` and no ``ensurepip``, and the installer's own preflight requires
 # both.
 RUNTIME_REPO = "astral-sh/python-build-standalone"
-RUNTIME_OS_TOKENS = {
-    "windows": "pc-windows-msvc",
-    "linux": "unknown-linux-gnu",
-    "macos": "apple-darwin",
-}
+# 有内置运行时资产的 platform.key 集合。资产名里的三元组片段（pc-windows-msvc 等）
+# 已经写在 RUNTIME_SPECS 的 asset 里，这里不再抄第二遍。
+RUNTIME_OS_KEYS = (platform_layer.WINDOWS, platform_layer.LINUX, platform_layer.MACOS)
 RUNTIME_ARCH_TOKENS = {
     "x86_64": "x86_64",
     "amd64": "x86_64",
@@ -64,8 +85,6 @@ RUNTIME_ARCH_TOKENS = {
     "aarch64": "aarch64",
 }
 MANIFEST_SCHEMA_VERSION = 1
-# PyPI 上的发行名与命令名不同（``graphifyy`` 提供 ``graphify``）。
-GRAPHIFY_PACKAGE = "graphifyy"
 
 
 @dataclass(frozen=True)
@@ -137,17 +156,48 @@ class RuntimeState:
     def usable(self) -> bool:
         return self.state == RUNTIME_OK and self.python is not None
 
+    def require_python(self) -> Path:
+        """可用的内置解释器；不可用时抛错。
+
+        这里没有回退项是刻意的：用工具链根外的解释器建出来的 venv，在受限宿主里连
+        基础解释器都读不到（实测 rc=101），装出一个跑不起来的副本比如实失败更糟。
+        所以「要建 venv 就必须有内置运行时」由返回类型表达，而不是由调用点的注释表达。
+        """
+        if self.state != RUNTIME_OK or self.python is None:
+            raise ValueError(self.reason or "内置 Python 运行时不可用")
+        return self.python
+
 
 def runtime_spec(platform, arch: Optional[str] = None) -> Optional[RuntimeSpec]:
     """Resolve the pinned asset for this platform, or None when unsupported."""
-    os_key = "windows" if platform.is_windows else ("macos" if platform.os_name == "Darwin" else "linux")
-    if os_key not in RUNTIME_OS_TOKENS:
+    if platform.key not in RUNTIME_OS_KEYS:
         return None
+    return RUNTIME_SPECS.get((platform.key, runtime_arch_token(arch)))
+
+
+def runtime_arch_token(arch: Optional[str] = None) -> str:
+    """机器名 → 支持矩阵里的架构标记；认不出时返回空串。"""
     machine = (arch or platform_module.machine()).lower()
-    arch_key = RUNTIME_ARCH_TOKENS.get(machine)
-    if arch_key is None:
-        return None
-    return RUNTIME_SPECS.get((os_key, arch_key))
+    return RUNTIME_ARCH_TOKENS.get(machine, "")
+
+
+def supported_runtime_targets() -> tuple[str, ...]:
+    """内置运行时覆盖的 ``<os>/<arch>`` 组合；pin 表就是支持矩阵，不再另存一份。"""
+    return tuple(f"{os_key}/{arch_key}" for os_key, arch_key in sorted(RUNTIME_SPECS))
+
+
+def unsupported_runtime_reason(platform, arch: Optional[str] = None) -> str:
+    """不在支持矩阵里时的说法：点名矩阵，而不是含糊的「找不到资产」。
+
+    机器名按宿主自己声称的那样报（``arm64`` 而不是归一后的 ``aarch64``）：读这条理由的
+    人是在 ``uname -m`` 的输出里看到过它的人。矩阵一侧继续用归一后的键。
+    """
+    machine = (arch or platform_module.machine()).lower()
+    return (
+        f"CodeKit 不为 {platform.key}/{machine} 内置 Python 运行时"
+        f"（支持矩阵：{'、'.join(supported_runtime_targets())}）。"
+        "需要它的组件不会退到工具链根外的解释器，因此如实失败。"
+    )
 
 
 def runtime_archive_url(spec: RuntimeSpec) -> str:
@@ -173,16 +223,18 @@ def _read_current(home: Path, platform) -> str:
     return tag if isinstance(tag, str) else ""
 
 
-def _write_current(home: Path, platform, spec: RuntimeSpec, python: Path, version: str) -> None:
+def _write_current(home: Path, platform, tag: str, python: Path) -> None:
+    """发布当前生效的运行时。只写有读者的字段：``tag`` 与 ``python``。
+
+    ``schema_version`` 保留为兼容位。资产名、摘要与版本属于安装日志，写在这里就得
+    永远有人负责同步它们，而没有任何读者。
+    """
     config.write_json(
         platform.runtime_current(home),
         {
             "schema_version": MANIFEST_SCHEMA_VERSION,
-            "tag": spec.tag,
-            "asset": spec.asset,
-            "sha256": spec.sha256,
+            "tag": tag,
             "python": str(python),
-            "version": version,
         },
     )
 
@@ -310,8 +362,7 @@ def ensure_runtime(installer, *, arch: Optional[str] = None) -> RuntimeState:
     spec = runtime_spec(platform, arch)
     if spec is None:
         return RuntimeState(
-            state=RUNTIME_ABSENT,
-            reason=f"没有适配 {platform.os_name} 的运行时资产",
+            state=RUNTIME_ABSENT, reason=unsupported_runtime_reason(platform, arch)
         )
     target = platform.runtime_dir(installer.home, spec.tag)
     executable = platform.runtime_python(target)
@@ -325,7 +376,7 @@ def ensure_runtime(installer, *, arch: Optional[str] = None) -> RuntimeState:
                 warnings.append(
                     f"current.json 记录的 tag 是 {active}，与本次固定的 {spec.tag} 不一致，已按 {spec.tag} 更新。"
                 )
-            _write_current(installer.home, platform, spec, executable, version)
+            _write_current(installer.home, platform, spec.tag, executable)
             return RuntimeState(
                 state=RUNTIME_OK,
                 python=executable,
@@ -373,7 +424,12 @@ def ensure_runtime(installer, *, arch: Optional[str] = None) -> RuntimeState:
             )
         return RuntimeState(state=RUNTIME_INCOMPLETE, reason=version)
     published = platform.runtime_python(target)
-    _write_current(installer.home, platform, spec, published, version)
+    if not version or not published.is_file():
+        return RuntimeState(
+            state=RUNTIME_INCOMPLETE,
+            reason="运行时已解包但发布后的解释器不可用，未更新 current.json",
+        )
+    _write_current(installer.home, platform, spec.tag, published)
     installer.track(platform.runtime_root(installer.home))
     return RuntimeState(
         state=RUNTIME_OK,
@@ -420,9 +476,10 @@ def classify_state(path: Path) -> str:
     swallows ``OSError`` in those and returns ``False``, which is exactly how the
     old resolver lost the ability to tell "absent" from "denied".  The skills
     side carries the same classification in
-    ``skills/_shared/scripts/codekit_runtime.py``; the two are kept in step by a
-    contract test rather than by code sharing, because the skills ship as a
-    plugin while this module does not.
+    ``skills/_shared/scripts/codekit_runtime.py``: skills ship as a plugin and
+    cannot import ``scripts/``, so that one is the copy they must keep; parity
+    between the two is asserted by ``SharedResolverParityTests`` rather than
+    claimed by a comment.
     """
     try:
         os.stat(path)
@@ -463,45 +520,45 @@ def readable_state(path: Path) -> str:
     return "ok"
 
 
-def gitnexus_entry(installer) -> dict[str, Any]:
-    """Manifest entry for GitNexus.
+def npm_prefix_probe(
+    platform, home: Path, component
+) -> tuple[str, Path, Optional[Path], Optional[str]]:
+    """``npm-private`` 落点的实测态：``(state, package_root, cli, node)``。
 
-    The runner is recorded as ``[<abs node>, <abs cli.js>]``: the npm-generated
-    shim is unreadable under the sandbox, and a bare ``node`` is not resolvable
-    by name there either, while ``C:\\Program Files\\nodejs\\node.exe`` executes.
+    只做 ``stat`` 与一次 PATH 查找，不起子进程：清单构建器与安装状态检测共用这一份
+    判据，而检测侧不该为每个组件付一次 ``--version`` 进程开销。runner 里的 ``node``
+    是宿主解释器（这条边界见模块 docstring），按名字解析一次后把绝对路径写进清单。
     """
-    platform = installer.platform
-    package_root = platform.npm_prefix_private(installer.home) / "node_modules" / "gitnexus"
-    entry: dict[str, Any] = {
-        "kind": "node-cli",
-        "state": "absent",
-        "runner": [],
-        "shim": None,
-        "package_root": str(package_root),
-        "version": "",
-        "source": "npm-private-prefix",
-    }
+    package_root = (
+        platform.npm_prefix_private(home) / "node_modules" / component.channels["npm"]
+    )
     state = classify_state(package_root)
     if state != "ok":
-        entry["state"] = state
-        return entry
-    cli = _package_bin(package_root, "gitnexus")
+        return state, package_root, None, None
+    cli = _package_bin(package_root, component.command)
     node = platform_layer.resolve_exe("node")
-    if cli is None or node is None:
-        entry["state"] = "not-executable" if node is None else "not-installed"
-        return entry
-    entry.update(
-        {
-            "state": "ok",
-            "runner": [node, str(cli)],
-            "shim": str(platform.npm_prefix_private(installer.home) / platform.shim_name("gitnexus")),
-            "node": {"path": node, "version": installer.command_version("node", ["-v"])},
-            "version": _package_version(package_root),
-            "identity_stable": True,
-            "local_embeddings": (package_root / "node_modules" / "onnxruntime-node").is_dir(),
-        }
+    if node is None:
+        return "not-executable", package_root, cli, None
+    if cli is None:
+        return "not-installed", package_root, None, node
+    return "ok", package_root, cli, node
+
+
+def npm_prefix_entry(installer, component) -> dict[str, Any]:
+    """``npm-private`` 条目：runner 记成 ``[<绝对 node>, <绝对 cli.js>]``。
+
+    npm 生成的 shim 在沙箱下不可读，裸 ``node`` 在那里也按名字解析不出来，而
+    ``C:\\Program Files\\nodejs\\node.exe`` 可以直接执行，所以存的是这一对绝对路径。
+    """
+    state, package_root, cli, node = npm_prefix_probe(
+        installer.platform, installer.home, component
     )
-    return entry
+    return {
+        "state": state,
+        "runner": [str(node), str(cli)] if state == "ok" else [],
+        "version": _package_version(package_root),
+        "package_root": str(package_root),
+    }
 
 
 def _package_json(package_root: Path) -> dict[str, Any]:
@@ -558,42 +615,75 @@ def _venv_package_version(python: Path, package: str) -> str:
     return lines[-1] if lines else ""
 
 
-def graphify_entry(installer) -> dict[str, Any]:
-    """Manifest entry for Graphify.
+def venv_probe(platform, home: Path, component) -> tuple[str, Path, Optional[Path]]:
+    """``python-venv`` 落点的实测态：``(state, venv, executable)``；不起子进程。
 
-    Its venv must be built from the bundled runtime; the previous venv was built
-    from the system Python and therefore could not start inside the sandbox.
-    ``pyvenv_cfg`` is recorded so a consumer can name the exact failure instead
-    of reporting an opaque non-zero exit.
+    入口能 ``stat`` 还不够：venv 的 ``python.exe`` 只是转发器，``pyvenv.cfg`` 的基础
+    解释器落在读不到的目录时它一定起不来（实测 rc=101），所以这里连带判定。
     """
-    platform = installer.platform
-    venv = platform.venv_dir(installer.home, "graphify")
-    executable = platform.venv_exe(venv, "graphify")
-    entry: dict[str, Any] = {
-        "kind": "python-venv",
-        "state": "absent",
-        "runner": [],
-        "venv": str(venv),
-        "venv_python": str(platform.venv_exe(venv, "python")),
-        "package": GRAPHIFY_PACKAGE,
-        "version": "",
-        "source": "venv",
-    }
+    venv = platform.venv_dir(home, component.command)
+    executable = platform.venv_exe(venv, component.command)
     state = readable_state(executable)
     if state != "ok":
-        entry["state"] = state
-        return entry
+        return state, venv, executable
     base = venv_base_state(venv)
-    entry["pyvenv_cfg"] = base["values"]
     if base["state"] != "ok":
-        entry["state"] = base["state"]
-        return entry
-    entry["state"] = "ok"
-    entry["runner"] = [str(executable)]
-    entry["version"] = _venv_package_version(
-        platform.venv_exe(venv, "python"), GRAPHIFY_PACKAGE
-    )
-    return entry
+        return base["state"], venv, executable
+    return "ok", venv, executable
+
+
+def venv_entry(installer, component) -> dict[str, Any]:
+    """``python-venv`` 条目。
+
+    The venv must be built from the bundled runtime; the previous venv was built
+    from the system Python and therefore could not start inside the sandbox.
+    """
+    platform = installer.platform
+    state, venv, executable = venv_probe(platform, installer.home, component)
+    venv_python = platform.venv_exe(venv, "python")
+    return {
+        "state": state,
+        "runner": [str(executable)] if state == "ok" else [],
+        "version": (
+            _venv_package_version(venv_python, component.channels["venv"])
+            if state == "ok"
+            else ""
+        ),
+        "venv": str(venv),
+    }
+
+
+# entry_kind → 清单 argv 构建器。新增一个根接管工具时，这里是唯一的登记点。
+ENTRY_BUILDERS = {
+    "npm-private": npm_prefix_entry,
+    "python-venv": venv_entry,
+}
+# entry_kind → 落点实测（不起子进程）。清单条目与安装状态检测必须出自同一个判据，
+# 否则会出现「清单说可用、组件状态说未安装」这类互相打架的结论。
+ENTRY_PROBES = {
+    "npm-private": npm_prefix_probe,
+    "python-venv": venv_probe,
+}
+
+
+def entry_state(platform, home: Path, component) -> str:
+    """某个根接管组件在本机的实测落点态。"""
+    probe = ENTRY_PROBES.get(getattr(component, "entry_kind", ""))
+    if probe is None:
+        raise ValueError(
+            f"{getattr(component, 'component_id', '?')} 没有 entry_kind 对应的落点探测"
+        )
+    return str(probe(platform, home, component)[0])
+
+
+def entry(installer, component) -> dict[str, Any]:
+    """按组件的 ``entry_kind`` 构建 ``toolchain.json`` 里的那一条。"""
+    builder = ENTRY_BUILDERS.get(getattr(component, "entry_kind", ""))
+    if builder is None:
+        raise ValueError(
+            f"{getattr(component, 'component_id', '?')} 没有 entry_kind 对应的清单构建器"
+        )
+    return builder(installer, component)
 
 
 def venv_base_state(venv: Path) -> dict[str, Any]:
@@ -630,10 +720,12 @@ def venv_base_state(venv: Path) -> dict[str, Any]:
     return {"state": "ok", "values": values}
 
 
-def write_manifest(
-    installer, runtime: RuntimeState, *, selected: Sequence[str] = ()
-) -> Optional[Path]:
+def write_manifest(installer, *, selected: Sequence[str] = ()) -> Optional[Path]:
     """Write ``toolchain.json`` and return its path.
+
+    字段只保留有读者的：``schema_version`` 与每个工具的 ``state`` / ``runner`` /
+    ``version`` / 落点目录。运行时的 tag 与解释器路径由 ``current.json`` 承载，警告
+    由安装日志承载——在同一份文件里再抄一遍，只会多出一个需要长期同步、却没人读的副本。
 
     Only tools the installer actually manages are recorded: an entry for a tool
     CodeKit never installed would read as authoritative while describing
@@ -644,32 +736,12 @@ def write_manifest(
     if not root.is_dir():
         return None
     tools: dict[str, Any] = {}
-    managed = set(selected)
-    if "gitnexus" in managed:
-        tools["gitnexus"] = gitnexus_entry(installer)
-    if "graphify" in managed:
-        tools["graphify"] = graphify_entry(installer)
-    document = {
-        "schema_version": MANIFEST_SCHEMA_VERSION,
-        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "installer_version": installer.plugin_version,
-        "root": str(root),
-        "platform": {
-            "os": "windows" if platform.is_windows else ("macos" if platform.os_name == "Darwin" else "linux"),
-            "arch": _arch(),
-            "key": platform.key,
-        },
-        "runtime": {
-            "state": runtime.state,
-            "tag": runtime.tag,
-            "python": str(runtime.python) if runtime.python else None,
-            "version": runtime.version,
-            "sha256": runtime.sha256,
-            "venv_ok": runtime.usable,
-        },
-        "tools": tools,
-        "warnings": list(runtime.warnings),
-    }
+    for component_id in selected:
+        component = registry.component_by_id(component_id)
+        if component is None or not component.entry_kind:
+            continue
+        tools[component_id] = entry(installer, component)
+    document = {"schema_version": MANIFEST_SCHEMA_VERSION, "tools": tools}
     target = platform.toolchain_manifest(installer.home)
     config.write_json(target, document)
     if os.name != "nt":
@@ -677,11 +749,6 @@ def write_manifest(
         os.chmod(target, 0o600)
     installer.track(target)
     return target
-
-
-def _arch() -> str:
-    machine = platform_module.machine().lower()
-    return RUNTIME_ARCH_TOKENS.get(machine, machine)
 
 
 def read_manifest(path: Path) -> dict[str, Any]:
@@ -695,6 +762,32 @@ def read_manifest(path: Path) -> dict[str, Any]:
     if document.get("schema_version") != MANIFEST_SCHEMA_VERSION:
         return {}
     return document
+
+
+def prune_manifest(path: Path, removed: Sequence[str]) -> bool:
+    """把已卸载的工具在清单里降级为 ``not-installed``。
+
+    卸载不能重写整份清单（那要重装才写得对），但留着一条 ``ok`` 更糟：技能侧把它当成
+    可采信的证据，直到下一次安装为止。条目本身保留——「装过又卸了」和「从来没这个
+    工具」是两件事，降级而不是删除就是为了让两者还能分开。
+    """
+    document = read_manifest(path)
+    tools = document.get("tools")
+    if not isinstance(tools, dict) or not removed:
+        return False
+    changed = False
+    for component_id in removed:
+        record = tools.get(component_id)
+        if not isinstance(record, dict) or record.get("state") == "not-installed":
+            continue
+        record["state"] = "not-installed"
+        record["runner"] = []
+        record["version"] = ""
+        changed = True
+    if not changed:
+        return False
+    config.write_json(path, document)
+    return True
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

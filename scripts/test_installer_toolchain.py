@@ -24,8 +24,9 @@ from unittest.mock import Mock, patch
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-# 技能侧共享层按路径加载：它随插件分发、安装器独立，因此两边各有一份实现而不是共用
-# 模块；一致性由 SharedResolverParityTests 断言，而不是靠注释声称。
+# 技能侧共享层按路径加载：技能随插件分发、不能导入 scripts/，因此状态判定（四态、
+# 可读性、venv 基础解释器）两侧各留一份实现，一致性由 SharedResolverParityTests 断言，
+# 而不是靠注释声称。工具清单不在这个例外里——它只有注册表的 entry_kind 一个来源。
 SHARED_SCRIPTS = SCRIPT_DIR.parent / "skills" / "_shared" / "scripts"
 sys.path.insert(0, str(SHARED_SCRIPTS))
 
@@ -50,6 +51,13 @@ def fake_installer(home: Path, *, platform: str = "Linux"):
     installer.track = Mock(side_effect=lambda path: installer.changed_paths.append(str(path)))
     installer.run_command = Mock(return_value=Mock(returncode=0))
     return installer
+
+
+def component(component_id: str):
+    """注册表里的组件定义：清单构建器现在按它的 ``entry_kind`` 分发。"""
+    definition = detector.registry.component_by_id(component_id)
+    assert definition is not None, component_id
+    return definition
 
 
 def publish_fake_runtime(installer, spec, *, version: str = "3.13.15") -> Path:
@@ -275,6 +283,18 @@ class EnsureRuntimeTests(unittest.TestCase):
             state = toolchain.ensure_runtime(installer, arch="riscv64")
             self.assertFalse(state.usable)
             self.assertEqual(toolchain.RUNTIME_ABSENT, state.state)
+            # 理由必须点名矩阵：含糊的「找不到资产」会把「CodeKit 不支持这台机器」
+            # 说得像一次偶发故障，用户会反复重跑安装器。
+            self.assertIn("riscv64", state.reason)
+            for target in toolchain.supported_runtime_targets():
+                self.assertIn(target, state.reason)
+
+    def test_windows_arm_is_declared_unsupported_not_misshandled(self) -> None:
+        windows = platform_layer.platform_for("Windows")
+        self.assertIsNone(toolchain.runtime_spec(windows, "arm64"))
+        self.assertIn(
+            "windows/arm64", toolchain.unsupported_runtime_reason(windows, "arm64")
+        )
 
 
 def seed_gitnexus(installer, *, bin_name: str = "dist/cli/index.js") -> Path:
@@ -296,7 +316,7 @@ class GitnexusEntryTests(unittest.TestCase):
             installer = fake_installer(Path(directory))
             root = seed_gitnexus(installer)
             with patch.object(platform_layer, "resolve_exe", return_value=r"C:\Program Files\nodejs\node.exe"):
-                entry = toolchain.gitnexus_entry(installer)
+                entry = toolchain.entry(installer, component("gitnexus"))
             self.assertEqual("ok", entry["state"])
             self.assertEqual(
                 [r"C:\Program Files\nodejs\node.exe", str(root / "dist" / "cli" / "index.js")],
@@ -307,14 +327,14 @@ class GitnexusEntryTests(unittest.TestCase):
     def test_missing_package_is_not_installed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             installer = fake_installer(Path(directory))
-            self.assertEqual("not-installed", toolchain.gitnexus_entry(installer)["state"])
+            self.assertEqual("not-installed", toolchain.entry(installer, component("gitnexus"))["state"])
 
     def test_package_without_node_is_not_executable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             installer = fake_installer(Path(directory))
             seed_gitnexus(installer)
             with patch.object(platform_layer, "resolve_exe", return_value=None):
-                self.assertEqual("not-executable", toolchain.gitnexus_entry(installer)["state"])
+                self.assertEqual("not-executable", toolchain.entry(installer, component("gitnexus"))["state"])
 
 
 class GraphifyEntryTests(unittest.TestCase):
@@ -327,11 +347,11 @@ class GraphifyEntryTests(unittest.TestCase):
             (venv / "pyvenv.cfg").write_text(
                 f"home = {installer.home / 'gone'}\n", encoding="utf-8"
             )
-            entry = toolchain.graphify_entry(installer)
+            entry = toolchain.entry(installer, component("graphify"))
             self.assertEqual("not-installed", entry["state"])
             self.assertEqual([], entry["runner"])
 
-    def test_working_venv_is_recorded_with_its_base(self) -> None:
+    def test_working_venv_is_recorded_by_the_shared_probe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             installer = fake_installer(Path(directory))
             base = installer.platform.runtime_dir(installer.home, "20260901") / "python"
@@ -340,10 +360,18 @@ class GraphifyEntryTests(unittest.TestCase):
             (venv / "bin").mkdir(parents=True)
             (venv / "bin" / "graphify").write_text("#!/bin/sh\n", encoding="utf-8")
             (venv / "pyvenv.cfg").write_text(f"home = {base}\n", encoding="utf-8")
-            entry = toolchain.graphify_entry(installer)
-            self.assertEqual("ok", entry["state"])
-            self.assertEqual([str(venv / "bin" / "graphify")], entry["runner"])
-            self.assertEqual(str(base), entry["pyvenv_cfg"]["home"])
+            # 「基础解释器可达」是这条 ok 的判据，由两侧共用的 venv_probe 给出；
+            # 清单不再抄一份 pyvenv.cfg，技能侧要归因时自己读一次。
+            self.assertEqual(
+                "ok",
+                toolchain.venv_probe(
+                    installer.platform, installer.home, component("graphify")
+                )[0],
+            )
+            entry = toolchain.entry(installer, component("graphify"))
+            self.assertEqual(
+                {"state", "runner", "version", "venv"}, set(entry), "清单里出现了无人读的字段"
+            )
 
     def test_installed_version_is_read_from_the_venv_metadata(self) -> None:
         # 清单里的 version 必须是实测值：留空会让报告把「装好了」显示成「版本未知」。
@@ -358,7 +386,7 @@ class GraphifyEntryTests(unittest.TestCase):
             (venv / "pyvenv.cfg").write_text(f"home = {base}\n", encoding="utf-8")
             completed = subprocess.CompletedProcess([], 0, stdout="0.9.61\n", stderr="")
             with patch.object(toolchain.subprocess, "run", return_value=completed):
-                entry = toolchain.graphify_entry(installer)
+                entry = toolchain.entry(installer, component("graphify"))
             self.assertEqual("ok", entry["state"])
             self.assertEqual("0.9.61", entry["version"])
 
@@ -404,10 +432,10 @@ class VenvPackageVersionTests(unittest.TestCase):
 
 
 class ManifestTests(unittest.TestCase):
-    def _write(self, home: Path, runtime, *, selected=("gitnexus", "graphify")) -> Path:
+    def _write(self, home: Path, *, selected=("gitnexus", "graphify")) -> Path:
         installer = fake_installer(home)
         installer.selected = list(selected)
-        return toolchain.write_manifest(installer, runtime, selected=selected)
+        return toolchain.write_manifest(installer, selected=selected)
 
     def test_manifest_round_trips_and_records_the_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -415,27 +443,60 @@ class ManifestTests(unittest.TestCase):
             installer = fake_installer(home)
             installer.platform.toolchain_root(home).mkdir(parents=True, exist_ok=True)
             seed_gitnexus(installer)
-            runtime = toolchain.RuntimeState(
-                state=toolchain.RUNTIME_OK,
-                python=home / "runtime" / "20260901" / "python" / "bin" / "python3",
-                version="3.13.15",
-                tag="20260901",
-                sha256="b" * 64,
-            )
             with patch.object(platform_layer, "resolve_exe", return_value="/usr/bin/node"):
-                path = self._write(home, runtime, selected=("gitnexus",))
+                path = self._write(home, selected=("gitnexus",))
             self.assertIsNotNone(path)
             document = toolchain.read_manifest(path)
+            # 顶层只有两个键有读者：schema_version 是兼容门禁，tools 是全部载荷。
+            # 运行时信息住在 current.json，警告住在安装日志——在这里再抄一份就是第二份
+            # 需要同步却没人读的事实。
+            self.assertEqual({"schema_version", "tools"}, set(document))
             self.assertEqual(1, document["schema_version"])
-            self.assertEqual("3.13.15", document["runtime"]["version"])
-            self.assertTrue(document["runtime"]["venv_ok"])
             self.assertEqual("ok", document["tools"]["gitnexus"]["state"])
             # 未选中的组件不写条目：清单不描述 CodeKit 没接管的东西。
             self.assertNotIn("graphify", document["tools"])
 
     def test_manifest_requires_the_toolchain_root_to_exist(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            self.assertIsNone(self._write(Path(directory), toolchain.RuntimeState()))
+            self.assertIsNone(self._write(Path(directory)))
+
+    def test_partial_reinstall_keeps_the_other_tool_recorded(self) -> None:
+        # A：清单是整份重写的，覆盖面不能等于本次勾选——只升级 graphify 时必须照样
+        # 写出已装好的 gitnexus，否则技能侧读不到绝对 argv，退回按命令名猜路径。
+        with tempfile.TemporaryDirectory() as directory:
+            installer = toolchain_installer(Path(directory))
+            installer.platform.toolchain_root(installer.home).mkdir(
+                parents=True, exist_ok=True
+            )
+            seed_local_gitnexus(installer)
+            installer.selected = ["graphify"]
+            with patch.object(platform_layer, "resolve_exe", return_value=r"C:\node\node.exe"):
+                # 本次勾选的 graphify（还没装，按实测态写入）+ 上一轮已装好的 gitnexus。
+                self.assertEqual(
+                    ["gitnexus", "graphify"], installer.manifest_components()
+                )
+                path = toolchain.write_manifest(installer, selected=installer.manifest_components())
+                document = toolchain.read_manifest(path)
+            self.assertEqual("ok", document["tools"]["gitnexus"]["state"])
+            self.assertTrue(document["tools"]["gitnexus"]["runner"])
+
+    def test_recorded_entry_survives_a_run_that_selected_nothing(self) -> None:
+        # 上一轮装过、这一轮一个工具都没勾：条目仍要被重新实测并写回。
+        with tempfile.TemporaryDirectory() as directory:
+            installer = toolchain_installer(Path(directory))
+            installer.platform.toolchain_root(installer.home).mkdir(
+                parents=True, exist_ok=True
+            )
+            seed_local_gitnexus(installer)
+            config.write_json(
+                installer.platform.toolchain_manifest(installer.home),
+                {
+                    "schema_version": toolchain.MANIFEST_SCHEMA_VERSION,
+                    "tools": {"gitnexus": {"state": "not-installed", "runner": []}},
+                },
+            )
+            with patch.object(platform_layer, "resolve_exe", return_value=r"C:\node\node.exe"):
+                self.assertEqual(["gitnexus"], installer.manifest_components())
 
     def test_manifest_is_read_only_to_its_owner(self) -> None:
         # 与 initialize 的 run-manifest 同一约定；Windows 没有 POSIX mode bits。
@@ -445,7 +506,7 @@ class ManifestTests(unittest.TestCase):
             home = Path(directory)
             installer = fake_installer(home)
             installer.platform.toolchain_root(home).mkdir(parents=True, exist_ok=True)
-            path = self._write(home, toolchain.RuntimeState(), selected=())
+            path = self._write(home, selected=())
             self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
 
     def test_wrong_schema_version_is_treated_as_absent(self) -> None:
@@ -685,10 +746,11 @@ class MigrationTargetTests(unittest.TestCase):
 
 
 class ChannelOrderTests(unittest.TestCase):
-    """工具链托管的组件：可达性优先，venv 通道必须排在 pipx 之前。
+    """落点不变量：根接管的组件只剩一根根内通道，失败也不会漏到根外。
 
-    pipx 的 shim 落在工具链根之外，受限宿主读不到——「不需要符号链接权限」这个理由
-    已经让位给「装上了在会话里能不能跑起来」。
+    历史形态是「pipx 与 venv 同时在候选里，只把 venv 排到前面」——venv 一失败就退到
+    pipx，产出一份受限宿主读不到的副本。现在 pipx 不再是通道，候选集合由注册表的
+    ``entry_kind`` 决定，这条用例锁的是「漏不到根外」而不是「谁排在前面」。
     """
 
     def _installer_with_runtime(self, home: Path):
@@ -698,26 +760,38 @@ class ChannelOrderTests(unittest.TestCase):
         )
         return installer
 
-    def test_venv_precedes_pipx_for_a_toolchain_component(self) -> None:
+    def test_root_bound_channels_come_from_entry_kind(self) -> None:
+        """每根根接管组件只剩它 entry_kind 允许的那一根通道，与运行时状态无关。"""
+        expected = {"gitnexus": ("npm",), "graphify": ("venv",)}
+        with tempfile.TemporaryDirectory() as directory:
+            usable = self._installer_with_runtime(Path(directory))
+            unusable = toolchain_installer(Path(directory))
+            for installer in (usable, unusable):
+                for component_id, only in expected.items():
+                    definition = detector.registry.component_by_id(component_id)
+                    self.assertEqual(only, installer.channel_order(definition), component_id)
+
+    def test_ordinary_components_keep_the_global_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             installer = self._installer_with_runtime(Path(directory))
-            order = installer.channel_order(detector.registry.component_by_id("graphify"))
-            self.assertLess(order.index("venv"), order.index("pipx"))
+            definition = detector.registry.component_by_id("gh")
+            declared = [kind for kind in detector.registry.CHANNEL_ORDER if kind in definition.channels]
+            self.assertEqual(tuple(declared), installer.channel_order(definition))
+            self.assertNotIn("venv", declared)
 
-    def test_order_is_untouched_without_a_usable_runtime(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            installer = toolchain_installer(Path(directory))
-            order = installer.channel_order(detector.registry.component_by_id("graphify"))
-            self.assertLess(order.index("pipx"), order.index("venv"))
-
-    def test_order_is_untouched_for_other_components(self) -> None:
+    def test_a_failed_venv_never_falls_through_to_a_root_external_channel(self) -> None:
+        """P0 回归：venv 失败后不得再试别的通道，否则组件会静默装到根外。"""
         with tempfile.TemporaryDirectory() as directory:
             installer = self._installer_with_runtime(Path(directory))
-            order = installer.channel_order(detector.registry.component_by_id("gh"))
-            self.assertLess(order.index("pipx"), order.index("venv"))
+            with patch.object(
+                Installer, "channel_available", return_value=True
+            ), patch.object(Installer, "install_channel", return_value=False) as channel:
+                self.assertFalse(installer.install_via_channels("graphify"))
+            self.assertEqual(1, channel.call_count)
+            self.assertEqual("venv", channel.call_args.args[1])
 
     def test_graphify_is_not_installed_outside_the_root_without_a_runtime(self) -> None:
-        """运行时不可用时如实失败，不退到 pipx 产出一份宿主读不到的副本。"""
+        """运行时不可用时如实失败，不退到根外产出一份宿主读不到的副本。"""
         with tempfile.TemporaryDirectory() as directory:
             installer = toolchain_installer(Path(directory))
             with patch.object(Installer, "install_channel") as channel:
@@ -732,6 +806,81 @@ class ChannelOrderTests(unittest.TestCase):
             ), patch.object(Installer, "install_channel", return_value=True) as channel:
                 self.assertTrue(installer.install_via_channels("graphify"))
             self.assertEqual("venv", channel.call_args.args[1])
+
+
+class BundledInterpreterBoundaryTests(unittest.TestCase):
+    """F：「建 venv 必须有内置运行时」由返回类型保证，调用点不再各自决定怎么退化。"""
+
+    def test_missing_runtime_raises_instead_of_borrowing_the_host(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = toolchain_installer(Path(directory))
+            installer.toolchain = toolchain.RuntimeState(
+                state=toolchain.RUNTIME_INCOMPLETE,
+                reason="运行时下载失败，且本机没有可用的旧版本",
+            )
+            with self.assertRaises(ValueError) as raised:
+                installer.toolchain_python()
+            self.assertIn("运行时下载失败", str(raised.exception))
+
+    def test_pinned_runtime_is_the_only_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installer = toolchain_installer(Path(directory))
+            python = installer.platform.runtime_dir(installer.home, "20260901") / "python"
+            installer.toolchain = toolchain.RuntimeState(
+                state=toolchain.RUNTIME_OK, python=python, version="3.13.15"
+            )
+            self.assertEqual(str(python), installer.toolchain_python())
+
+
+class LandingSpotStatusTests(unittest.TestCase):
+    """G：根接管组件的安装状态与版本按落点实测，与清单条目同一个判据。
+
+    按命令名走 PATH 两个方向都会读错：建不出人类转发入口时把已装的读成未装，而根外
+    还留着一份旧垫片时把 CodeKit 没接管的东西读成已装。
+    """
+
+    def _context(self, home: Path) -> detector.Context:
+        return detector.Context(
+            home=home, marketplace_local=None, version_file=home / "installed_versions"
+        )
+
+    def test_installed_in_root_counts_even_with_no_path_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            installer = toolchain_installer(home)
+            installer.platform.toolchain_root(home).mkdir(parents=True, exist_ok=True)
+            seed_local_gitnexus(installer)
+            with patch.object(
+                platform_layer, "resolve_exe", return_value=r"C:\node\node.exe"
+            ), patch.object(detector.shutil, "which", return_value=None):
+                self.assertTrue(detector.present("gitnexus", self._context(home)))
+                # 同一前提下按名字探测确实什么都读不到——版本只能来自清单。
+                self.assertEqual("", detector.command_version("gitnexus", ["--version"]))
+                config.write_json(
+                    installer.platform.toolchain_manifest(home),
+                    {
+                        "schema_version": toolchain.MANIFEST_SCHEMA_VERSION,
+                        "tools": {
+                            "gitnexus": toolchain.entry(
+                                installer, component("gitnexus")
+                            )
+                        },
+                    },
+                )
+                self.assertEqual("1.6.12", detector.component_version("gitnexus", self._context(home)))
+
+    def test_root_outside_shim_is_not_reported_as_installed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            toolchain_installer(home).platform.toolchain_root(home).mkdir(
+                parents=True, exist_ok=True
+            )
+            with patch.object(
+                detector.shutil,
+                "which",
+                return_value=str(home / "AppData" / "Roaming" / "npm" / "gitnexus.cmd"),
+            ):
+                self.assertFalse(detector.present("gitnexus", self._context(home)))
 
 
 class RecordedInstallPathTests(unittest.TestCase):

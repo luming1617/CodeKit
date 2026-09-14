@@ -152,6 +152,18 @@ class StagingHygieneTests(unittest.TestCase):
             (opencode / "plugins" / "codekit" / "skills" / "demo" / "tests" / "test_demo.py").is_file()
         )
 
+    def test_only_the_marketplace_manifest_is_staged_from_agents(self) -> None:
+        # `.agents/skills/gitnexus*/` 是本机跑过 `gitnexus analyze --skills` 的产物，
+        # 在 .gitignore 里且没有宿主读者；跟着 `.agents` 整目录复制会让同一份仓库在
+        # 两台机器上装出不同载荷。
+        repo = build_repo(self.base)
+        write(repo / ".agents" / "skills" / "gitnexus-cli" / "SKILL.md", "# generated here\n")
+
+        market, _opencode, _qoder = sources.prepare(repo, self.base / "state")
+
+        self.assertTrue((market / ".agents" / "plugins" / "marketplace.json").is_file())
+        self.assertFalse((market / ".agents" / "skills").exists())
+
 
 class SourceValidationTests(unittest.TestCase):
     def setUp(self) -> None:

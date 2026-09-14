@@ -24,15 +24,15 @@ CodeKit 是以插件形式分发给 Claude、Codex、OpenCode、Qoder 与 Qoder 
 - `.claude-plugin/`: Claude 插件元数据：plugin.json 与 marketplace.json（marketplace 条目 source 必须为 ./，且需含 codekit 条目与非空 description）。
 - `.codex-plugin/`: Codex 插件元数据：plugin.json 与 marketplace.json，与 .claude-plugin/ 同构，由 validate-plugin-manifests.py 校验名称与版本一致性。
 - `.qoder-plugin/`: Qoder 与 Qoder CN 共用的插件 manifest：实测目录内只有 plugin.json，没有 marketplace.json（两个发行版共享同一用户级配置根）。
-- `lefthook.yml`: git 钩子门禁：pre-commit 先运行 sync-plugin-version.py 并 git add 五个版本文件、再校验 manifest；pre-push 校验五个 marketplace/plugin 文件存在、技能布局、安装器 unittest 套件与 skills/*/tests 全部套件；钩子内部一律以 python3 调用脚本。
+- `lefthook.yml`: git 钩子门禁：pre-commit 先运行 sync-plugin-version.py 并 git add 版本文件（权威清单在 sync-plugin-version.py 的 TARGET_FILES）、再校验 manifest；pre-push 校验技能布局、安装器 unittest 套件与 skills/*/tests 全部套件；marketplace/plugin 文件的存在性检查已由 validate-plugin-manifests.py 负责（钩子里的内联重复检查已删除）；钩子按平台解析解释器（Windows 用 `py -3`，其余用 `python3`）。
 - `.standard/`: 本 run Phase 1 刚写入的规范库：01-global/（00-instructions.md、api.md、git.md、security.md、unit-test.md）与 02-stack/python/（00-instructions.md、01-test.md）；两个 00-instructions.md 为规范索引，带托管 index-files 块，模板来源是 skills/initialize/standard/。
-- `README.md`: 套件定位与一键安装入口说明；配套文档为 GUIDE.md（268 行使用指南）、INSTALL.md（709 行安装行为说明）与 INSTALL-STRATEGY.md（302 行组件安装策略），skills/README.md（61 行技能目录约定）。
+- `README.md`: 套件定位与一键安装入口说明；配套文档为 GUIDE.md（268 行使用指南）与 INSTALL-STRATEGY.md（302 行组件安装策略与安装行为说明），skills/README.md（61 行技能目录约定）。
 - `AGENTS.md`: CodeKit 托管的上下文文件（与 CLAUDE.md 成对，主 Agent 是唯一写者）；两者在本 run Phase 0 基线中均已存在且 dirty=false，其中既有托管块内容与当前工作树不符，本次扫描未采信（见 warnings）。
 
 ### Commands and Verification
 
 - 校验每个技能的 SKILL.md、openai.yaml、agent 元数据与资源引用完整性（脚本只读取 skills/ 并打印结果，实测输出 validated 7 CodeKit skills (26 agents, ...)，退出码 0）: `py -3 scripts/validate-skill-layout.py` (evidence: `scripts/validate-skill-layout.py`, `lefthook.yml`, `skills/README.md`)
-- 校验安装器组件注册表的 ID、分组顺序与渠道字段（--check 在 validate_registry 通过后直接 return 0，不打印也不导出注册表，实测退出码 0）: `py -3 scripts/component-registry.py --check` (evidence: `scripts/component-registry.py`, `INSTALL-STRATEGY.md`, `INSTALL.md`)
+- 校验安装器组件注册表的 ID、分组顺序与渠道字段（--check 在 validate_registry 通过后直接 return 0，不打印也不导出注册表，实测退出码 0）: `py -3 scripts/component-registry.py --check` (evidence: `scripts/component-registry.py`, `INSTALL-STRATEGY.md`)
 - 校验 Claude、Codex、Qoder 与 OpenCode 插件 manifest 的 JSON 语法、插件名、版本一致性与被引用文件是否存在（本 run 实测失败：missing manifest: .opencode\package.json，退出码 1，根因是当前分支把 .opencode/ 整体暂存删除，而非 initialize 造成，故不作为本次初始化的必过门禁）: `py -3 scripts/validate-plugin-manifests.py` (evidence: `scripts/validate-plugin-manifests.py`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `.qoder-plugin/plugin.json`, `lefthook.yml`)
 - 运行安装器、平台层、全局 agent 同步与 Qoder 安装的回归测试（pre-push test-installer 的等价命令；测试会在系统临时目录建目录并 fork sys.executable 子进程，属仓库外写入，故未标记为初始化必过验证，本 run 也未实测其通过状态）: `py -3 -m unittest discover -s scripts` (evidence: `scripts/test_installer_agents.py`, `scripts/test_installer_contracts.py`, `scripts/test_installer_qoder.py`, `scripts/test_installer_sources.py`, `lefthook.yml`)
 - 运行 initialize 控制器、worker contract、路径边界、结果门禁与端到端状态流转测试（在系统临时目录 git init 仓库并使用隔离 GITNEXUS_HOME；会 fork git 子进程，故不作为无副作用的初始化必过验证）: `py -3 -m unittest discover -s skills/initialize/tests` (evidence: `skills/initialize/tests/test_initialize_scripts.py`, `skills/initialize/scripts/controller.py`, `lefthook.yml`)
@@ -42,7 +42,7 @@ CodeKit 是以插件形式分发给 Claude、Codex、OpenCode、Qoder 与 Qoder 
 - 运行 product-doc 技能脚本测试（PRD 校验与审查状态机）: `py -3 -m unittest discover -s skills/product-doc/tests` (evidence: `skills/product-doc/tests/test_product_doc_skill_scripts.py`, `skills/product-doc/scripts/validate_prd.py`, `skills/product-doc/scripts/review_state.py`)
 - 运行 technical-doc 阶段控制器与模板契约测试: `py -3 -m unittest discover -s skills/technical-doc/tests` (evidence: `skills/technical-doc/tests/test_tech_doc_controller.py`, `skills/technical-doc/tests/test_template_contract.py`, `skills/technical-doc/scripts/tech_doc_controller.py`)
 - 把 plugin-version.json 的版本同步进四个平台 manifest（会改写 .claude-plugin、.codex-plugin、.opencode、.qoder-plugin 下的文件并属于仓库内写入，因此不作为无副作用验证；且当前 .opencode/ 已被暂存删除）: `py -3 scripts/sync-plugin-version.py` (evidence: `scripts/sync-plugin-version.py`, `plugin-version.json`, `lefthook.yml`)
-- Windows 下从本地仓库安装或升级选中的 CodeKit 组件（写用户级配置目录、可能联网与安装第三方 CLI，仅在人工明确要求时执行）: `install.cmd install -y` (evidence: `install.cmd`, `install.ps1`, `scripts/installer.py`, `INSTALL.md`)
+- Windows 下从本地仓库安装或升级选中的 CodeKit 组件（写用户级配置目录、可能联网与安装第三方 CLI，仅在人工明确要求时执行）: `install.cmd install -y` (evidence: `install.cmd`, `install.ps1`, `scripts/installer.py`, `INSTALL-STRATEGY.md`)
 - 卸载选中的 CodeKit 组件（删除用户级配置与插件目录，属外部副作用）: `uninstall.cmd -y` (evidence: `uninstall.cmd`, `uninstall.ps1`, `scripts/uninstaller.py`, `README.md`)
 - 构建 GitNexus 代码索引与 GitNexus skill 产物（写 .gitnexus/ 与全局 registry；gitnexus 不在仓库验证白名单内，本 run 由 controller.py analyze 派发执行，实测本次已产出 gitnexus-result.json）: `gitnexus analyze --skills --skip-agents-md --verbose` (evidence: `skills/initialize/scripts/gitnexus-step.py`, `skills/initialize/SKILL.md`, `skills/initialize/references/tool-adapters.md`)
 - 用 Graphify 以本地 AST 模式抽取代码知识图谱到 graphify-out/（外部工具，不在仓库验证白名单内，由 initialize-graphify subagent 执行，实测本次已产出 graphify-result.json）: `graphify extract . --out . --code-only` (evidence: `skills/initialize/references/tool-adapters.md`, `skills/initialize/agents/initialize-graphify.md`)

@@ -1,6 +1,6 @@
 ---
 name: initialize
-description: 初始化或升级仓库的 AI 开发规范、代码索引、知识图谱与项目上下文；GitNexus 由确定性控制器执行，Graphify 与 Context Scanner 强制派发为两个独立只读/受限写入 subagent，并执行基线隔离、结果门禁和可选受控提交。
+description: 初始化或升级仓库的 AI 开发规范、代码索引、知识图谱与项目上下文；GitNexus 与 Graphify 由确定性控制器按顺序执行，Context Scanner 强制派发为独立只读 subagent，并执行基线隔离、结果门禁和可选受控提交。
 argument-hint: '[--language java[,python[,go[,cpp]]]] [--embeddings] [--force] [--allow-partial] [--strict-tools] [--commit] [--allow-global-writes] [--no-git-hooks]'
 allowed-tools: 'Bash, Read, Write, Edit, Glob, Grep, Agent, Skill'
 ---
@@ -14,7 +14,7 @@ allowed-tools: 'Bash, Read, Write, Edit, Glob, Grep, Agent, Skill'
 ## 成功标准
 
 - 单一确定性控制器在任何写入前冻结 Git 与托管文件基线，并取得 initialize 独占锁。
-- `initialize-graphify` 与只读 `initialize-context-scanner` 作为两个独立 Sub-agent、GitNexus 作为控制器的确定性步骤，统一遵循同一 Worker contract；并发度随宿主容量调整。
+- `controller.py analyze` 与 `controller.py graphify` 作为控制器的两个确定性步骤按序执行、只读 `initialize-context-scanner` 作为独立 Sub-agent，三者统一遵循同一 Worker contract；并发度随宿主容量调整。
 - 主 Agent 独立核验 Worker 状态、写入范围与 artifact，不把 `partial`/`failed` 转译为 `success`。
 - `AGENTS.md`、`CLAUDE.md` 只有主 Agent在 Barrier 之后写入，且仅更新 CodeKit managed block。
 - required 阶段全部成功；重复执行无无意义 diff；提交行为满足显式授权与 dirty 基线门禁。
@@ -61,7 +61,7 @@ allowed-tools: 'Bash, Read, Write, Edit, Glob, Grep, Agent, Skill'
 flowchart TD
     P0["Phase 0 · 主 Agent<br/>参数、能力、Git 基线、锁"] --> P1["Phase 1 · 主 Agent/确定性脚本<br/>规范、managed ignore、结果清单"]
     P1 --> GN["controller.py analyze<br/>status、索引、skills"]
-    P1 --> GF["initialize-graphify<br/>full/update、知识图谱"]
+    GN --> GF["controller.py graphify<br/>full/update、知识图谱"]
     P1 --> CS["initialize-context-scanner<br/>只读仓库事实"]
     GN --> GATE["Phase 2 · Barrier / Result Gate"]
     GF --> GATE
@@ -78,24 +78,28 @@ flowchart TD
 | 参与者 | 职责 | 允许写入 |
 |---|---|---|
 | 主 Agent | Phase 0、容量规划、Barrier、上下文合并、最终验证与可选提交 | 全部 CodeKit 托管路径 |
-| 确定性控制器 | 持有状态机、可信 Worker 权限、结果摘要、managed block、最终门禁与锁释放；并执行 `analyze` 步骤 | 参数明确指定的托管路径/运行目录 |
+| 确定性控制器 | 持有状态机、可信 Worker 权限、结果摘要、managed block、最终门禁与锁释放；并执行 `analyze` 与 `graphify` 两个步骤 | 参数明确指定的托管路径/运行目录 |
 | 控制器 `analyze` 步骤 | 按 `status` 决策复用或索引，生成 GitNexus skills；参数全部由 manifest 推导 | `.gitnexus/` 与探测后声明的具体 skills 路径 |
-| `initialize-graphify` | 校验缓存与 sidecar，执行 full/update，报告 chunk 状态 | `graphify-out/` |
+| 控制器 `graphify` 步骤 | 按缓存与 sidecar 决策 full/update，生成知识图谱；参数全部由 manifest 推导 | `graphify-out/` |
 | `initialize-context-scanner` | 收集结构、模块、命令和证据，不做推断性写入 | 无 |
 
-不要假设永远有三个分析槽位。GitNexus 由控制器同步执行，Graphify 与 Context Scanner 必须创建两个指定名称的独立会话；容量足够时并行两路，容量不足时按可用槽位分批或串行，但两个会话都必须建立。协作能力不可用或指定角色无法创建时，状态必须为 `BLOCKED`，不得由主 Agent代做、普通串行自检或伪造独立结果。Claude 使用 Agent/Skill，Codex 使用 `spawn_agent` 等协作能力，OpenCode 使用其 task/subagent 能力；`allowed-tools` 不是跨平台能力开关。该能力是否真的存在，以 Phase 0 的 `probe-collab.py` 实测结论为准：宿主自报「支持多代理」和 `codex features list` 的 flag 状态都不构成证据，实测可以在工具面为空时仍报 stable。
+不要假设永远有两个分析槽位。GitNexus 与 Graphify 都由控制器同步执行，只有 Context Scanner 必须创建一个指定名称的独立会话；宿主没有可用派发槽位时，这一路仍然要建立，不得由主 Agent代做、普通串行自检或伪造独立结果。协作能力不可用或指定角色无法创建时，状态必须为 `BLOCKED`。Claude 使用 Agent/Skill，Codex 使用 `spawn_agent` 等协作能力，OpenCode 使用其 task/subagent 能力；`allowed-tools` 不是跨平台能力开关。该能力是否真的存在，以 Phase 0 的 `probe-collab.py` 实测结论为准：宿主自报「支持多代理」和 `codex features list` 的 flag 状态都不构成证据，实测可以在工具面为空时仍报 stable。
 
-## 派发规则与 GitNexus 执行方式（Claude Code / Codex / OpenCode / Qoder / Qoder CN）
+## 派发规则与工具执行方式（Claude Code / Codex / OpenCode / Qoder / Qoder CN）
 
-`initialize-graphify` 和 `initialize-context-scanner` 是硬性阶段门禁，不是可选建议。Phase 0 完成并取得 `prepared` manifest 后，主 Agent 必须读取对应的外部角色文件并创建两个指定名称的独立 Sub-agent；记录角色名、输入快照、独立会话标识和返回状态，等待结果后才能进入 Barrier。主 Agent不得自行执行角色工作来替代调用。
+`initialize-context-scanner` 是硬性阶段门禁，不是可选建议。Phase 0 完成并取得 `prepared` manifest 后，主 Agent 必须读取对应的角色文件并创建一个指定名称的独立 Sub-agent；记录角色名、输入快照、独立会话标识和返回状态，等待结果后才能进入 Barrier。主 Agent不得自行执行角色工作来替代调用。
 
-GitNexus 这一路不同：它是一次没有判断成分的工具调用，因此不再派发 Sub-agent，改由控制器执行 `analyze` 子命令生成同 schema 的 Worker result。主 Agent 只需调用控制器，不得自行拼装 `gitnexus` 命令或手工编写该 result。
+两个分析器都不派发 Sub-agent，改由控制器执行子命令生成同 schema 的 Worker result：GitNexus 走 `analyze`，Graphify 走 `graphify`（必须排在 `analyze` 之后）。主 Agent 只需调用控制器，不得自行拼装 `gitnexus` / `graphify` 命令或手工编写这两个 result。
+
+> 为什么 Graphify 不能留在子代理会话里：宿主的权限层按**执行上下文**区别对待同一条命令。实测（Qoder CN 桌面端 `--permission-mode auto`、`interactive=false`）子代理不继承主会话的工具允许规则（子代理的权限上下文里 `additionalRules` 为空），因此每一条子代理 Bash 都要经远程 auto-mode 分类器裁决：`graphify extract` 在三次派发的五次尝试里全部被拒，而同一子代理的 `graphify --version`、`--help`、`extract --help` 全部放行；主会话有 `rule.tool_allow` 命中、从不进分类器（22 次 Bash、0 次拒绝）。auto 模式下被拒的命令**不会**再落人工审批提示，`required` 阶段失败即整轮 `abort`。同形态重派、加 `mode="dontAsk"`（实测被归一成 `permissionMode: auto`）都无效。把这一路交给控制器执行是唯一在 Skill 权限内的解法；**不要**为了绕过分类器而包装 argv、改名或改走 `npx`/`pipx`——那是在规避宿主的安全边界。
 
 按宿主派发的方式（Claude Code / Codex / OpenCode / Qoder / Qoder CN 的角色标识与语法差异、“不得把派发指令注入子代理”的纪律、以及 Skill 在各宿主下的调用名）见 `$SKILLS_ROOT/_shared/prompts/subagent-mandate.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。进入任何派发阶段前必须读取该文件；角色由 `manage-global-agents.py`（仓库安装脚本）安装为**全局裸名**，不存在 `@agent-<plugin>:<name>` 这类插件作用域角色名。
 
-无法创建任一指定角色、无法保持独立会话、返回不符合 Worker contract 或结果快照不一致时，阶段状态必须为 `BLOCKED`/`failed`，停止收敛与提交；不得降级为主 Agent执行、普通工具摘要或“建议调用”。**该门禁只约束主 Agent（Orchestrator）：被派发的角色 Sub-agent 一律不再派发下一级 Sub-agent，也绝不因自身缺少派发能力而返回 `BLOCKED`；它只需按自己的角色契约完成本阶段并返回结构化结果。**
+无法创建指定角色、无法保持独立会话、返回不符合 Worker contract 或结果快照不一致时，阶段状态必须为 `BLOCKED`/`failed`，停止收敛与提交；不得降级为主 Agent执行、普通工具摘要或“建议调用”。**该门禁只约束主 Agent（Orchestrator）：被派发的角色 Sub-agent 一律不再派发下一级 Sub-agent，也绝不因自身缺少派发能力而返回 `BLOCKED`；它只需按自己的角色契约完成本阶段并返回结构化结果。**
 
-> 代价声明：GitNexus 一路不再具备「由另一个独立会话产出证据」的性质——它的 result 由控制器自己执行、自己校验。门禁仍然独立复核证据（Git 基线与写入范围、artifact 可解析、`allowed_paths` 收窄），但不宣称该路存在独立会话。
+> 代价声明：GitNexus 与 Graphify 两路不再具备「由另一个独立会话产出证据」的性质——它们的 result 由控制器自己执行、自己校验。门禁仍然独立复核证据（Git 基线与写入范围、artifact 可解析、`allowed_paths` 收窄），但不宣称这两路存在独立会话。
+
+> 顺序代价：Graphify 排在 `analyze` 之后，图谱建立在 GitNexus 刚写出的 `.claude/skills` / `.agents/skills` 镜像之上。这些目录由 Phase 0 的 managed `.gitignore` 条目隐藏、并由 `.graphifyignore` 的 managed 规则排除在抽取之外，门禁的越界检查按授权前缀核验它们；改动这条链路时要用 `test_both_tool_steps_drive_the_whole_flow_in_order` 复测，不要靠人眼判断「应该没影响」。
 
 ## Phase DAG 与门禁
 
@@ -139,19 +143,25 @@ Phase 0 同时在任何写入之前解析 GitNexus runner 并判定 embedding �
 
 先读取 [references/tool-adapters.md](references/tool-adapters.md) 选择 GitNexus/Graphify 模式，再读取 [references/worker-contract.md](references/worker-contract.md)。随后：
 
-1. **先派发两个 Sub-agent**：[agents/initialize-graphify.md](agents/initialize-graphify.md) 与 [agents/initialize-context-scanner.md](agents/initialize-context-scanner.md)，各自在独立会话中生成 `graphify` 和 `context-scanner` result。
+1. **先派发 Context Scanner Sub-agent**：[agents/initialize-context-scanner.md](agents/initialize-context-scanner.md)，在独立会话中生成 `context-scanner` result。
 2. **在等待窗口内运行 GitNexus 步骤**（控制器同步执行，不派发 Sub-agent）：
 
 ```bash
 <PYTHON> "<SKILL_DIR>/scripts/controller.py" analyze --manifest <run-manifest.json>
 ```
 
-控制器按冻结的 runner 与索引模式执行，并按 Worker contract 写出 `<run-id>/gitnexus-result.json`；它只写这一个 result，不推进 manifest 阶段（阶段由 gate 推进）。
+3. **紧接着运行 Graphify 步骤**（同样由控制器执行，必须排在 `analyze` 之后）：
+
+```bash
+<PYTHON> "<SKILL_DIR>/scripts/controller.py" graphify --manifest <run-manifest.json>
+```
+
+两个步骤各自按冻结的 runner、索引/缓存模式执行，并按 Worker contract 写出 `<run-id>/gitnexus-result.json` 与 `<run-id>/graphify-result.json`；每个步骤只写自己那一个 result，都不推进 manifest 阶段（阶段由 gate 推进）。顺序写错时 `graphify` 返回可恢复的输入错误（保持当前 run 与锁），先补跑 `analyze` 即可，不会把整轮判成失败。
 
 - GitNexus 以 `status` 为真相源：`status --json` 报 `current` 且 artifact 存在时直接复用索引，返回 `skipped + index-current`，不再执行 analyze。命令前缀只取 manifest 的 `tools.gitnexus.command`（`CODEKIT_GITNEXUS_RUNNER`、`PATH` 上的真实安装，或 CodeKit 已知安装目录里的真实安装），**不得**回落到 `.gitnexus/run.cjs`（它按 `gitnexus@latest` 走 npx，会漂移分析器身份并触发全量重建），也不通过 `npx`/`dlx` 下载；解析失败（`runner` 为 `unresolved`，或入口解析到了但 `available=false`）按 tool missing 返回 `skipped` 并带上 `resolution_hint`。基准参数为 `analyze --skills --skip-agents-md --verbose`，并镜像 `gitnexus_index.pdg`、按 `gitnexus_embedding_mode` 追加 `--drop-embeddings` 或先安装 embedding 栈；执行一律经过 `scripts/run-gitnexus.py`，默认隔离全局 registry，用户授权后才用 `--use-global-registry`。这些参数由控制器推导，主 Agent 不得自行覆盖。
 - **注册校验（不得省略）**：`status` 走仓库内 `.gitnexus/`，查询类命令与 MCP 图查询走全局 registry，两者可以不一致，所以 `status=current` 与 analyze 退出码 0 都**不能**证明查询路径可用。控制器在两条路径上都会实测 `gitnexus_registry_state`：未授权时不写注册表并返回 `partial + registry-missing`；已授权时先经 `gitnexus index <root>` 幂等补注册（复用路径尤其需要，那时 analyze 不会运行），仍未注册则 `failed`；成功后把实测到的 `registry` 写进 result。Gate 对 complete 的 gitnexus result 会自己重测一次注册，缺失即拒绝，绝不采信 result 的自述。
 - 当 GitNexus 支持 `--skills` 时，准备阶段会尝试创建 `.claude/skills` 与 `.agents/skills` 两个目标目录；若宿主目录只读且 help 支持 `--skip-skills`，manifest 标记 `community-only`，控制器追加该 flag 并保留社区 skills；不支持时明确失败。控制器必须申报每一处 Git 可见的变更路径；被 ignore 的分析产物目录只需申报实际写入的顶层条目，门禁按授权前缀核验。
-- Graphify Agent Skill 使用 `$graphify . --update --no-viz`（Codex）或 `/graphify . --update --no-viz`（Claude/OpenCode）；Shell CLI 必须使用其真实子命令 adapter（命令前缀取 manifest 的 `tools.graphify.runner` 绝对路径，不得回落裸名 `graphify`，宿主 shell 可能看不到用户级 `PATH`），不能执行 `graphify .`。`tools.graphify.runner_type` 为 `unresolved`、或 `tools.graphify.available` 为 `false`（入口解析到了但本会话跑不起来）时按 tool missing 返回 `skipped`，不得报 `execution-failed`。混合仓库或无明确语义后端时默认使用 `graphify extract . --out . --code-only`；Worker 按 `tools.graphify.supports.ast_process_pool` 与 `max_workers` 能力决定是否追加 `--max-workers 1`，未知能力按不支持处理且无 fallback flag 时明确失败。
+- Graphify 以缓存与 sidecar 为真相源：`graphify-out/graph.json`/`manifest.json` 可解析且节点非空、`.graphify_root` 规范化后等于当前仓库根、`.codekit-state.json` 的 root/version/ignore digest/mode 全部匹配且 `last_status == success` 时走 `update`，否则走 `extract`（`--force` 强制 full）。命令前缀只取 manifest 的 `tools.graphify.runner` 绝对路径，**不得**回落裸名 `graphify`（宿主 shell 可能看不到用户级 `PATH`），也不通过 `npx`/`pipx` 下载；路径参数与 `--out` 一律传仓库根的绝对路径（`update` 不接受 `--out`，且它把 `.graphify_root` 原样写成传入的路径，用 `.` 会让 root-match 依赖 cwd）。本路固定使用 `--code-only` 本地 AST 模式：语义/full 模式需要 backend、model、key 预检且要用户明确要求，manifest 不承载这些字段，所以**不得**静默退化。`tools.graphify.supports.ast_process_pool` 为 false 且 `max_workers` 为 true 时以 `GRAPHIFY_MAX_WORKERS=1` 收敛并行（`--max-workers` 只有 `extract` 接受，`update` 遇到未知 option 直接 `exit 2`）；两个能力位都为 false 时不执行。`graphify update` 用退出码 1 加「Nothing to update」表达无增量，那是完整复用，记 `skipped + no-change`，不是 `failed`。解析失败（`runner_type` 为 `unresolved`、入口解析到了但 `available` 为 false）与能力不支持一律按 tool missing 返回 `skipped` 并带上 `resolution_hint`，不得报 `execution-failed`。initialize 不使用 `$graphify` / `/graphify` 这类 Agent Skill 形态，也不执行 `graphify .`。
 - `initialize-context-scanner` 只返回结构化事实、命令候选与证据路径；主 Agent不得用自己的扫描摘要代替该 result。
 
 ### Phase 2：Barrier / Result Gate
@@ -212,7 +222,7 @@ barrier 结论为 `partial` 且**全部**由工具不可用造成时，门禁保
 - Scanner 事实、managed blocks 与上下文生成：[references/context-files.md](references/context-files.md)
 - 最终状态、diff、提交/锁释放报告：[references/final-report.md](references/final-report.md)
 - GitNexus 步骤（由控制器执行，参数全部来自 manifest）：`scripts/gitnexus-step.py`
-- `initialize-graphify`：[agents/initialize-graphify.md](agents/initialize-graphify.md)
+- Graphify 步骤（由控制器执行，参数全部来自 manifest）：`scripts/graphify-step.py`
 - `initialize-context-scanner`：[agents/initialize-context-scanner.md](agents/initialize-context-scanner.md)
 
 只在进入对应阶段时读取相关 reference，不预先加载全部文件。

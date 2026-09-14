@@ -1,6 +1,6 @@
 # 工具 Adapter
 
-所有探测由控制器的 `analyze` 步骤（GitNexus）或 `initialize-graphify` 使用已安装 runner 完成；initialize 不通过 `npx`、`bunx`、`pnpm dlx`、pip 或其他网络安装器下载工具。
+所有探测与执行都由控制器的两个确定性步骤完成——`analyze`（GitNexus）与 `graphify`（Graphify），两者都使用 manifest 里已安装的 runner；initialize 不通过 `npx`、`bunx`、`pnpm dlx`、pip 或其他网络安装器下载工具。
 
 ## 解析顺序与四态（两个工具共用）
 
@@ -36,7 +36,7 @@ EACCES，`%LOCALAPPDATA%\Programs\Python` 整个目录不可达。真正的出�
 
 「可读但跑不起来」必须落在 `available=false` 并保持 **`tool-missing`（`skipped`）**，
 不得记成 `execution-failed`：入口存在就假设它能跑，会把「本机跑不了」误报成「工具坏了」。
-GitNexus 的 `analyze` 步骤与 Graphify Worker 都以 manifest 的 `available` 为准；`available=false` 时
+GitNexus 的 `analyze` 步骤与 Graphify 的 `graphify` 步骤都以 manifest 的 `available` 为准；`available=false` 时
 同样不触发 embedding 与全局注册前提——向用户要一次针对跑不起来的工具的授权没有意义。
 
 **这类降级不打断运行**：门禁判 `partial` 但不 abort、不释放锁、也不要求 `--allow-partial`，
@@ -147,7 +147,7 @@ complete 结论。`--use-global-registry` 不可写时会降级为临时 registr
 4. CodeKit 已知安装目录里的 `graphify`（`source` 为 `declared`）——工具链根与历史落点（Windows
    `%APPDATA%\npm\graphify.cmd`）与 CodeKit 私有 venv 的 `Scripts/graphify.exe`。
 
-Worker 执行 `extract` / `update` / `cluster-only` 时**必须用这个绝对路径**。裸名
+控制器步骤执行 `extract` / `update` 时**必须用这个绝对路径**。裸名
 `graphify` 只在宿主 shell 的 `PATH` 上成立，而把用户级 `PATH` 丢掉的宿主（Codex
 桌面端的 shell 只继承机器级 `PATH`）解析不到它：探测已成功的工具会因此变成
 `execution-failed`，比诚实报 `tool-missing` 更难排查。`runner_type` 为
@@ -155,17 +155,22 @@ Worker 执行 `extract` / `update` / `cluster-only` 时**必须用这个绝对�
 拒绝读取 venv 里的解释器）时，一律按 tool missing 处理并返回 `skipped`，把
 `resolution_hint` 写进 warnings，不要自行拼 `npx` / `pipx` 兜底。这一态不要报
 `execution-failed`——它不是「工具坏了」，而是当前会话读不到；处置见上文
-「解析失败的三态」。
+「解析失败的三态」。能力位缺失或为 false 导致本路根本无法按契约执行（不支持
+`--code-only`，或 `ast_process_pool` 与 `max_workers` 双双为 false）同样记为
+`skipped + tool-missing`：那是环境事实，不是运行失败。
 
-Agent Skill 与 Shell CLI 是不同接口：
+initialize 只走 Shell CLI，不使用 `$graphify` / `/graphify` 这类 Agent Skill 形态，也不调用
+`cluster-only`：Shell 只能调用实际子命令（`graphify extract`、`graphify update`），不得执行
+`graphify .`。`--no-viz` 在 CLI adapter 中等价为不执行 HTML export。
 
-- Codex：`$graphify . --update --no-viz`
-- Claude/OpenCode：`/graphify . --update --no-viz`
-- Shell：调用 `graphify extract`、`graphify update`、`graphify cluster-only` 等实际子命令；不得执行 `graphify .`。`--no-viz` 在 CLI adapter 中等价为不执行 HTML export。
+模式固定为本地 AST：`graphify extract <root> --out <root> --code-only`。这是不依赖 LLM API key
+的形态；语义/full 模式必须先完成 backend、model 和 key 预检，并由用户明确要求，而 manifest 不
+承载这些字段，所以步骤**不得**静默退化成语义抽取。路径参数与 `--out` 都传仓库根的绝对路径而不
+是 `.`：`extract` 把 `.graphify_root` 写成解析后的绝对路径，`update`（`watch._rebuild_code`）
+却原样写入传入的路径，且 `update` 不接受 `--out`——只有两态都传绝对路径，门禁的 root-match 才
+不依赖 cwd。
 
-混合仓库或没有明确可用的语义 backend/model/key 时，Shell 默认使用 `graphify extract . --out . --code-only`。这是本地 AST 模式，不依赖 LLM API key；语义/full 模式必须先完成 backend、model 和 key 预检，并由用户明确要求。
-
-Graphify 能力由 `prepare.py` 写入 manifest 的 `tools.graphify.supports`：`ast_process_pool` 是使用 Graphify 可执行文件 shebang 对应 Python 的真实 `ProcessPoolExecutor(max_workers=2)` 探测，`max_workers` 来自 CLI help。Worker 必须把缺失或未知能力按 `false` 处理；AST 进程池不支持且 `max_workers` 支持时追加 `--max-workers 1`，否则返回明确失败，不得静默改变命令语义。
+Graphify 能力由 `prepare.py` 写入 manifest 的 `tools.graphify.supports`：`ast_process_pool` 是使用 Graphify 可执行文件 shebang 对应 Python 的真实 `ProcessPoolExecutor(max_workers=2)` 探测，`max_workers` 来自 CLI help。步骤把缺失或未知能力按 `false` 处理；AST 进程池不支持且 `max_workers` 支持时以 `GRAPHIFY_MAX_WORKERS=1` 收敛并行（`--max-workers` 只有 `extract` 接受，`update` 遇到未知 option 直接 `exit 2`，而 `extract` 内部就是把该 flag 写进这个环境变量），两者都不支持时不执行。不得静默改变命令语义。
 
 有效缓存必须同时满足：
 
@@ -174,9 +179,9 @@ Graphify 能力由 `prepare.py` 写入 manifest 的 `tools.graphify.supports`：
 - `.codekit-state.json` schema、root、Graphify 版本、ignore digest、mode 均匹配；
 - `last_status == "success"`。
 
-决策：无有效 graph/manifest 时 full；上述状态全部匹配时 update；root/版本/ignore/mode 变化或上次 partial/failed 时 full；显式 `--force` 时 full force。
+决策：无有效 graph/manifest 时 full；上述状态全部匹配时 update；root/版本/ignore/mode 变化或上次 partial/failed 时 full；显式 `--force` 时 full force。`update` 以退出码 1 加 stderr 里的「Nothing to update」表达无增量——那是完整复用，记 `skipped + no-change`（`exit_code` 为 null），不是 `failed`。步骤写进 result 的 `mode` 是固定值 `code-only`，sidecar 与门禁按同一常量比对。
 
-成功后由主 Agent（不是 Worker）原子写入；`ignore_digest` 只摘要 CodeKit managed Graphify ignore block：
+成功后由 `controller.py reconcile`（不是步骤自己）原子写入；`ignore_digest` 只摘要 CodeKit managed Graphify ignore block：
 
 ```json
 {
@@ -184,7 +189,7 @@ Graphify 能力由 `prepare.py` 写入 manifest 的 `tools.graphify.supports`：
   "root": "/absolute/project/root",
   "graphify_version": "0.9.56",
   "ignore_digest": "sha256:...",
-  "mode": "default",
+  "mode": "code-only",
   "last_status": "success"
 }
 ```

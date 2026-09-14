@@ -69,6 +69,14 @@ def bare_installer(home: Path) -> Installer:
     installer.os_name = installer.platform.os_name
     installer.state_dir = home / ".local" / "state" / "CodeKit"
     installer.state_dir.mkdir(parents=True, exist_ok=True)
+    installer.version_file = installer.state_dir / "installed_versions"
+    installer.context = detector.Context(
+        home=home,
+        marketplace_local=None,
+        version_file=installer.version_file,
+    )
+    # 飞书 skills 的归属记账默认未同步；用到它的用例自己置位。
+    installer.feishu_skills_synced = False
     installer.bin_dir = home / ".local" / "bin"
     installer.npm_bin_dir = home / ".npm-global" / "bin"
     installer.logger = Mock()
@@ -128,26 +136,14 @@ def handler_keys(path: Path, function: str) -> set[str]:
     raise AssertionError(f"handlers dict not found in {path}:{function}")
 
 
-def version_record_ids(path: Path) -> set[str]:
-    """用 AST 读取 save_versions 中登记的组件 ID 集合。"""
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "save_versions":
-            for inner in ast.walk(node):
-                if isinstance(inner, ast.Assign) and any(
-                    isinstance(target, ast.Name) and target.id == "values"
-                    for target in inner.targets
-                ):
-                    comprehension = inner.value
-                    if isinstance(comprehension, ast.ListComp) and comprehension.generators:
-                        iterator = comprehension.generators[0].iter
-                        if isinstance(iterator, ast.Tuple):
-                            return {
-                                element.value
-                                for element in iterator.elts
-                                if isinstance(element, ast.Constant)
-                            }
-    raise AssertionError(f"save_versions values list not found in {path}")
+def version_record_ids(installer: Installer) -> set[str]:
+    """跑一次 save_versions，返回状态文件里实际写入的键集合。"""
+    installer.save_versions()
+    return {
+        line.split("=", 1)[0]
+        for line in installer.version_file.read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    }
 
 
 class HelperContractTests(unittest.TestCase):
@@ -217,7 +213,11 @@ class DispatchParityTests(unittest.TestCase):
         self.assertEqual(
             handler_keys(SCRIPT_DIR / "uninstaller.py", "uninstall_component"), registry_ids
         )
-        self.assertEqual(version_record_ids(SCRIPT_DIR / "installer.py"), registry_ids)
+        with tempfile.TemporaryDirectory() as directory:
+            installer = bare_installer(Path(directory))
+            with patch.object(detector, "component_version", return_value="1.2.3"):
+                recorded = version_record_ids(installer)
+        self.assertEqual(registry_ids, recorded)
 
 
 class StrategyTableTests(unittest.TestCase):
@@ -230,13 +230,38 @@ class StrategyTableTests(unittest.TestCase):
                 "brew_cask",
                 "apt",
                 "winget",
-                "pipx",
                 "venv",
                 "release",
                 "script",
                 "powershell",
             ),
         )
+
+    def test_root_channel_declaration_requires_an_entry_kind(self) -> None:
+        """落点不变量在注册表层就成立：漏配 entry_kind 的根内通道过不了校验。"""
+        registry = detector.registry
+        leaked = registry.Component(
+            "sneaky",
+            "Sneaky",
+            "intel",
+            command="sneaky",
+            channels={"venv": "sneaky"},
+        )
+        with self.assertRaises(ValueError):
+            registry.validate_registry((leaked,), dict(registry.GROUPS), {})
+
+    def test_root_bound_component_cannot_mix_in_an_outside_channel(self) -> None:
+        registry = detector.registry
+        mixed = registry.Component(
+            "mixed",
+            "Mixed",
+            "intel",
+            command="mixed",
+            channels={"venv": "mixed", "brew": "mixed"},
+            entry_kind="python-venv",
+        )
+        with self.assertRaises(ValueError):
+            registry.validate_registry((mixed,), dict(registry.GROUPS), {})
 
     def test_windows_only_channels_never_leak_into_other_platforms(self) -> None:
         # winget/powershell 的存在不得影响 macOS/Linux 的通道选择。
@@ -2084,49 +2109,61 @@ class CodexMultiAgentTests(unittest.TestCase):
         installer.logger.log_path = home / "install.log"
         return installer
 
-    def test_patch_preserves_everything_outside_the_one_key(self) -> None:
-        updated, changed = codex.enable_multi_agent(self.CONFIG)
-        self.assertTrue(changed)
-        self.assertIn('model = "gpt-5"', updated)
-        self.assertIn("web_search_request = false", updated)
-        self.assertIn("[mcp_servers.gitnexus]", updated)
-        # 行尾注释与其前面的空白原样保留，只替换值本身。
-        self.assertIn("multi_agent_v2 = true  # off until restart", updated)
-        self.assertEqual(codex.enable_multi_agent(updated)[1], False)
+    def test_probe_is_isolated_from_the_current_repository(self) -> None:
+        """探测必须在空目录里跑：仓库正文里就有 ``spawn_agent`` 这个词。"""
+        seen = []
 
-    def test_patch_creates_the_table_without_touching_other_tables(self) -> None:
-        updated, changed = codex.enable_multi_agent('[a.features]\nx = 1\n')
-        self.assertTrue(changed)
-        self.assertEqual(updated, '[a.features]\nx = 1\n\n[features]\nmulti_agent_v2 = true\n')
+        def fake_run_capture(instance, args, *, timeout=15, cwd=None):
+            seen.append(Path(cwd) if cwd else None)
+            return RunResult(0, self.TOOLS)
 
-    def test_only_a_measured_empty_surface_counts_as_unavailable(self) -> None:
-        self.assertEqual(codex.classify_probe(1, self.TOOLS), codex.UNKNOWN)
-        self.assertEqual(codex.classify_probe(0, "no agent tools here"), codex.UNAVAILABLE)
-        self.assertEqual(codex.classify_probe(0, self.TOOLS), codex.AVAILABLE)
-
-    def test_apply_rolls_back_byte_for_byte_when_reprobe_still_sees_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
-            config = codex.config_path(home)
-            config.parent.mkdir()
-            config.write_text(self.CONFIG, encoding="utf-8")
-            before = config.read_bytes()
             installer = self._installer(home)
-            with patch.object(Installer, "codex_collab_verdict", return_value=(codex.UNAVAILABLE, "")):
-                self.assertFalse(installer.apply_codex_multi_agent(config))
-            self.assertEqual(config.read_bytes(), before)
+            with patch.object(Installer, "run_capture", autospec=True, side_effect=fake_run_capture):
+                verdict, _ = installer.codex_collab_verdict()
+            self.assertEqual(codex.AVAILABLE, verdict)
+            self.assertEqual(1, len(seen))
+            self.assertIsNotNone(seen[0])
+            self.assertTrue(seen[0].name.startswith("codekit-collab-probe-"))
+            self.assertNotEqual(home.resolve(), seen[0].resolve())
 
-    def test_apply_keeps_the_change_once_the_surface_reappears(self) -> None:
+    def test_single_tool_name_does_not_count_as_available(self) -> None:
+        # 判定阈值来自共享实现，安装器只是转述：单命中算未暴露，据此才会去写开关。
+        self.assertEqual(
+            codex.classify_probe(0, "用 spawn_agent 派发子代理"), codex.UNAVAILABLE
+        )
+
+    def test_enable_keeps_the_change_once_the_surface_reappears(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
-            config = codex.config_path(home)
-            config.parent.mkdir()
-            config.write_text(self.CONFIG, encoding="utf-8")
+            config_file = codex.config_path(home)
+            config_file.parent.mkdir()
+            config_file.write_text(self.CONFIG, encoding="utf-8")
             installer = self._installer(home)
-            with patch.object(Installer, "codex_collab_verdict", return_value=(codex.AVAILABLE, self.TOOLS)):
-                self.assertTrue(installer.apply_codex_multi_agent(config))
-            self.assertIn("multi_agent_v2 = true", config.read_text(encoding="utf-8"))
-            self.assertIn(str(config), installer.changed_paths)
+            # 首次探测看不到工具面，写入后的复验看到了 —— 这才是 enabled 那条路。
+            with patch.object(
+                Installer, "codex_probe_runner", side_effect=[(0, ""), (0, self.TOOLS)]
+            ):
+                outcome, detail = installer.enable_codex_multi_agent()
+            self.assertEqual(("enabled", ""), (outcome, detail))
+            self.assertIn("multi_agent_v2 = true", config_file.read_text(encoding="utf-8"))
+            self.assertIn(str(config_file), installer.changed_paths)
+
+    def test_enable_rolls_back_byte_for_byte_when_reprobe_still_sees_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config_file = codex.config_path(home)
+            config_file.parent.mkdir()
+            config_file.write_text(self.CONFIG, encoding="utf-8")
+            before = config_file.read_bytes()
+            installer = self._installer(home)
+            # 首次探测与写后复验都看不到工具面：结论必须是已回滚，且文件逐字节还原。
+            with patch.object(Installer, "codex_probe_runner", return_value=(0, "")):
+                outcome, detail = installer.enable_codex_multi_agent()
+            self.assertEqual(codex.ROLLED_BACK, outcome)
+            self.assertTrue(detail)
+            self.assertEqual(before, config_file.read_bytes())
 
     def test_selecting_codex_plugin_enables_it_without_a_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2153,10 +2190,10 @@ class CodexMultiAgentTests(unittest.TestCase):
             installer = self._installer(home, ["codex_plugin"])
             with patch.object(Installer, "command_exists", return_value=True), patch.object(
                 Installer, "codex_collab_verdict", return_value=(codex.UNKNOWN, "")
-            ), patch.object(Installer, "apply_codex_multi_agent") as applied:
+            ), patch.object(codex, "enable") as enable:
                 installer.configure_agent_capabilities()
             self.assertEqual(installer.agent_capabilities[0]["outcome"], "unknown")
-            self.assertFalse(applied.called)
+            self.assertFalse(enable.called)
             self.assertEqual(config.read_text(encoding="utf-8"), self.CONFIG)
 
     def test_other_platforms_get_no_invented_switch(self) -> None:
@@ -2176,7 +2213,7 @@ class CodexMultiAgentTests(unittest.TestCase):
         # 静默开启：整条链路只留一行提示，不再有汇总框与三行重启说明。
         with tempfile.TemporaryDirectory() as directory:
             installer = self._installer(Path(directory), ["codex_plugin", "claude_plugin"])
-            with patch.object(Installer, "enable_codex_multi_agent", return_value="enabled"):
+            with patch.object(Installer, "enable_codex_multi_agent", return_value=("enabled", "")):
                 installer.configure_agent_capabilities()
             printed = "\n".join(call.args[0] for call in installer.logger.info.call_args_list)
             self.assertEqual(installer.MULTI_AGENT_NOTICE, printed)
@@ -2189,7 +2226,7 @@ class CodexMultiAgentTests(unittest.TestCase):
         # 已开启是每次重跑都会出现的常态结论：不需要用户做任何事，就不该占版面。
         with tempfile.TemporaryDirectory() as directory:
             installer = self._installer(Path(directory), ["codex_plugin"])
-            with patch.object(Installer, "enable_codex_multi_agent", return_value="already-on"):
+            with patch.object(Installer, "enable_codex_multi_agent", return_value=("already-on", "")):
                 installer.configure_agent_capabilities()
             self.assertFalse(installer.logger.info.called)
             self.assertFalse(installer.logger.warn.called)
@@ -2198,13 +2235,24 @@ class CodexMultiAgentTests(unittest.TestCase):
     def test_unconfirmed_capability_warns_once_without_a_box(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             installer = self._installer(Path(directory), ["codex_plugin"])
-            with patch.object(Installer, "enable_codex_multi_agent", return_value="unknown"):
+            with patch.object(Installer, "enable_codex_multi_agent", return_value=("unknown", "")):
                 installer.configure_agent_capabilities()
             self.assertFalse(installer.logger.info.called)
             self.assertEqual(1, installer.logger.warn.call_count)
             text = str(installer.logger.warn.call_args.args[0])
             self.assertIn("Codex", text)
             self.assertIn("未确认", text)
+
+    def test_shared_reason_is_reported_instead_of_a_generic_line(self) -> None:
+        """失败原因只有共享编排知道（哪一步、哪个路径），安装器转述它而不是重写一句。"""
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self._installer(Path(directory), ["codex_plugin"])
+            reason = "写入 /tmp/x/config.toml 后复验仍看不到派发工具（unavailable），已回滚为原内容"
+            with patch.object(
+                Installer, "enable_codex_multi_agent", return_value=("rolled-back", reason)
+            ):
+                installer.configure_agent_capabilities()
+            self.assertIn(reason, str(installer.logger.warn.call_args.args[0]))
 
     def test_nothing_printed_without_a_plugin_component(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

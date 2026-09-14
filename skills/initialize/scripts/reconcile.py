@@ -21,6 +21,7 @@ from _common import (
     InitializeError,
     ValidationProgramMissing,
     atomic_write,
+    graphify_ignore_digest,
     load_json,
     replace_managed_block,
     resolve_validation_command,
@@ -239,14 +240,9 @@ def render_claude_standards(root: Path, indexes: list[Path]) -> str:
 def update_sidecar(root: Path, result: dict) -> str | None:
     if result.get("task") != "graphify" or result.get("status") != "success":
         return None
-    ignore = root / ".graphifyignore"
-    ignore_text = ignore.read_text(encoding="utf-8")
-    start = "# codekit:initialize:graphify-ignore:start"
-    end = "# codekit:initialize:graphify-ignore:end"
-    if ignore_text.count(start) != 1 or ignore_text.count(end) != 1:
+    digest = graphify_ignore_digest(root)
+    if digest is None:
         raise ReconcileError("cannot compute Graphify ignore digest from invalid managed block")
-    managed_ignore = start + ignore_text.split(start, 1)[1].split(end, 1)[0] + end
-    digest = "sha256:" + hashlib.sha256(managed_ignore.encode("utf-8")).hexdigest()
     sidecar = root / "graphify-out/.codekit-state.json"
     data = {
         "schema_version": 1,

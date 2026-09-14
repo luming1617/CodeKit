@@ -23,7 +23,7 @@
 |---|---|---|
 | Node.js | **>= 24.0.0** | 全局门槛取 24 LTS 主版本；gitnexus 另做组件级校验（见 §4） |
 | npm | 存在即可 | 随 Node 提供，是绝大多数组件的首选通道 |
-| python3 | **>= 3.10** | 只用于运行安装器本身（首次安装由它写下内置运行时，见 §4.2）。下限由 `installer.py` 自身的代码决定；组件侧已与系统 Python 脱钩，graphify 的 `python>=3.10` 依赖比对的是内置运行时的版本 |
+| python3 | **>= 3.10** | 只用于运行安装器本身（首次安装由它写下内置运行时，见 §4.2）。下限唯一声明在 `installer_config.MINIMUM_PYTHON`，两个入口脚本各自复述一次（入口必须自己证明解释器合格，这是唯一无法委托的检查），漂移由 `scripts/test_installer_preflight.py` 兜住；组件侧已与系统 Python 脱钩，graphify 的 `python>=3.10` 依赖比对的是内置运行时的版本 |
 | git | **存在即可** | 不再校验版本；仅用于读取 marketplace 提交号与写入全局 git 配置 |
 | curl / wget | **任一存在** | 用于脚本与发布包下载 |
 
@@ -59,17 +59,16 @@ npm  →  brew  →  brew_cask  →  apt  →  winget  →  pipx  →  venv  →
 `winget` 与 `powershell` 是 Windows 专用通道，可用性探测在其他平台恒为假，因此只是占住
 对应原生通道的位置，不改变 macOS/Linux 的选择结果。
 
-**例外**：由 CodeKit 工具链根接管的组件（`gitnexus` / `graphify`，见 §4.2）在**内置运行时可用时把 `venv` 提到 `pipx` 之前**——pipx 的 shim 落在工具链根之外，受限宿主（Codex 桌面端）读不到它，装上也跑不起来。运行时不可用时顺序不变，诚实退回 pipx。
+**落点约束**：`Component.entry_kind` 决定一个组件可以落在哪里（`gitnexus` / `graphify`，见 §4.2）。空值表示宿主自己的用户级目录；非空表示由 CodeKit 工具链根接管，此时候选通道被**过滤**成该 `entry_kind` 允许的那一根根内通道（`ENTRY_KIND_CHANNELS`）——不是把根内通道排到前面，而是根外通道根本不在候选里，所以根内通道失败之后不存在「退到根外产出一份受限宿主读不到的副本」这条路。运行时不可用时该组件如实失败。`validate_registry`（`--check` 与 pre-commit 都跑）会拒绝漏配 `entry_kind` 的 `venv` 声明，也拒绝根接管组件混入根外通道。
 
 | 通道 | target | 可用性判定 | 安装 / 升级语义 |
 |---|---|---|---|
-| `npm` | 官方 npm 包名（白名单） | `npm` 存在 | `npm install -g <pkg>@latest`（含升级） |
+| `npm` | 官方 npm 包名（白名单） | `npm` 存在 | `npm install -g <pkg>@latest`（含升级）；落点按 `entry_kind` 分：空值装进用户态前缀，`npm-private` 装进 `<工具链根>/npm` 并给人类 shell 建一个可选转发入口 |
 | `brew` | formula | `brew` 存在 | 已装且由 brew 管理则 `brew upgrade`，否则 `brew install`；命令已存在但不在 brew 管理下时**让位给下一通道**（避免装出第二份拷贝）；强制中科大镜像并关闭 brew 自动更新 |
 | `brew_cask` | cask | `brew` 存在 | 已装且由 brew 管理则 `brew upgrade --cask`，否则 `brew install --cask`；同样让位条件；镜像环境同 `brew` |
 | `apt` | 发行版包名 | Linux 且有包管理器 | `apt-get install -y`（需 sudo，见 §3）；包不存在则跳到下一通道 |
 | `winget` | winget 包 ID | **Windows 且 `winget` 存在** | 语义与 `brew` 对齐：命令缺失才 `winget install`；命令已存在时先用 `winget list` 确认由 winget 管理，再由 `winget upgrade` 升级，**"已是最新"返回非零（实测 `0x8A15002B`）不算失败**，否则会降级到 release 装出第二份；不在 winget 管理下则让位给下一通道。非交互必须带 `--accept-package-agreements --accept-source-agreements --silent --disable-interactivity`，否则 winget 会挂起等待输入 |
-| `pipx` | PyPI 发行名 | `pipx` 存在（缺失则先按 apt→brew 装 pipx） | `pipx install` / `pipx upgrade` |
-| `venv` | PyPI 发行名 | **内置运行时可用且能建 venv**（`<运行时> -c "import venv, ensurepip"`） | 用内置运行时 `-m venv --copies` 建到 `<工具链根>/venvs/<命令>`，再 `pip install -U <发行名>`；始终可重装 |
+| `venv` | PyPI 发行名 | **内置运行时可用且能建 venv**（`<运行时> -c "import venv, ensurepip"`） | 用内置运行时 `-m venv --copies` 建到 `<工具链根>/venvs/<命令>`，再 `pip install -U <发行名>`；始终可重装。落点必然在根内，因此**只有 `entry_kind` 非空的组件可以声明它** |
 | `release` | `Component.release` | `curl` 或 `wget` 存在 | 解析最新版 → 按模板展开资产名 → 下载 → 校验（如可）→ 解包 → 安装到用户 bin 目录；GitHub 地址优先走 gh-proxy。模板除 `{version}/{os}/{arch}/{ext}` 外还支持按 Rust target triple 命名的 `{target}` |
 | `script` | 官方安装脚本 URL | **非 Windows** 且存在可用的 POSIX shell | 下载后经 stdin 交给 shell 执行；GitHub 地址优先走 gh-proxy（见 §2.3）。Windows 上禁用该通道：Git for Windows 会把 `bash` 放进 PATH，只判断"有没有 shell"会让安装器用 Git Bash 跑 Unix 脚本（见 §8.3） |
 | `powershell` | Windows 专用 `.ps1` URL | **Windows 且存在 powershell** | 下载后经 stdin 交给 PowerShell 执行（`-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command -`） |
@@ -128,7 +127,7 @@ Homebrew 镜像同时把 `HOMEBREW_NO_AUTO_UPDATE=1` 写入环境：组件是否
 
 `requires` 为该组件自身的硬前置，不满足时**只跳过该组件**并给出指引，不影响其他组件。
 
-| 组件 | 分组 | 命令 | npm | brew | apt | winget | pipx/venv | script | release | requires |
+| 组件 | 分组 | 命令 | npm | brew | apt | winget | venv | script | release | requires |
 |---|---|---|---|---|---|---|---|---|---|---|
 | rtk | ai | `rtk` | — | `rtk` | — | — | — | 官方 install.sh | GitHub `rtk-ai/rtk`（`rtk-{target}.{ext}`） | — |
 | gitnexus | intel | `gitnexus` | `gitnexus` | — | — | — | — | — | — | **node >= 24.11.0** |
@@ -137,6 +136,9 @@ Homebrew 镜像同时把 `HOMEBREW_NO_AUTO_UPDATE=1` 写入环境：组件是否
 | glab | third | `glab` | — | `glab` | `glab` | `GLab.GLab` | — | — | GitLab `34675721` | — |
 | dingtalk_cli | third | `dws` | `dingtalk-workspace-cli` | — | — | — | — | — | — | — |
 | feishu_cli | third | `lark-cli` | `@larksuite/cli` | — | — | — | — | — | — | — |
+
+`entry_kind`（落点）：`gitnexus = npm-private`、`graphify = python-venv`，其余为空，落在宿主自己的
+用户级目录。前两者由 CodeKit 工具链根接管，见 §4.2。
 
 Windows 侧的三处差异：
 
@@ -159,15 +161,17 @@ gitnexus 并提示升级到 24.11+，其余组件照常安装。
 
 ### 4.2 工具链根与内置运行时（gitnexus / graphify）
 
-`gitnexus` 与 `graphify` 的落点不遵循「装到用户级默认目录」的惯例，而是**由 CodeKit 自持工具链根接管**（`installer.py` 的 `TOOLCHAIN_COMPONENTS`）。原因是受限宿主（实测 Codex 桌面端）的沙箱**按路径拒绝访问**——`%APPDATA%\npm` 下的入口连 `stat` 都拿不到（EACCES），`%LOCALAPPDATA%\Programs\Python` 整个目录不可达，而 `<home>/.local/share/CodeKit` 可读可执行（仅写入被拒）。
+`gitnexus` 与 `graphify` 的落点不遵循「装到用户级默认目录」的惯例，而是**由 CodeKit 自持工具链根接管**（注册表里声明 `entry_kind`，安装器的 `TOOLCHAIN_COMPONENTS` 由它派生）。原因是受限宿主（实测 Codex 桌面端）的沙箱**按路径拒绝访问**——`%APPDATA%\npm` 下的入口连 `stat` 都拿不到（EACCES），`%LOCALAPPDATA%\Programs\Python` 整个目录不可达，而 `<home>/.local/share/CodeKit` 可读可执行（仅写入被拒）。
 
 | 关注点 | 规则 |
 |---|---|
 | 根路径 | `<home>/.local/share/CodeKit`，三系统同一路径（`installer_platform.toolchain_root`），根内布局全部由它派生 |
-| 内置运行时 | python-build-standalone 的 `install_only` 资产，按 OS/arch 固定 tag 与 sha256，解到 `runtime/<tag>/` 并原子发布；发布前必须通过「`import venv, ensurepip` + 建一次 venv」冒烟 |
-| gitnexus | 装进**私有 npm 前缀** `<根>/npm`（`npm_config_prefix` 临时指向该前缀再还原），运行表达式记为绝对 `[<node>, <cli.js>]`；人类 shell 另留一份转发垫片，CodeKit 代码路径不依赖它 |
-| graphify | venv 建在 `<根>/venvs/graphify`，**基础解释器必须是内置运行时**（`--copies`）；系统 Python 建出的 venv 其 `pyvenv.cfg` 会指向被拒绝的目录，启动必失败（实测 rc=101）。运行时不可用时该组件**如实失败**，不退到 pipx 产出一份宿主读不到的副本 |
-| 清单 | `<根>/toolchain.json`（POSIX 下 `0600`）由安装器独占写入，记录每个工具的实测态与绝对 argv；它是**提示而非权威**，技能侧逐条复验后才采信（解析顺序与复验规则见 `skills/_shared/scripts/codekit_runtime.py` 的 `resolve_tool`） |
+| 内置运行时 | python-build-standalone 的 `install_only` 资产，按 OS/arch 固定 tag 与 sha256，解到 `runtime/<tag>/` 并原子发布；发布前必须通过「`import venv, ensurepip` + 建一次 venv」冒烟。**`RUNTIME_SPECS` 就是支持矩阵**（`supported_runtime_targets()`）：矩阵外的组合（如 `windows/arm64`）如实报「不支持」并点名矩阵，不悄悄改用工具链根外的解释器 |
+| gitnexus | `entry_kind = npm-private`：走 npm 通道但装进**私有前缀** `<根>/npm`（`npm_config_prefix` 临时指向该前缀再还原），运行表达式记为绝对 `[<node>, <cli.js>]`；人类 shell 另留一份转发垫片，CodeKit 代码路径不依赖它。**解释器就是宿主 node，这是有意的边界**：venv 会 re-exec 记在自身之外的基础解释器，所以 Python 必须纳管；`node + 绝对脚本` 没有这条链，实测宿主 `node.exe` 可达，且 gitnexus 的原生模块全是 N-API（`prebuilds/<platform>-<arch>`、`bin/napi-v6`），跨 major 稳定 |
+| graphify | `entry_kind = python-venv`：venv 建在 `<根>/venvs/<命令>`，**基础解释器必须是内置运行时**（`--copies`）；系统 Python 建出的 venv 其 `pyvenv.cfg` 会指向被拒绝的目录，启动必失败（实测 rc=101）。它是唯一的候选通道，因此运行时不可用时该组件**如实失败**，不会退到根外产出一份宿主读不到的副本 |
+| 清单 | `<根>/toolchain.json`（POSIX 下 `0600`）由安装器独占写入，**整份重写但覆盖面不止本次勾选**：本次目标 + 本机实测已装的托管组件 + 清单里已有记录的，否则只升级其中一个工具就会把另一个的条目抹掉，技能侧退回按命令名猜路径。字段只保留有读者的（`schema_version` 与每工具的 `state`/`runner`/`version`/落点目录），运行时的 tag 由 `current.json` 承载。它是**提示而非权威**，技能侧逐条复验后才采信（解析顺序与复验规则见 `skills/_shared/scripts/codekit_runtime.py` 的 `resolve_tool`） |
+| 落点即状态 | 根接管组件的「已安装」与版本一律按**落点实测**判定（`installer_toolchain.entry_state`，与清单条目同一个判据），不按命令名走 PATH：受限宿主里 PATH 条目齐全而 `stat` 被拒，按名字解析两个方向都会读错 |
+| 宿主注册表达式 | 各宿主拿到的启动表达式**以实测为准，不强行统一**：Claude / Codex 的 MCP 条目由 `gitnexus setup` 自己决定，CodeKit 只保证 Qoder 的注册与 `toolchain.json` 里那一条。报告要写清「这个宿主实际是什么」，而不是假设四家一样 |
 | 自动迁移 | 安装器检测到「已装但落点不在根内」的组件会就地重物化，**不需要用户重新勾选**；重建会让旧 venv 与 `graphify-out/` 缓存作废 |
 | 升级 | 运行时按 tag 并列保留上一个可用版本；tag 升级 = 一次新下载 + 重建全部 venv，属 CodeKit 的维护职责（改 `RUNTIME_SPECS` 的 pin），不是重跑安装器的副作用 |
 | 卸载 | 默认保留工具链根（同机多仓库共用一份运行时），`uninstall.sh --purge` / `uninstall.cmd --purge` 才移除 |
@@ -270,7 +274,7 @@ MSYS/MINGW 走 POSIX 入口，避免出现"能跑但 PATH / 前缀全是错的"�
 | 临时目录 | `$TMPDIR` / `/tmp` | `tempfile.gettempdir()` |
 | shell 配置 | 写 `.bashrc` / `.zshrc` / fish | **不写**，改为校验 PATH 并打印指引 |
 | 特权判定 | `os.geteuid() == 0` | `IsUserAnAdmin` |
-| PyPI 通道 | 工具链托管的组件（graphify）在运行时可用时 **venv 优先于 pipx**，三平台一致（见 §4.2）；运行时不可用时该组件如实失败，不退到 pipx | 同左 |
+| PyPI 通道 | 根接管的组件（graphify）的候选通道由 `entry_kind` 过滤成只剩 `venv`，因此**没有**退到根外的第二条路；运行时不可用时该组件如实失败。三平台同规则（见 §4.2） | 同左 |
 
 > Windows 上 CodeKit 不再自造 `~/.local/bin`：Node 安装包已经把 `%APPDATA%\npm` 写进
 > 用户 PATH，另起目录反而要多维护一份 PATH 配置。PowerShell profile 的路径是本地化的、

@@ -28,7 +28,7 @@ install.cmd
 
 安装内容：编程智能体 CLI（Claude / Codex / OpenCode / Qoder / Qoder CN，勾选对应插件时自动补装；插件安装以 CLI 为前置，仅有 Desktop 不能替代） · CodeKit 插件（Claude / OpenCode / Codex / Qoder / Qoder CN，分别包含对应平台的 subagent） · GitNexus · Graphify · gh · glab · 钉钉 CLI · 飞书 CLI · rtk(节省token)
 
-> 安装器在装任何组件之前只**检测**系统依赖，不会替你安装：git（存在即可）、Node.js ≥ 24、Python3 ≥ 3.10、npm、curl/wget 任一。任一不满足会醒目列出全部缺失项、当前版本与手动安装方式并中止。这套检测三平台共用一份实现（`scripts/installer_preflight.py`）；入口脚本只负责解析出一个满足下限的 Python 再转发。可选组件按统一优先级 `npm → brew → apt → winget → pipx/venv → 发布包/官方脚本` 探测安装（校验过摘要的发布资产优先于 `curl | bash`），详见 [INSTALL-STRATEGY.md](INSTALL-STRATEGY.md)。
+> 安装器在装任何组件之前只**检测**系统依赖，不会替你安装：git（存在即可）、Node.js ≥ 24、Python3 ≥ 3.10、npm、curl/wget 任一。任一不满足会醒目列出全部缺失项、当前版本与手动安装方式并中止。这套检测三平台共用一份实现（`scripts/installer_preflight.py`）；入口脚本只负责解析出一个满足下限的 Python 再转发。可选组件按统一优先级探测安装，顺序与落点例外只写在 [INSTALL-STRATEGY.md](INSTALL-STRATEGY.md) §2 一处。
 
 > Windows 上入口脚本用 `py -3`（不是 `python3`，该名字在干净系统上是微软商店别名桩），并强制 `-X utf8`。交互式选择器在 Windows 上同样可用（后端走 `CONOUT$` + `msvcrt`，并开启 ANSI 转义）；只有在拿不到终端时才会**显式打印默认选择清单**后继续，而不是静默采用默认值。
 

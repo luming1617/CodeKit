@@ -20,11 +20,18 @@ Channels are expressed as ``kind -> target``:
 * ``brew_cask``  target is a Homebrew cask;
 * ``apt``        target is a Debian/Ubuntu package name;
 * ``winget``     target is a winget package id (Windows only);
-* ``pipx``       target is a PyPI distribution installed with pipx;
 * ``venv``       target is a PyPI distribution installed into a private venv;
 * ``script``     target is an official installer-script URL, run with sh;
 * ``powershell`` target is a Windows-only PowerShell installer-script URL;
 * ``release``    target is resolved from ``Component.release`` (release assets).
+
+``Component.entry_kind`` decides *where* a component may land.  Empty means the
+host's own user-level directories (``~/.npm-global``, ``~/.local/bin``), which a
+path-selective sandbox may not be able to read.  Non-empty means CodeKit's own
+toolchain root owns the tool, and each value admits exactly one channel — the
+only one whose target directory is inside that root (``ENTRY_KIND_CHANNELS``).
+That makes "a root-owned tool can never be installed outside the root" a
+property of this table rather than of a call site.
 """
 
 from __future__ import annotations
@@ -56,12 +63,32 @@ CHANNEL_ORDER: tuple[str, ...] = (
     "brew_cask",
     "apt",
     "winget",
-    "pipx",
     "venv",
     "release",
     "script",
     "powershell",
 )
+
+# 由 CodeKit 自持工具链根接管的入口类型 → 该类型唯一允许的获取通道。
+# 每个通道的落点都必须在根内（``<根>/npm`` 与 ``<根>/venvs/<命令>``），否则受限宿主
+# 读不到自己会话里要启动的东西。新增一个根接管工具时只需在这里加一行并给组件写上
+# ``entry_kind``，落点约束由 ``validate_registry`` 自动生效。
+ENTRY_KIND_CHANNELS: Mapping[str, frozenset[str]] = {
+    "npm-private": frozenset({"npm"}),
+    "python-venv": frozenset({"venv"}),
+}
+
+# 落点必然在工具链根内的通道：非根接管的组件不得声明它，否则工具会静默出现在清单之外，
+# 技能侧只能靠猜路径找到它。``npm`` 不在其列——同一个通道按 ``entry_kind`` 可以落用户
+# 前缀（钉钉/飞书 CLI），也可以落私有前缀（gitnexus），落点由 entry_kind 决定。
+ROOT_ONLY_CHANNELS: frozenset[str] = frozenset({"venv"})
+
+
+def root_bound_ids(components: Optional[Sequence[Component]] = None) -> tuple[str, ...]:
+    """声明了 ``entry_kind``（即由工具链根接管）的组件 ID，按注册表顺序。"""
+    items = COMPONENTS if components is None else components
+    return tuple(item.component_id for item in items if item.entry_kind)
+
 
 # Only these npm package names may ever be installed. The allowlist exists
 # because several well-known CLI names are squatted or owned by unrelated
@@ -113,6 +140,10 @@ class Component:
     version_source: str = ""
     release: Optional[ReleaseSpec] = None
     plugin: bool = False
+    # ``entry_kind`` 决定落点：空串 = 宿主默认用户目录；非空 = CodeKit 自持工具链根，
+    # 取值必须是 ``ENTRY_KIND_CHANNELS`` 的键，它同时给出唯一允许的通道与该组件在
+    # ``toolchain.json`` 里用哪个 argv 构建器。
+    entry_kind: str = ""
 
 
 GROUPS: Dict[str, str] = {
@@ -167,6 +198,7 @@ COMPONENTS: Sequence[Component] = (
         version_args=("--version",),
         channels={"npm": "gitnexus"},
         requires=("node>=24.11.0",),
+        entry_kind="npm-private",
     ),
     Component(
         "graphify",
@@ -174,9 +206,12 @@ COMPONENTS: Sequence[Component] = (
         "intel",
         command="graphify",
         version_args=("--version",),
-        channels={"pipx": "graphifyy", "venv": "graphifyy"},
+        # 只有 venv：pipx 的 shim 落在工具链根之外，受限宿主（Codex 桌面端）读不到，
+        # 装上了也等于没装。历史上它同时声明过 pipx，那条通道正是漏进根外的入口。
+        channels={"venv": "graphifyy"},
         requires=("python>=3.10",),
         version_source="pypi:graphifyy",
+        entry_kind="python-venv",
     ),
     Component(
         "gh",
@@ -317,9 +352,35 @@ def validate_registry(
             raise ValueError(
                 f"release spec/repo mismatch: {component.component_id}"
             )
+        _validate_entry_kind(component)
 
     for key, channels in agent_channels.items():
         _validate_channels(f"agent:{key}", channels)
+
+
+def _validate_entry_kind(component: Component) -> None:
+    """落点不变量：根接管的组件只能经由根内通道获取，根外的组件拿不到根内通道。"""
+    kind = component.entry_kind
+    if not kind:
+        leaked = sorted(set(component.channels) & ROOT_ONLY_CHANNELS)
+        if leaked:
+            raise ValueError(
+                f"channel(s) {leaked} land inside the CodeKit toolchain root and "
+                f"require an entry_kind: {component.component_id}"
+            )
+        return
+    allowed = ENTRY_KIND_CHANNELS.get(kind)
+    if allowed is None:
+        raise ValueError(
+            f"unknown entry_kind {kind!r} for {component.component_id} "
+            f"(known: {sorted(ENTRY_KIND_CHANNELS)})"
+        )
+    outside = sorted(set(component.channels) - allowed)
+    if outside or not component.channels:
+        raise ValueError(
+            f"{component.component_id} owns entry_kind {kind!r}; its channels must "
+            f"be exactly {sorted(allowed)}, found {sorted(component.channels)}"
+        )
 
 
 def _validate_channels(owner: str, channels: Mapping[str, str]) -> None:

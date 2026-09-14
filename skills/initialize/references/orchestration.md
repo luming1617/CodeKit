@@ -21,12 +21,11 @@
 
 ## Phase 1 容量规划
 
-- GitNexus 由控制器同步执行（`controller.py analyze`），不占用子 Agent 槽位：先在等待窗口内运行它，或先派发两个 Sub-agent 再运行。
-- 可用并发槽位不少于 2：同时启动 `initialize-graphify`、`initialize-context-scanner`。
-- 只有 1 个可用槽位：按顺序创建两个指定名称的独立 Subagent，前一路返回后再创建下一路；不能改由主 Agent代做。
+- GitNexus 与 Graphify 都由控制器同步执行（`controller.py analyze`，随后 `controller.py graphify`），不占用子 Agent 槽位：在 Scanner 的等待窗口内按这一顺序跑完两路。
+- 只有一个必需的派发对象：`initialize-context-scanner`。宿主有 1 个及以上可用槽位即可并行推进两路控制器步骤。
 - 无法创建指定名称的 Subagent：状态为 `BLOCKED`，不得以主 Agent扫描、普通工具摘要或自然语言结果替代。
 
-不要为了凑固定 DAG 创建额外 Worker。`initialize-graphify` 与 `initialize-context-scanner` 的角色定义位于 `../agents/`，必须使用它们的名称和独立会话；不要让任何分析器与 Phase 3 的上下文写入并发。
+不要为了凑固定 DAG 创建额外 Worker。`initialize-context-scanner` 的角色定义位于 `../agents/`，必须使用它的名称和独立会话；不要让任何分析器与 Phase 3 的上下文写入并发。
 
 ## 阶段状态
 

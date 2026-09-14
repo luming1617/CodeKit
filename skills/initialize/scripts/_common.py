@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -238,6 +239,32 @@ def safe_relative(raw: str) -> PurePosixPath:
     if path.is_absolute() or ".." in path.parts or not path.parts:
         raise InitializeError(f"unsafe repository-relative path: {raw!r}")
     return path
+
+
+def graphify_ignore_digest(root: Path) -> str | None:
+    """摘要 CodeKit managed Graphify ignore block；缺失或标记损坏时返回 ``None``。
+
+    三个消费者必须算出同一个值：控制器步骤据此判断缓存是否可复用、``reconcile`` 据此
+    写 ``.codekit-state.json``、门禁据此复核 sidecar。任何一处口径不同，每次 initialize
+    都会把自己的缓存判成失效并重跑 full 抽取。
+    """
+    ignore = root / ".graphifyignore"
+    if not ignore.is_file():
+        return None
+    try:
+        text = ignore.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if text.count(GRAPHIFY_START) != 1 or text.count(GRAPHIFY_END) != 1:
+        return None
+    if text.index(GRAPHIFY_START) > text.index(GRAPHIFY_END):
+        return None
+    managed = (
+        GRAPHIFY_START
+        + text.split(GRAPHIFY_START, 1)[1].split(GRAPHIFY_END, 1)[0]
+        + GRAPHIFY_END
+    )
+    return "sha256:" + hashlib.sha256(managed.encode("utf-8")).hexdigest()
 
 
 def resolved_repository_path(root: Path, raw: str) -> Path:

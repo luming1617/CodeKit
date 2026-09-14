@@ -20,8 +20,6 @@ from _common import (
     ERROR_CODE_COLLAB_UNAVAILABLE,
     ERROR_CODE_TOOL_MISSING,
     EXPECTED_TASKS,
-    GRAPHIFY_END,
-    GRAPHIFY_START,
     IGNORE_END,
     IGNORE_START,
     INDEX_END,
@@ -40,6 +38,7 @@ from _common import (
     atomic_json,
     git_status,
     gitnexus_registry_state,
+    graphify_ignore_digest,
     load_json,
     resolve_validation_command,
     resolved_repository_path,
@@ -561,15 +560,9 @@ def validate_graphify_state(root: Path, manifest: dict) -> list[str]:
         errors.append("Graphify state sidecar schema mismatch")
     if Path(state.get("root", "")).resolve() != root or state.get("last_status") != "success":
         errors.append("Graphify state sidecar root/status mismatch")
-    ignore = root / ".graphifyignore"
-    start, end = GRAPHIFY_START, GRAPHIFY_END
-    if ignore.is_file():
-        text = ignore.read_text(encoding="utf-8")
-        if text.count(start) == 1 and text.count(end) == 1:
-            managed = start + text.split(start, 1)[1].split(end, 1)[0] + end
-            expected = "sha256:" + hashlib.sha256(managed.encode("utf-8")).hexdigest()
-            if state.get("ignore_digest") != expected:
-                errors.append("Graphify state sidecar ignore digest mismatch")
+    expected = graphify_ignore_digest(root)
+    if expected is not None and state.get("ignore_digest") != expected:
+        errors.append("Graphify state sidecar ignore digest mismatch")
     if state.get("mode") != receipt.get("mode", "default"):
         errors.append("Graphify state sidecar mode mismatch")
     if receipt.get("version") and state.get("graphify_version") != receipt.get("version"):

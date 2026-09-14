@@ -71,4 +71,4 @@ Markdown 角色文件。安装时：
 | product-doc   | product-extractor、product-writer、product-reviewer                                     |
 | release-doc   | release-dependencies、release-writer、release-critic、release-refiner、release-reviewer |
 | technical-doc | tech-context、tech-architect、tech-critic、tech-refiner、tech-reviewer                  |
-| initialize    | initialize-graphify、initialize-context-scanner（GitNexus 由控制器 `analyze` 执行）     |
+| initialize    | initialize-context-scanner（GitNexus 与 Graphify 由控制器步骤 `analyze`/`graphify` 执行） |
