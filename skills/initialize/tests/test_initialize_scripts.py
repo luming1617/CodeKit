@@ -2860,6 +2860,29 @@ class ContextContractTests(unittest.TestCase):
         self.assertIn("VALIDATION_PROGRAMS", scanner)
         self.assertIn("context-files.md", scanner)
 
+    def test_scanner_role_lists_every_gate_required_field(self):
+        """角色正文的字段清单必须与 gate 的 REQUIRED_FIELDS 逐项相等。
+
+        正文原先只以散文列举字段，漏掉 `runner`：Scanner 严格照正文写就必然缺键，
+        而 gate 对三路 Worker 使用同一份字段集合，缺任何一个键即整轮 `aborted` 并释放锁，
+        不属于可恢复的输入错误。夹具对所有 task 都硬写 `runner`，所以只有这条守卫能发现漂移。
+        """
+        text = (SKILL_DIR / "agents" / "initialize-context-scanner.md").read_text(encoding="utf-8")
+        documented: set[str] = set()
+        blocks = text.split("```")
+        for index in range(1, len(blocks), 2):
+            # ``split("```")`` keeps the info string joined to the first content line.
+            lines = blocks[index].splitlines()[1:]
+            keys = {
+                line.split(":", 1)[0].strip() for line in lines
+                if line.strip() and not line[0].isspace() and ":" in line
+            }
+            if "schema_version" in keys:
+                documented = keys
+                break
+        self.assertTrue(documented, "角色正文必须内联 Worker result 的字段清单")
+        self.assertEqual(set(validator.REQUIRED_FIELDS), documented)
+
     def test_single_string_evidence_is_accepted(self):
         context = scan_context(self.root, [
             {"purpose": "Check", "command": "python3 check.py", "evidence": "README.md"},
