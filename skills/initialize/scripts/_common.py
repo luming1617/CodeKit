@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,26 @@ from pathlib import Path, PurePosixPath
 
 class InitializeError(RuntimeError):
     """Base error shared by all initialize phases."""
+
+
+def _load_shared_runtime():
+    """按路径加载跨技能共用的工具链解析模块。
+
+    不能用普通 ``import``：本文件由 ``controller.py`` 用 ``spec_from_file_location``
+    加载，不保证 ``skills/_shared/scripts`` 在 ``sys.path`` 上。加载失败属于打包缺陷
+    （该文件与技能一同发布），不是运行期状况，所以直接抛错而不是降级。
+    """
+    path = Path(__file__).resolve().parents[2] / "_shared" / "scripts" / "codekit_runtime.py"
+    spec = importlib.util.spec_from_file_location("codekit_runtime", path)
+    if spec is None or spec.loader is None:
+        raise InitializeError(f"missing shared toolchain resolver: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+runtime = _load_shared_runtime()
 
 
 def configure_utf8_streams() -> None:
@@ -93,6 +114,11 @@ ERROR_CODE_OUT_OF_SCOPE = "out-of-scope"
 ERROR_CODE_INTERNAL = "internal-error"
 ERROR_CODE_REGISTRY_MISSING = "registry-missing"
 COMPLETE_SKIP_CODES = frozenset({ERROR_CODE_INDEX_CURRENT, ERROR_CODE_NO_CHANGE})
+# 「工具在本宿主不可用」造成的降级：未安装/读不到/跑不起来，以及缺全局注册。这是环境
+# 事实而不是运行失败——用户能做的只有重装或提权，与「是否接受 partial」无关，因此它
+# 不再要求 --allow-partial，也不再 abort 释放锁（那才会逼出反复重跑）。真实失败
+# （execution-failed、chunk-failures 等）不在此列，仍走原有的显式授权路径。
+DEGRADED_TOOL_CODES = frozenset({ERROR_CODE_TOOL_MISSING, ERROR_CODE_REGISTRY_MISSING})
 WORKER_ERROR_CODES = frozenset({
     None,
     ERROR_CODE_TOOL_MISSING,
@@ -215,6 +241,32 @@ def safe_relative(raw: str) -> PurePosixPath:
     return path
 
 
+def graphify_ignore_digest(root: Path) -> str | None:
+    """摘要 CodeKit managed Graphify ignore block；缺失或标记损坏时返回 ``None``。
+
+    三个消费者必须算出同一个值：控制器步骤据此判断缓存是否可复用、``reconcile`` 据此
+    写 ``.codekit-state.json``、门禁据此复核 sidecar。任何一处口径不同，每次 initialize
+    都会把自己的缓存判成失效并重跑 full 抽取。
+    """
+    ignore = root / ".graphifyignore"
+    if not ignore.is_file():
+        return None
+    try:
+        text = ignore.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if text.count(GRAPHIFY_START) != 1 or text.count(GRAPHIFY_END) != 1:
+        return None
+    if text.index(GRAPHIFY_START) > text.index(GRAPHIFY_END):
+        return None
+    managed = (
+        GRAPHIFY_START
+        + text.split(GRAPHIFY_START, 1)[1].split(GRAPHIFY_END, 1)[0]
+        + GRAPHIFY_END
+    )
+    return "sha256:" + hashlib.sha256(managed.encode("utf-8")).hexdigest()
+
+
 def resolved_repository_path(root: Path, raw: str) -> Path:
     relative = safe_relative(raw)
     lexical = root.joinpath(*relative.parts)
@@ -230,6 +282,86 @@ def resolved_repository_path(root: Path, raw: str) -> Path:
     return lexical
 
 
+def known_tool_dirs() -> list[Path]:
+    """CodeKit 可能放置命令入口的绝对目录，按优先级排列。
+
+    实现已收敛到跨技能共享的解析模块：安装器与 7 个技能必须看同一份候选目录，否则
+    两边的路径知识会各自漂移（历史上就漏掉了 pipx 在 Windows 的 ``~/.local/bin``）。
+    顺序是工具链根内的目录在前，``%APPDATA%\\npm`` 与系统 Python 目录等历史落点在后。
+
+    历史落点**必须保留**：正是尝试它们才把「未安装」与「已安装但读不到」区分开。
+    """
+    return runtime.toolchain_paths()
+
+
+def executable_names(program: str) -> list[str]:
+    """``program`` 在该宿主上可能出现的入口文件名，按可直接执行的程度排序。
+
+    Windows 上 npm 会同时生成无扩展名的 POSIX 脚本、``.cmd`` 与 ``.ps1``；无
+    扩展名那份是给 shell 用的，``CreateProcess`` 不能直接启动，所以 ``.exe`` /
+    ``.cmd`` / ``.bat`` 排在前面。
+    """
+    return runtime.executable_names(program)
+
+
+def declared_tool_scan(program: str) -> tuple[str | None, str]:
+    """在 CodeKit 已知安装目录里扫描 ``program``，返回 ``(路径, 状态)``。
+
+    状态取值见共享模块的四态：命中为 ``ok``；全都没命中时是 ``not-installed``，或
+    「至少一个候选被拒绝读取」时更具体的 ``not-readable``。旧实现用
+    ``Path.is_file()`` 的 ``except OSError`` 判定「被拒绝读取」，那条分支永远不可达
+    （CPython 会把 ``OSError`` 吞成 ``False``），所以第二态实际产不出来——这正是
+    诊断一直只能靠猜的原因。
+    """
+    argv, failure = runtime.scan_declared(program)
+    if argv:
+        return argv[0], runtime.OK
+    return None, failure or runtime.NOT_INSTALLED
+
+
+def declared_tool_path(program: str) -> str | None:
+    """已知安装目录里 ``program`` 的路径，找不到返回 ``None``。"""
+    path, _ = declared_tool_scan(program)
+    return path
+
+
+def tool_state(tool: dict) -> str:
+    """工具快照的实测状态；未记录状态的旧 manifest 按 ``available`` 推断。"""
+    state = tool.get("state")
+    if isinstance(state, str) and state in runtime.TOOLCHAIN_STATES:
+        return state
+    return runtime.OK if tool.get("available", True) else runtime.NOT_EXECUTABLE
+
+
+def tool_runnable(tool: dict) -> bool:
+    """manifest 里的工具快照是否真的可以执行。
+
+    「能 stat 到入口」不等于「能执行」：宿主沙箱可能拒绝读取入口或它依赖的解释
+    器，此时探测（``--version``）失败。可用性以探测结论 ``available`` 与实测的
+    ``state`` 共同为准，否则会把一次诚实跳过记成 ``execution-failed``，把「本机
+    跑不了」误报成「工具坏了」。
+    """
+    command = tool.get("command")
+    if not command or tool.get("runner") == "unresolved":
+        return False
+    if tool_state(tool) != runtime.OK:
+        return False
+    return bool(tool.get("available", True))
+
+
+def which_with_fallback(program: str) -> str | None:
+    """解析可执行程序：``python``/``py`` 这类不归 CodeKit 管的命令按四段解析。
+
+    刻意不把内置运行时算进这条回退链：仓库验证命令（``py -3 -m pytest``）依赖的是
+    **项目自己的**解释器环境，用只有标准库的内置运行时去跑会「真的失败」，把一个本
+    该跳过的验证变成假失败。内置运行时只服务于 CodeKit 自己托管的两个工具。
+
+    解析失败返回 ``None``，由调用方记为 ``skipped``——诚实跳过好过跑出假结论。
+    """
+    resolution = runtime.resolve_tool(program)
+    return resolution.argv[0] if resolution.resolved else None
+
+
 def resolve_validation_command(root: Path, command: str) -> list[str]:
     """Turn a recorded repository command into a directly executable argv.
 
@@ -237,6 +369,10 @@ def resolve_validation_command(root: Path, command: str) -> list[str]:
     treated as untrusted: shell syntax is rejected, the program must be on the
     allow list (or a repository script path), and nothing is ever run through a
     shell.  The working directory is always the frozen repository root.
+
+    ``PATH`` 之外还会查 CodeKit 已知的安装目录：宿主丢掉用户级 ``PATH`` 时，
+    ``py`` / ``python`` 这类命令会在这里被找到，从而按真实退出码判定，而不是
+    被误记成 ``skipped/tool-missing``。
     """
     if not isinstance(command, str) or not command.strip():
         raise InitializeError("repository validation command is empty")
@@ -255,7 +391,7 @@ def resolve_validation_command(root: Path, command: str) -> list[str]:
         return [str(candidate), *argv[1:]]
     if program not in VALIDATION_PROGRAMS:
         raise InitializeError(f"repository validation program is not allowed: {program}")
-    executable = shutil.which(program)
+    executable = which_with_fallback(program)
     if executable is None:
         raise ValidationProgramMissing(
             f"repository validation program is not installed: {program}"
@@ -266,7 +402,7 @@ def resolve_validation_command(root: Path, command: str) -> list[str]:
 def git_status(root: Path) -> dict[str, str]:
     completed = subprocess.run(
         ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-        cwd=root, text=True, capture_output=True, check=False,
+        cwd=root, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False,
     )
     if completed.returncode:
         raise InitializeError(completed.stderr.strip() or "git status failed")

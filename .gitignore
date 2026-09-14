@@ -6,8 +6,6 @@
 *.ipr
 *.iws
 .claude/
-.agents/
-.opencode/
 
 # Python bytecode caches (skills ship runnable test suites)
 __pycache__/

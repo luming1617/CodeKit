@@ -30,8 +30,11 @@ from _common import (
     atomic_write,
     git_status,
     gitnexus_registry_state,
+    known_tool_dirs,
     replace_managed_block,
+    runtime,
     snapshot_trees,
+    tool_runnable,
     utc_now,
     utc_run_id_timestamp,
 )
@@ -172,7 +175,7 @@ def acquire_state_lock(root: Path, run_id: str) -> tuple[Path, Path, Path, bool,
 
 
 def run(command: list[str], cwd: Path, *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False)
+    completed = subprocess.run(command, cwd=cwd, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
     if check and completed.returncode:
         message = completed.stderr.strip() or completed.stdout.strip() or "command failed"
         raise PrepareError(f"{' '.join(command)}: {message}")
@@ -343,7 +346,7 @@ def probe_graphify_ast_process_pool(graphify_path: Path, root: Path) -> bool:
             completed = subprocess.run(
                 [*interpreter, str(script)],
                 cwd=root,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 capture_output=True,
                 check=False,
                 timeout=3,
@@ -356,22 +359,153 @@ def probe_graphify_ast_process_pool(graphify_path: Path, root: Path) -> bool:
 def gitnexus_command() -> tuple[list[str], str]:
     """解析 GitNexus runner，返回 ``(argv 前缀, 类型)``。
 
-    只接受真实安装（显式覆盖或 ``PATH`` 上的 ``gitnexus``）。仓库内的
-    ``.gitnexus/run.cjs`` 是兜底 shim，在没有真实安装时按 ``gitnexus@latest``
-    走 npx/bunx/pnpm dlx：每次解析到的版本、Node 版本和依赖树都可能不同，
-    GitNexus 因而判定分析器身份变化并强制**全量重建**；那也违反「不通过
-    npx/dlx 下载」的约束。需要 shim 时用 ``CODEKIT_GITNEXUS_RUNNER`` 显式指定。
+    解析顺序：``CODEKIT_GITNEXUS_RUNNER``、``PATH`` 上的 ``gitnexus``、CodeKit
+    已知安装目录（``installed``）。仓库内的 ``.gitnexus/run.cjs`` 是兜底 shim，
+    在没有真实安装时按 ``gitnexus@latest`` 走 npx/bunx/pnpm dlx：每次解析到的
+    版本、Node 版本和依赖树都可能不同，GitNexus 因而判定分析器身份变化并强制
+    **全量重建**；那也违反「不通过 npx/dlx 下载」的约束。已知目录这一段是给
+    「宿主把用户级 ``PATH`` 丢掉」的情况兜底的：Codex 桌面端的 shell 只继承
+    机器级 ``PATH``，而安装器把 ``gitnexus`` 落在 ``%APPDATA%\\npm``。需要 shim
+    时用 ``CODEKIT_GITNEXUS_RUNNER`` 显式指定。
+    """
+    command, runner, _ = gitnexus_resolution()
+    return command, runner
+
+
+def gitnexus_resolution() -> tuple[list[str], str, str]:
+    """``gitnexus_command`` 的完整形态，额外带出实测状态。
+
+    显式 override 时不再扫描：用户给定的命令就是要用的那一条，能不能跑由后续探测判定。
     """
     override = os.environ.get("CODEKIT_GITNEXUS_RUNNER", "").strip()
     if override:
         # posix=False so a Windows ``C:\...\python.exe`` keeps its backslashes.
         parts = [part.strip('"') for part in shlex.split(override, posix=False)]
         if parts:
-            return parts, "override"
-    installed = shutil.which("gitnexus")
-    if installed:
-        return [installed], "global"
-    return [], "unresolved"
+            return parts, "override", runtime.OK
+    return resolve_installed_command("gitnexus")
+
+
+def resolve_installed_command(program: str) -> tuple[list[str], str, str]:
+    """解析工具启动命令，返回 ``(argv, 来源, 状态)``。
+
+    argv **保留全部元素**：清单里的 runner 可能是 ``[<node>, <cli.js>]`` 这样的多段命令，
+    只取第一段会把脚本参数丢掉，等于把工具启动成一个裸解释器。来源取值 ``override`` /
+    ``toolchain`` / ``path`` / ``declared`` / ``unresolved``，状态是共享模块的四态。
+
+    **清单优先于 ``PATH``**：即使会话里恰好有一个能用的旧 shim，也按安装器写出的绝对
+    argv 执行，结果才跨宿主确定。
+    """
+    resolution = runtime.resolve_tool(program)
+    if resolution.resolved:
+        return list(resolution.argv), resolution.source, runtime.OK
+    return [], resolution.source, resolution.state
+
+
+def graphify_command() -> tuple[list[str], str]:
+    """解析 Graphify runner，返回 ``(argv 前缀, 类型)``。
+
+    与 GitNexus 对称：``CODEKIT_GRAPHIFY_RUNNER`` 覆盖 → ``PATH`` → CodeKit 已知
+    安装目录。安装器在 Windows 上把命令暴露成 ``%APPDATA%\\npm\\graphify.cmd``
+    垫片（本体在私有 venv 里），两者都只在用户级 ``PATH`` 上，所以同样需要这一
+    段兜底。
+    """
+    command, runner, _ = graphify_resolution()
+    return command, runner
+
+
+def graphify_resolution() -> tuple[list[str], str, str]:
+    """``graphify_command`` 的完整形态，额外带出实测状态。"""
+    override = os.environ.get("CODEKIT_GRAPHIFY_RUNNER", "").strip()
+    if override:
+        parts = [part.strip('"') for part in shlex.split(override, posix=False)]
+        if parts:
+            return parts, "override", runtime.OK
+    return resolve_installed_command("graphify")
+
+
+def known_tool_dir_hint() -> str:
+    """已知安装目录的现状，拼进解析失败的提示里，让提示可操作。
+
+    只列真实存在的目录；宿主拒绝 ``stat`` 时跳过，提示生成同样不允许失败。
+    """
+    directories: list[str] = []
+    for path in known_tool_dirs():
+        try:
+            if path.is_dir():
+                directories.append(str(path))
+        except OSError:
+            continue
+    return "、".join(directories) if directories else "本机没有已存在的候选目录"
+
+
+def tool_scan_clause(program: str, state: str) -> str:
+    """把实测状态写成提示从句。
+
+    ``not-readable`` 与 ``not-installed`` 必须分开说：前者代表工具可能就装在那些目录
+    里、只是当前会话读不到（Codex 桌面端的沙箱会拒绝读取 ``%APPDATA%`` 下的入口），
+    此时让用户去重装是错的建议。
+    """
+    if state == runtime.NOT_READABLE:
+        return "；至少一个候选入口被宿主拒绝读取，说明它可能已安装但当前会话读不到"
+    if state == runtime.NOT_EXECUTABLE:
+        return "；候选入口可读，但本会话启动不起来（入口依赖的解释器或运行时不可达）"
+    return "；候选入口均确认不存在，判断为本机未安装"
+
+
+def escalation_hint(env_var: str) -> str:
+    """工具不可用时的统一出路：重装到 CodeKit 工具链根，或显式指定 runner。
+
+    刻意**不再建议「把目录加进 PATH」**：实测受限宿主（Codex 桌面端）的 PATH 里用户级
+    条目是全的，被拒绝的是对这些目录的文件系统访问，改 PATH 无效。真正的出路是让工具
+    落在已实测可读可执行的 CodeKit 工具链根里。
+    """
+    installer = "install.cmd install" if os.name == "nt" else "install.sh install"
+    return (
+        f"出路：用安装器重跑并勾选该组件（{installer}），它会按本会话实测可用的位置物化工具"
+        f"到 CodeKit 工具链根（{runtime.toolchain_root()}）并写出 toolchain.json；"
+        f"或用 {env_var} 显式指定当前会话真能读到且能执行的 runner。"
+    )
+
+
+def _shim_cli_entry(shim: Path) -> Path | None:
+    """从 npm/venv 生成的转发脚本里找出真正的 CLI 入口。
+
+    ``%APPDATA%\\npm\\gitnexus.cmd`` 只写了一句
+    ``node "%dp0%\\node_modules\\gitnexus\\dist\\cli\\index.js"``，包目录并不在
+    shim 的父级路径上：按文件名向上找 ``package.json`` 会一路失败，把真实安装
+    误判成「分析器身份不稳定 + 缺 embedding 栈」，进而触发全量重建与向量降级。
+    """
+    try:
+        lines = shim.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        for quoted, bare in re.findall(
+            r'"([^"]+\.(?:js|cjs|mjs))"|([^\s"]+\.(?:js|cjs|mjs))', line, re.IGNORECASE
+        ):
+            target = (quoted or bare).strip()
+            lowered = target.lower()
+            anchored = "%dp0%" in lowered or "%~dp0" in lowered
+            cleaned = target.replace("%~dp0%", "").replace("%dp0%", "").strip().strip('"')
+            # 脚本里的 ``%dp0%`` 前缀表示「与 shim 同目录」，去掉后必须按相对路径
+            # 拼接；没有该前缀的绝对路径（POSIX 生成的 shim）直接使用。
+            if anchored or not os.path.isabs(cleaned):
+                candidate = shim.parent / cleaned.lstrip("\\/")
+            else:
+                candidate = Path(cleaned)
+            if candidate.is_file():
+                return candidate.resolve()
+    return None
+
+
+def _cli_entry(path: Path) -> Path:
+    """把入口折叠成真正的 CLI 文件；不是转发脚本时等价于 ``resolve()``。"""
+    if path.suffix.lower() in {".cmd", ".bat"}:
+        target = _shim_cli_entry(path)
+        if target is not None:
+            return target
+    return path.resolve()
 
 
 def gitnexus_cli_path(command: list[str]) -> Path | None:
@@ -379,11 +513,11 @@ def gitnexus_cli_path(command: list[str]) -> Path | None:
     if not command:
         return None
     if len(command) == 1:
-        return Path(command[0]).resolve()
+        return _cli_entry(Path(command[0]))
     for item in reversed(command[1:]):
         candidate = Path(item)
         if candidate.suffix in {".js", ".cjs", ".mjs"} or candidate.is_file():
-            return candidate.resolve()
+            return _cli_entry(candidate)
     return None
 
 
@@ -473,7 +607,7 @@ def gitnexus_embedding_plan(
 
 
 def gitnexus_registration_plan(
-    registry: dict[str, object], runner: object, authorized: bool, allow_partial: bool
+    registry: dict[str, object], tool: dict[str, object], authorized: bool, allow_partial: bool
 ) -> list[str]:
     """判定 GitNexus 全局注册前提，返回 warnings；未授权且未接受降级时报错。
 
@@ -482,8 +616,11 @@ def gitnexus_registration_plan(
     解析仓库，所以注册不是可选优化：只写仓库内索引而不注册时，``status`` 一切正常，
     查询却全部报 “No indexed repositories found”。与 embedding 前提一样，该判定在
     任何写入之前完成：未获用户授权时零业务写入地失败，由主 Agent 询问后重跑。
+
+    前提只对**真能执行**的 runner 生效：入口解析到了但探测失败时（沙箱拒绝读取），
+    gitnexus 阶段会按 tool-missing 跳过，此时再要求用户授权写全局注册表只是白问。
     """
-    if registry.get("registered") or runner in {None, "unresolved"} or authorized:
+    if registry.get("registered") or not tool_runnable(tool) or authorized:
         return []
     if allow_partial:
         return [
@@ -502,7 +639,7 @@ def gitnexus_registration_plan(
 
 
 def tool_capabilities(root: Path) -> dict[str, object]:
-    command, runner = gitnexus_command()
+    command, runner, state = gitnexus_resolution()
     cli = gitnexus_cli_path(command)
     if command:
         gitnexus = probe(command, root)
@@ -511,9 +648,21 @@ def tool_capabilities(root: Path) -> dict[str, object]:
         gitnexus["cli"] = str(cli) if cli else None
         gitnexus["identity_stable"] = gitnexus_install_root(cli) is not None
         gitnexus["local_embeddings"] = gitnexus_local_embeddings(cli)
+        if not gitnexus["available"] and state == runtime.OK:
+            # 「能 stat 到入口」不等于「能执行」：沙箱可能拒绝读取入口或它依赖的
+            # 解释器。这一支仍是 tool-missing，提示要说清是跑不起来而不是没装。
+            state = runtime.NOT_EXECUTABLE
+            gitnexus["resolution_hint"] = (
+                f"已解析到 GitNexus runner（{command[0]}，来源 {runner}），但探测命令未"
+                "能执行，判断为本会话跑不起来。"
+                + escalation_hint("CODEKIT_GITNEXUS_RUNNER")
+            )
+        # 状态随快照落盘：门禁与报告引用实测态，而不是各自重新推导一遍。
+        gitnexus["state"] = state
     else:
         gitnexus = {
             "available": False,
+            "state": state,
             "runner": runner,
             "command": [],
             "cli": None,
@@ -521,14 +670,18 @@ def tool_capabilities(root: Path) -> dict[str, object]:
             "local_embeddings": False,
             "supports": {},
             "resolution_hint": (
-                "未在 PATH 上找到 gitnexus，且不会回落到 .gitnexus/run.cjs "
-                "(它按 gitnexus@latest 走 npx，会让索引身份漂移并触发全量重建)。"
-                "请把 <npm 前缀>/bin 加入 PATH（安装器的 shell 配置步骤可自动完成），"
-                "或用 CODEKIT_GITNEXUS_RUNNER 显式指定 runner。"
+                "未在 CODEKIT_GITNEXUS_RUNNER、toolchain.json、PATH 或 CodeKit 已知安装"
+                "目录中找到 gitnexus"
+                + tool_scan_clause("gitnexus", state)
+                + "，且不会回落到 .gitnexus/run.cjs (它按 gitnexus@latest 走 npx，"
+                "会让索引身份漂移并触发全量重建)。已知安装目录："
+                + known_tool_dir_hint() + "。"
+                + escalation_hint("CODEKIT_GITNEXUS_RUNNER")
             ),
         }
 
-    graphify_path = shutil.which("graphify")
+    graphify_command_argv, graphify_runner, graphify_state = graphify_resolution()
+    graphify_path = graphify_command_argv[0] if graphify_command_argv else None
     if graphify_path:
         version = run([graphify_path, "--version"], root, check=False)
         help_result = run([graphify_path, "--help"], root, check=False)
@@ -537,6 +690,8 @@ def tool_capabilities(root: Path) -> dict[str, object]:
         graphify = {
             "available": version.returncode == 0 or help_result.returncode == 0,
             "runner": graphify_path,
+            "runner_type": graphify_runner,
+            "command": list(graphify_command_argv),
             "version": (version.stdout or version.stderr).strip().splitlines()[:1],
             "supports": {
                 "update": "update" in help_text,
@@ -550,8 +705,31 @@ def tool_capabilities(root: Path) -> dict[str, object]:
                 "ast_process_pool": probe_graphify_ast_process_pool(Path(graphify_path), root),
             },
         }
+        if not graphify["available"] and graphify_state == runtime.OK:
+            graphify_state = runtime.NOT_EXECUTABLE
+            graphify["resolution_hint"] = (
+                f"已解析到 Graphify runner（{graphify_path}，来源 {graphify_runner}），"
+                "但探测命令未能执行，判断为本会话跑不起来。"
+                + escalation_hint("CODEKIT_GRAPHIFY_RUNNER")
+            )
+        graphify["state"] = graphify_state
     else:
-        graphify = {"available": False, "runner": None, "version": [], "supports": {}}
+        graphify = {
+            "available": False,
+            "state": graphify_state,
+            "runner": None,
+            "runner_type": graphify_runner,
+            "command": [],
+            "version": [],
+            "supports": {},
+            "resolution_hint": (
+                "未在 CODEKIT_GRAPHIFY_RUNNER、toolchain.json、PATH 或 CodeKit 已知安装"
+                "目录中找到 graphify"
+                + tool_scan_clause("graphify", graphify_state)
+                + "。已知安装目录：" + known_tool_dir_hint() + "。"
+                + escalation_hint("CODEKIT_GRAPHIFY_RUNNER")
+            ),
+        }
     return {"gitnexus": gitnexus, "graphify": graphify}
 
 
@@ -663,6 +841,11 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
     parser.add_argument("--commit", action="store_true")
     parser.add_argument("--allow-global-writes", action="store_true")
     parser.add_argument(
+        "--strict-tools",
+        action="store_true",
+        help="gate a tool that is unavailable instead of degrading to partial",
+    )
+    parser.add_argument(
         "--no-git-hooks",
         action="store_true",
         help="skip `graphify hook install` in this repository (git hooks are on by default)",
@@ -706,23 +889,30 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
     }
     head_result = run(["git", "rev-parse", "--verify", "HEAD"], root, check=False)
     tools = tool_capabilities(root)
-    # 索引模式与 embedding 前提在任何写入之前判定：不满足时零业务写入地失败。
+    gitnexus_tool = tools.get("gitnexus")
+    gitnexus_tool = gitnexus_tool if isinstance(gitnexus_tool, dict) else {}
+    # 索引模式始终按仓库内既有索引读取；但两个「前提」只对真能执行的 runner 生效，
+    # 否则会拿一次无意义的授权去换一个跑不起来的工具。
     index_modes = gitnexus_index_modes(root)
-    embedding_mode, embedding_warnings = gitnexus_embedding_plan(
-        index_modes,
-        bool(tools.get("gitnexus", {}).get("local_embeddings")),
-        args.embeddings,
-        args.allow_global_writes,
-    )
-    # 注册前提与 embedding 前提同样在任何写入之前判定：查询类命令与 MCP 图查询只
-    # 从全局 registry 解析仓库，缺注册时索引可用但查不到，必须由用户明确取舍。
     registry = gitnexus_registry_state(root)
-    registry_warnings = gitnexus_registration_plan(
-        registry,
-        tools.get("gitnexus", {}).get("runner"),
-        args.allow_global_writes,
-        args.allow_partial,
-    )
+    if tool_runnable(gitnexus_tool):
+        embedding_mode, embedding_warnings = gitnexus_embedding_plan(
+            index_modes,
+            bool(gitnexus_tool.get("local_embeddings")),
+            args.embeddings,
+            args.allow_global_writes,
+        )
+        # 注册前提与 embedding 前提同样在任何写入之前判定：查询类命令与 MCP 图查询
+        # 只从全局 registry 解析仓库，缺注册时索引可用但查不到，必须由用户明确取舍。
+        registry_warnings = gitnexus_registration_plan(
+            registry,
+            gitnexus_tool,
+            args.allow_global_writes,
+            args.allow_partial,
+        )
+    else:
+        embedding_mode, embedding_warnings = "preserve", []
+        registry_warnings = []
     state_root, lock_path, run_dir, state_is_temporary, state_warnings, descriptor = acquire_state_lock(root, run_id)
     manifest_path = run_dir / "run-manifest.json"
     manifest: dict[str, object] = {
@@ -745,6 +935,7 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
             "commit": args.commit,
             "allow_global_writes": args.allow_global_writes,
             "graph_git_hooks": not args.no_git_hooks,
+            "strict_tools": args.strict_tools,
         },
         "baseline_status": baseline_status,
         "baseline_files": baseline_files,

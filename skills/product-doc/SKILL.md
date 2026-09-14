@@ -52,7 +52,7 @@ flowchart LR
 
 ## 路径解析约定
 
-> 本文档中的 `SKILL_DIR` / `SKILLS_ROOT` 解析方式、派发时必须显式传入的路径清单，以及“Skill 之间不得用相对路径互相引用文件”的纪律，统一见 `$SKILLS_ROOT/_shared/prompts/path-convention.md`；下面是本 Skill 的特有补充。
+> 本文档中的 `SKILL_DIR` / `SKILLS_ROOT` 解析方式、`<PYTHON>` 启动器按宿主的解析规则、派发时必须显式传入的路径清单，以及“Skill 之间不得用相对路径互相引用文件”的纪律，统一见 `$SKILLS_ROOT/_shared/prompts/path-convention.md`；下面是本 Skill 的特有补充。
 
 **`SKILL_DIR` = 本文档所在目录的绝对路径**（插件安装时为 `<plugin-cache>/skills/product-doc`）用于定位需要读取的 `references/` 资源文件、`agents/` 角色规范源文件与 `scripts/` 门禁脚本；在命令行、Agent 提示或任何外部进程中引用这些路径时统一使用 `$SKILL_DIR`，并在调用前解析为绝对路径，不要假设当前目录、当前插件目录或仓库根目录就是 Skill 目录。正文内联的资源描述（例如 `references/check-standard.md`）按“相对 `SKILL_DIR`”理解，由主 Agent 读取时解析。
 
@@ -66,19 +66,19 @@ flowchart LR
 | `$SKILL_DIR/scripts/review_state.py` | 维护 `<feature-directory>/prd-review.json` 台账：轮次、视角路由、稿件指纹、Finding 闭环与交付门禁 | 初稿落盘后 `init`；每份报告 `record`；每条意见 `close`；收齐视角后 `advance`；交付前 `verify` |
 
 ```bash
-python3 "$SKILL_DIR/scripts/validate_prd.py" <feature-directory>/product-doc.md
-python3 "$SKILL_DIR/scripts/review_state.py" verify --state <feature-directory>/prd-review.json
+<PYTHON> "$SKILL_DIR/scripts/validate_prd.py" <feature-directory>/product-doc.md
+<PYTHON> "$SKILL_DIR/scripts/review_state.py" verify --state <feature-directory>/prd-review.json
 ```
 
 `record` 或 `verify` 返回非 0（输出以 `BLOCKED:` 或 `INVALID:` 开头）时不得进入交付，也不得把 PRD 自检结论写为“已确认”。台账文件固定命名为 `prd-review.json`，与 PRD 同目录，供人工复核与下游 Skill 读取；上一版正文快照固定写入同目录 `history/product-doc-v<版本>.md`。
 
 派发 Sub-agent 时，必须在输入中显式给出：`SKILL_DIR` 的绝对路径、本次需求的工作目录（`<feature-directory>`，新需求为 `docs/YYYY-MM-DD-<feature-name>/`）的绝对路径与其中的固定文件名，以及要读取的角色文件名；不得让 Sub-agent 自行猜测资源文件或输入资料的位置。
 
-## Subagent 强制调用规则（Claude Code / Codex / OpenCode）
+## Subagent 强制调用规则（Claude Code / Codex / OpenCode / Qoder / Qoder CN）
 
 `product-extractor`、`product-writer` 和按规模路由的 `product-reviewer` 都是硬性阶段门禁，不是可选建议。进入对应阶段前，主 Agent 必须创建指定名称的独立 Sub-agent，并记录调用名称、输入快照、独立会话标识和返回状态；主 Agent 自己完成该阶段、普通串行自检或只写“建议调用”均不合规。无法创建指定 Sub-agent 时，阶段状态必须为 `BLOCKED`，不得伪造提取、成稿或评审结果。**该门禁只约束主 Agent（Orchestrator）：被派发的角色 Sub-agent 一律不再派发下一级 Sub-agent，也绝不因自身缺少派发能力而返回 `BLOCKED`；它只需按自己的角色契约完成本阶段并返回结构化结果。**
 
-按宿主派发的方式（Claude Code / Codex / OpenCode 的角色标识与语法差异、“不得把派发指令注入子代理”的纪律、以及 Skill 在各宿主下的调用名）见 `$SKILLS_ROOT/_shared/prompts/subagent-mandate.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。进入任何派发阶段前必须读取该文件；角色由 `manage-global-agents.py`（仓库安装脚本）安装为**全局裸名**，不存在 `@agent-<plugin>:<name>` 这类插件作用域角色名。
+按宿主派发的方式（Claude Code / Codex / OpenCode / Qoder / Qoder CN 的角色标识与语法差异、“不得把派发指令注入子代理”的纪律、以及 Skill 在各宿主下的调用名）见 `$SKILLS_ROOT/_shared/prompts/subagent-mandate.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。进入任何派发阶段前必须读取该文件；角色由 `manage-global-agents.py`（仓库安装脚本）安装为**全局裸名**，不存在 `@agent-<plugin>:<name>` 这类插件作用域角色名。
 
 开始执行时声明：**“使用 product-doc skill，根据产品说明资料生成或变更产品需求说明书。”** 并说明当前是新需求还是需求变更模式。
 
@@ -363,8 +363,8 @@ flowchart TB
 交付前必须依次跑完两个门禁（任一非 0 都只能交付阻塞报告，不得声称已确认）：
 
 ```bash
-python3 "$SKILL_DIR/scripts/validate_prd.py" <feature-directory>/product-doc.md
-python3 "$SKILL_DIR/scripts/review_state.py" verify --state <feature-directory>/prd-review.json
+<PYTHON> "$SKILL_DIR/scripts/validate_prd.py" <feature-directory>/product-doc.md
+<PYTHON> "$SKILL_DIR/scripts/review_state.py" verify --state <feature-directory>/prd-review.json
 ```
 
 确认无法闭环而必须交付阻塞报告时，改用 `verify --state ... --allow-blocked`：它的退出码 0 只表示“阻塞台账完整、可以归档交付”，不表示需求已确认。

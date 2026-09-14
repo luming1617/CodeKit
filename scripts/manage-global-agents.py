@@ -8,7 +8,6 @@ import json
 import os
 import shutil
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Optional
@@ -19,11 +18,15 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_agents as agents  # noqa: E402
+import installer_config as config  # noqa: E402
 import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 
 
 MANAGED_MARKER = "managed-by: codekit"
+# Codex 的角色是生成的 TOML，没有 frontmatter，归属只能声明在文件开头的注释里；
+# 这份头部注释由 codex_toml 写出、由 is_managed_content 读回，必须同源。
+MANAGED_OWNER_COMMENT = "# Managed by CodeKit"
 # 平台键与全局 agent 目录的唯一来源：installer_agents 负责目录布局，
 # installer_qoder 负责两个 Qoder 发行版的共享配置根。
 TOOLS = ("claude", "opencode", "codex", *qoder.PLATFORMS)
@@ -97,6 +100,35 @@ def agent_files(source: Path) -> list[Path]:
     )
 
 
+def is_managed_content(text: str) -> bool:
+    """判断一份内容是否声明了 CodeKit 归属：只看文件头部的归属区。
+
+    Markdown 认 frontmatter 里的 ``managed-by`` 键；Codex 的角色是生成的 TOML，没有
+    frontmatter，认首个键赋值之前那段头部注释。两种判据都只在头部生效，绝不按整文
+    子串包含判定：角色正文会被原样嵌进 TOML 的 developer_instructions，正文里提过一
+    次标记就会把别人的文件认成 CodeKit 自己写的，卸载时直接误删。
+    """
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        closing = next(
+            (index for index in range(1, len(lines)) if lines[index].strip() == "---"),
+            None,
+        )
+        if closing is None:
+            return False
+        for line in lines[1:closing]:
+            key, _, value = line.partition(":")
+            if key.strip() == "managed-by":
+                return value.strip().strip("'\"") == "codekit"
+        return False
+    header: list[str] = []
+    for line in lines:
+        if line.strip() and not line.lstrip().startswith("#"):
+            break
+        header.append(line)
+    return MANAGED_OWNER_COMMENT in "\n".join(header)
+
+
 def parse_agent(path: Path) -> tuple[str, str, str]:
     """解析 agent Markdown 的 frontmatter，并校验名称、描述和 CodeKit 标记。"""
     text = path.read_text(encoding="utf-8")
@@ -117,10 +149,8 @@ def parse_agent(path: Path) -> tuple[str, str, str]:
 
     name = metadata.get("name", "")
     description = metadata.get("description", "")
-    # Compare the frontmatter key, not the whole text: a role that merely mentions the
-    # marker in prose must not be adopted (and later deleted) as a CodeKit-managed file.
-    if not name or not description or metadata.get("managed-by") != "codekit":
-        raise ValueError(f"name, description or 'managed-by: codekit' key missing: {path}")
+    if not name or not description or not is_managed_content(text):
+        raise ValueError(f"name, description or {MANAGED_MARKER!r} key missing: {path}")
     body = "\n".join(lines[end + 1:]).strip() + "\n"
     return name, description, body
 
@@ -141,27 +171,12 @@ def collect_agents(source: Path) -> list[tuple[Path, str, str, str]]:
     return collected
 
 
-def atomic_write(path: Path, content: str) -> bool:
-    """仅在内容变化时通过临时文件原子写入目标，避免留下半文件。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    old = path.read_text(encoding="utf-8") if path.exists() else None
-    if old == content:
-        return False
-    with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=path.parent, delete=False
-    ) as handle:
-        handle.write(content)
-        temporary = Path(handle.name)
-    os.replace(temporary, path)
-    return True
-
-
 def backup_if_needed(path: Path, backup_root: Path) -> None:
     """覆盖非 CodeKit 管理的同名 agent 前先备份，已管理文件则直接允许刷新。"""
     if not path.exists():
         return
     existing = path.read_text(encoding="utf-8", errors="replace")
-    if MANAGED_MARKER in existing or "# Managed by CodeKit" in existing:
+    if is_managed_content(existing):
         return
     target = backup_root / path.name
     if target.exists():
@@ -176,7 +191,7 @@ def codex_toml(name: str, description: str, body: str) -> str:
     """把 canonical Markdown agent 转换成 Codex 使用的 TOML 内容。"""
     # JSON string escaping is also valid TOML basic-string escaping.
     return (
-        "# Managed by CodeKit; generated from the canonical Markdown agent.\n"
+        f"{MANAGED_OWNER_COMMENT}; generated from the canonical Markdown agent.\n"
         f"name = {json.dumps(name, ensure_ascii=False)}\n"
         f"description = {json.dumps(description, ensure_ascii=False)}\n"
         f"developer_instructions = {json.dumps(body, ensure_ascii=False)}\n"
@@ -234,6 +249,11 @@ def destinations(
     }
 
 
+def agent_suffix(tool: str) -> str:
+    """宿主使用的角色文件后缀：Codex 用生成的 TOML，其余沿用 canonical Markdown。"""
+    return ".toml" if tool == "codex" else ".md"
+
+
 def install(
     source: Path,
     home: Path,
@@ -258,35 +278,69 @@ def install(
         markdown = with_output_language(source_file.read_text(encoding="utf-8"), clause)
         body = with_output_language(body, clause)
         for tool in tools:
+            destination = target_dirs[tool] / f"{name}{agent_suffix(tool)}"
             if tool == "codex":
-                destination = target_dirs[tool] / f"{name}.toml"
                 content = codex_toml(name, description, body)
             elif tool == "opencode":
-                destination = target_dirs[tool] / f"{name}.md"
                 content = opencode_markdown(markdown)
             else:
-                destination = target_dirs[tool] / f"{name}.md"
                 content = markdown
             backup_if_needed(destination, backup_root / tool)
-            if atomic_write(destination, content):
+            if config.atomic_write(destination, content):
                 changed += 1
 
     print(
         f"installed {len(parsed)} CodeKit subagents for {', '.join(tools)} "
         f"({changed} files changed)"
     )
+    pruned = prune_removed_agents(parsed, home, tools, config_root)
+    for path in pruned:
+        print(f"removed retired CodeKit subagent: {path}")
     return 0
 
 
+def prune_removed_agents(
+    parsed: list[tuple[Path, str, str, str]],
+    home: Path,
+    tools: tuple[str, ...] = TOOLS,
+    config_root: Optional[Path] = None,
+) -> list[Path]:
+    """删除源里已不存在、但曾被 CodeKit 装过的 agent 文件。
+
+    角色下线不会自己从全局目录消失：宿主仍能派发一个 Skill 已经不再编排的角色，而它的
+    正文还在指示它执行本应由控制器执行的命令。只碰带 CodeKit 管理标记的文件，且只碰
+    本次安装覆盖的工具；删除失败只报告不中断——安装本身已经成功。
+    """
+    expected = {
+        path
+        for _, name, _, _ in parsed
+        for path in (
+            destinations(home, tools, config_root)[tool] / f"{name}{agent_suffix(tool)}"
+            for tool in tools
+        )
+    }
+    removed: list[Path] = []
+    for path in _managed_files(home, tools, config_root):
+        if path in expected:
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            print(f"could not remove retired managed agent: {path}: {exc}", file=sys.stderr)
+            continue
+        removed.append(path)
+    return removed
+
+
 def _is_managed(path: Path) -> bool:
-    """判断文件是否包含 CodeKit 管理标记，防止卸载误删用户文件。"""
+    """读取文件并判断其是否由 CodeKit 管理，防止卸载误删用户文件。"""
     if not path.is_file():
         return False
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
-    return MANAGED_MARKER in text or "# Managed by CodeKit" in text
+    return is_managed_content(text)
 
 
 def _managed_files(
@@ -297,8 +351,7 @@ def _managed_files(
     """收集指定工具布局中所有由 CodeKit 管理的 agent 文件。"""
     target_dirs = destinations(home, tools, config_root)
     layouts = tuple(
-        (target_dirs[tool], "*.toml" if tool == "codex" else "*.md")
-        for tool in tools
+        (target_dirs[tool], f"*{agent_suffix(tool)}") for tool in tools
     )
     return sorted(
         path
@@ -324,8 +377,9 @@ def status(
             for _, name, _, _ in parsed:
                 for tool in tools:
                     expected += 1
-                    suffix = ".toml" if tool == "codex" else ".md"
-                    present += int(_is_managed(target_dirs[tool] / f"{name}{suffix}"))
+                    present += int(
+                        _is_managed(target_dirs[tool] / f"{name}{agent_suffix(tool)}")
+                    )
             print("up_to_date" if present == expected else "installed" if present else "not_installed")
             return 0
 
@@ -344,7 +398,7 @@ def uninstall(
         try:
             path.unlink()
         except OSError as exc:
-            print(f"could not remove managed agent: {path}: {exc}", file=os.sys.stderr)
+            print(f"could not remove managed agent: {path}: {exc}", file=sys.stderr)
             return 1
         removed += 1
     print(f"removed {removed} CodeKit global subagent file(s) for {', '.join(tools)}")

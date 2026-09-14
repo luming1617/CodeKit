@@ -106,13 +106,13 @@ prd_appendix_markdown: <可直接追加到 PRD「独立评审意见」章节的�
 主控必须把每个 Reviewer 的输出规范化为 JSON 后写入 `<feature-directory>/prd-review.json`，并通过台账脚本推进状态，而不是凭记忆判断轮次：
 
 ```bash
-python3 "$SKILL_DIR/scripts/review_state.py" init --state <feature-directory>/prd-review.json \
+<PYTHON> "$SKILL_DIR/scripts/review_state.py" init --state <feature-directory>/prd-review.json \
   --prd <feature-directory>/product-doc.md --mode new|change --scale S|M|L --input <source-file>...
-python3 "$SKILL_DIR/scripts/review_state.py" record --state <feature-directory>/prd-review.json \
+<PYTHON> "$SKILL_DIR/scripts/review_state.py" record --state <feature-directory>/prd-review.json \
   --report <normalized-report.json>
-python3 "$SKILL_DIR/scripts/review_state.py" close --state <feature-directory>/prd-review.json \
+<PYTHON> "$SKILL_DIR/scripts/review_state.py" close --state <feature-directory>/prd-review.json \
   --finding PR-001 --resolution fixed|deferred|rejected --evidence <说明> [--q-ref Q-001]
-python3 "$SKILL_DIR/scripts/review_state.py" verify --state <feature-directory>/prd-review.json
+<PYTHON> "$SKILL_DIR/scripts/review_state.py" verify --state <feature-directory>/prd-review.json
 ```
 
 `verify` 未通过（退出码非 0）时不得进入交付，不得把 PRD 自检结论写为"已确认"。

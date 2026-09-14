@@ -96,7 +96,7 @@ task_dag:
 **机械校验（控制器 P1-1）：**计划确认前必须执行以下命令；校验失败时不得冻结 `plan_version`：
 
 ```bash
-python3 "$SKILL_DIR/scripts/code_impl_controller.py" validate-contract \
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" validate-contract \
   --kind task-dag /path/to/task-dag.json
 ```
 
@@ -302,7 +302,7 @@ code_review_handoff:
 **机械校验（控制器 P1-1）：**调用 `codekit:code-review` 前必须执行以下命令；校验失败时不得发出 Handoff：
 
 ```bash
-python3 "$SKILL_DIR/scripts/code_impl_controller.py" validate-contract \
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" validate-contract \
   --kind handoff /path/to/handoff.json
 ```
 

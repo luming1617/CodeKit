@@ -30,6 +30,7 @@ from _common import (
     gitnexus_registry_state,
     load_json,
     snapshot_trees,
+    tool_runnable,
     utc_now,
 )
 
@@ -112,7 +113,7 @@ def invoke(skill_dir: Path, root: Path, command: list[str], *, authorized: bool)
     if authorized:
         argv.append("--use-global-registry")
     argv += ["--", *command]
-    return subprocess.run(argv, text=True, capture_output=True, check=False)
+    return subprocess.run(argv, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
 
 
 def register_index(
@@ -272,7 +273,10 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
             }, ensure_ascii=False, indent=2))
         return 0
 
-    if not command or tool.get("runner") == "unresolved":
+    if not tool_runnable(tool):
+        # 「入口解析到了」不等于「能执行」：沙箱拒绝读取入口或它依赖的解释器时，
+        # 探测（``--version``）已经失败。这是本机跑不了，不是工具坏了，按
+        # tool-missing 诚实跳过，让门禁走 partial 而不是把 run 拖进 execution-failed。
         hint = tool.get("resolution_hint")
         warnings = [hint] if isinstance(hint, str) and hint else []
         return publish(

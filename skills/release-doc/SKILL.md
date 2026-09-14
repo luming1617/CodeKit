@@ -25,11 +25,11 @@ argument-hint: '<feature-directory>'
 
 派发 Sub-agent 时，必须在输入中显式给出：`SKILL_DIR` 的绝对路径、`<feature-directory>` 的绝对路径与其中的固定文件名（输入 `product-doc.md`、`technical-doc.md`，输出 `release-doc.md`），以及要读取的角色文件名；不得让 Sub-agent 自行猜测资源文件或输入文档的位置。
 
-## Subagent 强制调用规则（Claude Code / Codex / OpenCode）
+## Subagent 强制调用规则（Claude Code / Codex / OpenCode / Qoder / Qoder CN）
 
 五个发布角色都是硬性阶段门禁，不是可选建议。进入对应阶段前，主控 Agent 必须创建指定名称的独立 Sub-agent，并记录调用名称、输入快照、独立会话标识和返回状态；主控 Agent 自己完成该阶段、普通串行自检或只写“建议调用”均不合规。无法创建指定 Sub-agent 时，阶段状态必须为 `BLOCKED`，不得伪造依赖解析、方案、故障审查、修订或独立评审结果。**该门禁只约束主 Agent（Orchestrator）：被派发的角色 Sub-agent 一律不再派发下一级 Sub-agent，也绝不因自身缺少派发能力而返回 `BLOCKED`；它只需按自己的角色契约完成本阶段并返回结构化结果。**
 
-按宿主派发的方式（Claude Code / Codex / OpenCode 的角色标识与语法差异、“不得把派发指令注入子代理”的纪律、以及 Skill 在各宿主下的调用名）见 `$SKILLS_ROOT/_shared/prompts/subagent-mandate.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。进入任何派发阶段前必须读取该文件；角色由 `manage-global-agents.py`（仓库安装脚本）安装为**全局裸名**，不存在 `@agent-<plugin>:<name>` 这类插件作用域角色名。
+按宿主派发的方式（Claude Code / Codex / OpenCode / Qoder / Qoder CN 的角色标识与语法差异、“不得把派发指令注入子代理”的纪律、以及 Skill 在各宿主下的调用名）见 `$SKILLS_ROOT/_shared/prompts/subagent-mandate.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。进入任何派发阶段前必须读取该文件；角色由 `manage-global-agents.py`（仓库安装脚本）安装为**全局裸名**，不存在 `@agent-<plugin>:<name>` 这类插件作用域角色名。
 
 ## Agent 架构与职责
 

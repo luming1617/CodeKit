@@ -89,7 +89,9 @@ def _git(root: Path, *args: str, binary: bool = False) -> str | bytes:
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=not binary,
+            # encoding 只能在文本模式下传：带上它会强制开启文本模式，二进制调用
+            # （``binary=True``）会因此拿到 str 而不是 bytes，把 diff 字节流改坏。
+            **({"text": True, "encoding": "utf-8", "errors": "replace"} if not binary else {"text": False}),
         )
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr if exc.stderr is not None else b""

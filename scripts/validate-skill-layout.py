@@ -15,6 +15,8 @@ SKILLS_DIR = Path(__file__).resolve().parents[1] / "skills"
 INTERFACE_FIELDS = ("display_name", "short_description", "default_prompt")
 CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 SCRIPT_REF = re.compile(r"scripts/([A-Za-z0-9_.-]+\.py)")
+SHARED_SCRIPT_REF = re.compile(r"_shared/scripts/([A-Za-z0-9_.-]+\.py)")
+SHARED_SCRIPT_PREFIX = "_shared/scripts/"
 REFERENCE_REF = re.compile(r"(?:SKILL_DIR`?/)?references/([A-Za-z0-9_./-]+\.md)")
 SHARED_REF = re.compile(r"_shared/prompts/([A-Za-z0-9_.-]+\.md)")
 MARKDOWN_LINK = re.compile(r"\]\(([^)\s]+)\)")
@@ -23,6 +25,10 @@ AGENT_KEYS = ("name", "description", "mode", "tools")
 # Artifacts only a single skill writes; any other skill mentioning them is referencing
 # a file that never appears in its own run.
 OWNED_ARTIFACTS = {"run-manifest.json": "initialize"}
+# On Windows `python3` is the Microsoft Store alias stub: `which` finds it, but running
+# it prints nothing and exits non-zero, so a skill that hardcodes it reads as "Python is
+# missing" and blocks the phase. Skills must use the <PYTHON> placeholder instead.
+PYTHON3_COMMAND = re.compile(r"(?:^|\s)(?:\$ )?python3(?=[ \t]+[\"'<$])")
 
 
 def frontmatter(path: Path) -> dict[str, str]:
@@ -116,10 +122,17 @@ def check_dangling_references(skill: Path, problems: list[str]) -> None:
         problems.append(f"{skill.name}: cannot read SKILL.md: {exc}")
         return
 
-    for script in sorted(set(SCRIPT_REF.findall(text))):
+    for script in sorted(set(SCRIPT_REF.findall(text.replace(SHARED_SCRIPT_PREFIX, "#")))):
         if not (skill / "scripts" / script).is_file():
             problems.append(
                 f"{skill.name}: SKILL.md calls scripts/{script}, which this skill does not ship"
+            )
+
+    for script in sorted(set(SHARED_SCRIPT_REF.findall(text))):
+        if not (skill.parent / "_shared" / "scripts" / script).is_file():
+            problems.append(
+                f"{skill.name}: SKILL.md calls _shared/scripts/{script}, which the "
+                "skills tree does not ship"
             )
 
     for artifact, owner in sorted(OWNED_ARTIFACTS.items()):
@@ -147,6 +160,12 @@ def check_assets(skill: Path, problems: list[str]) -> None:
             continue
         text = source.read_text(encoding="utf-8")
         where = source.relative_to(skill.parent).as_posix()
+        if PYTHON3_COMMAND.search(text):
+            problems.append(
+                f"{where}: hardcodes the python3 launcher in a command; call scripts via the "
+                "<PYTHON> placeholder resolved per host "
+                "(see skills/_shared/prompts/path-convention.md)"
+            )
         for name in sorted(set(REFERENCE_REF.findall(text))):
             if not (skill / "references" / name).is_file():
                 problems.append(f"{where}: references/{name} does not exist")
@@ -165,6 +184,25 @@ def check_assets(skill: Path, problems: list[str]) -> None:
                 continue
             if not target.exists():
                 problems.append(f"{where}: link '{link}' does not resolve to a file")
+
+
+def check_python_launcher(skill: Path, problems: list[str]) -> None:
+    """A skill that ships gate scripts must resolve <PYTHON>, not assume a host."""
+    if not any((skill / "scripts").glob("*.py")):
+        return
+    try:
+        text = (skill / "SKILL.md").read_text(encoding="utf-8")
+    except OSError:
+        return
+    if "<PYTHON>" not in text:
+        problems.append(
+            f"{skill.name}: SKILL.md must call its scripts through the <PYTHON> placeholder"
+        )
+    if "path-convention.md" not in text:
+        problems.append(
+            f"{skill.name}: SKILL.md must reference _shared/prompts/path-convention.md, "
+            "the single source that resolves <PYTHON> per host"
+        )
 
 
 def check_agents(skills: list[Path], problems: list[str]) -> None:
@@ -210,6 +248,7 @@ def main() -> int:
         check_skill(skill, problems)
         check_dangling_references(skill, problems)
         check_assets(skill, problems)
+        check_python_launcher(skill, problems)
     check_agents(skills, problems)
     if problems:
         for problem in problems:

@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Structured configuration helpers used by the CodeKit installer.
 
-The shell installer still owns platform/package-manager commands, while this
-module owns data parsing and file updates.  Every write is performed through
-an atomic replacement so a failed install does not leave a partially-written
-configuration file behind.
+The installer owns platform/package-manager commands, while this module owns data
+parsing and file updates.  Every write is performed through an atomic replacement
+so a failed install does not leave a partially-written configuration file behind.
+
+This is a library: ``installer.py`` / ``uninstaller.py`` / ``installer_state.py``
+import it and nothing runs this file as a program.
 """
 
 from __future__ import annotations
 
-import argparse
 import importlib.util
 import json
 import os
@@ -26,7 +27,6 @@ VERSION_PATTERN = re.compile(r"(?<!\d)(\d+)(?:\.(\d+)){1,3}(?!\d)")
 SEMVER_PATTERN = re.compile(
     r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$"
 )
-MCP_SECTION_PATTERN = re.compile(r"^\[mcp_servers\.([^\]]+)\]\s*$")
 
 # 直连 registry.npmjs.org 在国内网络下常超时。NPM_REGISTRY 既由 set_npm 写入
 # npm_config_registry（本会话所有 npm/npx 子进程生效），也用作版本探测 URL；
@@ -60,21 +60,55 @@ REMOTE_FETCH_TIMEOUT = 20
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
+# 系统 Python 下限：安装器自身的代码要求它，且**每次 install/uninstall 运行都在用**——
+# 首次由它写下内置运行时，之后组件侧就与它无关（graphify 的 venv 由内置运行时创建）。
+# 入口脚本（install.sh / install.ps1）用解释器自检同一件事，这里的常量是唯一声明。
+# 不要改成优先/回退用工具链根里的内置运行时来运行安装器：运行时正是安装器要修复的对象，
+# 自引用会让它一旦损坏就再也修不回来。
+MINIMUM_PYTHON = (3, 10)
+MINIMUM_PYTHON_TEXT = ".".join(str(part) for part in MINIMUM_PYTHON)
+
+# 插件身份：marketplace 名与插件名。安装、状态检测、卸载与 manifest 校验共用这一份——
+# 此前每个模块各抄一遍，还用 CODEX_/CLAUDE_ 前缀把同一个值写成两个名字。
+PLUGIN_NAME = "codekit"
+MARKETPLACE_NAME = "co-daming"
+
 # 安装器运行期依赖的辅助模块清单（含 installer.py，供卸载器复用）。
 # installer.py / uninstaller.py 在导入这些模块之前先调用 require_helper_files()：
 # 否则残缺检出会在模块加载期抛出原始 ModuleNotFoundError，而不是受控的单行错误。
+# 最后一项在技能侧：Codex 的 TOML 读写与探测只有那一份实现，安装器按路径加载它
+# （见 installer_codex.py），因此它同样是安装器的硬依赖。
 REQUIRED_HELPER_FILES = (
     "component-registry.py",
     "component-selector.py",
     "installer.py",
     "installer_agents.py",
+    "installer_codex.py",
     "installer_config.py",
     "installer_platform.py",
+    "installer_preflight.py",
     "installer_qoder.py",
     "installer_sources.py",
     "installer_state.py",
+    "installer_toolchain.py",
     "manage-global-agents.py",
+    "../skills/_shared/scripts/probe-collab.py",
 )
+
+
+def require_python(version: Optional[tuple[int, ...]] = None) -> None:
+    """校验系统 Python 下限，不满足时抛出带指引的 ValueError。
+
+    入口脚本自己也会探一次（那是唯一无法委托给被启动程序的检查）；这里兜住直接
+    调用 ``installer.py`` / ``uninstaller.py`` 的路径。
+    """
+    current = tuple(version) if version is not None else tuple(sys.version_info[:2])
+    if current < MINIMUM_PYTHON:
+        found = ".".join(str(part) for part in current)
+        raise ValueError(
+            f"Python {MINIMUM_PYTHON_TEXT}+ is required to run CodeKit, found {found}. "
+            "Install it from https://www.python.org/downloads/ and retry."
+        )
 
 
 def require_helper_files(directory: Optional[Path] = None) -> None:
@@ -90,7 +124,15 @@ def require_helper_files(directory: Optional[Path] = None) -> None:
 
 
 def load_module(path: Path, name: str) -> Any:
-    """按文件路径加载辅助模块，供需要读取策略表的模块共用同一实例。"""
+    """按文件路径加载辅助模块，供需要读取策略表的模块共用同一实例。
+
+    同名模块只执行一次：注册表与配置被两个调用方各加载一份时，``CHANNEL_ORDER``
+    这类常量在进程里就有两个身份，改一处判据在另一处不生效。路径型模块（文件名带
+    连字符，不能走普通 import）必须靠这里去重。
+    """
+    cached = sys.modules.get(name)
+    if cached is not None:
+        return cached
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"could not load helper module: {path}")
@@ -267,22 +309,6 @@ def set_key_value(path: Path, key: str, value: str) -> bool:
     return atomic_write(path, "\n".join(output).rstrip("\n") + "\n")
 
 
-def remove_key_value(path: Path, key: str) -> bool:
-    """从状态文件删除指定键，并在有变化时使用原子写入保存。"""
-    if not path.exists():
-        return False
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError) as exc:
-        raise ValueError(f"could not read {path}: {exc}") from exc
-    prefix = f"{key}="
-    output = [line for line in lines if not line.startswith(prefix)]
-    if output == lines:
-        return False
-    content = "\n".join(output).rstrip("\n")
-    return atomic_write(path, f"{content}\n" if content else "")
-
-
 def validate_plugin_version(path: Path) -> str:
     """校验插件版本文件中的 SemVer 字符串，并返回合法版本。"""
     document = read_json(path)
@@ -311,34 +337,6 @@ def json_path(document: Any, path: str) -> Any:
             return None
         current = current[part]
     return current
-
-
-def json_version_from_stdin(field: str) -> str:
-    """从 stdin JSON 的指定字段提取数字版本，输入无效时返回空字符串。"""
-    try:
-        document = json.load(sys.stdin)
-    except (json.JSONDecodeError, ValueError):
-        return ""
-    return extract_version(json_field(document, field))
-
-
-def json_asset_sha_from_stdin(asset_name: str) -> str:
-    """从 release JSON 的 assets 数组中读取指定文件的 SHA 摘要。"""
-    try:
-        document = json.load(sys.stdin)
-    except (json.JSONDecodeError, ValueError):
-        return ""
-    if not isinstance(document, Mapping):
-        return ""
-    assets = document.get("assets", [])
-    if not isinstance(assets, list):
-        return ""
-    for asset in assets:
-        if isinstance(asset, Mapping) and asset.get("name") == asset_name:
-            digest = asset.get("digest")
-            if isinstance(digest, str):
-                return digest.split(":", 1)[-1]
-    return ""
 
 
 _JSONC_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
@@ -476,198 +474,23 @@ def remove_opencode_plugins(path: Path, prefix: str = "codekit@") -> bool:
     return write_json(path, document)
 
 
-def toml_mcp_servers(path: Path) -> list[str]:
-    """Return MCP server names from Codex TOML.
-
-    Python 3.11+'s tomllib is preferred.  The fallback only needs to inspect
-    section headers and keeps this installer usable with older system Python.
-    """
-
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise ValueError(f"could not read {path}: {exc}") from exc
-
-    try:
-        import tomllib  # type: ignore[import-not-found]
-    except ImportError:
-        tomllib = None  # type: ignore[assignment]
-
-    if tomllib is not None:
-        try:
-            document = tomllib.loads(text)
-        except (tomllib.TOMLDecodeError, ValueError) as exc:
-            raise ValueError(f"invalid TOML file {path}: {exc}") from exc
-        servers = document.get("mcp_servers", {})
-        return sorted(servers.keys()) if isinstance(servers, dict) else []
-
-    names = []
-    for line in text.splitlines():
-        match = MCP_SECTION_PATTERN.match(line.strip())
-        if match:
-            names.append(match.group(1).strip('"\''))
-    return sorted(set(names))
-
-
 def write_versions(
     path: Path,
     values: Iterable[tuple[str, str]],
-    script_version: str,
     marketplace_sha: str = "",
 ) -> bool:
-    """生成安装版本状态文件，包含时间戳、组件版本、脚本版本和 marketplace SHA。"""
+    """生成安装版本状态文件。
+
+    只写有读者的字段：组件版本供人工核对，``marketplace_sha`` 是插件「有更新」判据
+    （见 installer_state.marketplace_changed）。生成时间留在文件头注释里，不再占用
+    一个从不被读取的键。
+    """
     timestamp = datetime.now().astimezone()
     lines = [
         "# CodeKit Plugin - Installed Versions",
         f"# Generated: {timestamp.strftime('%Y-%m-%dT%H:%M:%S%z')}",
-        f"install_timestamp={int(timestamp.timestamp())}",
     ]
     lines.extend(f"{key}={value}" for key, value in values)
-    lines.append(f"script_version={script_version}")
     if marketplace_sha:
         lines.append(f"marketplace_sha={marketplace_sha}")
     return atomic_write(path, "\n".join(lines) + "\n")
-
-
-def parse_assignments(values: Iterable[str]) -> list[tuple[str, str]]:
-    """解析命令行传入的 key=value 列表，并拒绝缺少键名的项。"""
-    result = []
-    for value in values:
-        if "=" not in value:
-            raise ValueError(f"invalid key/value assignment: {value!r}")
-        key, item = value.split("=", 1)
-        if not key:
-            raise ValueError(f"invalid empty key in assignment: {value!r}")
-        result.append((key, item))
-    return result
-
-
-def build_parser() -> argparse.ArgumentParser:
-    """构建配置辅助命令的分层 CLI 解析器。"""
-    parser = argparse.ArgumentParser(description="CodeKit installer config helpers")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    version = subparsers.add_parser("version")
-    version_subparsers = version.add_subparsers(dest="version_command", required=True)
-    extract = version_subparsers.add_parser("extract")
-    extract.add_argument("value")
-    compare = version_subparsers.add_parser("ge")
-    compare.add_argument("left")
-    compare.add_argument("right")
-
-    plugin_version = subparsers.add_parser("plugin-version")
-    plugin_version.add_argument("--file", required=True, type=Path)
-
-    json_parser = subparsers.add_parser("json")
-    json_subparsers = json_parser.add_subparsers(dest="json_command", required=True)
-    json_version = json_subparsers.add_parser("version")
-    json_version.add_argument("--field", required=True)
-    json_path_parser = json_subparsers.add_parser("path")
-    json_path_parser.add_argument("--path", required=True)
-    json_subparsers.add_parser("asset-sha").add_argument("--asset", required=True)
-    json_set = json_subparsers.add_parser("set")
-    json_set.add_argument("--file", required=True, type=Path)
-    json_set.add_argument("--key", required=True)
-    json_set.add_argument("--value", required=True)
-
-    opencode = subparsers.add_parser("opencode")
-    opencode_subparsers = opencode.add_subparsers(
-        dest="opencode_command", required=True
-    )
-    for name in ("has", "remove"):
-        command = opencode_subparsers.add_parser(name)
-        command.add_argument("--file", required=True, type=Path)
-        command.add_argument("--prefix", default="codekit@")
-    add = opencode_subparsers.add_parser("add")
-    add.add_argument("--file", required=True, type=Path)
-    add.add_argument("--plugin", required=True)
-
-    toml_parser = subparsers.add_parser("toml")
-    toml_subparsers = toml_parser.add_subparsers(dest="toml_command", required=True)
-    mcp = toml_subparsers.add_parser("mcp-servers")
-    mcp.add_argument("--file", required=True, type=Path)
-
-    kv = subparsers.add_parser("kv")
-    kv_subparsers = kv.add_subparsers(dest="kv_command", required=True)
-    for name in ("get", "set", "remove"):
-        command = kv_subparsers.add_parser(name)
-        command.add_argument("--file", required=True, type=Path)
-        command.add_argument("--key", required=True)
-    kv_subparsers.choices["set"].add_argument("--value", required=True)
-
-    versions = subparsers.add_parser("versions")
-    versions.add_argument("--file", required=True, type=Path)
-    versions.add_argument("--script-version", required=True)
-    versions.add_argument("--marketplace-sha", default="")
-    versions.add_argument("--set", dest="assignments", action="append", default=[])
-    return parser
-
-
-def main(argv: Optional[list[str]] = None) -> int:
-    """分发版本、JSON、OpenCode、TOML、键值和版本文件辅助命令。"""
-    args = build_parser().parse_args(argv)
-    try:
-        if args.command == "version":
-            if args.version_command == "extract":
-                print(extract_version(args.value))
-            else:
-                raise SystemExit(0 if version_greater_or_equal(args.left, args.right) else 1)
-        elif args.command == "plugin-version":
-            print(validate_plugin_version(args.file))
-        elif args.command == "json":
-            if args.json_command == "version":
-                print(json_version_from_stdin(args.field))
-            elif args.json_command == "path":
-                try:
-                    document = json.load(sys.stdin)
-                except (json.JSONDecodeError, ValueError):
-                    document = None
-                value = json_path(document, args.path)
-                if isinstance(value, bool):
-                    print(str(value).lower())
-                elif isinstance(value, (str, int, float)):
-                    print(value)
-            elif args.json_command == "asset-sha":
-                print(json_asset_sha_from_stdin(args.asset))
-            else:
-                document = read_json(args.file)
-                if not isinstance(document, dict):
-                    raise ValueError(f"JSON document must be an object: {args.file}")
-                document[args.key] = args.value
-                write_json(args.file, document)
-        elif args.command == "opencode":
-            if args.opencode_command == "has":
-                raise SystemExit(
-                    0 if opencode_has_plugin(args.file, args.prefix) else 1
-                )
-            if args.opencode_command == "add":
-                add_opencode_plugin(args.file, args.plugin)
-            else:
-                remove_opencode_plugins(args.file, args.prefix)
-        elif args.command == "toml":
-            for server in toml_mcp_servers(args.file):
-                print(server)
-        elif args.command == "kv":
-            if args.kv_command == "get":
-                value = read_key_value(args.file, args.key)
-                if value:
-                    print(value)
-            elif args.kv_command == "set":
-                set_key_value(args.file, args.key, args.value)
-            else:
-                remove_key_value(args.file, args.key)
-        elif args.command == "versions":
-            write_versions(
-                args.file,
-                parse_assignments(args.assignments),
-                args.script_version,
-                args.marketplace_sha,
-            )
-    except ValueError as exc:
-        print(f"installer config: {exc}", file=sys.stderr)
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

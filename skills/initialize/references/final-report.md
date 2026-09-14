@@ -3,7 +3,7 @@
 ## 最终状态
 
 - `success`：所有 required 阶段成功，所有结果与 artifact 复核有效，无越界写入。
-- `partial`：仅存在允许的 skipped，且用户显式 `--allow-partial` 后完成上下文；不能称为成功。`required_for_initialize` 验证因白名单程序未安装而 `skipped` 时同样降级为 `partial`（此时即使 gate 为 success 也不得记为 success），并禁止提交。gitnexus 的 `partial/registry-missing` 属于同一档：索引与 artifact 有效，但仓库未注册进 GitNexus 全局 registry，`list`/`query`/`context`/`impact`/`trace`/`cypher`/`check`/`detect-changes` 与 MCP 图查询全部不可用；报告必须原样列出该限制并给出修复方式（获准后带 `--allow-global-writes` 重跑）。`graphify hook install` 真实失败也是同一档：图谱本身有效，但仓库不会随提交刷新，`commit_status` 为 `blocked-graphify-git-hooks`，报告必须给出可重试命令、`graphify hook uninstall` 回滚命令，以及「不需要钩子时带 `--no-git-hooks` 重跑」。
+- `partial`：存在允许的 skipped，运行**仍然完成**上下文生成；不能称为成功。工具不可用（`not-installed` / `not-readable` / `not-executable`，即 `tools.*.available` 为 `false` 或 `state` 非 `ok`）造成的降级**不需要 `--allow-partial`，也不再 abort 重跑**——门禁自动接受并写入 `worker_gate.degradations`；报告必须逐条点名、原样引用 `resolution_hint` 与实测 `state`，并给出修复命令（重跑安装器把工具物化到 CodeKit 工具链根）或 `CODEKIT_GITNEXUS_RUNNER` / `CODEKIT_GRAPHIFY_RUNNER`。`--allow-partial` 现在只用于全局注册/embedding 这类需要用户取舍的前提性降级。`required_for_initialize` 验证因白名单程序未安装而 `skipped` 时同样降级为 `partial`（此时即使 gate 为 success 也不得记为 success），并禁止提交。gitnexus 的 `partial/registry-missing` 属于同一档：索引与 artifact 有效，但仓库未注册进 GitNexus 全局 registry，`list`/`query`/`context`/`impact`/`trace`/`cypher`/`check`/`detect-changes` 与 MCP 图查询全部不可用；报告必须原样列出该限制并给出修复方式（获准后带 `--allow-global-writes` 重跑）。`graphify hook install` 真实失败也是同一档：图谱本身有效，但仓库不会随提交刷新，`commit_status` 为 `blocked-graphify-git-hooks`，报告必须给出可重试命令、`graphify hook uninstall` 回滚命令，以及「不需要钩子时带 `--no-git-hooks` 重跑」。判据见 [tool-adapters.md](tool-adapters.md)；不得把「本机跑不了」写成「未安装」或「工具坏了」，也不得把「重跑安装器」写成「改 PATH」。`--strict-tools` 下这类降级改为 fail-closed 并 abort。
 - `failed`：任一 required failure、工具存在但运行失败、artifact 无效、上下文生成/验证失败或越界写入。失败时 manifest 的 phase 为 `aborted`，只有 `final_report.status` 保留 `failed`；不会持久化未定义的 `failed` phase。
 
 ## 验证
@@ -37,7 +37,7 @@
 
 ## 报告字段
 
-报告 run-id、root、languages、各阶段及 gitnexus 步骤（控制器执行）/ `initialize-graphify` / `initialize-context-scanner` 状态、partial 原因、artifact 验证、变更文件、validators（含来源、命令、退出码与输出尾部）、`validation_warnings`（skipped 验证原样展示）、`graphify_git_hooks`（`installed`/`skipped`/`failed` 与 `reason`/`command`/`exit_code`/`output_tail`/`rollback`；`skipped` 的原因不得省略）、commit decision、锁释放结果、`restart_required` 与 `restart_notice`。上下文截断或渲染告警（`context_warnings`，如 AGENTS.md 条目超行预算被裁剪）必须原样展示，不得静默丢弃。不要声称 skipped 的分析已完成，不隐藏 Graphify chunk/健康警告。
+报告 run-id、root、languages、各阶段及 gitnexus / graphify 两个控制器步骤（`controller.py analyze`、`controller.py graphify`）与 `initialize-context-scanner` 状态、partial 原因、artifact 验证、变更文件、validators（含来源、命令、退出码与输出尾部）、`validation_warnings`（skipped 验证原样展示）、`graphify_git_hooks`（`installed`/`skipped`/`failed` 与 `reason`/`command`/`exit_code`/`output_tail`/`rollback`；`skipped` 的原因不得省略）、commit decision、锁释放结果、`restart_required` 与 `restart_notice`。协作能力探测结论（`$SKILLS_ROOT/_shared/scripts/probe-collab.py` 的 `host`、`collab`、`evidence` 中的 command / exit_code / tools）必须原样列出：它是「宿主确实能派发」的证据，不是主 Agent 的自述；取得用户授权后运行过 `--enable` 的，还要登记其 `enable.action`（`enabled` / `noop` / `refused` / `rolled-back`）与改动的文件路径，`rolled-back` 时不得声称已开启。`collab` 为 `unavailable` 时 `fix` 字段原文照抄、不得把本次描述为已完成，并以醒目的重启提示作为报告最后一段。上下文截断或渲染告警（`context_warnings`，如 AGENTS.md 条目超行预算被裁剪）必须原样展示，不得静默丢弃。不要声称 skipped 的分析已完成，不隐藏 Graphify chunk/健康警告。
 
 ## 生效提示（重启 Agent 应用）
 

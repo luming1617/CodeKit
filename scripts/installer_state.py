@@ -3,14 +3,12 @@
 
 Package managers and vendor CLIs remain external commands.  This module owns
 the data model around them: detection, version state, presence checks, and
-recap rendering.  The installer shell uses the TSV output for compatibility
-with its existing terminal selector.
+recap rendering.  It is a library: the installer and uninstaller import it,
+and nothing runs this file as a program.
 """
 
 from __future__ import annotations
 
-import argparse
-import importlib.util
 import json
 import platform
 import shutil
@@ -24,37 +22,22 @@ from typing import Any, Iterable, Optional
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = SCRIPT_DIR / "installer_config.py"
 REGISTRY_PATH = SCRIPT_DIR / "component-registry.py"
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 
 import installer_agents as agents  # noqa: E402
+import installer_config as config  # noqa: E402
 import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
+import installer_toolchain as toolchain  # noqa: E402
+
+# 文件名带连字符，只能按路径加载；走 config.load_module 是为了让 installer_agents
+# 与 installer_toolchain 拿到的是同一份注册表，而不是各执行一遍。
+registry = config.load_module(REGISTRY_PATH, "codekit_component_registry")
 
 
-def load_module(path: Path, name: str) -> Any:
-    """按文件路径动态加载注册表或配置模块，供状态检测复用其定义。"""
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load helper module: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-config = load_module(CONFIG_PATH, "codekit_installer_config")
-registry = load_module(REGISTRY_PATH, "codekit_component_registry")
-
-
-CODEX_MARKETPLACE = "co-daming"
-CODEX_PLUGIN = "codekit"
-CLAUDE_MARKETPLACE = "co-daming"
-CLAUDE_PLUGIN = "codekit"
-OPENCODE_PLUGIN = "codekit"
 ANSI_RED = "\033[0;31m"
 ANSI_RESET = "\033[0m"
 
@@ -226,11 +209,6 @@ def agent_presence(name: str, home: Path, os_name: Optional[str] = None) -> str:
     return ""
 
 
-def agent_present(name: str, home: Path, os_name: Optional[str] = None) -> bool:
-    """判断 Claude、Codex 或 OpenCode 的 CLI/Desktop 是否可用。"""
-    return bool(agent_presence(name, home, os_name))
-
-
 def agent_cli_presence(
     platform_key: str,
     home: Path,
@@ -378,7 +356,7 @@ def repository_plugin_version(context: Context) -> str:
 def claude_installed_version(home: Path) -> str:
     """读取 Claude 插件注册表中记录的实际安装版本。"""
     document = config.read_json(home / ".claude" / "plugins" / "installed_plugins.json")
-    entries = config.json_path(document, f"plugins.{CLAUDE_PLUGIN}@{CLAUDE_MARKETPLACE}")
+    entries = config.json_path(document, f"plugins.{config.PLUGIN_NAME}@{config.MARKETPLACE_NAME}")
     if not isinstance(entries, list):
         return ""
     for entry in entries:
@@ -390,7 +368,7 @@ def claude_installed_version(home: Path) -> str:
 
 def codex_installed_version(home: Path) -> str:
     """读取 Codex 插件缓存中以版本号命名的目录，取其中最新的一版。"""
-    root = home / ".codex" / "plugins" / "cache" / CODEX_MARKETPLACE / CODEX_PLUGIN
+    root = home / ".codex" / "plugins" / "cache" / config.MARKETPLACE_NAME / config.PLUGIN_NAME
     try:
         versions = [item.name for item in root.iterdir() if item.is_dir()]
     except OSError:
@@ -430,9 +408,15 @@ def qoder_present(descriptor: Any, context: Context) -> bool:
 
 
 def component_version(component: str, context: Context) -> str:
-    """按组件类型选择版本来源：CLI 命令来自策略表，插件来自自身配置。"""
+    """按组件类型选版本来源：根接管组件先取清单实测，再退到 CLI 命令，插件取自身配置。"""
     definition = registry.component_by_id(component)
     if definition is not None and definition.command:
+        if definition.entry_kind:
+            # 根接管组件的版本以清单实测记录为准：安装器刚从落点里读过一次，而按命令名
+            # 跑 --version 可能命中一个根外的旧垫片，或在建不出转发入口时干脆探测不到。
+            recorded = toolchain_entry(component, context).get("version")
+            if isinstance(recorded, str) and recorded:
+                return recorded
         value = command_version(definition.command, list(definition.version_args))
         # CLI 的首行版本输出普遍是 "工具名 version 1.2.3 (构建信息)" 这类文本
         # （`gh --version`、`lark-cli --version` 都是），结果页只需要三段版本号；
@@ -455,7 +439,7 @@ def component_version(component: str, context: Context) -> str:
 
 def claude_cache_present(home: Path) -> bool:
     """判断 Claude 插件缓存是否已由 CLI 或 Desktop 写入共享目录。"""
-    return (home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE / CLAUDE_PLUGIN).is_dir()
+    return (home / ".claude" / "plugins" / "cache" / config.MARKETPLACE_NAME / config.PLUGIN_NAME).is_dir()
 
 
 def present(component: str, context: Context) -> bool:
@@ -466,19 +450,26 @@ def present(component: str, context: Context) -> bool:
     """
     definition = registry.component_by_id(component)
     if definition is not None and definition.command:
+        if definition.entry_kind:
+            # 根接管的组件按落点判定，与清单构建、报告自检同一个判据：按命令名解析会
+            # 把根外一份旧垫片读成「已安装」，而在建不出转发入口的宿主上又会把已经装好
+            # 的读成「未安装」——两个方向都错。
+            return toolchain.entry_state(
+                platform_layer.platform_for(), context.home, definition
+            ) == "ok"
         return shutil.which(definition.command) is not None
     if component == "claude_plugin":
         listing = plugin_listing("claude", ["plugin", "list"])
         registered = bool(listing) and has_line(
-            listing, f"{CLAUDE_PLUGIN}@{CLAUDE_MARKETPLACE}", False
+            listing, f"{config.PLUGIN_NAME}@{config.MARKETPLACE_NAME}", False
         )
         if not registered:
             # 只装 Desktop 的机器没有 CLI 命令，但插件缓存由两端共享写入。
             registered = claude_cache_present(context.home)
         return registered and platform_subagents_state(context, "claude") in {"installed", "up_to_date"}
     if component == "codex_plugin":
-        listing = plugin_listing("codex", ["plugin", "list", "--marketplace", CODEX_MARKETPLACE])
-        return bool(listing) and has_line(listing, f"{CODEX_PLUGIN}@{CODEX_MARKETPLACE}") and platform_subagents_state(context, "codex") in {"installed", "up_to_date"}
+        listing = plugin_listing("codex", ["plugin", "list", "--marketplace", config.MARKETPLACE_NAME])
+        return bool(listing) and has_line(listing, f"{config.PLUGIN_NAME}@{config.MARKETPLACE_NAME}") and platform_subagents_state(context, "codex") in {"installed", "up_to_date"}
     if component == "opencode_plugin":
         return config.opencode_has_plugin(
             config.opencode_config_file(context.home / ".config" / "opencode")
@@ -509,9 +500,9 @@ def component_leftovers(component: str, context: Context) -> list[Path]:
         candidates: tuple[Path, ...] = tuple(qoder.cached_copies(root))
     else:
         candidate = {
-            "claude_plugin": context.home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE,
-            "codex_plugin": context.home / ".codex" / "plugins" / "cache" / CODEX_MARKETPLACE,
-            "opencode_plugin": context.home / ".config" / "opencode" / "node_modules" / OPENCODE_PLUGIN,
+            "claude_plugin": context.home / ".claude" / "plugins" / "cache" / config.MARKETPLACE_NAME,
+            "codex_plugin": context.home / ".codex" / "plugins" / "cache" / config.MARKETPLACE_NAME,
+            "opencode_plugin": context.home / ".config" / "opencode" / "node_modules" / config.PLUGIN_NAME,
         }.get(component)
         candidates = (candidate,) if candidate is not None else ()
     return [path for path in candidates if platform_layer.has_contents(path)]
@@ -599,25 +590,6 @@ def all_states(context: Context) -> list[ComponentState]:
         detect_component(component.component_id, context, latest)
         for component in registry.COMPONENTS
     ]
-
-
-def export_states(context: Context) -> None:
-    """以无颜色 TSV 输出状态，供 shell/Python 选择器之间稳定传递。"""
-    def tsv_field(value: str) -> str:
-        """清理 TSV 禁止字符，确保单个状态不会破坏行列结构。"""
-        return value.replace("\t", " ").replace("\r", " ").replace("\n", " ")
-
-    for state in all_states(context):
-        print(
-            "\t".join(
-                (
-                    tsv_field(state.component_id),
-                    tsv_field(state.status),
-                    tsv_field(state.installed_version),
-                    tsv_field(state.latest_version),
-                )
-            )
-        )
 
 
 def component_description(component_id: str) -> str:
@@ -716,10 +688,42 @@ def display_path(path: Path, home: Path) -> str:
         return str(path)
 
 
+def toolchain_entry(component: str, context: Context) -> dict[str, Any]:
+    """``toolchain.json`` 里该组件 ``state == ok`` 的条目；否则为空字典。
+
+    工具链托管的组件装在私有 npm 前缀 / 私有 venv 里，只有清单知道确切位置与版本。只
+    采信 ``state == "ok"`` 的条目：非 ok 是「实测不可用」的记录，拿它当安装路径或版本
+    等于把一次失败的安装展示成装好的。
+    """
+    platform = platform_layer.platform_for()
+    document = toolchain.read_manifest(platform.toolchain_manifest(context.home))
+    tools = document.get("tools")
+    entry = tools.get(component) if isinstance(tools, dict) else None
+    return entry if isinstance(entry, dict) and entry.get("state") == "ok" else {}
+
+
+def toolchain_recorded_path(component: str, context: Context) -> Optional[Path]:
+    """清单里该组件的实测落点；清单不可用、组件不受管或态非 ok 时返回 None。"""
+    entry = toolchain_entry(component, context)
+    for key in ("package_root", "venv"):
+        value = entry.get(key)
+        if isinstance(value, str) and value:
+            return Path(value)
+    runner = entry.get("runner")
+    if isinstance(runner, list) and runner:
+        return Path(str(runner[0]))
+    return None
+
+
 def component_install_path(component: str, context: Context) -> str:
     """返回组件的实际安装路径或用户态安装的稳定回退路径。"""
     definition = registry.component_by_id(component)
     if definition is not None and definition.command:
+        # 清单先于 ``which``：按命令名解析可能命中一个根外的旧垫片，那不是会话里
+        # 真正会被启动的那一个。
+        recorded = toolchain_recorded_path(component, context)
+        if recorded is not None:
+            return display_path(recorded, context.home)
         path = shutil.which(definition.command)
         if path:
             return display_path(Path(path), context.home)
@@ -744,9 +748,9 @@ def component_install_path(component: str, context: Context) -> str:
             return "—"
         return display_path(qoder.plugin_cache_root(root), context.home)
     plugin_paths = {
-        "claude_plugin": context.home / ".claude" / "plugins" / "cache" / CLAUDE_MARKETPLACE,
-        "opencode_plugin": context.home / ".config" / "opencode" / "node_modules" / "codekit",
-        "codex_plugin": context.home / ".codex" / "plugins" / "cache" / CODEX_MARKETPLACE,
+        "claude_plugin": context.home / ".claude" / "plugins" / "cache" / config.MARKETPLACE_NAME,
+        "opencode_plugin": context.home / ".config" / "opencode" / "node_modules" / config.PLUGIN_NAME,
+        "codex_plugin": context.home / ".codex" / "plugins" / "cache" / config.MARKETPLACE_NAME,
     }
     path = plugin_paths.get(component)
     return display_path(path, context.home) if path else "—"
@@ -865,46 +869,3 @@ def render_recap(mode: str, records: Iterable[str], context: Context) -> None:
         print(f"\n本次共处理 {total} 个组件：全部成功")
     else:
         print(f"\n本次共处理 {total} 个组件：成功 {ok_count}，失败 {fail_count}")
-
-
-def build_parser() -> argparse.ArgumentParser:
-    """构建状态检测命令行解析器。"""
-    parser = argparse.ArgumentParser(description="CodeKit component state helpers")
-    parser.add_argument("command", choices=("detect", "present", "recap"))
-    parser.add_argument("--home", type=Path, default=Path.home())
-    parser.add_argument("--marketplace-local", type=Path, default=None)
-    parser.add_argument("--version-file", type=Path, required=False)
-    parser.add_argument("--component")
-    parser.add_argument("--mode", choices=("install", "uninstall"))
-    parser.add_argument("--record", action="append", default=[])
-    return parser
-
-
-def main(argv: Optional[list[str]] = None) -> int:
-    """分发 detect/present/recap 子命令，并统一处理输入错误。"""
-    args = build_parser().parse_args(argv)
-    context = Context(
-        home=args.home,
-        marketplace_local=args.marketplace_local,
-        version_file=args.version_file
-        or platform_layer.platform_for().state_dir(args.home) / "installed_versions",
-    )
-    try:
-        if args.command == "detect":
-            export_states(context)
-        elif args.command == "present":
-            if not args.component:
-                raise ValueError("--component is required for present")
-            raise SystemExit(0 if present(args.component, context) else 1)
-        else:
-            if not args.mode:
-                raise ValueError("--mode is required for recap")
-            render_recap(args.mode, args.record, context)
-    except (RuntimeError, ValueError, OSError) as exc:
-        print(f"installer state: {exc}", file=sys.stderr)
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -1,0 +1,6 @@
+{
+  "name": "codekit",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "plugins/codekit.js"
+}

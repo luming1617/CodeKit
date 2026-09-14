@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import argparse
 import os
 import shutil
 import tempfile
@@ -136,21 +135,31 @@ def replace_stages(replacements: Sequence[tuple[Path, Path]]) -> None:
             remove_path(backup)
 
 
+def required_paths(source: Path) -> tuple[Path, ...]:
+    """一份完整检出必须存在的插件源文件。
+
+    安装器判断「当前仓库能否当本地 marketplace 源」与这里构建兼容源前的完整性校验共用
+    这一份：两处各抄一遍时会出现「判定可用、构建却报缺文件」的漂移。
+    """
+    return (
+        source / ".agents" / "plugins" / "marketplace.json",
+        source / ".claude-plugin" / "marketplace.json",
+        source / ".claude-plugin" / "plugin.json",
+        source / ".codex-plugin" / "marketplace.json",
+        source / ".codex-plugin" / "plugin.json",
+        source / ".opencode" / "package.json",
+        source / ".opencode" / "plugins" / "codekit.js",
+        source / ".qoder-plugin" / "plugin.json",
+        source / "plugin-version.json",
+        source / "skills",
+    )
+
+
 def prepare(source: Path, state_dir: Path) -> tuple[Path, Path, Path]:
     """校验仓库、构建临时兼容源，并以可回滚方式替换最终安装目录。"""
     source = source.resolve()
     state_dir = state_dir.resolve()
-    required = (
-        source / ".agents" / "plugins" / "marketplace.json",
-        source / ".claude-plugin",
-        source / ".codex-plugin",
-        source / ".opencode",
-        source / ".qoder-plugin",
-        source / "skills",
-        source / ".opencode" / "package.json",
-        source / "plugin-version.json",
-    )
-    missing = [str(path) for path in required if not path.exists()]
+    missing = [str(path) for path in required_paths(source) if not path.exists()]
     if missing:
         raise ValueError(f"marketplace source is incomplete: {', '.join(missing)}")
 
@@ -184,8 +193,10 @@ def prepare(source: Path, state_dir: Path) -> tuple[Path, Path, Path]:
             directory.mkdir(parents=True, exist_ok=True)
 
         # Codex 只认 `<root>/.agents/plugins/marketplace.json`；`.codex-plugin/`
-        # 提供的是插件自身的元数据，两者都需要。
-        copy_contents(source / ".agents", market_tmp / ".agents")
+        # 提供的是插件自身的元数据，两者都需要。`.agents` 下其余内容（实测只有本机
+        # `gitnexus analyze --skills` 生成的 `skills/`，已在 .gitignore 里）没有任何
+        # 宿主读者，整目录复制会让插件载荷随机器而变，因此只取 `plugins/`。
+        copy_contents(source / ".agents" / "plugins", market_tmp / ".agents" / "plugins")
         copy_contents(source / ".claude-plugin", market_tmp / ".claude-plugin")
         copy_contents(source / ".codex-plugin", market_tmp / ".codex-plugin")
         copy_contents(source / ".opencode" / "plugins", market_tmp / ".opencode" / "plugins")
@@ -244,28 +255,3 @@ def prepare(source: Path, state_dir: Path) -> tuple[Path, Path, Path]:
         raise
 
     return market_stage, opencode_stage, qoder_stage
-
-
-def build_parser() -> argparse.ArgumentParser:
-    """构建兼容插件源生成器的命令行解析器。"""
-    parser = argparse.ArgumentParser(description="Build CodeKit Plugin compatibility sources")
-    parser.add_argument("command", choices=("prepare",))
-    parser.add_argument("--source", required=True, type=Path)
-    parser.add_argument("--state-dir", required=True, type=Path)
-    return parser
-
-
-def main() -> int:
-    """执行 prepare 子命令并将构建失败转换为非零退出码。"""
-    args = build_parser().parse_args()
-    try:
-        market_stage, opencode_stage, qoder_stage = prepare(args.source, args.state_dir)
-    except (OSError, ValueError) as exc:
-        print(f"installer sources: {exc}", file=os.sys.stderr)
-        return 1
-    print(f"{market_stage}\t{opencode_stage}\t{qoder_stage}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

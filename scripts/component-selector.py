@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive terminal component selector used by install.sh.
+"""Interactive terminal component selector invoked by installer.py / uninstaller.py.
 
 The shell writes a tab-separated component manifest and this program owns all
 terminal rendering and key handling.  The final selection is emitted as a

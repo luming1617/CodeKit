@@ -14,6 +14,7 @@ allowed-tools: 'Bash, Read, Write, Agent, Grep, Skill'
 ## 路径与产物约定
 
 - **`SKILL_DIR`**：本 `SKILL.md` 所在目录的绝对路径；插件安装时该目录为 `<plugin-cache>/skills/bugfix`。本 Skill 的脚本、模板和参考资料一律按 `SKILL_DIR` 解析后调用，不得假设当前工作目录就是 Skill 目录，也不得把 `skills/bugfix/...` 当作仓库相对路径直接执行。
+- **`<PYTHON>`**：调用本 Skill 门禁脚本时使用的 Python 启动器占位符，执行前替换成字面量（不是 shell 变量）：Windows 用 `py -3`，macOS/Linux 用 `python3`，替换前用 `--version` 实测退出码为 0。Windows 上不要发 `python3`：干净系统里它是微软商店别名桩，`which` 找得到却无任何输出即以非零码退出，会被误判成本机没有 Python。完整解析纪律见 `$SKILLS_ROOT/_shared/prompts/path-convention.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。
 - **`RUN_DIR`**：`<仓库根目录>/.codekit/bugfix/<run-id>/`，由 `bugfix_state.py start` 创建，是本次 Bugfix 唯一允许的产物落盘位置。该目录自带局部 `.gitignore`（内容 `*`），因此审批前保存提案仍然满足“审批前只读”，不会留下受版本控制的文件变化。
 - 产物布局：`state.json`（快照、提案与审批绑定）、`proposal.md`（调查与修复提案）、`approval.txt`（用户批准原文）、`validation-record.json`（真实执行的验证证据）、`delivery-report.md`（最终交付报告）。这些中间产物一律不进版本库；最终 Diff 只能包含获批的源码与测试改动。
 
@@ -31,11 +32,11 @@ allowed-tools: 'Bash, Read, Write, Agent, Grep, Skill'
 - 调查阶段使用 [assets/bugfix-proposal-template.md](assets/bugfix-proposal-template.md)；实施完成后使用 [assets/bugfix-delivery-report-template.md](assets/bugfix-delivery-report-template.md)。
 - 确定性门禁脚本：`scripts/validate_bugfix_proposal.py`（提案结构与审批语义校验）和 `scripts/bugfix_state.py`（快照冻结、提案记录、审批绑定、越界检查与验证执行）；两者都按 `SKILL_DIR` 解析路径调用，不得用 Agent 自述替代其退出码。
 
-## Subagent 强制调用规则（Claude Code / Codex / OpenCode）
+## Subagent 强制调用规则（Claude Code / Codex / OpenCode / Qoder / Qoder CN）
 
 `bugfix-investigator`、`bugfix-challenger` 和获批后使用的 `bugfix-implementer` 都是硬性阶段门禁，不是可选建议。进入对应阶段前，主 Agent 必须创建指定名称的独立 Sub-agent，并记录调用名称、输入快照、独立会话标识和返回状态；主 Agent 自己完成该阶段、普通串行自检或只写“建议调用”均不合规。无法创建指定 Sub-agent 时，阶段状态必须为 `BLOCKED`，不得伪造角色产出或继续通过门禁。**该门禁只约束主 Agent（Orchestrator）：被派发的角色 Sub-agent 一律不再派发下一级 Sub-agent，也绝不因自身缺少派发能力而返回 `BLOCKED`；它只需按自己的角色契约完成本阶段并返回结构化结果。**
 
-按宿主派发的方式（Claude Code / Codex / OpenCode 的角色标识与语法差异、“不得把派发指令注入子代理”的纪律、以及 Skill 在各宿主下的调用名）见 `$SKILLS_ROOT/_shared/prompts/subagent-mandate.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。进入任何派发阶段前必须读取该文件；角色由 `manage-global-agents.py`（仓库安装脚本）安装为**全局裸名**，不存在 `@agent-<plugin>:<name>` 这类插件作用域角色名。
+按宿主派发的方式（Claude Code / Codex / OpenCode / Qoder / Qoder CN 的角色标识与语法差异、“不得把派发指令注入子代理”的纪律、以及 Skill 在各宿主下的调用名）见 `$SKILLS_ROOT/_shared/prompts/subagent-mandate.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。进入任何派发阶段前必须读取该文件；角色由 `manage-global-agents.py`（仓库安装脚本）安装为**全局裸名**，不存在 `@agent-<plugin>:<name>` 这类插件作用域角色名。
 
 ## 下游 Skill 强制调用：`code-review`
 
@@ -219,7 +220,7 @@ flowchart TB
 参数与资料解析完成后，创建 `RUN_DIR` 并冻结快照（`<run-id>` 用 `YYYYMMDD-short-name`，`--documents` 只传实际找到的文档；`DOCUMENTS: NOT_AVAILABLE` 时省略该参数，不得传占位路径）：
 
 ```bash
-python3 "$SKILL_DIR/scripts/bugfix_state.py" start --root <仓库根目录> --run-id <run-id> \
+<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" start --root <仓库根目录> --run-id <run-id> \
   --documents <PRD/TDD/RPD 路径>
 ```
 
@@ -276,8 +277,8 @@ python3 "$SKILL_DIR/scripts/bugfix_state.py" start --root <仓库根目录> --ru
 严格使用提案模板输出：问题判定、问题原因、证据链、修复方案、允许修改文件、明确不修改、影响风险、验证计划和审批信息。提案必须写入 `RUN_DIR/proposal.md`，保存后运行结构校验并记录提案：
 
 ```bash
-python3 "$SKILL_DIR/scripts/validate_bugfix_proposal.py" "$RUN_DIR/proposal.md"
-python3 "$SKILL_DIR/scripts/bugfix_state.py" record-proposal --manifest "$RUN_DIR/state.json" \
+<PYTHON> "$SKILL_DIR/scripts/validate_bugfix_proposal.py" "$RUN_DIR/proposal.md"
+<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" record-proposal --manifest "$RUN_DIR/state.json" \
   --proposal "$RUN_DIR/proposal.md" --proposal-id <BF-YYYYMMDD-short-name> --version <N> --review-mode FULL
 ```
 
@@ -298,7 +299,7 @@ python3 "$SKILL_DIR/scripts/bugfix_state.py" record-proposal --manifest "$RUN_DI
 条件 2–4 由脚本核验，不接受任何角色的自述。把用户批准原文逐字保存为 `RUN_DIR/approval.txt` 后运行：
 
 ```bash
-python3 "$SKILL_DIR/scripts/bugfix_state.py" verify-approval --manifest "$RUN_DIR/state.json" \
+<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" verify-approval --manifest "$RUN_DIR/state.json" \
   --approval-file "$RUN_DIR/approval.txt" --proposal "$RUN_DIR/proposal.md"
 ```
 
@@ -319,7 +320,7 @@ Implementer 只修改契约允许的文件，先添加或确认能暴露问题�
 用控制器计算实际变更并与获批范围做差集，再人工核对 Diff 能否逐项映射到获批方案、明确不修改的行为是否保持：
 
 ```bash
-python3 "$SKILL_DIR/scripts/bugfix_state.py" verify-scope --manifest "$RUN_DIR/state.json" \
+<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" verify-scope --manifest "$RUN_DIR/state.json" \
   --allowed <获批仓库相对路径>
 ```
 
@@ -330,7 +331,7 @@ python3 "$SKILL_DIR/scripts/bugfix_state.py" verify-scope --manifest "$RUN_DIR/s
 依次执行回归测试、受影响单元/集成/契约测试、编译/静态检查，以及触发的并发、事务、兼容、Migration、性能或回滚验证。每项都必须由控制器真实执行并落盘：
 
 ```bash
-python3 "$SKILL_DIR/scripts/bugfix_state.py" run-validation --manifest "$RUN_DIR/state.json" \
+<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" run-validation --manifest "$RUN_DIR/state.json" \
   --proves "<该检查证明的具体主张>" -- <命令与参数>
 ```
 

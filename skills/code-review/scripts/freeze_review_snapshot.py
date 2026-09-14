@@ -24,7 +24,9 @@ def run_git(repo: Path, *args: str, text: bool = False) -> bytes | str:
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=text,
+            # encoding 只能在文本模式下传：带上它会强制开启文本模式，二进制调用
+            # （``text=False``）会因此拿到 str 而不是 bytes，把快照字节流改坏。
+            **({"text": True, "encoding": "utf-8", "errors": "replace"} if text else {"text": False}),
         )
     except FileNotFoundError as exc:
         raise SnapshotError("git executable not found on PATH") from exc

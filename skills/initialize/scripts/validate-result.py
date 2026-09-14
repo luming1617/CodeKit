@@ -16,11 +16,10 @@ from pathlib import Path
 
 from _common import (
     COMPLETE_SKIP_CODES,
+    DEGRADED_TOOL_CODES,
     ERROR_CODE_COLLAB_UNAVAILABLE,
     ERROR_CODE_TOOL_MISSING,
     EXPECTED_TASKS,
-    GRAPHIFY_END,
-    GRAPHIFY_START,
     IGNORE_END,
     IGNORE_START,
     INDEX_END,
@@ -39,6 +38,7 @@ from _common import (
     atomic_json,
     git_status,
     gitnexus_registry_state,
+    graphify_ignore_digest,
     load_json,
     resolve_validation_command,
     resolved_repository_path,
@@ -383,6 +383,47 @@ def aggregate_status(results: list[dict]) -> str:
     return "success"
 
 
+def result_error_code(result: dict) -> object:
+    error = result.get("error")
+    return error.get("code") if isinstance(error, dict) else None
+
+
+def degrading_results(results: list[dict]) -> list[dict]:
+    """把整体拖成 ``partial`` 的那些结果，逐条带出任务、状态与原文提示。"""
+    degrading: list[dict] = []
+    for result in results:
+        status = result.get("status")
+        code = result_error_code(result)
+        if status == "partial" or (
+            status == "skipped" and code not in COMPLETE_SKIP_CODES
+        ):
+            warnings = result.get("warnings")
+            hint = warnings[0] if isinstance(warnings, list) and warnings else None
+            degrading.append(
+                {
+                    "task": result.get("task"),
+                    "status": status,
+                    "code": code,
+                    "hint": hint if isinstance(hint, str) else None,
+                }
+            )
+    return degrading
+
+
+def is_tool_degradation_only(results: list[dict]) -> bool:
+    """``partial`` 是否**完全**由工具不可用造成。
+
+    这是一条环境事实，不是需要用户二次授权的降级：用户能做的只有重装或提权，跟「接受
+    partial」无关。因此它不再要求 ``--allow-partial``，也不再 abort 释放锁——那才会逼出
+    反复重跑。只要求「每一个把整体拖成 partial 的结果都是工具不可用」，一旦混进真实失败
+    （例如 Graphify chunk 失败），就恢复原有的显式授权要求。
+    """
+    degrading = degrading_results(results)
+    if not degrading:
+        return False
+    return all(item["code"] in DEGRADED_TOOL_CODES for item in degrading)
+
+
 def workers_command(args: argparse.Namespace, *, emit: bool = True) -> int:
     manifest = load_json(args.manifest)
     root = Path(manifest["root"]).resolve()
@@ -430,11 +471,25 @@ def workers_command(args: argparse.Namespace, *, emit: bool = True) -> int:
         status = "failed"
     else:
         status = aggregate_status(results)
+    degraded_tools = degrading_results(results) if status == "partial" else []
+    options = manifest.get("options") if isinstance(manifest.get("options"), dict) else {}
+    tool_only_degradation = status == "partial" and is_tool_degradation_only(results)
     if status == "blocked":
         errors.append("collaboration unavailable; initialize gate is blocked")
-    elif status == "partial" and not manifest.get("options", {}).get("allow_partial"):
+    elif tool_only_degradation and not options.get("strict_tools"):
+        # 工具在本宿主不可用是环境事实，不是需要用户二次授权的降级：如实记为 partial
+        # 并让流程跑完（锁保留，reconcile/finish 才能继续），报告里逐条点名。
+        # --strict-tools 给 CI 恢复 fail-closed 的旧行为。
+        pass
+    elif status == "partial" and not options.get("allow_partial"):
         errors.append("partial result requires --allow-partial")
-    manifest["worker_gate"] = {"status": status, "errors": errors, "tasks": sorted(tasks)}
+    manifest["worker_gate"] = {
+        "status": status,
+        "errors": errors,
+        "tasks": sorted(tasks),
+        "degradations": degraded_tools,
+        "tool_only_degradation": tool_only_degradation,
+    }
     manifest["worker_results"] = receipts
     if not errors and status in {"success", "partial"}:
         manifest["authorized_changed_paths"] = sorted(declared)
@@ -505,15 +560,9 @@ def validate_graphify_state(root: Path, manifest: dict) -> list[str]:
         errors.append("Graphify state sidecar schema mismatch")
     if Path(state.get("root", "")).resolve() != root or state.get("last_status") != "success":
         errors.append("Graphify state sidecar root/status mismatch")
-    ignore = root / ".graphifyignore"
-    start, end = GRAPHIFY_START, GRAPHIFY_END
-    if ignore.is_file():
-        text = ignore.read_text(encoding="utf-8")
-        if text.count(start) == 1 and text.count(end) == 1:
-            managed = start + text.split(start, 1)[1].split(end, 1)[0] + end
-            expected = "sha256:" + hashlib.sha256(managed.encode("utf-8")).hexdigest()
-            if state.get("ignore_digest") != expected:
-                errors.append("Graphify state sidecar ignore digest mismatch")
+    expected = graphify_ignore_digest(root)
+    if expected is not None and state.get("ignore_digest") != expected:
+        errors.append("Graphify state sidecar ignore digest mismatch")
     if state.get("mode") != receipt.get("mode", "default"):
         errors.append("Graphify state sidecar mode mismatch")
     if receipt.get("version") and state.get("graphify_version") != receipt.get("version"):
@@ -608,7 +657,7 @@ def ignored_by_git(root: Path, relative: str) -> bool:
 
 def git_value(root: Path, command: list[str]) -> str | None:
     completed = subprocess.run(
-        ["git", *command], cwd=root, text=True, capture_output=True, check=False,
+        ["git", *command], cwd=root, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False,
     )
     return completed.stdout.strip() if completed.returncode == 0 else None
 
@@ -652,7 +701,7 @@ def run_repository_validations(
         print(f"initialize: running repository validation: {command}", file=sys.stderr)
         try:
             completed = subprocess.run(
-                argv, cwd=root, text=True, capture_output=True, check=False, timeout=timeout,
+                argv, cwd=root, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False, timeout=timeout,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             errors.append(f"repository validation could not complete: {command}: {exc}")
@@ -736,7 +785,7 @@ def install_graphify_git_hooks(
     try:
         completed = subprocess.run(
             [detail, "hook", "install"],
-            cwd=root, text=True, capture_output=True, check=False, timeout=timeout,
+            cwd=root, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False, timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         record["error"] = str(exc)
@@ -758,7 +807,7 @@ def commit_exact_paths(root: Path, paths: list[str]) -> str:
     if not paths:
         raise ValidationError("no eligible initialize changes to commit")
     add = subprocess.run(
-        ["git", "add", "--", *paths], cwd=root, text=True, capture_output=True, check=False,
+        ["git", "add", "--", *paths], cwd=root, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False,
     )
     if add.returncode:
         raise ValidationError(add.stderr.strip() or "git add failed")
@@ -767,12 +816,12 @@ def commit_exact_paths(root: Path, paths: list[str]) -> str:
             "git", "commit", "--only", "-m",
             "chore: initialize repository for AI development", "--", *paths,
         ],
-        cwd=root, text=True, capture_output=True, check=False,
+        cwd=root, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False,
     )
     if commit.returncode:
         raise ValidationError(commit.stderr.strip() or commit.stdout.strip() or "git commit failed")
     head = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=root, text=True, capture_output=True, check=False,
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False,
     )
     if head.returncode:
         raise ValidationError(head.stderr.strip() or "cannot resolve commit SHA")

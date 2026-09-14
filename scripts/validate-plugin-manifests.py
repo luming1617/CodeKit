@@ -9,14 +9,29 @@ the single version source, and point at files that actually exist.
 from __future__ import annotations
 
 import json
-import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import installer_config as config  # noqa: E402
+
+ROOT = SCRIPT_DIR.parent
 PLUGIN_NAME = "codekit"
-VERSION = re.compile(r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$")
 SKILLS_DIR = ROOT / "skills"
+# Which manifests carry the version is owned by sync-plugin-version.py; its filename
+# carries a hyphen, so it is reached through the shared path loader (which also keeps
+# a single module instance). Re-declaring the list here is how the two scripts drift
+# apart and a bumped version lands in some manifests but not the others.
+SYNC_SCRIPT = SCRIPT_DIR / "sync-plugin-version.py"
+SYNC_MODULE_NAME = "codekit_sync_plugin_version"
+
+
+def version_targets() -> tuple[Path, ...]:
+    """Version-bearing manifests, read from the list the synchronizer writes."""
+    return tuple(config.load_module(SYNC_SCRIPT, SYNC_MODULE_NAME).TARGET_FILES)
 
 
 class ManifestError(ValueError):
@@ -38,8 +53,12 @@ def load_json(path: Path) -> dict:
 def check_version_source() -> str:
     document = load_json(ROOT / "plugin-version.json")
     version = str(document.get("version", ""))
-    if not VERSION.fullmatch(version):
-        raise ManifestError(f"plugin-version.json: {version!r} is not a plain x.y.z version")
+    # Shared with the synchronizer and the installer (installer_config.SEMVER_PATTERN);
+    # a stricter local rule used to reject versions the other two had just accepted.
+    if not config.SEMVER_PATTERN.fullmatch(version):
+        raise ManifestError(
+            f"plugin-version.json: {version!r} is not a semantic version such as 1.0.0"
+        )
     return version
 
 
@@ -101,10 +120,8 @@ def check_opencode_entry() -> None:
 def main() -> int:
     try:
         version = check_version_source()
-        assert_name_and_version(ROOT / ".claude-plugin" / "plugin.json", version)
-        assert_name_and_version(ROOT / ".codex-plugin" / "plugin.json", version)
-        assert_name_and_version(ROOT / ".opencode" / "package.json", version)
-        assert_name_and_version(ROOT / ".qoder-plugin" / "plugin.json", version)
+        for relative in version_targets():
+            assert_name_and_version(ROOT / relative, version)
         check_marketplaces()
         check_opencode_entry()
         count = check_skill_tree()

@@ -27,10 +27,10 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_config as config  # noqa: E402
-from installer_platform import has_contents, rmtree  # noqa: E402
+from installer_platform import has_contents, rmtree, text_kwargs  # noqa: E402
 
 
-PLUGIN_NAME = "codekit"
+PLUGIN_NAME = config.PLUGIN_NAME
 # Local-directory installs are registered under the implicit `local` marketplace.
 CACHE_MARKETPLACE = "local"
 PLUGIN_ID = f"{PLUGIN_NAME}@{CACHE_MARKETPLACE}"
@@ -132,9 +132,9 @@ def run(args: Sequence[str], timeout: float = 20.0) -> tuple[int, str]:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
             timeout=timeout,
             check=False,
+            **text_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return 1, ""
@@ -356,15 +356,6 @@ def remove_mcp_server(root: Path, name: str) -> bool:
     if not servers:
         document.pop("mcpServers", None)
     return _write_json(settings_path(root), document)
-
-
-def mcp_server(root: Path, name: str) -> dict[str, Any]:
-    """Return the effective ``mcpServers`` entry for a name, if any."""
-    servers = read_settings(root).get("mcpServers")
-    if not isinstance(servers, dict):
-        return {}
-    entry = servers.get(name)
-    return dict(entry) if isinstance(entry, dict) else {}
 
 
 def _hook_map(document: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -740,18 +731,6 @@ def describe_cli(commands: Sequence[str], path: str) -> str:
     return f"{command} ({path})"
 
 
-def cli_presence(
-    platform_key: str,
-    home: Path,
-    environ: Optional[Mapping[str, str]] = None,
-) -> str:
-    """Describe the platform CLI's location; an empty string means missing."""
-    descriptor = PLATFORMS[platform_key]
-    return describe_cli(
-        descriptor.cli_commands, cli_path(platform_key, home, environ)
-    )
-
-
 def capable_cli(
     descriptor: Platform,
     environ: Optional[Mapping[str, str]] = None,
@@ -971,8 +950,3 @@ def foreign_os_roots(descriptor: Platform) -> list[Path]:
         if candidate.is_dir():
             roots.append(candidate)
     return roots
-
-
-def supported_platform_keys() -> Iterable[str]:
-    """Return the platform keys the installer knows how to drive."""
-    return tuple(PLATFORMS)
