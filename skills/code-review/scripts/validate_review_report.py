@@ -516,17 +516,36 @@ class ReportValidator:
             self.error("$.release_gate.checks", f"must contain all release checks; missing {sorted(RELEASE_CHECKS - seen)}")
         blockers = self.require_string_list(gate.get("blocking_reasons"), "$.release_gate.blocking_reasons")
         conditions = self.require_string_list(gate.get("conditions"), "$.release_gate.conditions")
+        # Gate 状态按 FAIL > NOT_VERIFIED > CONDITIONAL > 全 PASS 的优先级裁决：
+        # 高优先级检查项存在时，低优先级分支不得再对 status 提出互斥要求，
+        # 否则 release-gate.md 允许的混合严重度报告（如 FAIL + CONDITIONAL → NOT_READY）
+        # 会落进无解死锁，逼迫伪造检查项状态才能通过校验。
+        fail_present = "FAIL" in check_statuses
+        not_verified_present = "NOT_VERIFIED" in check_statuses
+        conditional_present = "CONDITIONAL" in check_statuses
         if status == "READY" and any(item not in {"PASS", "NOT_APPLICABLE"} for item in check_statuses):
             self.error("$.release_gate.status", "READY permits only PASS or NOT_APPLICABLE checks")
-        if status != "NOT_APPLICABLE" and "FAIL" in check_statuses and status != "NOT_READY":
+        if status != "NOT_APPLICABLE" and fail_present and status != "NOT_READY":
             self.error("$.release_gate.status", "any FAIL check requires NOT_READY")
-        elif status != "NOT_APPLICABLE" and "NOT_VERIFIED" in check_statuses and status != "NOT_VERIFIED":
+        elif status != "NOT_APPLICABLE" and not fail_present and not_verified_present and status != "NOT_VERIFIED":
             self.error("$.release_gate.status", "any NOT_VERIFIED check requires NOT_VERIFIED unless a FAIL requires NOT_READY")
-        elif status != "NOT_APPLICABLE" and "CONDITIONAL" in check_statuses and status != "READY_WITH_CONDITIONS":
-            self.error("$.release_gate.status", "any CONDITIONAL check requires READY_WITH_CONDITIONS")
-        elif status != "NOT_APPLICABLE" and check_statuses and all(
-            item in {"PASS", "NOT_APPLICABLE"} for item in check_statuses
-        ) and status != "READY":
+        elif (
+            status != "NOT_APPLICABLE"
+            and not fail_present
+            and not not_verified_present
+            and conditional_present
+            and status != "READY_WITH_CONDITIONS"
+        ):
+            self.error("$.release_gate.status", "any CONDITIONAL check requires READY_WITH_CONDITIONS unless a FAIL or NOT_VERIFIED check takes precedence")
+        elif (
+            status != "NOT_APPLICABLE"
+            and not fail_present
+            and not not_verified_present
+            and not conditional_present
+            and check_statuses
+            and all(item in {"PASS", "NOT_APPLICABLE"} for item in check_statuses)
+            and status != "READY"
+        ):
             self.error("$.release_gate.status", "all PASS or NOT_APPLICABLE checks require READY")
         if status == "READY_WITH_CONDITIONS" and ("CONDITIONAL" not in check_statuses or not conditions):
             self.error("$.release_gate", "READY_WITH_CONDITIONS requires a CONDITIONAL check and conditions")

@@ -19,7 +19,9 @@ allowed-tools: 'Bash, Read, Agent, Grep'
 
 > 本文档中的 `SKILL_DIR` / `SKILLS_ROOT` 解析方式、`<PYTHON>` 启动器按宿主的解析规则、派发时必须显式传入的路径清单，以及“Skill 之间不得用相对路径互相引用文件”的纪律，统一见 `$SKILLS_ROOT/_shared/prompts/path-convention.md`；下面是本 Skill 的特有补充。
 
-本 Skill 自带的脚本是 `scripts/freeze_review_snapshot.py`（步骤 02）和 `scripts/validate_review_report.py`（步骤 21），一律以 **`SKILL_DIR` = 本文档所在目录的绝对路径**（插件安装时为 `<plugin-cache>/skills/code-review`）解析为 `"$SKILL_DIR/scripts/<name>"` 后调用；`SKILL_DIR` 同时用于定位需要读取的 `references/` 资源文件与 `agents/` 角色规范源文件。在命令行、Agent 提示或任何外部进程中引用这些路径时统一使用 `$SKILL_DIR`，不要假设当前目录、当前插件目录或仓库根目录就是 Skill 目录。
+本 Skill 自带的脚本是 `scripts/freeze_review_snapshot.py`（步骤 02，含 `--auto-target branch` 目标解析与 `--emit-skeleton` 报告骨架）和 `scripts/validate_review_report.py`（步骤 21），一律以 **`SKILL_DIR` = 本文档所在目录的绝对路径**（插件安装时为 `<plugin-cache>/skills/code-review`）解析为 `"$SKILL_DIR/scripts/<name>"` 后调用；`SKILL_DIR` 同时用于定位需要读取的 `references/` 资源文件与 `agents/` 角色规范源文件。在命令行、Agent 提示或任何外部进程中引用这些路径时统一使用 `$SKILL_DIR`，不要假设当前目录、当前插件目录或仓库根目录就是 Skill 目录。
+
+本 Skill 的全部运行时产物（`review-snapshot.json`、`review-report.json`、渲染后的 Markdown 报告）固定写入被审仓库的 `$RUN_DIR = <仓库根目录>/.codekit/code-review/<run-id>/`，与 code-impl 等 Skill 共用 `.codekit/` 运行时根；快照脚本会硬编码排除未跟踪的 `.codekit/` 文件，产物因此不会在重冻结时污染快照。
 
 派发 Sub-agent 时，必须在输入中显式给出：`SKILL_DIR` 的绝对路径、目标快照与 Diff 的定位符（base SHA / commit SHA / 分支），以及本次审查使用的冻结输入契约（Handoff、`materials.documents`、`review_mode`）的路径或内容；不得让 Sub-agent 自行猜测脚本位置或输入范围。
 
@@ -192,38 +194,33 @@ flowchart TB
 
 ## 02 冻结审查快照
 
-上游 Skill 已提供 Review Handoff 时，优先使用 Handoff 中冻结的目标、`Base SHA`、`Head SHA` 和 `diff_digest`，不得用当前分支状态覆盖；以下本地分支规则仅适用于独立执行本 Skill 的情况。独立执行时，默认将审查目标确定为“当前分支相对于本地 `master`/`main` 分支分叉点以来的全部差异”。不访问远程仓库、不执行 fetch、不切换分支；`feature-directory` 只用于解析需求文档，不改变代码审查目标。
+产物落点固定为 `$RUN_DIR = <仓库根目录>/.codekit/code-review/<run-id>/`，`<run-id>` 用 `YYYY-MM-DD-<目标短名>`；快照、报告骨架和最终 JSON 报告都写在这里，不写仓库根或其他位置。`freeze_review_snapshot.py` 在 untracked 枚举时硬编码排除顶层 `.codekit/` 目录（见下文披露），上一轮产物不会污染新一轮快照。
 
-使用只读 Git 命令确定目标：
+上游 Skill 已提供 Review Handoff 时，优先使用 Handoff 中冻结的目标、`Base SHA`、`Head SHA` 和 `diff_digest`，不得用当前分支状态覆盖；此时用显式 `--repo/--base-sha/--head-sha/--target-type/--target-locator` 重新生成 manifest 并与 Handoff 比对，不一致即 `BLOCKED`。不访问远程仓库、不执行 fetch、不切换分支；`feature-directory` 只用于解析需求文档，不改变代码审查目标。
 
-1. 使用 `git rev-parse --show-toplevel` 获取仓库根目录；当前处于 detached HEAD 时直接记录为 `BLOCKED`。
-2. 使用当前分支作为 Head：`current_branch = git symbolic-ref --short HEAD`，`head_sha = git rev-parse HEAD`。当前分支若为 `master` 或 `main`，没有可审查的分支差异，记录为 `BLOCKED`。
-3. 仅从本地分支中选择基线：优先使用 `refs/heads/master`；不存在时使用 `refs/heads/main`；两者都不存在时记录为 `BLOCKED`。若两者同时存在，固定优先 `master`，并在 `target_locator` 中记录实际选择的基线。
-4. 计算 `base_tip_sha = git rev-parse <base-ref>`，再计算 `merge_base_sha = git merge-base <base-tip-sha> <head_sha>`。本次审查的 committed 代码范围是 `merge_base_sha..head_sha`，不能直接使用 `base_tip_sha..head_sha` 代替。
-5. 将目标记录为 `target_type: branch`，`target_locator` 使用 `<base-ref>...<current-branch>`；快照中的 `base_sha` 使用 `merge_base_sha`，`head_sha` 使用当前分支的 `head_sha`。
+独立执行时，默认审查目标是“当前分支相对于本地 `master`/`main` 分支分叉点以来的全部差异”。该目标的判定是确定性逻辑，已由脚本实现，Orchestrator **不得**再逐条执行 git 探测命令：
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/freeze_review_snapshot.py" \
+  --auto-target branch \
+  --emit-skeleton "$RUN_DIR/review-report.json" \
+  > "$RUN_DIR/review-snapshot.json"
+```
+
+`--auto-target branch` 在脚本内只读完成原探测步骤的全部内容：解析仓库根目录；detached HEAD → `BLOCKED`；当前分支为 `master`/`main`（无分支差异）→ `BLOCKED`；基线固定优先 `refs/heads/master`、其次 `refs/heads/main`、都不存在 → `BLOCKED`，实际选择的基线记录在 `target_locator`（`<base-ref>...<current-branch>`）；committed 范围取 `merge_base_sha..head_sha`，不能直接用 `base_tip_sha..head_sha` 代替。退出码语义：`0` 生成 manifest；`3` 表示审查目标本身不成立，stderr 首行为 `BLOCKED: <原因>`，直接进入 `BLOCKED` 结论路径并仍进入报告流程记录证据；`2` 或其他失败是脚本/环境错误，禁止手工填写 digest 继续。
 
 完整审查输入必须同时包含以下四部分，并全部来自当前工作树：
 
 - committed：`git diff --binary --no-ext-diff <merge-base-sha> <head-sha>`；
 - staged：`git diff --binary --no-ext-diff --cached`；
 - unstaged：`git diff --binary --no-ext-diff`；
-- untracked：`git ls-files --others --exclude-standard -z` 列出的文件，按新增文件读取其完整内容。
+- untracked：`git ls-files --others --exclude-standard -z` 列出的文件（顶层 `.codekit/` 除外），按新增文件读取其完整内容。
 
 当前分支的未提交代码属于本次审查目标，不得标记为 `preexisting_changes`，也不得从审查范围中排除。快照生成后禁止提交、切换分支、恢复文件、添加或删除未跟踪文件；若后续发现工作树内容变化，必须停止合并结果并重新冻结快照，使旧的验证结果失效。
 
-快照必须由确定性脚本生成，不能由 Agent 手工填写 digest：
+快照必须由确定性脚本生成，不能由 Agent 手工填写 digest。`--emit-skeleton` 会用签名 manifest 机械预填报告骨架：`snapshot` 九个字段（含全部 64-hex digest）、`scope.target_type`/`target_locator` 与九个覆盖维度名一律从 manifest 复制，模型不得手工转录这些值；其余判断性字段全部是 null 占位，未填写的骨架必然通不过步骤 21 校验，不得当作成品交付。所有 Reviewer、验证命令和最终报告必须使用同一份快照及 `diff_digest`（每条 Validation Record 的 `diff_digest` 直接从骨架继承），任何字段不一致都必须阻塞。本模式不传 `--preexisting-change`。
 
-```bash
-<PYTHON> "$SKILL_DIR/scripts/freeze_review_snapshot.py" \
-  --repo <仓库根目录> \
-  --base-sha <merge-base-sha> \
-  --head-sha <current-head-sha> \
-  --target-type branch \
-  --target-locator <base-ref>...<current-branch> \
-  > review-snapshot.json
-```
-
-本模式不传 `--preexisting-change`；现有脚本会只读计算 committed、staged、unstaged 和 untracked 内容的 SHA-256，并生成 `diff_digest`、`manifest_digest` 与变更文件集合。报告中的 `snapshot` 必须逐字段复制该 manifest；所有 Reviewer、验证命令和最终报告必须使用同一份快照及 `diff_digest`，任何字段不一致都必须阻塞。
+**排除披露：**`.codekit/` 排除只针对未跟踪的运行时产物；任何其他目录的未跟踪文件、以及已被版本控制的 `.codekit/` 变更，仍照常计入审查范围。需要在该排除之外快照时，用显式 `--base-sha/--head-sha` 模式并人工核对 `changed_files`。
 
 记录步骤 01 实际解析到的每份文档（`feature-directory` 非空时为该目录及其子目录命中的文件，为空时为 `docs/` 递归收集到的文件）和规范的 revision/更新时间及内容摘要；取不到稳定版本时，以本次读取内容摘要作为冻结版本。`DOCUMENTS: NOT_AVAILABLE` 时只登记资料缺失本身，不得伪造文档路径或版本。
 
@@ -363,7 +360,7 @@ Release Gate 只评估，不执行部署、生产 Migration、流量操作或回
 
 ## 20 生成审查报告
 
-先按 [contracts.md](references/contracts.md) 生成规范化 JSON 报告负载，再从同一负载渲染中文 Markdown。报告必须包含：结论与依据、快照、审查范围、需求变更三类台账及其审查结果、Findings、Open Questions、Traceability Matrix、Coverage Matrix、本地验证证据、Release Gate、排除/未验证项和剩余风险。
+以步骤 02 `--emit-skeleton` 产出的 `$RUN_DIR/review-report.json` 为底稿，按 [contracts.md](references/contracts.md) 补全判断性字段，再从同一负载渲染中文 Markdown；`snapshot`、`scope.target_type`/`target_locator`、覆盖维度名和 Validation Record 的 `diff_digest` 直接沿用骨架值，不得重新转录或改写。报告必须包含：结论与依据、快照、审查范围、需求变更三类台账及其审查结果、Findings、Open Questions、Traceability Matrix、Coverage Matrix、本地验证证据、Release Gate、排除/未验证项和剩余风险。
 
 不要把摘要写成新证据；不要隐藏未运行检查、被限制的工具、缺失文档或已有基线失败。
 
@@ -373,17 +370,17 @@ Release Gate 只评估，不执行部署、生产 Migration、流量操作或回
 
 ```bash
 <PYTHON> "$SKILL_DIR/scripts/validate_review_report.py" \
-  --snapshot-manifest review-snapshot.json review-report.json
+  --snapshot-manifest "$RUN_DIR/review-snapshot.json" "$RUN_DIR/review-report.json"
 # 或
 <PYTHON> "$SKILL_DIR/scripts/validate_review_report.py" \
-  --snapshot-manifest review-snapshot.json - < review-report.json
+  --snapshot-manifest "$RUN_DIR/review-snapshot.json" - < "$RUN_DIR/review-report.json"
 ```
 
 退出码 0 只表示结构、必填字段、矩阵维度和结论不变量通过，不表示审查结论正确。
 
 ## 22 补充报告缺项
 
-根据校验器的精确错误补充缺失字段、状态或限制说明，并重新运行步骤 21。未知事实必须使用 `NOT_VERIFIED`、Open Question 或 limitation 表达；不得为了校验通过而伪造命令、退出码、文件位置或证据。
+根据校验器的精确错误补充缺失字段、状态或限制说明，并重新运行步骤 21。未知事实必须使用 `NOT_VERIFIED`、Open Question 或 limitation 表达；不得为了校验通过而伪造命令、退出码、文件位置或证据。**结构修复循环最多 3 轮**：第 3 轮后仍不通过时停止修补，把校验器剩余错误逐条写入 `blockers`，交付一份结论为 `BLOCKED` 且如实列出缺项的报告（`BLOCKED` 允许 `traceability`/`validation` 为空数组，但所有必填键必须存在）；不得为凑过校验而修改证据性字段。
 
 结构通过后才交付 Markdown 报告，并同时说明：审查目标摘要、最终结论、阻塞 Findings 数、验证实际执行范围、Release Gate、关键限制和需要用户回答的问题。
 

@@ -16,8 +16,11 @@ sys.path.insert(0, str(SKILL_DIR / "scripts"))
 
 from freeze_review_snapshot import (  # noqa: E402
     SnapshotError,
+    TargetBlocked,
+    build_report_skeleton,
     build_snapshot,
     parse_name_status,
+    resolve_auto_branch_target,
     run_git,
     untracked_manifest,
 )
@@ -330,6 +333,30 @@ class ReportContractTests(unittest.TestCase):
         errors = ReportValidator().validate(report)
         self.assertTrue(any("NOT_VERIFIED requires a NOT_VERIFIED check" in error for error in errors))
 
+    def test_release_gate_fail_takes_precedence_over_lower_status_checks(self) -> None:
+        # release-gate.md 允许混合严重度：FAIL 强制 NOT_READY 时，不得再因
+        # 同时存在 CONDITIONAL / NOT_VERIFIED 项而报互斥错误（历史死锁回归）。
+        cases = (
+            ("NOT_READY", {"rollback": "FAIL", "monitoring": "CONDITIONAL"}),
+            ("NOT_READY", {"rollback": "FAIL", "monitoring": "NOT_VERIFIED"}),
+            ("NOT_VERIFIED", {"rollback": "NOT_VERIFIED", "monitoring": "CONDITIONAL"}),
+        )
+        for status, overrides in cases:
+            with self.subTest(status=status, overrides=tuple(sorted(overrides))):
+                report = valid_report()
+                report["verdict"] = "REQUEST_CHANGES"
+                report["release_gate"] = release_gate(status, overrides)
+                errors = [error for error in ReportValidator().validate(report) if error.startswith("$.release_gate")]
+                self.assertEqual(errors, [])
+
+    def test_release_gate_precedence_does_not_relax_wrong_status(self) -> None:
+        # FAIL + CONDITIONAL 仍不得伪装成 READY_WITH_CONDITIONS。
+        report = valid_report()
+        report["verdict"] = "REQUEST_CHANGES"
+        report["release_gate"] = release_gate("READY_WITH_CONDITIONS", {"rollback": "FAIL", "monitoring": "CONDITIONAL"})
+        errors = ReportValidator().validate(report)
+        self.assertTrue(any("any FAIL check requires NOT_READY" in error for error in errors))
+
     def test_forged_manifest_digest_is_rejected(self) -> None:
         report = valid_report()
         manifest = signed_manifest()
@@ -404,6 +431,81 @@ class SnapshotScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(SnapshotError):
                 run_git(Path(directory), "rev-parse", "--verify", "deadbeef^{commit}")
+
+    def _init_repo(self, repo: Path) -> str:
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "gc.auto", "0"], cwd=repo, check=True)
+        (repo / "app.py").write_text("print('base')\n", encoding="utf-8")
+        subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+        # 归一化初始分支名，避免宿主 init.defaultBranch 差异影响基线优先级断言。
+        subprocess.run(["git", "branch", "-M", "master"], cwd=repo, check=True)
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+    def test_auto_target_resolves_merge_base_and_prefers_master(self) -> None:
+        # ignore_cleanup_errors tolerates the .git rmtree race seen on WSL/9p mounts.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            repo = Path(directory)
+            base = self._init_repo(repo)
+            # main 与 master 同时存在时，locator 必须记录实际选择的 master 基线。
+            subprocess.run(["git", "branch", "main"], cwd=repo, check=True)
+            subprocess.run(["git", "checkout", "-qb", "feature"], cwd=repo, check=True)
+            (repo / "new.py").write_text("print('feat')\n", encoding="utf-8")
+            subprocess.run(["git", "add", "new.py"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "feat"], cwd=repo, check=True)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+            resolved = resolve_auto_branch_target(repo)
+            self.assertEqual(resolved["target_type"], "branch")
+            self.assertEqual(resolved["target_locator"], "master...feature")
+            self.assertEqual(resolved["base_sha"], base)
+            self.assertEqual(resolved["head_sha"], head)
+
+    def test_auto_target_blocks_baseline_branch_and_detached_head(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            repo = Path(directory)
+            self._init_repo(repo)
+            with self.assertRaises(TargetBlocked):
+                resolve_auto_branch_target(repo)  # 当前分支即 master，无分支差异
+            subprocess.run(["git", "checkout", "-qb", "feature"], cwd=repo, check=True)
+            subprocess.run(["git", "checkout", "-q", "--detach"], cwd=repo, check=True)
+            with self.assertRaises(TargetBlocked):
+                resolve_auto_branch_target(repo)  # detached HEAD
+
+    def test_untracked_manifest_excludes_codekit_runtime_dir(self) -> None:
+        # 上一轮审查产物不得计入 untracked_digest（观测者效应固定排除）。
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "regular.py").write_text("print('x')\n", encoding="utf-8")
+            artifact = repo / ".codekit" / "code-review" / "run-1"
+            artifact.mkdir(parents=True)
+            (artifact / "review-snapshot.json").write_text("{}", encoding="utf-8")
+            paths, _ = untracked_manifest(repo)
+            self.assertEqual(paths, ["regular.py"])
+
+    def test_report_skeleton_prefills_only_manifest_bound_fields(self) -> None:
+        manifest = signed_manifest()
+        skeleton = build_report_skeleton(manifest)
+        for field in (
+            "base_sha",
+            "head_sha",
+            "diff_digest",
+            "changed_files",
+            "staged_digest",
+            "unstaged_digest",
+            "untracked_digest",
+            "preexisting_changes",
+            "manifest_digest",
+        ):
+            self.assertEqual(skeleton["snapshot"][field], manifest[field])
+        self.assertEqual(skeleton["scope"]["target_locator"], manifest["target_locator"])
+        self.assertEqual({entry["dimension"] for entry in skeleton["coverage"]}, set(DIMENSIONS))
+        errors = ReportValidator(snapshot_manifest=manifest).validate(skeleton)
+        # 机械字段已绑定 manifest；判断字段留空必须让校验失败，骨架不可被直接交付。
+        self.assertFalse([error for error in errors if error.startswith(("$.snapshot", "$.scope.target"))])
+        self.assertTrue(any(error.startswith("$.verdict") for error in errors))
 
 
 if __name__ == "__main__":

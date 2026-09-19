@@ -36,34 +36,27 @@ review_input:
 
 ## Review Snapshot
 
+由 `freeze_review_snapshot.py` 生成（独立分支目标用 `--auto-target branch`，Handoff 模式用显式 SHA 参数），字段集合与脚本输出严格一致，任何 Agent 不得手工填写或增删键：
+
 ```yaml
 review_snapshot:
+  schema_version: "1.0"
   repository_root: absolute-path
-  target_type: string
-  target_locator: string
-  branch: string | null
-  merge_base_sha: git-sha | null
-  base_sha: git-sha
+  target_type: string                # branch | local_diff | commit_range | ...
+  target_locator: string             # 如 master...feature/x，记录实际选择的基线
+  base_sha: git-sha                  # branch 目标下为 merge-base，而非基线分支 tip
   head_sha: git-sha
-  commits: [git-sha]
-  changed_files:
-    - path: repo-relative-path
-      status: added | modified | deleted | renamed | untracked
-      old_path: repo-relative-path | null
-  diff_digest: string
-  diff_artifact: reference
-  staged_digest: string | null
-  unstaged_digest: string | null
-  untracked_digest: string | null
-  preexisting_changes: [repo-relative-path]
-  target_metadata_digest: string | null
-  manifest_digest: sha256
-  material_versions:
-    - locator: string
-      revision: string | null
-      content_digest: string
-  frozen_at: timestamp
+  changed_files:                     # "STATUS:path" 字符串；重命名/复制为 "R:old->new"
+    - string
+  staged_digest: sha256
+  unstaged_digest: sha256
+  untracked_digest: sha256           # 顶层 .codekit/ 运行时产物被固定排除（SKILL.md 步骤 02 披露）
+  preexisting_changes: [string]      # 独立 branch 目标模式固定为 []
+  diff_digest: sha256
+  manifest_digest: sha256            # 对剔除本字段后的规范 JSON 计算签名
 ```
+
+报告负载的 `snapshot` 键恰好复制其中 9 个字段（`base_sha`、`head_sha`、`diff_digest`、`changed_files`、`staged_digest`、`unstaged_digest`、`untracked_digest`、`preexisting_changes`、`manifest_digest`），`scope.target_type`/`target_locator` 与 manifest 一致；这些机械字段由 `--emit-skeleton` 预填，不得手工转录。文档版本记录（locator/revision/content_digest）登记在步骤 02 台账与 Context Contract 中，不属于签名 manifest。
 
 所有后续角色都必须回显 `diff_digest`。出现不同摘要时停止合并结果并重新冻结。
 
@@ -263,6 +256,8 @@ release_gate:
   blocking_reasons: [string]
   conditions: [string]
 ```
+
+顶层 `status` 按检查项的最高优先级裁决：存在 `FAIL` 必须 `NOT_READY`；否则存在 `NOT_VERIFIED` 必须 `NOT_VERIFIED`；否则存在 `CONDITIONAL` 必须 `READY_WITH_CONDITIONS`；全部 `PASS`/`NOT_APPLICABLE` 才允许 `READY`。低优先级检查项（如 `CONDITIONAL`、`NOT_VERIFIED`）可以与 `FAIL` 共存于 `NOT_READY`，其条件与缺口写在各自的 `condition_or_gap` 中，不得为迁就顶层状态而改写检查项结果。
 
 ## 规范化报告 JSON
 
