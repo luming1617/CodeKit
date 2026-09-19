@@ -36,6 +36,25 @@ Base SHA、分支、文档 digest 和预存工作树快照，并拒绝覆盖已�
 创建、任务范围检查、审查快照和失败归属都必须写入这个状态；`.codekit/` 是运行时证据
 目录，不得把它作为业务变更提交。
 
+运行目录内的产物固定为：`state.json`（台账与判定记录）、`input-contract.json`（步骤
+01 的输入冻结，`init` 会立即自校验）、`scope-checks/NNN-<task-id>.json`（每次范围检查
+的完整记录）、`task-ledger.md`（由 `render-ledger` 从 `state.json` 渲染，勿手写）、
+`review-snapshot.json`（审查快照）与 `gate-report.json`（步骤 16 的交付门禁结果）。
+**这些文件不需要读入上下文**：`state.json` 只保存紧凑行记录，完整文件清单在
+`scope-checks/` 里；需要恢复现场时用 `show` 取有界摘要，不要 `Read` 整个状态文件。
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" show --state "$state_path"
+```
+
+`show` 返回当前阶段、各状态任务数、未完成任务、验证记录计数、冻结/审查结论计数、
+剩余重试预算，以及三份文档是否与冻结时一致（`drifted_materials`）。会话中断后恢复、
+或任何“我现在到哪一步”的判断，都以它为准。
+
+控制器对文档解码失败（非 UTF-8、含 BOM）会给出 `BLOCKED:` 与检测到的编码，而不是
+traceback；确需继续时以 `init --allow-lossy-decoding` 重开一个 run，该选择会记录在
+`materials.*.decoding` 里并在最终报告中披露。
+
 ## 开始前必须读取的资源
 
 本 Skill 的独立角色使用全局 agents：`impl-planner`、`impl-implementer`、`impl-debugger`，规范源文件位于 `skills/code-impl/agents/`。它们分别对应 Planner、Implementer 和 Debugger；最终审查仍调用系统 `codekit:code-review` Skill。
@@ -89,7 +108,7 @@ Planner 必须为每个变更项建立实现映射：修改项列出现有代码
 5. **证据优先。**不得仅凭 Subagent 的 DONE、口头说明或历史结果判定通过。以实际 Diff、文件范围、命令、退出码、日志摘要和当前 SHA 为准。
 6. **保护现有工作。**预先存在的未提交修改属于用户。记录并避开它们；若任务范围与其重叠且无法可靠区分，进入人工介入，不得覆盖、回退或擅自整理。
 7. **写并发必须隔离。**同一工作区一次只运行一个可写 Implementer。只有在平台提供彼此隔离的工作树且合并方式已获授权时，才可并行执行文件范围不重叠的写任务。只读角色可并行。
-8. **有限重试。**同一错误指纹最多重试 3 次；每次重试前必须根据新证据改变代码、测试、上下文或任务计划。审查修复最多 2 轮。达到上限后进入人工介入。
+8. **有限重试。**同一（归一化后的）错误指纹最多重试 3 次、最多出现 4 次，单个任务累计派发不超过 6 次，审查修复最多 2 轮；三条预算都由控制器机械执行，达到上限即进入人工介入。重试前必须根据新证据改变代码、测试、上下文或任务计划，并且必须有对应的 `record-failure` 登记，否则 `dispatch-task` 直接拒绝。
 9. **持续推进。**计划确认后，持续调度到完成或触发明确的人工介入条件；不要在正常任务之间反复询问是否继续。
 
 ## SKILL 架构
@@ -205,6 +224,11 @@ Orchestrator 的第一项工作是校验 `<feature-directory>` 及其中固定�
 
 Planner 必须返回 [contracts.md](references/contracts.md) 定义的 Task DAG。每个任务都要有明确依赖、目标、允许修改文件、只读上下文、验收标准、任务级验证命令、风险和人工验收候选。无法从仓库验证的路径或命令不得伪造。
 
+Orchestrator 把 Planner 返回的 JSON **原样**写入 `<run>/task-dag.json` 作为本轮 DAG 产物：
+不得改键名、补字段或把散文重写成结构（需要改动就说明 Planner 输出不合规、退回重做，
+而不是由主 Agent 代写）；后续 `validate-contract --kind task-dag` 与
+`record-tasks --from-dag` 都以这个文件为准，步骤 16 的 `gate` 也以它登记的台账为准。
+
 ## 04 计划确认
 
 Orchestrator 独立检查：
@@ -218,6 +242,32 @@ Orchestrator 独立检查：
 - 整体验证是否覆盖跨模块、契约、Migration 和本地构建需求。
 
 局部缺漏或错误退回 Planner，并说明精确问题；规格冲突、重大架构取舍或权限缺口进入步骤 17。确认后冻结 `plan_version`，执行中任何重规划都要递增版本并记录原因。
+
+### 机械校验（步骤 04）
+
+Planner 的 DAG 必须先落盘为 JSON 产物，再用控制器校验；校验不过不得进入步骤 05：
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" validate-contract \
+  --kind task-dag "$dag_path"
+```
+
+控制器会拒绝：含环的依赖、`requirement_trace[].source` 不在
+`product_requirements|technical_design|release_plan|user_request`、`requirement` 或
+`covered_by` 为空、以及 `covered_by` 指向不存在的任务 id 与不属于
+`human_acceptance[].id` 的追踪项（即“需求已覆盖”必须是可核对的引用，不能是散文）。
+
+确认通过后，用一次调用把整份 DAG 登记进任务台账（取代逐个 `record-task` 的 N 次状态读写）：
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" record-tasks \
+  --state "$state_path" --from-dag "$dag_path"
+```
+
+`record-tasks` 会再次执行同一份 `task-dag` 校验、按 `plan_version` 登记全部任务与写入
+范围，并返回 `registered`/`already_present`/`tasks_total` 摘要；重复执行是幂等的。它拒绝
+部分写入：任何一条任务不合法时状态文件保持不变。后续单独补建的任务仍用步骤 05 的
+`record-task`。
 
 ## 05 任务调度
 
@@ -250,6 +300,13 @@ Orchestrator 独立检查：
 
 `dispatch-task` 只接受两种来源状态：`PENDING → READY → RUNNING`（首次派发）和 `FAILED → RUNNING`（重试，任务台账的 `attempts` 自动加 1）；未登记任务或其他来源会以 `ControllerError`（退出码 2）拒绝。返回体只含 `task_id`、`status`、`attempts` 与 `agent` 摘要（`session_id`/`role`/`status`），不要把完整状态文件复述进上下文。特殊迁移（如判定 `BLOCKED`、人工要求 `SUPERSEDED`）仍用 `update-task --state "$state_path" --task-id '<task-id>' --status <STATUS>`。
 
+`FAILED → RUNNING` 的重试默认受门禁约束（`--retry-policy gated`，即默认值）：控制器要求
+本任务存在一条 `record-failure` 登记，且登记时间不早于任务进入 `FAILED` 的时间，处置不得
+已是 `human_intervention`，并且该任务累计派发次数不得超过 `MAX_TASK_ATTEMPTS`（=6，绝对
+上限，独立于同一指纹的 4 次预算）。也就是说“没有诊断记录就无法重试”由机器执行，不再依赖
+Orchestrator 自觉。`--retry-policy prose` 是回退开关，只用于门禁本身成为故障源时临时放行，
+放行会在返回体里标注，最终报告必须如实说明用了多少次 prose 重试。
+
 非法迁移（如 PENDING 直接跳至 PASS、从终态再次转移）控制器会以 `ControllerError` 拒绝并退出码 2，不得绕过。
 
 ## 06 编码实现
@@ -277,10 +334,24 @@ Sub-agent 创建的角色登记已由步骤 05 的 `dispatch-task` 原子完成�
 
 Orchestrator 使用本地工具对本次任务产生的新 Diff 执行：
 
-1. **范围检查优先：**实际新增、修改、删除和重命名文件必须在 Task Contract 内；同时确认用户原有变更未被覆盖。
+1. **范围检查优先：**实际新增、修改、删除和重命名文件必须在 Task Contract 内；同时确认用户原有变更未被覆盖。`check-scope` 只用于**诊断**（它写一条范围证据，不改变任务状态）；判定一律走步骤 08 的 `settle-task`，由它复算并落定。
 2. 依次运行该任务适用的格式检查、编译/类型检查、单元测试、Lint 和静态检查。
 3. 记录精确命令、工作目录、开始/结束时间、退出码、关键日志与未运行原因。
 4. 不把未执行、超时、跳过或日志缺失记为 PASS。
+
+每条任务级命令跑完必须立刻落成验证记录，控制器拒绝与退出码矛盾的自报结论：
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" record-validation \
+  --state "$state_path" --scope task --task-id '<task-id>' \
+  --name '<检查名>' --command '<精确命令行>' --cwd '<工作目录>' \
+  --exit-code '<退出码>' --result PASS --evidence '<日志关键行>'
+```
+
+规则由控制器强制：`PASS` 必须 `--exit-code 0` 且带证据（长日志用 `--evidence-file`，内联
+证据超过 4000 字符会被拒）；`FAIL` 必须是非 0 退出码；`NOT_RUN` 不得带退出码，必须给
+`--not-run-reason`。每条记录都会自动绑定当前工作树指纹与 `head_sha`，这是步骤 16 判断
+“证据是否描述被交付的这份 Diff”的依据。
 
 范围检查必须由控制器执行，而不是只看 Implementer 自报；检查以 `--task-id` 绑定 Task Ledger，授权集合由控制器按“该任务登记范围 ∪ 已 `PASS` 任务范围”确定性推导，不接受调用方现场声明文件：
 
@@ -289,7 +360,8 @@ Orchestrator 使用本地工具对本次任务产生的新 Diff 执行：
   --state "$state_path" --task-id '<task-id>'
 ```
 
-控制器返回结果中包含以下关键字段：
+控制器返回的**摘要**包含以下关键字段（完整文件清单写在 `scope-checks/` 的独立记录里，
+`state.json` 只留计数与越界项，不要把它整体读回上下文）：
 
 - `preexisting_modified`：**不在** 授权集合内且内容发生变化的预存文件——这才是真正的越界，导致 `BLOCKED`。
 - `authorized_overlaps`：**在** 授权集合内的预存 dirty 文件发生变化——这是已预期的重叠（已经人工介入后纳入范围），不影响 `PASS` 判定。
@@ -322,7 +394,12 @@ Implementer 返回 `NEEDS_SCOPE` 且 Orchestrator 决定扩充授权时，必须
   --error-fingerprint '<normalized-fingerprint>'
 ```
 
-`settle-task --status FAILED` 不要求范围检查通过；需要先单独排查越界时可用 `check-scope`。被拒绝的 PASS 不会写入任务状态：范围越界要么经 `expand-scope` 合法化后重判，要么按 `FAILED` 进入步骤 09。
+`settle-task --status FAILED` 不要求范围检查通过，但**必须**带 `--error-fingerprint`：它是重试预算计数、Debugger 归档和步骤 16 追溯的唯一键，缺失时控制器在推进状态之前直接拒绝（任务停留在 `RUNNING`）。需要先单独排查越界时可用 `check-scope`。被拒绝的 PASS 不会写入任务状态：范围越界要么经 `expand-scope` 合法化后重判，要么按 `FAILED` 进入步骤 09。
+
+判定成功时控制器把这一行写进台账：完成时间、结束时的 `final_diff_digest`/`final_head_sha`、
+该任务实际改动的文件（`changed_files`，按任务自己的范围归因，不是全局 Diff）、累计错误
+指纹和本次尝试的收尾结果；返回体只回显 `status`、`scope_result`、越界清单、
+`changed_files` 与 12 位 `diff_digest`。
 
 ## 09 失败诊断
 
@@ -364,6 +441,12 @@ Orchestrator 根据证据决策：
 
 同一错误指纹最多重试 3 次，且由控制器机械执行：每次失败必须通过 `record-failure` 登记，同一指纹的第 1 次出现记为初始失败，第 2–4 次仍返回 `RETRY_MAPPED_TASK`；第 5 次出现时控制器自动把处置改为 `human_intervention`、resolution 改为 `ATTEMPT_CAP`（见控制器 `MAX_FINGERPRINT_ATTEMPTS`），不得靠改写或换用指纹绕过。错误指纹至少包含失败命令、测试名或诊断位置、异常类型和归一化关键信息；只改变日志中的时间戳、临时路径或行号漂移不算新错误。
 
+“换用指纹”现在也无法绕过预算：控制器按归一化形式计数（十六进制串、数字、引号内文本、
+路径分别折叠为 `<hex>`、`#`、`<str>`、`<path>`），因此同一条断言在 412 行和 517 行失败、
+或 token 值变了，都记作同一个错误。`record-failure` 同时保存原文与归一化形式，`show` 会
+显示该指纹已出现几次。除指纹预算外，单个任务累计派发次数受 `MAX_TASK_ATTEMPTS`（=6）
+约束，且 `FAILED → RUNNING` 必须有一条不早于本次失败的 `record-failure`（见步骤 05）。
+
 ### 重规划（TASK_PLAN 或 REPLAN_MULTI_TASK_IMPACT）
 
 `TASK_PLAN` 根因或多任务影响时，必须先调用 `replan` 推进计划版本，再退回步骤 03 重新规划：
@@ -382,7 +465,18 @@ Orchestrator 根据证据决策：
 
 ## 11 任务登记
 
-任务 PASS 后更新内存中的执行台账或用户允许的计划文件，记录：任务状态、`plan_version`、开始/结束时间、当前 `HEAD SHA`、任务自有 Diff 指纹、实际修改文件、验证证据、尝试次数和遗留观察。未经授权不要为了登记而创建 commit 或修改方案文档。
+任务台账是控制器产物，不再靠 Orchestrator 手抄。每次任务判定后重新渲染：
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" render-ledger --state "$state_path"
+```
+
+`render-ledger` 从 `state.json` 写出 `<run>/task-ledger.md` 的托管块，列固定为
+`任务 | 状态 | 计划版本 | 尝试 | 开始 | 结束 | 授权文件 | 自有变更 | 验证 | 失败指纹 | 扩权`
+（“验证”是该任务级验证记录的 `通过/总数`，明细在 `state.json` 的 `validations`），并只替换
+托管块本身——你在同一文件里手写的说明、评审意见会被保留，但托管块内不得手写。返回体给出
+`rows`/`passed`/`total` 与 `ledger_digest`。未经授权不要为了登记而创建 commit 或修改方案
+文档；把台账渲染到计划文件需要 `--output` 显式指定路径。
 
 ## 12 整体验证
 
@@ -410,6 +504,19 @@ Code Review Handoff 的 `base_sha`、`head_sha`、`diff_digest`、预存快照�
 
 记录每项 PASS、FAIL 或 NOT_RUN 及理由。历史基线失败只能标为“非本轮引入”，不能伪装成通过。
 
+每一项整体检查同样必须落成 `--scope overall` 的验证记录（不接受 `--task-id`）：
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" record-validation \
+  --state "$state_path" --scope overall --name '全量测试' \
+  --command 'pytest -q' --cwd '<repo_root>' \
+  --exit-code 0 --result PASS --evidence-file '<run>/logs/pytest.txt'
+```
+
+整体验证记录与 `freeze-review` 必须描述同一份工作树：记录会自动绑定当前 Diff 指纹，冻结后
+再写入任何文件，都会让步骤 16 的 `gate` 判定“证据早于交付 Diff”而 `BLOCKED`，此时必须
+重新验证并重新冻结，不能沿用旧日志。
+
 ## 13 整体验证判定
 
 所有强制本地验证通过且没有未解释的新失败时进入独立审查。失败则携带整体验证快照进入步骤 09，并由步骤 10 决定修复、重规划或人工介入。
@@ -424,6 +531,29 @@ Code Review Handoff 的输入必须同时固定 `<feature-directory>/product-doc
 
 系统 `codekit:code-review` 必须返回其规范化 JSON 报告和由同一负载渲染的 Markdown 报告，并由它自带的确定性校验器验证结构。Orchestrator 只接收与 Handoff 的 `Base SHA`、`Head SHA` 和 Diff digest 完全一致且结构校验退出码为 0 的报告；不得把旧快照、未校验报告或口头摘要作为审查通过证据。
 
+### 机械校验（步骤 14）
+
+发出 Handoff 前必须校验它，收到报告后必须把结论登记进状态；两步都是控制器命令，退出码非 0 时不得继续：
+
+```bash
+# 1) 冻结 Handoff 的机械校验（review_mode=FULL、三份文档 access=available、locator 真实可读）
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" validate-contract \
+  --kind handoff "$handoff_path"
+
+# 2) 登记审查结论：digest 取自控制器自己的最后一次冻结，不由调用方填写
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" record-review \
+  --state "$state_path" --verdict '<APPROVE|APPROVE_WITH_FOLLOW_UPS|REQUEST_CHANGES|BLOCKED>' \
+  --report-path '<run>/review-report.json' \
+  --validator-exit-code '<code-review 自带校验器的退出码>' \
+  --summary '<一句话结论摘要>'
+```
+
+`record-review` 在任何 `freeze-review` 之前会被拒绝（结论必须绑定一个已定义 Diff），
+`--report-path` 必须指向真实存在的文件，报告会按内容摘要登记；`record-agent` 不再接受
+`APPROVE` 之类的结论值——那个命令只登记 `RUNNING|DONE|ARCHIVED|FAILED|BLOCKED`。
+一份报告对应一条记录；每轮重新冻结后必须重新登记，旧结论不会被采信（见步骤 16）。
+报告文件请写在运行目录（`.codekit/`）内，不要写进仓库工作树，否则会被范围检查判为越界。
+
 如果系统 Skill 不存在、宿主不支持嵌套 Skill 调用、审查无法保持只读、报告结构校验失败后仍无法修复，或返回快照不一致，则进入步骤 17。不得静默回退到旧 Reviewer Subagent。
 
 ## 15 审查判定
@@ -436,9 +566,27 @@ Orchestrator 严格使用 [contracts.md](references/contracts.md) 的 Code Revie
 - `BLOCKED`：进入步骤 17，向用户说明缺失的关键证据、权限、环境或宿主能力。
 - 完成 2 轮审查修复后仍为 `REQUEST_CHANGES`：进入人工介入。修复轮的重新冻结与步骤 12 共享 `MAX_REVIEW_FREEZES` 预算，控制器在第 4 次 `freeze-review` 时直接拒绝，作为该上限的机械兜底。
 
-不得把 `BLOCKED`、结构校验失败、快照不一致或 `APPROVE_WITH_FOLLOW_UPS` 中的条件性事项改写成无条件 `APPROVE`。
+每一轮的结论都要用 `record-review` 重新登记（新快照 + 新报告 + 该校验器的退出码）；判定
+只看最后一次冻结对应的记录，历史条目仅用于展示修复轮次。
 
 ## 16 最终报告
+
+写报告之前必须先过交付门禁，门禁结论由控制器给出，不由 Orchestrator 自评：
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" gate --state "$state_path"
+```
+
+`gate` 逐条核对：当前计划版本的任务是否全部 `PASS`；每个任务是否有 `--scope task` 的
+验证记录；是否存在 `--scope overall` 且指纹与最后一次冻结一致的整体证据；是否已冻结审查
+快照、快照产物是否可读；最新审查结论是否存在、是否为可交付结论（`APPROVE` /
+`APPROVE_WITH_FOLLOW_UPS`）、其结构校验是否退出 0、结论绑定的 Diff 指纹是否就是最后一次
+冻结；报告文件是否仍在磁盘上；以及最终范围检查是否干净。任一不满足即退出码 2 并打印
+`BLOCKED: ...`，详情写入 `<run>/gate-report.json`。
+
+`gate` 的退出码就是“能否宣称编码完成”的判据：不得用 `--mode warn-only` 绕过它出报告
+（该模式仅供排障和盘点，仍会在返回体里标 `BLOCKED (warn-only)`）。若门禁挡住，回到对应
+步骤补证据、补验证或进入步骤 17，不要绕过。
 
 使用 [contracts.md](references/contracts.md) 的交付报告结构，至少包含：
 
@@ -471,8 +619,12 @@ Orchestrator 严格使用 [contracts.md](references/contracts.md) 的 Code Revie
 
 只有同时满足以下条件才可报告“编码完成”：
 
-1. 所有 Task 均登记为 PASS；
-2. 整体验证满足发布方案中的全部本地要求；
-3. 系统 `codekit:code-review` 返回经结构校验且快照一致的 `APPROVE` 或 `APPROVE_WITH_FOLLOW_UPS`；
-4. 未决事项均明确归类为非阻塞风险或人工验收项；
-5. 最终报告可以让用户从命令、退出码、Diff 和 SHA 复核结论。
+1. `gate --state "$state_path"` 退出码为 0（`gate-report.json` 的 `status` 为 `PASS`）；
+2. 所有 Task 均登记为 PASS；
+3. 整体验证满足发布方案中的全部本地要求，且证据以 `record-validation` 落盘；
+4. 系统 `codekit:code-review` 返回经结构校验且快照一致的 `APPROVE` 或 `APPROVE_WITH_FOLLOW_UPS`，并以 `record-review` 登记；
+5. 未决事项均明确归类为非阻塞风险或人工验收项；
+6. 最终报告可以让用户从命令、退出码、Diff 和 SHA 复核结论。
+
+`gate` 未通过却输出“编码完成”的报告视为不合规交付：报告必须原样列出 `gate-report.json`
+中的失败项，并把状态写为 `BLOCKED`。

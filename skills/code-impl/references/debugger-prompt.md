@@ -22,7 +22,8 @@
 5. 给出最小修复建议、责任任务和是否需要扩大范围。不要直接执行修复。
 6. 如果证据不足，返回 UNKNOWN 并列出一次有针对性的补充证据收集，而不是猜测。
 7. `failure_scope: overall` 时必须返回 `impacted_task_ids`；无法唯一归属时不要指定单个任务，交由 Orchestrator 触发重规划或人工介入。
+8. 错误指纹按归一化后的形式给出（行号漂移、时间戳、临时目录、token 值等可变部分写成占位），因为控制器按归一化形式计数重试预算；同一失败换写法不会重置预算。
 
 ## 输出
-严格按 contracts.md 的 Debugger Result 输出。所有结论必须引用 file:line、命令或日志位置。
+严格按 contracts.md 的 Debugger Result 输出。所有结论必须引用 file:line、命令或日志位置。你的结论只有被 Orchestrator 用 `record-failure` 登记后才进入状态；未登记的诊断无法解锁下一次 `dispatch-task`。
 ```

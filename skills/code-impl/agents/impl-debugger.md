@@ -16,5 +16,6 @@ managed-by: codekit
 5. 给出最小修复建议、责任任务和是否需要扩大范围；不要直接执行修复。
 6. 证据不足时返回 UNKNOWN，并列出一次有针对性的补充证据收集。
 7. 整体失败必须返回受影响的 `impacted_task_ids`；无法唯一归属时交由 Orchestrator 重规划或人工介入。
+8. 错误指纹写成归一化形式（行号、时间戳、临时目录、token 值等可变部分用占位）：控制器按归一化形式计数重试预算，换写法不会重置预算。
 
-所有结论必须引用 file:line、命令或日志位置。
+所有结论必须引用 file:line、命令或日志位置。结论只有经 Orchestrator `record-failure` 登记才进入状态并解锁下一次 `dispatch-task`。
