@@ -608,34 +608,45 @@ def gitnexus_embedding_plan(
 
 def gitnexus_registration_plan(
     registry: dict[str, object], tool: dict[str, object], authorized: bool, allow_partial: bool
-) -> list[str]:
-    """判定 GitNexus 全局注册前提，返回 warnings；未授权且未接受降级时报错。
+) -> tuple[str, list[str]]:
+    """判定 GitNexus 全局注册前提，返回 ``(action, warnings)``；不预先拦人。
 
     查询类命令（``list``/``query``/``context``/``impact``/``trace``/``cypher``/
     ``check``/``detect-changes``）与 MCP 图查询只从 ``<GITNEXUS_HOME>/registry.json``
     解析仓库，所以注册不是可选优化：只写仓库内索引而不注册时，``status`` 一切正常，
-    查询却全部报 “No indexed repositories found”。与 embedding 前提一样，该判定在
-    任何写入之前完成：未获用户授权时零业务写入地失败，由主 Agent 询问后重跑。
+    查询却全部报 “No indexed repositories found”。
 
-    前提只对**真能执行**的 runner 生效：入口解析到了但探测失败时（沙箱拒绝读取），
-    gitnexus 阶段会按 tool-missing 跳过，此时再要求用户授权写全局注册表只是白问。
+    但**判定方式不是预检**：``os.access`` 在按路径拒绝文件系统访问的沙箱里会谎报
+    可写，用它决定「要不要问人」会把「其实写得进去」的运行也拦下来。所以这里只声明
+    本次运行打算怎么处理，真正的是否有权限由一次真实尝试回答（gitnexus 步骤的
+    ``gitnexus index <root>``）：
+
+    - ``none``：已注册，或 runner 跑不起来（那类降级与注册无关）。
+    - ``authorized``：用户已授权（``--allow-global-writes``），步骤直接写真实注册表。
+    - ``declined``：用户用 ``--allow-partial`` 明确接受 ``partial/registry-missing``。
+    - ``attempt``：先尝试真实注册；宿主拒绝时步骤以可恢复的 ``registry-denied`` 停下，
+      由主 Agent 按宿主提权通道重跑同一条命令后再问用户。
     """
-    if registry.get("registered") or not tool_runnable(tool) or authorized:
-        return []
+    if registry.get("registered") or not tool_runnable(tool):
+        return "none", []
+    if authorized:
+        return "authorized", []
     if allow_partial:
-        return [
+        return "declined", [
             "已按 --allow-partial 接受 GitNexus 注册缺失：本次不写全局注册表 "
             f"{registry.get('path')}，gitnexus 阶段记为 partial/registry-missing，"
             "查询类命令与 MCP 图查询在注册前不可用。",
         ]
-    raise PrepareError(
-        f"GitNexus 全局注册表 {registry.get('path')} 中没有本仓库："
+    return "attempt", [
+        f"GitNexus 全局注册表 {registry.get('path')} 中还没有本仓库："
         "list/query/context/impact/trace/cypher/check/detect-changes 与 MCP 图查询"
         "只能从该注册表解析仓库，缺少注册时索引虽然 status 正常但一律报 "
-        "“No indexed repositories found”。请询问用户是否允许在仓库之外写入注册表："
-        "允许则带 --allow-global-writes 重新运行；不允许则带 --allow-partial "
-        "明确接受 gitnexus 阶段降级为 partial/registry-missing。"
-    )
+        "“No indexed repositories found”。本次先尝试一次真实注册"
+        "（gitnexus index <root>，幂等且只写 registry.json）：成功即继续，不需要任何人"
+        "点头；宿主拒绝这次仓库外写入时，控制器 stop 在可恢复的 registry-denied 并给出"
+        "重试命令，主 Agent 按宿主提权通道重跑同一条命令，仍失败再询问用户；用户拒绝时"
+        "带 --allow-partial 接受 gitnexus 阶段降级为 partial/registry-missing。",
+    ]
 
 
 def tool_capabilities(root: Path) -> dict[str, object]:
@@ -902,9 +913,10 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
             args.embeddings,
             args.allow_global_writes,
         )
-        # 注册前提与 embedding 前提同样在任何写入之前判定：查询类命令与 MCP 图查询
-        # 只从全局 registry 解析仓库，缺注册时索引可用但查不到，必须由用户明确取舍。
-        registry_warnings = gitnexus_registration_plan(
+        # 注册不在这里拦人：缺注册时先声明「本次会尝试一次真实注册」，是否真有权限由
+        # gitnexus 步骤的一次 ``index <root>`` 回答——预检用的 os.access 在沙箱里会
+        # 谎报可写，用它决定要不要问人会把本来写得进去的运行也停下。
+        registry_action, registry_warnings = gitnexus_registration_plan(
             registry,
             gitnexus_tool,
             args.allow_global_writes,
@@ -912,7 +924,7 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
         )
     else:
         embedding_mode, embedding_warnings = "preserve", []
-        registry_warnings = []
+        registry_action, registry_warnings = "none", []
     state_root, lock_path, run_dir, state_is_temporary, state_warnings, descriptor = acquire_state_lock(root, run_id)
     manifest_path = run_dir / "run-manifest.json"
     manifest: dict[str, object] = {
@@ -947,7 +959,7 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
         "tools": tools,
         "gitnexus_index": index_modes,
         "gitnexus_embedding_mode": embedding_mode,
-        "gitnexus_registry": registry,
+        "gitnexus_registry": {**registry, "action": registry_action},
         "warnings": [*state_warnings, *embedding_warnings, *registry_warnings],
         "prepared_changed_files": [],
         "authorized_changed_paths": [],

@@ -40,6 +40,8 @@
 | M    | 跨模块或跨服务、接口/数据库/缓存/MQ 任一变化 | S 级全部内容，并补充总体架构、时序图、完整兼容性矩阵、容量、完整监控大盘与告警、部署拓扑   |
 | L    | 核心链路、架构调整、大规模迁移或高风险变更    | M 级全部内容，并补充容量测算、故障处置、安全专项设计、数据演进和跨团队关键技术决策依据       |
 
+规模归属不是作者偏好：`finalize-inputs` 用冻结 PRD 正文与仓库实测判定命中的变更类别（数据 / 接口 / 消息 / 定时 / 配置），0 类为 `S`、1～3 类为 `M`、≥4 类为 `L`，结论写入 `state.json` 并登记在第 16 章“运行元数据”台账，文档信息表的“方案规模”一格照抄该结论。`gate` 的 `scale-chapters` 按上表机械核对，分两档：任何规模下“最低要求”点名的章节都要在位；`M`/`L` 级的监控大盘设计、告警设计、部署拓扑必须有实质设计，写“不涉及”或短于一节最低标准即 `BLOCKED`。被命中类别对应的 `条件必填` 章节（§6 接口与契约、§7 数据库、§8 消息、§9 定时任务、§10 配置与依赖）保留“不涉及 + 原因”的退路——只写结论不给原因同样阻塞。判定确实错了时写 `[需人工确认: 规模应为 X，理由…]` 并照常按判定的规模写，不要自行下调后交付。
+
 ## 技术栈适配规则
 
 本模板以 Java / Dubbo / Nacos / XXL-JOB / Prometheus 举例，但章节语义与技术栈无关：
@@ -982,20 +984,23 @@ flowchart TB
 
 # 16. 审查闭环记录（必填）
 
-> 本章由 Refiner 与维护状态的主控共同填写：每条 `CRITIC-<NNN>` 和 `REVIEW-<round>-<NNN>`
-> 都必须有一行处置记录，`Blocker`/`High` 不得挂起或拒绝。表格内容必须与
-> `.codekit/technical-doc/<run-id>/state.json` 一致，交付门禁会据此核对。
+> 本章的两个台账由确定性控制器生成，不要手写、也不要把 `state.json` 的内容复制进来：
+> 每次 `record-finding`／`record-fix` 之后，由主控执行 `tech_doc_controller.py render-ledger`
+> （见 `SKILL.md` 命令表），它会在下列标记之间写入 Finding 处置映射与运行元数据。
+>
+> - 门禁 `ledger-blocks-present` 要求标记存在，`ledger-matches-state` 要求标记之间的内容与
+>   `.codekit/technical-doc/<run-id>/state.json` 完全一致；手改标记内内容、漏掉一条 Finding、
+>   或在标记之外另抄一份台账，都会阻塞交付。
+> - 标记不能被放进代码围栏，也不要在本章重复给出 Finding 列表。
+> - 正文仍由各角色撰写：处置理由写进对应设计章节，本章只回答“哪些 Finding、如何处置、如何验证”。
 
-| Finding ID | 来源 | 轮次 | 严重度 | 位置 | 处置 | 验证方式 | 状态 |
-|------------|------|------|--------|------|------|----------|------|
-| CRITIC-001 | Critic | 0 | 【填写】 | 【填写】 | 【填写】 | 【填写】 | 已修复 / 待确认 / 不采纳 |
+<!-- codekit:technical-doc:ledger:findings:start -->
+（由 `render-ledger` 生成，勿手改）
+<!-- codekit:technical-doc:ledger:findings:end -->
 
-| 字段 | 值 |
-|------|-----|
-| `review_round` | 【1～5】 |
-| 独立终审结论 | APPROVE / APPROVE_WITH_FOLLOW_UPS / REQUEST_CHANGES / BLOCKED |
-| 交付门禁 | PASS / PARTIAL_DEGRADED（降级时必须说明未满足的独立性门禁） |
-| 仍需人工确认 | 【无 / 具体事项及其影响的决策】 |
+<!-- codekit:technical-doc:ledger:run-metadata:start -->
+（由 `render-ledger` 生成，勿手改）
+<!-- codekit:technical-doc:ledger:run-metadata:end -->
 
 ---
 
@@ -1038,16 +1043,19 @@ flowchart TB
 
 ## 变更历史（只追加，不覆盖；需求变更时必填）
 
-> 新需求填写“无历史版本”。需求变更时，先把上一版有效 TDD 归档为运行目录下的独立文件
-> （`tech_doc_controller.py archive-history`），再在本节末尾**追加一行索引**：版本、日期、
-> 输入摘要和 `【修改】/【新增】/【删除】` 数量。**不要**把旧版正文粘贴进本文档——
-> 包裹旧正文的 markdown 围栏会被旧版内的 mermaid/sql 围栏提前截断，且文档会随每次变更成倍膨胀。
-> 不得覆盖、删除或重排已有历史、评审处理记录和发布结果。
+> 需求变更时，先把上一版有效 TDD 归档为运行目录下的独立文件
+> （`tech_doc_controller.py archive-history`），并在 INPUT 阶段用
+> `finalize-inputs --prd-changes 修改数/新增数/删除数`（如 `3/1/0`）登记这次需求变更的规模；
+> 本节索引由 `tech_doc_controller.py render-ledger` 依据这两条记录生成。
+> **不要**把旧版正文粘贴进本文档——包裹旧正文的 markdown 围栏会被旧版内的 mermaid/sql
+> 围栏提前截断，且文档会随每次变更成倍膨胀。不得覆盖、删除或重排已有历史、评审处理记录和发布结果。
 
 ### 历史版本索引
 
-| 序号 | 版本 | 归档日期 | 变更台账（修改/新增/删除） | 归档文件 |
-|------|------|----------|------------------------------|----------|
-| 1 | 【旧版本号】 | YYYY-MM-DD | 【n/n/n】 | `.codekit/technical-doc/<run-id>/history/01-【旧版本号】.md` |
+索引是本节唯一的一份；不要在别处再抄一份归档清单，也不要手改标记之间的表格。
+
+<!-- codekit:technical-doc:ledger:history-index:start -->
+（由 `render-ledger` 生成，只追加不手改；未发生需求变更时保留“无历史版本”）
+<!-- codekit:technical-doc:ledger:history-index:end -->
 
 ---

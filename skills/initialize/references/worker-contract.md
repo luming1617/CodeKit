@@ -81,5 +81,6 @@ error:
 5. 带 root 的 artifact/sidecar 必须解析到当前仓库根。
 6. `gitnexus` 的 complete 结论必须能在宿主环境重测到全局注册；缺失即拒绝（`registry-missing`），不得由 result 的 `registry` 字段自述代替。
 7. `partial`、`failed` 保持原状态；不得按“失败 Worker 数量”聚合。`collab-unavailable` 是编排阻断，不是普通 partial，且不得由 `--allow-partial` 放行。
+8. 仓库外写入被宿主拒绝时**根本没有 result**：控制器以 `registry-denied`（退出码 77、`recoverable: true`）返回并保持 run 与锁，主 Agent 按宿主提权通道重跑控制器给出的 `retry_command`（`controller.py register --manifest …`，只做那次写入），成功后重跑 `analyze`。它不是 Worker 的 `error.code`，也不得由主 Agent 手工补写一份 result 绕过它；用户明确拒绝后才按 `--allow-partial` 记 `partial/registry-missing`。`register` 自身的前提错误（manifest 已不是 `prepared`、`tools.gitnexus` 不可执行、锁身份不符）同样按可恢复的输入错误上报，保持 run 与锁——它是补救命令，不得把要救的 run 拖进 `aborted`。
 
 校验器输出 `success | partial | failed` 和每项证据。required failure、越界写入或 artifact root 不一致均为 failed。

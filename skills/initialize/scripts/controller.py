@@ -93,7 +93,9 @@ def require_prior_step(manifest: dict, filename: str, step: str) -> None:
         )
 
 
-def report_recoverable_input_error(manifest_path: Path, error: Exception) -> int:
+def report_recoverable_input_error(
+    manifest_path: Path, error: Exception, *, hint: str | None = None
+) -> int:
     try:
         manifest = validator.load_json(manifest_path)
         phase = manifest.get("phase")
@@ -103,15 +105,19 @@ def report_recoverable_input_error(manifest_path: Path, error: Exception) -> int
         phase = "unknown"
         run_dir = manifest_path.parent
         current_lock_status = "unknown"
-    if current_lock_status == "held":
-        hint = (
-            "repair or copy the JSON input into expected_run_dir and retry this same run; "
-            "do not start initialize again"
-        )
-    elif current_lock_status == "absent":
-        hint = "the run lock is absent; inspect the manifest and start a new initialize run"
-    else:
-        hint = "the run lock status is unknown; inspect the manifest before retrying or restarting"
+    if hint is None:
+        if current_lock_status == "held":
+            hint = (
+                "repair or copy the JSON input into expected_run_dir and retry this same run; "
+                "do not start initialize again"
+            )
+        elif current_lock_status == "absent":
+            hint = "the run lock is absent; inspect the manifest and start a new initialize run"
+        else:
+            hint = (
+                "the run lock status is unknown; inspect the manifest before retrying or "
+                "restarting"
+            )
     print(json.dumps({
         "status": "input-error",
         "recoverable": True,
@@ -122,6 +128,44 @@ def report_recoverable_input_error(manifest_path: Path, error: Exception) -> int
         "hint": hint,
     }, ensure_ascii=False, indent=2), file=sys.stderr)
     return 2
+
+
+def report_registry_denied(manifest_path: Path, error: "gitnexus_step.RegistryWriteDenied") -> int:
+    """宿主拒绝了那次仓库外写入：可恢复，保持 run 与锁，交回宿主提权通道。
+
+    这不是运行失败：注册要么在带提权的重试里成功，要么用户拒绝后按
+    ``partial/registry-missing`` 降级。把全部机器可读信息打给主 Agent，尤其是
+    ``retry_command``——它就是不变量：首次尝试与升级重试用同一条命令，宿主若弹窗，
+    弹的永远是同一条 argv 与同一个目标文件。
+    """
+    try:
+        manifest = validator.load_json(manifest_path)
+        phase = manifest.get("phase")
+        run_dir = Path(manifest.get("state_run_dir", manifest_path.parent))
+        current_lock_status = lock_status(manifest)
+    except Exception:
+        phase = "unknown"
+        run_dir = manifest_path.parent
+        current_lock_status = "unknown"
+    print(json.dumps({
+        "status": "registry-denied",
+        "recoverable": True,
+        "phase": phase,
+        "lock": current_lock_status,
+        "message": str(error),
+        "registry_path": error.registry_path,
+        "exit_code": error.exit_code,
+        "retry_command": error.retry_command,
+        "justification": error.justification,
+        "expected_run_dir": str(run_dir),
+        "hint": (
+            "宿主拒绝了这次仓库外写入。按 references/tool-adapters.md 的「全局注册」一节，"
+            "用宿主提权通道原样重跑 retry_command（与刚才那条命令逐字相同），成功后再重跑 "
+            "controller.py analyze 继续同一个 run；重试仍被拒再询问用户，用户拒绝则带 "
+            "--allow-partial 接受 partial/registry-missing。"
+        ),
+    }, ensure_ascii=False, indent=2), file=sys.stderr)
+    return gitnexus_step.REGISTRY_DENIED_EXIT
 
 
 def abort_safely(manifest: Path, reason: str) -> None:
@@ -163,6 +207,12 @@ def build_parser() -> argparse.ArgumentParser:
         "analyze", help="run the deterministic GitNexus step and write its worker result"
     )
     analyze.add_argument("--manifest", required=True, type=Path)
+
+    register = commands.add_parser(
+        "register",
+        help="attempt the single out-of-repo GitNexus registry write, and nothing else",
+    )
+    register.add_argument("--manifest", required=True, type=Path)
 
     graphify = commands.add_parser(
         "graphify",
@@ -243,8 +293,32 @@ def main(argv: list[str] | None = None) -> int:
         try:
             validate_active_manifest(args.manifest)
             return gitnexus_step.main(["--manifest", str(args.manifest)], emit=True)
+        except gitnexus_step.RegistryWriteDenied as error:
+            return report_registry_denied(args.manifest, error)
         except Exception:
             abort_safely(args.manifest, "gitnexus step raised an exception")
+            raise
+    if args.command == "register":
+        try:
+            validate_active_manifest(args.manifest)
+            return gitnexus_step.register_main(["--manifest", str(args.manifest)], emit=True)
+        except gitnexus_step.RegistryWriteDenied as error:
+            return report_registry_denied(args.manifest, error)
+        except validator.ValidationError as error:
+            # register 是补救命令：前提不满足（manifest 不是 prepared、runner 不可跑、
+            # 锁身份不符）是可修的输入问题，绝不能 abort 掉它要救的那个 run。
+            # gitnexus_step 抛的 InitializeError 与 validator.ValidationError 是同一个类。
+            return report_recoverable_input_error(
+                args.manifest,
+                error,
+                hint=(
+                    "register 的前提不满足：manifest 必须仍是 prepared，且 tools.gitnexus 可执行。"
+                    "run 与锁保持不动——先核对 manifest，再重试 register，或回到 controller.py "
+                    "analyze 继续同一个 run。"
+                ),
+            )
+        except Exception:
+            abort_safely(args.manifest, "gitnexus register raised an exception")
             raise
     if args.command == "graphify":
         try:
