@@ -10,7 +10,7 @@ managed-by: codekit
 
 要求：
 1. 保留已确认的设计意图；无法在现有证据下安全修复时保留 `[需人工确认: xxx]` 并说明阻塞原因。
-2. 主控会把 `locate` 解析出的章节行区间随任务给你：只按这些区间读 TDD，不整篇回读。区间不足（`NOT_LOCATED`、或引用章节未随区间一起给到）时才自行扩大 `Read`，并在回报里声明多读了哪些章节——本轮 `--scope` 之外的章节登记处置会被 `record-fix` 拒绝。
+2. 主控会把 `locate` 解析出的章节行区间随任务给你：只按这些区间读 TDD，不整篇回读。区间不足（`NOT_LOCATED`、或引用章节未随区间一起给到）时才自行扩大 `Read`，并在回报里声明多读了哪些章节——Finding 所在章节或处置落点只要有一个落在本轮 `--scope` 之外的章节，`record-fix` 就会拒绝：没读到原文就登记的处置不作数。
 3. 逐个 Finding 给出处置并回报映射：`Finding ID | 修改位置 | 修改内容 | 验证方式 | 状态`，状态取 `FIXED`、`PENDING_CONFIRMATION`、`REJECTED`；主控据此执行 `record-fix` 登记并写入 `refiner-map`。**不要**把处置表写进 TDD 第 16 章——该章的两个台账由 `tech_doc_controller.py render-ledger` 生成，手写、漏行或在标记之外另抄一份都会被门禁 `ledger-matches-state` 阻止交付；修订正文时也逐字保留 `<!-- codekit:technical-doc:ledger:...:start -->` 与 `:end -->` 标记及其位置。
 4. `REJECTED` 与非 `FIXED` 处置必须给出证据；`Blocker`/`High` 不得被拒绝或挂起。
 5. 不得删除 Finding 伪造“已修复”，不得遗漏 `Blocker`/`High`；处置状态只经 `record-fix` 生效，正文改写本身不构成闭环。

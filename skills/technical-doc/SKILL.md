@@ -82,13 +82,13 @@ flowchart LR
 | 命令 | 用途 |
 |------|------|
 | `record-source` / `finalize-inputs` | 登记每项资料的 `source_id`、定位符、`READ/NOT_FOUND/NOT_ACCESSIBLE`、摘要与可信度，并给出 `input_status`；定位符会被磁盘核对，与声明不符即失败；`UPDATE` 运行必须同时用 `--prd-changes 修改数/新增数/删除数`（如 `3/1/0`）登记需求变更规模；`finalize-inputs` 顺带跑一次**规模探针**并把 `scale`/`signals`/`greenfield` 写进 `state.json`，返回值里就有，主控把它原样传给 Context Loader 与 Architect |
-| `start-stage --to <STAGE>` | 推进阶段状态机；前置证据不足即失败；进入 `REVIEW` 时可带 `--review-scope full|incremental`，增量轮只能由控制器在严重度门停后推导，不接受主控自报范围 |
+| `start-stage --to <STAGE>` | 推进阶段状态机；前置证据不足即失败；进入 `REVIEW` 时可带 `--review-scope full|incremental`，增量轮只能由控制器在严重度门停后推导，不接受主控自报范围（想强制全量就省略该参数，由控制器决定最小可证范围）；进入 `DELIVERY` 前每条 Finding 都必须已登记处置 |
 | `record-agent` | 登记一次具名子代理调用：先用 `--status DISPATCHED`（带 `--session-id` 与 `--input-digest`）开时间窗，再用同一 `--session-id` 以 `COMPLETED`/`BLOCKED`/`ABORTED` 收口并写入墙钟耗时，收口调用可省略 `--input-digest`；派发后什么都没产出也必须用 `ABORTED` 收口；Reviewer 一旦 `DISPATCHED` 就占用本轮名额；`--scope "7.2,4.1"` 声明本次真正注入的章节，读取量由索引算出 |
 | `write-artifact` | 把 `context-pack`、`draft`、`critic-findings`、`refiner-map`、`review-report` 落入运行目录 |
-| `record-finding` / `record-fix` | 登记 Finding 与逐项处置（处置是 Finding 唯一的闭环入口）；`record-fix` 只在 `REFINER` 阶段有效，评审结论在桌上时主 Agent 不得自己给改动打分 |
+| `record-finding` / `record-fix` | 登记 Finding 与逐项处置（处置是 Finding 唯一的闭环入口）；`record-fix` 的常规入口是 `REFINER` 阶段，评审结论在桌上时主 Agent 不得自己给改动打分；唯一例外：通过性结论（`APPROVE`/`APPROVE_WITH_FOLLOW_UPS`）挂账后，本轮新报的非阻断 Finding 允许在 `REVIEW`/`DELIVERY` 阶段直接登记 `PENDING_CONFIRMATION`/`REJECTED`（`FIXED` 声称改了正文，仍必须走 Refiner 轮 + 全新 Reviewer） |
 | `record-review` | 把终审结论与被审 TDD 的内容快照绑定，并绑定**本轮的审查范围**（`--scope` 只能复述 `start-stage` 打开的范围，不能把增量轮改写成全量）；第 16 章标记之间的生成台账不计入该快照 |
 | `archive-history` | 把被覆盖的上一版 TDD 归档为独立文件 |
-| `index` / `locate` | 重建 `doc-index.json`（章节 → 行区间、符号、Finding 归属），或把一条 Finding 的位置、一个章节号解析成行区间与读取预算；`locate` 找不到对应标题时返回 `NOT_LOCATED` 并给出兜底读法，不猜 |
+| `index` / `locate` | 重建 `doc-index.json`（章节 → 行区间、符号、Finding 归属），或把一条 Finding 的位置、一个章节号解析成行区间与读取预算；`locate`、`--scope` 派发与 `record-fix` 都会在 TDD 变化后自动重建索引，不必手动先跑 `index`；`locate` 找不到对应标题时返回 `NOT_LOCATED` 并给出兜底读法，不猜 |
 | `render-ledger --state <state> --tdd-file <TDD>` | 从 `state.json` 重写 TDD 第 16 章的生成台账（Finding 处置映射、运行元数据）与“历史版本索引”，并顺带重建索引 |
 | `gate` / `show` | 交付门禁与运行状态摘要；`show` 按 `prep`/`write`/`audit` 汇总各阶段墙钟耗时，给出派发计数（`timed`/`aborted`/`open`/`scoped`/`over_budget`）、索引摘要、`review_stop` 判定与 `scale` 结论 |
 
@@ -98,10 +98,10 @@ flowchart LR
 
 一份 5,000 行的 TDD 约 21 万 token，超过 20 万窗口：每一轮都整篇回读，就是上一次运行把 54% 的 Refiner 时间花在“找那段在哪、现在写的是什么”上的原因。
 
-- 草稿落盘后先跑一次 `index`；此后 Refiner 的派发**先 `locate`**，按返回的行区间读取注入，不整篇回读。`locate --finding CRITIC-007` 会连带返回该章节按编号引用到的其他章节——只改一处、漏掉引用它的那一处，是下一轮 Finding 的来源。
+- 草稿落盘后 Refiner 的派发**先 `locate`**，按返回的行区间读取注入，不整篇回读；索引缺失或 TDD 已变时 `locate` 自己重建，不需要手动先跑一次 `index`。`locate --finding CRITIC-007` 会连带返回该章节按编号引用到的其他章节——只改一处、漏掉引用它的那一处，是下一轮 Finding 的来源。
 - 区间不足时**允许扩大读取**（`locate` 返回 `NOT_LOCATED`，或引用章节没随区间给到），不是硬门禁：Refiner 需在回报里声明多读了哪些章节。整篇可读始终是保留的退路，按节注入只是把翻页换成一次查表；Critic 与 Reviewer 做的是全量审查，不受本节约束。
 - 派发时把注入的章节写进 `record-agent --scope "7.2,4.1"`：读取量、行区间和是否超预算由索引算出，不接受子代理自述；`over_budget: true` 就把这一轮拆成更小的派发，而不是让角色自己翻页。`--scope` 只在开时间窗的那次调用上声明。
-- 处置只能落在**本轮**所有 `--scope` 的并集里：一轮拆成多次按节派发是允许的，但上一轮声明过的章节不覆盖本轮，扩大范围靠再派发一次带 `--scope` 的 Refiner，而不是补一条旧范围外的 `record-fix`。
+- 处置只能落在**本轮**所有 `--scope` 的并集里，且 Finding 所在章节与处置落点都在并集内（缺一即拒，只核对处置落点会漏掉“没读原文就凭 Finding 描述改”的那条路）：一轮拆成多次按节派发是允许的，但上一轮声明过的章节不覆盖本轮，扩大范围靠再派发一次带 `--scope` 的 Refiner，而不是补一条旧范围外的 `record-fix`。
 - `init --context-window` 填宿主的真实窗口（默认 200000）；预算 = 窗口 × 0.5，剩下的要留给角色自己的指令与产出。
 
 ### 严重度门停与增量终审
@@ -157,7 +157,7 @@ flowchart LR
 - 模板示例与真实系统冲突时以代码证据为准并删除示例事实；
 - 派发时给出 `scale`：`S` 级可以把 §12/§13 收缩成基础项并写明原因，`M`/`L` 级的“完整监控大盘与告警”“部署拓扑”必须有实质设计；被信号点名的 `条件必填` 章节可以填 `不涉及`，但必须带原因。`gate` 按同一张表核对，不会因为“文档短一点更快”而放行。
 
-`draft` 落盘后主控立即跑一次 `index`，之后 Refiner 的派发按“读取预算与按节注入”执行；Critic 做全量审查，Reviewer 在全量轮也读完整篇——对这些轮次索引只是定位工具，不缩小审查范围；命中严重度门停的增量终审轮例外（见“严重度门停与增量终审”）。
+`draft` 落盘后 Refiner 的派发按“读取预算与按节注入”执行（首次 `locate` 会自己建索引，不用先手动跑 `index`）；Critic 做全量审查，Reviewer 在全量轮也读完整篇——对这些轮次索引只是定位工具，不缩小审查范围；命中严重度门停的增量终审轮例外（见“严重度门停与增量终审”）。
 
 `gate` 会核对以下章节锚点在 TDD 中确实存在，缺一即 `BLOCKED`：`变更记录`、`需求到设计`（追踪表）、`关键技术决策记录`（ADR）、`风险登记与工作量评估`、`审查闭环记录`；`UPDATE` 运行还必须有 `历史版本索引`。
 
@@ -191,6 +191,8 @@ flowchart LR
 
 输出 `status: APPROVE | APPROVE_WITH_FOLLOW_UPS | REQUEST_CHANGES | BLOCKED`，新增 Finding 用 `REVIEW-<round>-<NNN>` 登记，结论用 `record-review` 与被审快照、本轮范围绑定。主控不得直接改写 TDD 后宣称 Reviewer 通过。
 
+通过性结论不是本轮 Finding 的终点：`gate` 的 `every-finding-has-a-disposition` 与 `start-stage --to DELIVERY` 都要求每条 Finding 有处置，而第 5 轮之后已无处再开 Refiner 轮。为此控制器允许在 `REVIEW`/`DELIVERY` 阶段（仅限通过性结论挂账时）对**本轮**新报的非阻断 Finding 直接登记 `PENDING_CONFIRMATION`/`REJECTED`，处置落点必须与 Finding 位置一致；`FIXED` 声称改过正文，仍只能由 Refiner 轮产生并配一次全新终审。这个例外是给 follow-up 收口的，不是给主控免审改文档开后门。
+
 第 5 轮后仍有 `Blocker`/`High`、状态为 `BLOCKED` 或独立 Reviewer 无法启动时，停止循环并交付阻塞报告，不得继续循环或宣称 TDD 已完成。
 
 ## 需求变更识别与 TDD 历史
@@ -199,7 +201,7 @@ flowchart LR
 
 PRD 当前版本中用户最新明确的方案和逻辑优先于旧 PRD、旧 TDD、旧评审意见和模型推断。若最新 PRD 与旧 TDD 冲突，以最新 PRD 重算设计、兼容、迁移、测试和发布影响；若代码、接口契约或安全约束使新逻辑不可安全实现，记录 `[需人工确认: ...]` 及证据，不得静默回退旧方案。
 
-`UPDATE` 运行必须在写入新版本前用 `archive-history` 把上一版有效 TDD 归档为运行目录下的独立文件，“历史版本索引”由 `render-ledger` 依据归档记录与 `finalize-inputs --prd-changes` 的台账生成（版本、归档日期、修改/新增/删除数量、归档文件），任何角色都不得手写索引行。**禁止把旧版正文内嵌进 markdown 围栏**（嵌套围栏会提前截断，且会让文档随每次变更成倍膨胀）；`gate` 会拒绝含嵌套文档围栏的产物。当前正文只保留最新有效方案，历史只追加、不覆盖、不重排。
+`UPDATE` 运行必须在写入新版本前用 `archive-history` 把上一版有效 TDD 归档为运行目录下的独立文件，“历史版本索引”由 `render-ledger` 依据归档记录与 `finalize-inputs --prd-changes` 的台账生成（版本、归档日期、修改/新增/删除数量、归档文件），任何角色都不得手写索引行。渲染时 `render-ledger` 会先读出文档里上一次运行留下的索引行（按 版本+归档文件 去重、按时间顺序重排序号）再接上本 run 的新行——跨 run 的索引同样只追加、不覆盖。**禁止把旧版正文内嵌进 markdown 围栏**（嵌套围栏会提前截断，且会让文档随每次变更成倍膨胀）；`gate` 会拒绝含嵌套文档围栏的产物。当前正文只保留最新有效方案，历史只追加、不覆盖、不重排。
 
 ## 降级模式
 

@@ -467,7 +467,11 @@ def _verify_locator(root: Path, source_id: str, kind: str, locator: str, status:
         raise ControllerError(
             f"source '{source_id}' claims NOT_ACCESSIBLE but nothing exists at {candidate}; that is NOT_FOUND"
         )
-    return {"resolved": str(candidate), "resolved_kind": "absent"}
+    # What is left: NOT_FOUND with nothing there (truly absent), or NOT_ACCESSIBLE with
+    # something there (present but unopenable) -- labelling the second one "absent" would
+    # state the opposite of what the caller just verified.
+    kind = "absent" if not exists else "inaccessible"
+    return {"resolved": str(candidate), "resolved_kind": kind}
 
 
 def record_source(
@@ -547,6 +551,14 @@ def _probe_scale(state: dict[str, Any]) -> dict[str, Any]:
     """
     prd = Path(state["materials"]["product_requirements"]["locator"])
     prd_text = _read_document(prd, "PRD")
+    frozen = state["materials"]["product_requirements"].get("content_digest") or ""
+    live_digest = _text_digest(prd_text)
+    if frozen and live_digest != frozen:
+        raise ControllerError(
+            f"the PRD changed after init froze it (init digest {frozen[:18]}…, "
+            f"now {live_digest[:18]}…); every later stage would design against bytes the "
+            "run never froze — start a new run against the current PRD"
+        )
     signals = _scale_signals(prd_text)
     count = len(signals)
     if count == 0:
@@ -771,12 +783,28 @@ def _incremental_coverage(path: Path, state: dict[str, Any], tdd: Path) -> tuple
     current = {item["key"]: item["digest"] for item in index["sections"]}
     changed = {key for key, digest in current.items() if baseline.get(key) != digest}
     removed = {key for key in baseline if key not in current}
-    ancestors = {key.rsplit(".", 1)[0] for key in removed if "." in key}
-    missing = sorted((changed | ancestors) - covered)
+    ancestors: set[str] = set()
+    orphans: set[str] = set()
+    for key in removed:
+        head = key
+        parent = ""
+        while "." in head:
+            head = head.rsplit(".", 1)[0]
+            if head in current:
+                parent = head
+                break
+        if parent:
+            ancestors.add(parent)
+        else:
+            # A section with no surviving ancestor has nothing left whose digest can
+            # witness its deletion -- a whole top-level chapter is the case that used to
+            # pass silently.  It must itself have appeared in some later scope.
+            orphans.add(key)
+    missing = sorted((changed | ancestors | orphans) - covered)
     if missing:
         return False, (
-            f"round {last_full['round']} was the last full pass; sections changed since it and "
-            f"never reviewed: {', '.join(missing[:12])}"
+            f"round {last_full['round']} was the last full pass; sections changed or were "
+            f"deleted since it and never reviewed: {', '.join(missing[:12])}"
         )
     return True, (
         f"{len(changed)} changed section(s) since round {last_full['round']} covered by "
@@ -899,9 +927,10 @@ def start_stage(state_path: str | Path, target_stage: str, review_scope: str | N
             raise ControllerError(
                 f"rounds {'、'.join(str(item) for item in stop['quiet_rounds'])} raised no Blocker/High "
                 "and no must_fix is open, so a full pass now re-reads a document the earlier rounds "
-                "show to be mostly unchanged; open the round with --review-scope incremental, or "
-                "deliver on the passing verdict (init --review-stop-policy fixed restores the "
-                "unconditional cap)"
+                "show to be mostly unchanged; omit --review-scope and let the controller pick the "
+                "smallest scope it can prove (it still falls back to a full round when no "
+                "incremental scope can be derived), or deliver on the passing verdict "
+                "(init --review-stop-policy fixed restores the unconditional cap)"
             )
         plan: dict[str, Any] | None = None
         if stop["forced"] and state["reviews"]:
@@ -929,6 +958,7 @@ def start_stage(state_path: str | Path, target_stage: str, review_scope: str | N
         }
     elif target == "DELIVERY":
         _require_approved_review(state)
+        _require_all_findings_tracked(state)
     elif target == "CLOSED":
         _require_gate_pass(state)
 
@@ -991,6 +1021,27 @@ def _require_approved_review(state: dict[str, Any]) -> None:
         raise ControllerError(
             f"review round {last['round']} returned {last['status']}; only "
             f"{', '.join(PASSING_REVIEW_STATUSES)} may reach delivery"
+        )
+
+
+def _require_all_findings_tracked(state: dict[str, Any]) -> None:
+    """Fail while the run is still in a stage that can turn back, not after DELIVERY.
+
+    The same condition is the gate's ``every-finding-has-a-disposition``; discovering it
+    only at the gate left no legal transition out of DELIVERY, so one late non-blocking
+    finding could strand the whole run.
+    """
+    untracked = [
+        item["id"]
+        for item in state["findings"]
+        if not any(fix["finding_id"] == item["id"] for fix in state["fixes"])
+    ]
+    if untracked:
+        raise ControllerError(
+            f"findings without a disposition: {', '.join(untracked[:12])}; delivery may not "
+            "open on an unfinished ledger — from this stage, record-fix accepts "
+            "PENDING_CONFIRMATION/REJECTED for this round's non-blocking findings, and "
+            "must_fix or older findings need a Refiner round first"
         )
 
 
@@ -1247,6 +1298,27 @@ def _closed(state: dict[str, Any], finding_id: str) -> bool:
     return bool(fix and fix["status"] in {"FIXED", "REJECTED"})
 
 
+def _passing_verdict_open(state: dict[str, Any]) -> bool:
+    """The newest verdict is this round's and is one of the two approving statuses."""
+    if not state["reviews"]:
+        return False
+    last = state["reviews"][-1]
+    return (
+        last["round"] == state["review_round"]
+        and last["status"] in PASSING_REVIEW_STATUSES
+    )
+
+
+def _locations_agree(state_path: Path, finding_location: str, location: str) -> bool:
+    """Whether a disposition answers the section the finding was raised against."""
+    numbers = _index_numbers(state_path)
+    key_finding, _ = _resolve_location(numbers, [], finding_location)
+    key_fix, _ = _resolve_location(numbers, [], location)
+    if key_finding and key_fix:
+        return key_finding == key_fix
+    return finding_location.strip() == location.strip()
+
+
 def record_fix(
     state_path: str | Path,
     finding_id: str,
@@ -1255,11 +1327,17 @@ def record_fix(
     change: str,
     verification: str,
 ) -> dict[str, Any]:
-    """Map one Finding to a disposition; the Refiner may not silently drop findings."""
+    """Map one Finding to a disposition; the Refiner may not silently drop findings.
+
+    A disposition is normally the Refiner stage's output: logging one while a review
+    verdict is already on the table is how the orchestrator ends up grading its own
+    edits.  The one exception is a passing verdict's non-blocking follow-up — a
+    ``PENDING_CONFIRMATION`` or ``REJECTED`` changes no bytes and closes no reviewer's
+    edit, and demanding a whole Refiner+Reviewer round just to register one would
+    strand the run whenever the round budget is already spent.  ``FIXED`` claims a text
+    change and keeps requiring the Refiner stage either way.
+    """
     path, state = load_state(state_path)
-    # A disposition is the output of the Refiner stage.  Logging one while a review verdict
-    # is already on the table is how the orchestrator ends up grading its own edits.
-    _require_stage(state, "REFINER", "record-fix")
     if status not in FIX_STATUSES:
         raise ControllerError(f"fix status must be one of {', '.join(FIX_STATUSES)}")
     finding = next((item for item in state["findings"] if item["id"] == finding_id), None)
@@ -1268,7 +1346,33 @@ def record_fix(
     for label, value in (("location", location), ("change", change), ("verification", verification)):
         if not value.strip():
             raise ControllerError(f"{label} is required")
-    _refiner_scope_covers(path, state, location)
+    stage = state["stage"]
+    if stage == "REFINER":
+        _refiner_scope_covers(path, state, finding, location)
+    elif stage in {"REVIEW", "DELIVERY"} and _passing_verdict_open(state):
+        if status == "FIXED":
+            raise ControllerError(
+                f"{finding_id}: FIXED claims a text change, which after a verdict needs a "
+                "Refiner round and a fresh review — dispose the follow-up as "
+                "PENDING_CONFIRMATION or REJECTED instead"
+            )
+        if finding["source"] != "REVIEWER" or finding["round"] != state["review_round"]:
+            raise ControllerError(
+                f"only findings this round's review just raised may be disposed without a "
+                f"Refiner round, and {finding_id} comes from {finding['source'].lower()} "
+                f"round {finding['round']}"
+            )
+        if not _locations_agree(path, finding["location"], location):
+            raise ControllerError(
+                f"the disposition for {finding_id} points at '{location}' but the finding was "
+                f"raised against '{finding['location']}'; a disposition must answer that finding"
+            )
+    else:
+        raise ControllerError(
+            "record-fix requires stage REFINER"
+            " (or, after a passing verdict, REVIEW/DELIVERY for this round's non-blocking "
+            f"follow-ups), current stage is {stage}"
+        )
     if status == "REJECTED" and finding["must_fix"]:
         raise ControllerError(f"{finding_id} is {finding['severity']} and cannot be rejected")
     if status == "PENDING_CONFIRMATION" and finding["must_fix"]:
@@ -1604,23 +1708,70 @@ def _run_metadata_body(state: dict[str, Any], doc_text: str, run_dir: str) -> li
     return body
 
 
-def _history_index_body(state: dict[str, Any]) -> list[str]:
+def _prior_history_rows(text: str) -> list[str]:
+    """History rows already rendered into the document, verbatim and in order.
+
+    ``render-ledger`` replaces the whole block, so without merging the previous rows back in,
+    the second UPDATE run would erase what the first run wrote — the index promises
+    只追加、不覆盖、不重排 across runs, not just within one.  Rows are trusted as parsed: the
+    archived files beside them are the evidence, and this is the only channel they survived in.
+    """
+    try:
+        blocks = _ledger_blocks(text.splitlines())
+    except ControllerError:
+        return []
+    span = blocks.get("history-index")
+    if span is None:
+        return []
+    rows: list[str] = []
+    for line in text.splitlines()[span[0] + 1 : span[1]]:
+        stripped = line.strip()
+        if not stripped.startswith("|") or "序号" in stripped or "无历史版本" in stripped:
+            continue
+        if set(stripped) <= set("|-: "):
+            continue
+        if len(stripped.split("|")) < 7:
+            continue
+        rows.append(stripped)
+    return rows
+
+
+def _history_index_body(
+    state: dict[str, Any], prior_rows: list[str] | tuple[str, ...] = ()
+) -> list[str]:
     rows = [
         "| 序号 | 版本 | 归档日期 | 变更台账（修改/新增/删除） | 归档文件 |",
         "|---|---|---|---|---|",
     ]
+    seen: set[tuple[str, str]] = set()
+    for line in prior_rows:
+        cells = line.split("|")
+        key = (cells[2].strip(), cells[-2].strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        # 序号 restates the rendered position; everything else survives verbatim.
+        cells[1] = f" {len(seen)} "
+        rows.append("|".join(cells))
     changes = state.get("prd_changes") or "—"
     for item in state["history"]:
+        # Three trailing parts keep the run-id visible: two runs archiving the same version
+        # would otherwise print an identical, unresolvable file cell.
+        archived = "`{}`".format("/".join(Path(item["path"]).as_posix().split("/")[-3:]))
+        key = (item["version"], archived)
+        if key in seen:
+            continue
+        seen.add(key)
         rows.append(
-            "| {} | {} | {} | {} | `{}` |".format(
-                item["index"],
+            "| {} | {} | {} | {} | {} |".format(
+                len(seen),
                 _cell(item["version"]),
                 _cell(str(item.get("archived_at", ""))[:10]),
                 _cell(changes),
-                _cell("/".join(Path(item["path"]).as_posix().split("/")[-2:])),
+                archived,
             )
         )
-    if len(rows) == 2:
+    if not seen:
         rows.append("| — | 无历史版本 | — | — | 本 run 未归档旧版 TDD |")
     return ["**历史版本索引**（生成，只追加不手改）", "", *rows]
 
@@ -1629,7 +1780,7 @@ def _expected_ledger(state: dict[str, Any], doc_text: str, run_dir: str) -> dict
     return {
         "findings": _findings_ledger_body(state),
         "run-metadata": _run_metadata_body(state, strip_ledger_bodies(doc_text), run_dir),
-        "history-index": _history_index_body(state),
+        "history-index": _history_index_body(state, _prior_history_rows(doc_text)),
     }
 
 
@@ -2193,8 +2344,17 @@ def _index_numbers(state_path: Path) -> dict[str, str]:
         return {}
 
 
-def _refiner_scope_covers(state_path: Path, state: dict[str, Any], location: str) -> None:
+def _refiner_scope_covers(
+    state_path: Path, state: dict[str, Any], finding: dict[str, Any], location: str
+) -> None:
     """A per-section Refiner dispatch may not dispose of a finding it was never handed.
+
+    Both ends are checked: the section the disposition claims to have touched *and* the
+    section the finding was raised against.  A fix may land in a different chapter than
+    the finding names, but the round still has to have been handed the finding's own
+    location -- naming an in-scope section while the finding sits outside would otherwise
+    stay a bypass.  A location that resolves to no heading stays disposable: the guard
+    must not invent a scope for it.
 
     The window is the current REFINER stage, which is what makes a split round legal: several
     scoped dispatches contribute the union of their sections, while a scope declared in an
@@ -2220,12 +2380,15 @@ def _refiner_scope_covers(state_path: Path, state: dict[str, Any], location: str
                 scopes.append(key)
     if not scopes:
         return
-    key, _ = _resolve_location(_index_numbers(state_path), [], location)
-    if key is not None and key not in scopes:
-        raise ControllerError(
-            f"'{location}' resolves to section {key}, outside every --scope this round's Refiner "
-            f"dispatches were handed ({', '.join(scopes)}); widen it or read that section first"
-        )
+    numbers = _fresh_index(state_path, state, _resolve_tdd(state, None))["numbers"]
+    for label, value in (("disposition", location), ("finding", finding["location"])):
+        key, _ = _resolve_location(numbers, [], value)
+        if key is not None and key not in scopes:
+            raise ControllerError(
+                f"'{value}' ({label} location) resolves to section {key}, outside every --scope "
+                f"this round's Refiner dispatches were handed ({', '.join(scopes)}); widen it or "
+                "read that section first"
+            )
 
 
 def _scan_document(text: str, state: dict[str, Any]) -> list[dict[str, Any]]:

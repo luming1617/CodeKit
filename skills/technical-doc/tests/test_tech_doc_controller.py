@@ -334,6 +334,18 @@ class TechDocControllerTests(unittest.TestCase):
         )
         self.assertEqual(entry["resolved_kind"], "file")
         self.assertTrue(entry["content_digest"].startswith("sha256:"))
+        # a source that exists but cannot be opened is present, not absent — the ledger
+        # must not state the opposite of what the caller just verified
+        present = controller.record_source(
+            state, "SRC-5", "SYSTEM_EVIDENCE", str(self.feature / "product-doc.md"),
+            "NOT_ACCESSIBLE", "v1", "存在但打不开", "LOW",
+        )
+        self.assertEqual(present["resolved_kind"], "inaccessible")
+        absent = controller.record_source(
+            state, "SRC-6", "SYSTEM_EVIDENCE", str(self.feature / "gone.md"),
+            "NOT_FOUND", "v1", "确实不存在", "LOW",
+        )
+        self.assertEqual(absent["resolved_kind"], "absent")
         # a non-path locator (a human decision) is taken at face value
         self.assertNotIn(
             "resolved_kind",
@@ -791,6 +803,27 @@ class TechDocControllerTests(unittest.TestCase):
         result = controller.gate(state, tdd)
         self.assertEqual(result["status"], "PASS", result["failures"])
 
+    def test_history_index_accumulates_across_update_runs(self) -> None:
+        """The second UPDATE run may not erase the rows the first run's render wrote."""
+        first, tdd = self.closed_loop("run-h1", update=True)
+        controller.render_ledger(first, tdd)
+        second = Path(controller.init_run(self.repo, self.feature, "run-h2"))
+        self.to_refiner(second, "3/1/0")
+        controller.start_stage(second, "REVIEW")
+        controller.archive_history(second, "1.0")
+        self.approve_round(second, "s-review-h2")
+        controller.render_ledger(second, tdd)
+        # Re-rendering merges the rows it just wrote back against the same state: no duplicates.
+        again = controller.render_ledger(second, tdd)
+        self.assertFalse(again["changed"])
+        text = tdd.read_text(encoding="utf-8")
+        self.assertIn("| 1 | 0.9 |", text)
+        self.assertIn("| 2 | 1.0 |", text)
+        self.assertEqual(text.count("| 1.0 |"), 1)
+        self.assertEqual(text.count("| 0.9 |"), 1)
+        result = controller.gate(second, tdd)
+        self.assertEqual(result["status"], "PASS", result["failures"])
+
     def test_render_ledger_refuses_once_the_run_is_closed(self) -> None:
         state, tdd = self.closed_loop("run-30")
         controller.render_ledger(state, tdd)
@@ -1086,6 +1119,15 @@ class TechDocControllerTests(unittest.TestCase):
         with self.assertRaises(controller.ControllerError) as ctx:
             controller.record_fix(state, "REVIEW-1-001", "FIXED", "7.2", "沿用上一轮的认知", "无")
         self.assertIn("outside every --scope", str(ctx.exception))
+        # The bypass this closes: naming an in-scope section while the finding itself sits
+        # outside is still a disposition written without ever reading the original text.
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_fix(state, "REVIEW-1-001", "FIXED", "15.2", "范围内顺手改", "回归")
+        self.assertIn("finding location", str(ctx.exception))
+        # Widening the round with a scoped dispatch for 7.2 makes the same fix legal.
+        controller.record_agent(
+            state, "tech-refiner", "tech-refiner", "s-refine-3", "sha256:in", "COMPLETED", "7.2"
+        )
         controller.record_fix(state, "REVIEW-1-001", "FIXED", "15.2", "本轮范围内改", "回归")
 
     def test_render_ledger_leaves_the_index_fresh(self) -> None:
@@ -1168,7 +1210,7 @@ class TechDocControllerTests(unittest.TestCase):
         self.quiet_round(state, 1)
         with self.assertRaises(controller.ControllerError) as ctx:
             self.quiet_round(state, 2, "full")
-        self.assertIn("--review-scope incremental", str(ctx.exception))
+        self.assertIn("omit --review-scope", str(ctx.exception))
         self.assertIn("--review-stop-policy fixed", str(ctx.exception))
 
     def test_an_open_must_fix_keeps_the_review_full(self) -> None:
@@ -1241,6 +1283,64 @@ class TechDocControllerTests(unittest.TestCase):
         detail = next(item for item in result["checks"] if item["name"] == "incremental-review-covers-changes")
         self.assertIn("15", str(detail["detail"]))
 
+    def test_a_deleted_top_level_chapter_is_not_silently_covered(self) -> None:
+        """A section nobody can re-read any more still has to appear in some later scope."""
+        state, opened = self.after_quiet_rounds("run-79")
+        tdd = self.feature / "technical-doc.md"
+        text = tdd.read_text(encoding="utf-8")
+        start = text.index("## 15. 风险登记与工作量评估")
+        end = text.index("## 16. 审查闭环记录")
+        tdd.write_text(text[:start] + text[end:], encoding="utf-8")
+        self.assertIn("12", opened["sections"])
+        self.approve_round(state, "s-review-3")
+        self.render(state)
+        result = controller.gate(state, tdd)
+        self.assertIn("incremental-review-covers-changes", result["failures"])
+        detail = next(item for item in result["checks"] if item["name"] == "incremental-review-covers-changes")
+        self.assertIn("15", str(detail["detail"]))
+
+    def test_a_final_round_followup_closes_without_an_extra_refiner_round(self) -> None:
+        """The deadlock shape: round 5 approves with Low follow-ups and nowhere left to refine."""
+        state, _ = self.after_quiet_rounds("run-78", 4)
+        self.record(state, "tech-reviewer", "s-review-5")
+        report = self.artifact(state, "review-report", "第 5 轮增量终审报告：无阻塞项，两个 follow-up。\n")
+        controller.record_review(
+            state, "APPROVE_WITH_FOLLOW_UPS", report["path"],
+            self.feature / "technical-doc.md", "s-review-5",
+        )
+        controller.record_finding(
+            state, "REVIEWER", "REVIEW-5-001", "Low", "12", "大盘少一个分维度面板", None, None
+        )
+        # FIXED claims a text change: after a verdict that still needs its own round.
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_fix(state, "REVIEW-5-001", "FIXED", "12", "补面板", "截图")
+        self.assertIn("Refiner round", str(ctx.exception))
+        # Delivery is refused while the ledger is unfinished — and it says which finding.
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(state, "DELIVERY")
+        self.assertIn("REVIEW-5-001", str(ctx.exception))
+        # Older rounds keep the Refiner-only rule; the exception is scoped to this round.
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_fix(state, "REVIEW-1-001", "REJECTED", "12", "重新论证", "复检")
+        self.assertIn("reviewer round 1", str(ctx.exception))
+        # A disposition must answer the section the finding was raised against.
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_fix(state, "REVIEW-5-001", "REJECTED", "13", "不改", "证据")
+        self.assertIn("must answer that finding", str(ctx.exception))
+        controller.record_fix(state, "REVIEW-5-001", "REJECTED", "12", "维持现状", "SRE 复核意见")
+        controller.start_stage(state, "DELIVERY")
+        # The window stays open from DELIVERY too, so a late non-blocking finding cannot strand it.
+        controller.record_finding(
+            state, "REVIEWER", "REVIEW-5-002", "Low", "13", "告警阈值未路由", None, None
+        )
+        controller.record_fix(
+            state, "REVIEW-5-002", "PENDING_CONFIRMATION", "13", "保留待确认", "上线前人工核对路由"
+        )
+        self.render(state)
+        result = controller.gate(state, self.feature / "technical-doc.md")
+        self.assertEqual(result["status"], "PASS", result["failures"])
+        controller.start_stage(state, "CLOSED")
+
     # ------------------------------------------------------------------- scale and greenfield
 
     def write_prd(self, text: str) -> Path:
@@ -1280,6 +1380,18 @@ class TechDocControllerTests(unittest.TestCase):
         with_code = self.probe("run-83", PRD)
         self.assertFalse(with_code["greenfield"])
         self.assertEqual(with_code["backend_code_files"], 1)
+
+    def test_scale_probe_refuses_a_prd_that_drifted_after_init(self) -> None:
+        """Designing against bytes the run never froze is exactly what the probe exists to stop."""
+        state = Path(controller.init_run(self.repo, self.feature, "run-83b"))
+        controller.record_source(
+            state, "SRC-1", "PRD", str(self.feature / "product-doc.md"),
+            "READ", "v1", "需求已读取", "HIGH",
+        )
+        self.write_prd(PRD + "\n## 功能需求\n运营希望导出接口增加可配置的限流阈值。\n")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.finalize_inputs(state, "PASS", "全部关键资料已读取")
+        self.assertIn("changed after init", str(ctx.exception))
 
     def test_scale_gate_demands_the_chapters_the_probe_flagged(self) -> None:
         self.write_prd(PRD_STRUCTURAL)

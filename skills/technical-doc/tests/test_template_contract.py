@@ -112,7 +112,7 @@ class DocIndexContractTests(unittest.TestCase):
         for role in ("tech-critic", "tech-reviewer"):
             with self.subTest(role=role):
                 self.assertIn("真实章节号", AGENTS[role])
-        self.assertIn("index", AGENTS["tech-architect"])
+        self.assertIn("locate", AGENTS["tech-architect"])
 
     def test_refiner_reads_by_section_but_keeps_the_full_read(self) -> None:
         """The wave ships a locator, not a wall: widening the read must stay allowed and declared."""
