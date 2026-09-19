@@ -48,6 +48,17 @@ TASK_STATE_TRANSITIONS: dict[str, set[str]] = {
     "SUPERSEDED": set(),
 }
 
+# HIGH-1: SKILL.md budgets become mechanical enforcement instead of prose.
+# MAX_FINGERPRINT_ATTEMPTS counts record-failure occurrences of one error
+# fingerprint: the initial failure plus at most 3 retries (step 10 "同一错误指纹
+# 最多重试 3 次"). The 5th occurrence of the same fingerprint forces
+# disposition=human_intervention / resolution=ATTEMPT_CAP.
+MAX_FINGERPRINT_ATTEMPTS = 4
+# MAX_REVIEW_FREEZES caps freeze-review calls: initial review + 2 repair
+# rounds (step 15 "审查修复最多 2 轮"); the 4th freeze raises and must route
+# to step 17 (人工介入).
+MAX_REVIEW_FREEZES = 3
+
 
 class ControllerError(ValueError):
     """A user-correctable workflow or contract error."""
@@ -272,8 +283,20 @@ def init_run(root: Path, feature_directory: str | Path, run_id: str) -> Path:
     return target / "state.json"
 
 
-def record_agent(state_path: str | Path, role: str, name: str, session_id: str, input_digest: str, status: str) -> None:
-    path, state = load_state(state_path)
+def _append_agent(
+    state: dict[str, Any],
+    role: str,
+    name: str,
+    session_id: str,
+    input_digest: str,
+    status: str,
+) -> dict[str, Any]:
+    """Register or update one agent entry inside ``state`` (no writes).
+
+    Shared by record_agent and the dispatch-task composite so both paths keep
+    the same metadata-immutability rule: a reused session id may only change
+    status, never role/name/input_digest.
+    """
     if role not in ROLES:
         raise ControllerError(f"unsupported role: {role}")
     if not all(value.strip() for value in (name, session_id, input_digest, status)):
@@ -285,17 +308,32 @@ def record_agent(state_path: str | Path, role: str, name: str, session_id: str, 
             raise ControllerError(f"agent session metadata changed: {session_id}")
         existing["status"] = status
         existing["updated_at"] = _now()
-        _atomic_json(path, state)
-        return
-    state["agents"].append({
+        return existing
+    entry = {
         "role": role,
         "name": name,
         "session_id": session_id,
         "input_digest": input_digest,
         "status": status,
         "recorded_at": _now(),
-    })
+    }
+    state["agents"].append(entry)
+    return entry
+
+
+def record_agent(state_path: str | Path, role: str, name: str, session_id: str, input_digest: str, status: str) -> None:
+    path, state = load_state(state_path)
+    _append_agent(state, role, name, session_id, input_digest, status)
     _atomic_json(path, state)
+
+
+def _require_task(state: dict[str, Any], task_id: str) -> dict[str, Any]:
+    task = next((t for t in state["tasks"] if t["task_id"] == task_id), None)
+    if task is None:
+        raise ControllerError(
+            f"unknown task: {task_id}; register it with record-task before using task commands"
+        )
+    return task
 
 
 def record_task(
@@ -340,9 +378,7 @@ def update_task(state_path: str | Path, task_id: str, status: str) -> dict[str, 
         PASS / BLOCKED / SUPERSEDED  are terminal.
     """
     path, state = load_state(state_path)
-    task = next((t for t in state["tasks"] if t["task_id"] == task_id), None)
-    if task is None:
-        raise ControllerError(f"unknown task: {task_id}")
+    task = _require_task(state, task_id)
     current = task.get("status", "PENDING")
     allowed = TASK_STATE_TRANSITIONS.get(current, set())
     if status not in allowed:
@@ -414,23 +450,187 @@ def _compute_scope_result(
     }
 
 
-def check_scope(state_path: str | Path, allowed_files: Iterable[str]) -> dict[str, Any]:
-    """Run scope check and persist the result to state (side-effectful).
+def _task_allowed_set(state: dict[str, Any], task: dict[str, Any]) -> set[str]:
+    """Registered write scope of one task plus files already owned by PASS tasks.
 
-    Use _compute_scope_result directly when only the judgment is needed and
-    you want to avoid appending to scope_checks (e.g. freeze_review).
+    HIGH-2: in a serial worktree the dirty diff is cumulative, so a task-bound
+    scope check allows this task's registered files and anything an earlier
+    task already delivered (status PASS, any plan version). Files belonging to
+    tasks that have not reached PASS stay violations.
+    """
+    allowed: set[str] = set(task.get("allowed_files", []))
+    allowed |= {
+        f
+        for t in state["tasks"]
+        if t.get("status") == "PASS"
+        for f in t.get("allowed_files", [])
+    }
+    return allowed
+
+
+def check_scope(state_path: str | Path, task_id: str) -> dict[str, Any]:
+    """Task-bound scope check persisted to state (HIGH-2).
+
+    The allowed set is derived from the Task Ledger, never from the caller:
+    check-scope no longer accepts ad-hoc file grants and no longer widens
+    ``authorized_files`` permanently. To add files to a task's write scope,
+    call expand-scope with an explicit reason first.
     """
     path, state = load_state(state_path)
     root = _require_repo_root(state["repository"]["root"])
-    allowed: set[str] = set()
-    for item in allowed_files:
-        _, relative = _inside(root, item)
-        allowed.add(relative)
-    result = _compute_scope_result(root, state["preexisting_snapshot"], allowed)
-    state["authorized_files"] = sorted(set(state.get("authorized_files", [])) | allowed)
+    task = _require_task(state, task_id)
+    result = _compute_scope_result(
+        root, state["preexisting_snapshot"], _task_allowed_set(state, task)
+    )
+    result["task_id"] = task_id
     state["scope_checks"].append(result)
     _atomic_json(path, state)
     return result
+
+
+# States from which a task's registered write scope may still be widened.
+# PASS / BLOCKED / SUPERSEDED are terminal and cannot expand.
+EXPANDABLE_TASK_STATES = {"PENDING", "READY", "RUNNING", "FAILED"}
+
+
+def expand_scope(
+    state_path: str | Path,
+    task_id: str,
+    extra_files: Iterable[str],
+    reason: str,
+) -> dict[str, Any]:
+    """Widen one task's registered write scope with an audited reason (HIGH-2).
+
+    Used when the Implementer returns NEEDS_SCOPE: the Orchestrator must call
+    expand-scope before re-dispatching; out-of-scope writes stay BLOCKED and
+    every expansion is recorded on the task for the final report.
+    """
+    path, state = load_state(state_path)
+    task = _require_task(state, task_id)
+    if task.get("status") not in EXPANDABLE_TASK_STATES:
+        raise ControllerError(
+            f"cannot expand scope for {task_id}: status {task.get('status')} is terminal; "
+            f"expansion is only allowed in {sorted(EXPANDABLE_TASK_STATES)}"
+        )
+    if not reason.strip():
+        raise ControllerError("expand-scope requires a non-empty --reason")
+    root = _require_repo_root(state["repository"]["root"])
+    added: list[str] = []
+    for item in extra_files:
+        _, relative = _inside(root, item)
+        if relative not in task["allowed_files"]:
+            task["allowed_files"].append(relative)
+            added.append(relative)
+    task["allowed_files"] = sorted(set(task["allowed_files"]))
+    task.setdefault("scope_expansions", []).append({
+        "added_files": sorted(added),
+        "reason": reason.strip(),
+        "at": _now(),
+    })
+    task["updated_at"] = _now()
+    _atomic_json(path, state)
+    return {
+        "task_id": task_id,
+        "added_files": sorted(added),
+        "allowed_files": task["allowed_files"],
+    }
+
+
+def dispatch_task(
+    state_path: str | Path,
+    task_id: str,
+    session_id: str,
+    input_digest: str,
+    *,
+    role: str = "impl-implementer",
+) -> dict[str, Any]:
+    """Composite dispatch gate for steps 05/06: one call, one state write.
+
+    Moves PENDING → READY → RUNNING (or FAILED → RUNNING for a retry) and
+    registers the Implementer agent atomically, replacing the separate
+    update-task ×2 + record-agent round-trips. Only registered tasks can be
+    dispatched; the retry count is kept on the task ledger entry.
+    """
+    path, state = load_state(state_path)
+    task = _require_task(state, task_id)
+    current = task.get("status", "PENDING")
+    if current not in {"PENDING", "FAILED"}:
+        raise ControllerError(
+            f"cannot dispatch {task_id}: status must be PENDING or FAILED (retry), got {current}"
+        )
+    now = _now()
+    for step in (["READY", "RUNNING"] if current == "PENDING" else ["RUNNING"]):
+        task["status"] = step
+        task["updated_at"] = now
+    task["attempts"] = int(task.get("attempts", 0)) + 1
+    agent = _append_agent(state, role, role, session_id, input_digest, "RUNNING")
+    _atomic_json(path, state)
+    return {
+        "task_id": task_id,
+        "status": task["status"],
+        "attempts": task["attempts"],
+        "agent": {
+            "session_id": agent["session_id"],
+            "role": agent["role"],
+            "status": agent["status"],
+        },
+    }
+
+
+def settle_task(
+    state_path: str | Path,
+    task_id: str,
+    status: str,
+    error_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Composite verdict gate for steps 07/08: scope check + VALIDATING → PASS|FAILED.
+
+    RUNNING is first advanced to VALIDATING (idempotent when already there),
+    then the task-bound scope check runs and is persisted with the task id
+    (and the error fingerprint when given). ``status=PASS`` raises when the
+    scope check is BLOCKED and leaves the task in VALIDATING — an out-of-scope
+    write can never be settled as PASS; the Orchestrator must fix scope with
+    expand-scope, or settle FAILED and record-failure.
+    """
+    if status not in {"PASS", "FAILED"}:
+        raise ControllerError("settle-task status must be PASS or FAILED")
+    path, state = load_state(state_path)
+    task = _require_task(state, task_id)
+    current = task.get("status")
+    if current == "RUNNING":
+        task["status"] = "VALIDATING"
+        task["updated_at"] = _now()
+    elif current != "VALIDATING":
+        raise ControllerError(
+            f"cannot settle {task_id}: status must be RUNNING or VALIDATING, got {current}"
+        )
+    root = _require_repo_root(state["repository"]["root"])
+    scope = _compute_scope_result(
+        root, state["preexisting_snapshot"], _task_allowed_set(state, task)
+    )
+    scope["task_id"] = task_id
+    if error_fingerprint:
+        scope["error_fingerprint"] = error_fingerprint
+    state["scope_checks"].append(scope)
+    # Persist the scope evidence even if the PASS verdict is rejected below.
+    _atomic_json(path, state)
+    if status == "PASS" and scope["result"] != "PASS":
+        raise ControllerError(
+            f"cannot settle {task_id} as PASS: scope check BLOCKED "
+            f"(unauthorized_files={scope['unauthorized_files']}, "
+            f"preexisting_modified={scope['preexisting_modified']}); "
+            "use expand-scope with a reason or settle FAILED and record-failure"
+        )
+    task["status"] = status
+    task["updated_at"] = _now()
+    _atomic_json(path, state)
+    return {
+        "task_id": task_id,
+        "status": status,
+        "scope_result": scope["result"],
+        "unauthorized_files": scope["unauthorized_files"],
+        "preexisting_modified": scope["preexisting_modified"],
+    }
 
 
 def freeze_review(state_path: str | Path) -> dict[str, Any]:
@@ -442,6 +642,14 @@ def freeze_review(state_path: str | Path) -> dict[str, Any]:
     """
     path, state = load_state(state_path)
     root = _require_repo_root(state["repository"]["root"])
+    # HIGH-1: freeze budget — initial review + 2 repair rounds (step 15).
+    existing_freezes = len(state.get("review_snapshots", []))
+    if existing_freezes >= MAX_REVIEW_FREEZES:
+        raise ControllerError(
+            f"review freeze limit reached ({existing_freezes}/{MAX_REVIEW_FREEZES}): "
+            "initial review plus 2 repair rounds is the budget; a further "
+            "REQUEST_CHANGES cycle requires human intervention (step 17)"
+        )
     baseline_paths = {item["path"] for item in state["preexisting_snapshot"]["files"]}
 
     # Build allowed set: current-version tasks + older PASS tasks.
@@ -451,8 +659,9 @@ def freeze_review(state_path: str | Path) -> dict[str, Any]:
         task_pv = task.get("plan_version", current_pv)
         if task_pv == current_pv or task.get("status") == "PASS":
             allowed.update(task.get("allowed_files", []))
-    # Backward-compat: include files accumulated via direct check_scope calls
-    # (covers runs that skip record_task, e.g. simple single-task executions).
+    # Backward-compat: runs initialised before HIGH-2 may still carry
+    # authorized_files accumulated by the old check_scope; newer code keeps
+    # that list replan-managed only, so reading it here is harmless.
     allowed.update(state.get("authorized_files", []))
 
     # Pure computation — no state writes from the scope-check itself.
@@ -478,7 +687,16 @@ def freeze_review(state_path: str | Path) -> dict[str, Any]:
     }
     artifact = path.parent / "review-snapshot.json"
     _atomic_json(artifact, snapshot)
-    state["review_snapshots"].append({"path": str(artifact), **snapshot})
+    # Keep only a compact reference in state.json; the full snapshot (with the
+    # embedded preexisting diff) already lives in the artifact file, and
+    # duplicating it per freeze grew state.json roughly 40 KB per round.
+    state["review_snapshots"].append({
+        "path": str(artifact),
+        "base_sha": snapshot["base_sha"],
+        "head_sha": snapshot["head_sha"],
+        "diff_digest": snapshot["diff_digest"],
+        "frozen_at": snapshot["frozen_at"],
+    })
     state["phase"] = "REVIEW_FROZEN"
     _atomic_json(path, state)
     return snapshot
@@ -515,11 +733,26 @@ def record_failure(
     else:
         disposition = "human_intervention" if root_cause in {"PERMISSION", "SPEC_OR_ARCH"} else "collect_evidence"
         resolution = disposition.upper()
+    # HIGH-1: mechanical retry budget. Every retry cycle must be registered
+    # here, so counting failures with this fingerprint counts attempts. The
+    # first occurrence is the initial failure; retries are capped at
+    # MAX_FINGERPRINT_ATTEMPTS - 1 (step 10). The 5th occurrence stops
+    # authorising retries and forces human intervention.
+    if not error_fingerprint.strip():
+        raise ControllerError("error-fingerprint must be non-empty")
+    prior = sum(
+        1 for item in state["failures"] if item.get("error_fingerprint") == error_fingerprint
+    )
+    occurrences = prior + 1
+    if disposition == "retry_implementation" and occurrences > MAX_FINGERPRINT_ATTEMPTS:
+        disposition = "human_intervention"
+        resolution = "ATTEMPT_CAP"
     event = {
         "failure_scope": failure_scope,
         "impacted_task_ids": impacted,
         "root_cause": root_cause,
         "error_fingerprint": error_fingerprint,
+        "fingerprint_occurrences": occurrences,
         "disposition": disposition,
         "resolution": resolution,
         "recorded_at": _now(),
@@ -753,9 +986,36 @@ def main(argv: list[str] | None = None) -> int:
     ut.add_argument("--status", required=True,
                     choices=sorted(TASK_STATE_TRANSITIONS))
 
-    scope = sub.add_parser("check-scope")
+    scope = sub.add_parser("check-scope",
+                           help="Task-bound scope check; the allowed set comes from the "
+                                "Task Ledger (task files + PASS-task files), not the caller")
     scope.add_argument("--state", required=True)
-    scope.add_argument("--allowed-file", action="append", default=[])
+    scope.add_argument("--task-id", required=True)
+
+    # HIGH-2: audited write-scope widening (Implementer returned NEEDS_SCOPE)
+    ex = sub.add_parser("expand-scope",
+                        help="Add files to a non-terminal task's registered scope with a reason")
+    ex.add_argument("--state", required=True)
+    ex.add_argument("--task-id", required=True)
+    ex.add_argument("--add-file", action="append", default=[], required=True)
+    ex.add_argument("--reason", required=True)
+
+    # Composite dispatch gate: PENDING/FAILED → RUNNING + record-agent, one write
+    dt = sub.add_parser("dispatch-task",
+                        help="PENDING->READY->RUNNING (or FAILED->RUNNING retry) and register "
+                             "the Implementer agent in one atomic step")
+    dt.add_argument("--state", required=True)
+    dt.add_argument("--task-id", required=True)
+    dt.add_argument("--session-id", required=True)
+    dt.add_argument("--input-digest", required=True)
+
+    # Composite verdict gate: scope check + VALIDATING → PASS|FAILED
+    st = sub.add_parser("settle-task",
+                        help="Run the task-bound scope check, then move the task to PASS or FAILED")
+    st.add_argument("--state", required=True)
+    st.add_argument("--task-id", required=True)
+    st.add_argument("--status", required=True, choices=("PASS", "FAILED"))
+    st.add_argument("--error-fingerprint", default=None)
 
     review = sub.add_parser("freeze-review")
     review.add_argument("--state", required=True)
@@ -790,7 +1050,16 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(update_task(args.state, args.task_id, args.status),
                              ensure_ascii=False, indent=2))
         elif args.command == "check-scope":
-            print(json.dumps(check_scope(args.state, args.allowed_file),
+            print(json.dumps(check_scope(args.state, args.task_id),
+                             ensure_ascii=False, indent=2))
+        elif args.command == "expand-scope":
+            print(json.dumps(expand_scope(args.state, args.task_id, args.add_file, args.reason),
+                             ensure_ascii=False, indent=2))
+        elif args.command == "dispatch-task":
+            print(json.dumps(dispatch_task(args.state, args.task_id, args.session_id, args.input_digest),
+                             ensure_ascii=False, indent=2))
+        elif args.command == "settle-task":
+            print(json.dumps(settle_task(args.state, args.task_id, args.status, args.error_fingerprint),
                              ensure_ascii=False, indent=2))
         elif args.command == "freeze-review":
             print(json.dumps(freeze_review(args.state), ensure_ascii=False, indent=2))

@@ -66,16 +66,19 @@ class ControllerTests(unittest.TestCase):
         state_path = controller.init_run(self.repo, self.feature, "run-2")
         (self.repo / "README.md").write_text("overwritten\n", encoding="utf-8")
         (self.repo / "secret.txt").write_text("unexpected\n", encoding="utf-8")
-        result = controller.check_scope(state_path, ["src/app.py"])
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        result = controller.check_scope(state_path, "T01")
         self.assertEqual(result["result"], "BLOCKED")
         self.assertEqual(result["preexisting_modified"], ["README.md"])
         self.assertEqual(result["unauthorized_files"], ["secret.txt"])
+        self.assertEqual(result["task_id"], "T01")
 
     def test_scope_passes_for_new_allowed_file(self) -> None:
         state_path = controller.init_run(self.repo, self.feature, "run-3")
         (self.repo / "src").mkdir()
         (self.repo / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
-        result = controller.check_scope(state_path, ["src/app.py"])
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        result = controller.check_scope(state_path, "T01")
         self.assertEqual(result["result"], "PASS")
 
     def test_feature_directory_cannot_escape_repository(self) -> None:
@@ -114,7 +117,8 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["agents"][0]["status"], "ARCHIVED")
         (self.repo / "src").mkdir()
         (self.repo / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
-        self.assertEqual(controller.check_scope(state_path, ["src/app.py"])["result"], "PASS")
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        self.assertEqual(controller.check_scope(state_path, "T01")["result"], "PASS")
         snapshot = controller.freeze_review(state_path)
         self.assertEqual(snapshot["changed_files"], ["src/app.py"])
         self.assertTrue((state_path.parent / "review-snapshot.json").is_file())
@@ -123,7 +127,8 @@ class ControllerTests(unittest.TestCase):
         state_path = controller.init_run(self.repo, self.feature, "run-7")
         (self.repo / "src").mkdir()
         (self.repo / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
-        controller.check_scope(state_path, ["src/app.py"])
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        controller.check_scope(state_path, "T01")
         (self.repo / "other.py").write_text("unexpected\n", encoding="utf-8")
         with self.assertRaises(controller.ControllerError):
             controller.freeze_review(state_path)
@@ -146,7 +151,8 @@ class ControllerTests(unittest.TestCase):
         (self.repo / "README.md").write_text("preexisting\n", encoding="utf-8")
         state_path = controller.init_run(self.repo, self.feature, "run-p02")
         (self.repo / "README.md").write_text("task-modified\n", encoding="utf-8")
-        result = controller.check_scope(state_path, ["README.md"])
+        controller.record_task(state_path, "T01", ["README.md"])
+        result = controller.check_scope(state_path, "T01")
         self.assertEqual(result["result"], "PASS")
         self.assertEqual(result["preexisting_modified"], [])
         self.assertIn("README.md", result["authorized_overlaps"])
@@ -156,7 +162,8 @@ class ControllerTests(unittest.TestCase):
         (self.repo / "README.md").write_text("preexisting\n", encoding="utf-8")
         state_path = controller.init_run(self.repo, self.feature, "run-p02neg")
         (self.repo / "README.md").write_text("overwritten\n", encoding="utf-8")
-        result = controller.check_scope(state_path, ["src/app.py"])  # README NOT in allowed
+        controller.record_task(state_path, "T01", ["src/app.py"])  # README NOT in scope
+        result = controller.check_scope(state_path, "T01")
         self.assertEqual(result["result"], "BLOCKED")
         self.assertEqual(result["preexisting_modified"], ["README.md"])
 
@@ -328,7 +335,8 @@ class ControllerTests(unittest.TestCase):
         state_path = controller.init_run(self.repo, self.feature, "run-del")
         (self.repo / "to-delete.py").unlink()
         (self.repo / "new_file.py").write_text("new\n", encoding="utf-8")
-        result = controller.check_scope(state_path, ["to-delete.py", "new_file.py"])
+        controller.record_task(state_path, "T01", ["to-delete.py", "new_file.py"])
+        result = controller.check_scope(state_path, "T01")
         self.assertEqual(result["result"], "PASS")
         self.assertIn("to-delete.py", result["deleted_files"])
         self.assertIn("new_file.py", result["new_files"])
@@ -374,6 +382,224 @@ class ControllerTests(unittest.TestCase):
         target = self.repo / ".codekit" / "probe2.json"
         controller._atomic_json(target, {"a": 1}, mode=0o644)
         self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+
+    # ── HIGH-1: mechanical retry and review-freeze budgets ─────────────────────
+
+    def test_fingerprint_attempt_cap_forces_human_intervention(self) -> None:
+        """HIGH-1: 4 occurrences of a fingerprint still retry; the 5th is ATTEMPT_CAP."""
+        state_path = controller.init_run(self.repo, self.feature, "run-cap1")
+        controller.record_task(state_path, "T01", ["src/a.py"])
+        fp = "pytest::t::AssertionError"
+        for n in range(1, controller.MAX_FINGERPRINT_ATTEMPTS + 1):
+            event = controller.record_failure(state_path, "task", ["T01"], "CODE_OR_TEST", fp)
+            self.assertEqual(event["disposition"], "retry_implementation")
+            self.assertEqual(event["fingerprint_occurrences"], n)
+        capped = controller.record_failure(state_path, "task", ["T01"], "CODE_OR_TEST", fp)
+        self.assertEqual(capped["disposition"], "human_intervention")
+        self.assertEqual(capped["resolution"], "ATTEMPT_CAP")
+        self.assertEqual(capped["fingerprint_occurrences"], controller.MAX_FINGERPRINT_ATTEMPTS + 1)
+
+    def test_fingerprint_cap_is_per_fingerprint(self) -> None:
+        """A new error fingerprint restarts the retry budget."""
+        state_path = controller.init_run(self.repo, self.feature, "run-cap2")
+        controller.record_task(state_path, "T01", ["src/a.py"])
+        for _ in range(controller.MAX_FINGERPRINT_ATTEMPTS):
+            controller.record_failure(state_path, "task", ["T01"], "CODE_OR_TEST", "pytest::old::fail")
+        event = controller.record_failure(state_path, "task", ["T01"], "CODE_OR_TEST", "pytest::new::fail")
+        self.assertEqual(event["disposition"], "retry_implementation")
+        self.assertEqual(event["fingerprint_occurrences"], 1)
+
+    def test_missing_task_mapping_precedes_attempt_cap(self) -> None:
+        """Unmappable overall failures keep BLOCKED_MISSING_TASK_MAPPING precedence."""
+        state_path = controller.init_run(self.repo, self.feature, "run-cap3")
+        fp = "pytest::overall::fail"
+        for _ in range(controller.MAX_FINGERPRINT_ATTEMPTS + 2):
+            event = controller.record_failure(state_path, "overall", [], "CODE_OR_TEST", fp)
+            self.assertEqual(event["resolution"], "BLOCKED_MISSING_TASK_MAPPING")
+
+    def test_record_failure_rejects_empty_fingerprint(self) -> None:
+        state_path = controller.init_run(self.repo, self.feature, "run-cap4")
+        with self.assertRaises(controller.ControllerError):
+            controller.record_failure(state_path, "overall", [], "CODE_OR_TEST", "   ")
+
+    def test_freeze_review_capped_at_max_freezes(self) -> None:
+        """HIGH-1: initial freeze + 2 repair rounds; the 4th freeze raises."""
+        state_path = controller.init_run(self.repo, self.feature, "run-fzc")
+        for _ in range(controller.MAX_REVIEW_FREEZES):
+            controller.freeze_review(state_path)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.freeze_review(state_path)
+        self.assertIn("review freeze limit", str(ctx.exception))
+        self.assertIn("human intervention", str(ctx.exception))
+
+    def test_freeze_review_state_keeps_compact_snapshot_reference(self) -> None:
+        """state.json stores only a reference; the bulk stays in the artifact file."""
+        state_path = controller.init_run(self.repo, self.feature, "run-fzs")
+        controller.freeze_review(state_path)
+        entry = json.loads(state_path.read_text(encoding="utf-8"))["review_snapshots"][-1]
+        self.assertEqual(
+            set(entry),
+            {"path", "base_sha", "head_sha", "diff_digest", "frozen_at"},
+        )
+        artifact = json.loads(Path(entry["path"]).read_text(encoding="utf-8"))
+        self.assertIn("preexisting_diff_snapshot", artifact)
+
+    # ── HIGH-2: scope comes from the ledger, never from the caller ─────────────
+
+    def test_check_scope_requires_registered_task(self) -> None:
+        state_path = controller.init_run(self.repo, self.feature, "run-tb1")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.check_scope(state_path, "T404")
+        self.assertIn("record-task", str(ctx.exception))
+
+    def test_check_scope_no_longer_widens_authorized_files(self) -> None:
+        """The old permanent-authorization side effect (HIGH-2) must be gone."""
+        state_path = controller.init_run(self.repo, self.feature, "run-tb2")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        self.assertEqual(controller.check_scope(state_path, "T01")["result"], "PASS")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["authorized_files"], [])
+
+    def test_check_scope_allows_files_from_earlier_pass_task(self) -> None:
+        """Serial worktree: cumulative diff is fine once the owning task PASSED."""
+        state_path = controller.init_run(self.repo, self.feature, "run-tb3")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "a.py").write_text("a\n", encoding="utf-8")
+        (self.repo / "src" / "b.py").write_text("b\n", encoding="utf-8")
+        controller.record_task(state_path, "T01", ["src/a.py"])
+        controller.record_task(state_path, "T02", ["src/b.py"])
+        for status in ["READY", "RUNNING", "VALIDATING", "PASS"]:
+            controller.update_task(state_path, "T01", status)
+        self.assertEqual(controller.check_scope(state_path, "T02")["result"], "PASS")
+
+    def test_check_scope_blocks_file_owned_by_unrun_task(self) -> None:
+        """Files registered to a not-yet-PASS task are still out of scope."""
+        state_path = controller.init_run(self.repo, self.feature, "run-tb4")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "a.py").write_text("a\n", encoding="utf-8")
+        (self.repo / "src" / "b.py").write_text("b\n", encoding="utf-8")
+        controller.record_task(state_path, "T01", ["src/a.py"])
+        controller.record_task(state_path, "T02", ["src/b.py"])
+        result = controller.check_scope(state_path, "T01")
+        self.assertEqual(result["result"], "BLOCKED")
+        self.assertEqual(result["unauthorized_files"], ["src/b.py"])
+
+    def test_expand_scope_widens_task_and_records_audit(self) -> None:
+        """NEEDS_SCOPE flow: register the extra file with a reason, then PASS."""
+        state_path = controller.init_run(self.repo, self.feature, "run-ex1")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+        (self.repo / "src" / "extra.py").write_text("extra\n", encoding="utf-8")
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        controller.update_task(state_path, "T01", "READY")
+        controller.update_task(state_path, "T01", "RUNNING")
+        self.assertEqual(controller.check_scope(state_path, "T01")["result"], "BLOCKED")
+        outcome = controller.expand_scope(state_path, "T01", ["src/extra.py"], "Implementer returned NEEDS_SCOPE")
+        self.assertEqual(outcome["added_files"], ["src/extra.py"])
+        self.assertEqual(controller.check_scope(state_path, "T01")["result"], "PASS")
+        task = json.loads(state_path.read_text(encoding="utf-8"))["tasks"][0]
+        self.assertEqual(task["scope_expansions"][0]["reason"], "Implementer returned NEEDS_SCOPE")
+        self.assertEqual(task["scope_expansions"][0]["added_files"], ["src/extra.py"])
+
+    def test_expand_scope_rejects_terminal_task(self) -> None:
+        state_path = controller.init_run(self.repo, self.feature, "run-ex2")
+        controller.record_task(state_path, "T01", ["src/a.py"])
+        for status in ["READY", "RUNNING", "VALIDATING", "PASS"]:
+            controller.update_task(state_path, "T01", status)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.expand_scope(state_path, "T01", ["src/b.py"], "too late")
+        self.assertIn("terminal", str(ctx.exception))
+
+    def test_expand_scope_requires_reason(self) -> None:
+        state_path = controller.init_run(self.repo, self.feature, "run-ex3")
+        controller.record_task(state_path, "T01", ["src/a.py"])
+        with self.assertRaises(controller.ControllerError):
+            controller.expand_scope(state_path, "T01", ["src/b.py"], "   ")
+
+    # ── composite dispatch-task / settle-task commands ─────────────────────────
+
+    def test_dispatch_task_pending_to_running_with_agent(self) -> None:
+        """One call replaces PENDING→READY→RUNNING plus record-agent."""
+        state_path = controller.init_run(self.repo, self.feature, "run-dp1")
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        outcome = controller.dispatch_task(state_path, "T01", "session-impl-1", "digest-t01")
+        self.assertEqual(outcome["status"], "RUNNING")
+        self.assertEqual(outcome["attempts"], 1)
+        self.assertEqual(outcome["agent"], {
+            "session_id": "session-impl-1", "role": "impl-implementer", "status": "RUNNING",
+        })
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["tasks"][0]["status"], "RUNNING")
+        self.assertEqual(state["agents"][0]["input_digest"], "digest-t01")
+
+    def test_dispatch_task_retry_from_failed(self) -> None:
+        state_path = controller.init_run(self.repo, self.feature, "run-dp2")
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        controller.dispatch_task(state_path, "T01", "session-1", "digest-1")
+        controller.settle_task(state_path, "T01", "FAILED")
+        outcome = controller.dispatch_task(state_path, "T01", "session-2", "digest-2")
+        self.assertEqual(outcome["status"], "RUNNING")
+        self.assertEqual(outcome["attempts"], 2)
+
+    def test_dispatch_task_rejects_non_dispatchable_status(self) -> None:
+        state_path = controller.init_run(self.repo, self.feature, "run-dp3")
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        controller.dispatch_task(state_path, "T01", "session-1", "digest-1")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.dispatch_task(state_path, "T01", "session-2", "digest-2")
+        self.assertIn("PENDING or FAILED", str(ctx.exception))
+
+    def test_dispatch_task_rejects_unregistered_task(self) -> None:
+        state_path = controller.init_run(self.repo, self.feature, "run-dp4")
+        with self.assertRaises(controller.ControllerError):
+            controller.dispatch_task(state_path, "T404", "session-1", "digest-1")
+
+    def test_settle_task_pass_blocked_by_scope_stays_validating(self) -> None:
+        """An out-of-scope write can never be settled as PASS."""
+        state_path = controller.init_run(self.repo, self.feature, "run-st1")
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+        (self.repo / "stray.py").write_text("stray\n", encoding="utf-8")
+        controller.dispatch_task(state_path, "T01", "session-1", "digest-1")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.settle_task(state_path, "T01", "PASS")
+        self.assertIn("scope check BLOCKED", str(ctx.exception))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["tasks"][0]["status"], "VALIDATING")
+        self.assertEqual(state["scope_checks"][-1]["result"], "BLOCKED")
+        # Recovering: FAILED is still settleable from VALIDATING.
+        outcome = controller.settle_task(state_path, "T01", "FAILED", "pytest::t::fail")
+        self.assertEqual(outcome["status"], "FAILED")
+        final = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(final["scope_checks"][-1]["error_fingerprint"], "pytest::t::fail")
+
+    def test_settle_task_full_pass_path(self) -> None:
+        state_path = controller.init_run(self.repo, self.feature, "run-st2")
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+        controller.dispatch_task(state_path, "T01", "session-1", "digest-1")
+        outcome = controller.settle_task(state_path, "T01", "PASS")
+        self.assertEqual(outcome["status"], "PASS")
+        self.assertEqual(outcome["scope_result"], "PASS")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["tasks"][0]["status"], "PASS")
+        self.assertEqual(len(state["scope_checks"]), 1)
+
+    def test_settle_task_rejects_unstarted_and_finished_tasks(self) -> None:
+        state_path = controller.init_run(self.repo, self.feature, "run-st3")
+        with self.assertRaises(controller.ControllerError):
+            controller.settle_task(state_path, "T01", "PASS")  # unregistered
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        with self.assertRaises(controller.ControllerError):
+            controller.settle_task(state_path, "T01", "PASS")  # PENDING
+        controller.dispatch_task(state_path, "T01", "session-1", "digest-1")
+        controller.settle_task(state_path, "T01", "FAILED")
+        with self.assertRaises(controller.ControllerError):
+            controller.settle_task(state_path, "T01", "FAILED")  # terminal retry must re-dispatch
 
 
 if __name__ == "__main__":

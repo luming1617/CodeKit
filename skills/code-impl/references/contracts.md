@@ -143,7 +143,7 @@ task_contract:
   code_review_findings: []
 ```
 
-修改范围扩大、权限变化或验收标准变化时，必须生成新的 Task Contract；不要口头追加隐含范围。
+修改范围扩大、权限变化或验收标准变化时，必须生成新的 Task Contract；不要口头追加隐含范围。写入范围的机械扩权只能由控制器的 `expand-scope`（`--task-id` + `--reason`，登记进任务台账）完成；`check-scope` 与 `settle-task` 按 Task Ledger 推导授权集合（任务登记范围 ∪ 已 `PASS` 任务范围），不接受调用方现场声明的文件。
 
 ## Implementation Result
 
@@ -224,7 +224,10 @@ failure_attribution:
 
 约束：`task` 必须且只能映射一个 Task；`overall` 无法映射时必须为
 `BLOCKED_MISSING_TASK_MAPPING`，映射到多个 Task 时必须为
-`REPLAN_MULTI_TASK_IMPACT`。这类记录由
+`REPLAN_MULTI_TASK_IMPACT`。同一 `error_fingerprint` 的第 5 次登记（控制器
+`MAX_FINGERPRINT_ATTEMPTS` = 4 次容许 = 初始 + 3 次重试）会把处置强制改为
+`disposition: human_intervention`、`resolution: ATTEMPT_CAP`，事件中的
+`fingerprint_occurrences` 给出当前计数。这类记录由
 `$SKILL_DIR/scripts/code_impl_controller.py record-failure` 写入运行状态。
 
 ## Task Ledger
@@ -233,7 +236,7 @@ failure_attribution:
 task_ledger:
   - task_id: T01
     plan_version: 1
-    status: PENDING | READY | RUNNING | VALIDATING | PASS | FAILED | BLOCKED
+    status: PENDING | READY | RUNNING | VALIDATING | PASS | FAILED | BLOCKED | SUPERSEDED
     started_at: timestamp | null
     completed_at: timestamp | null
     head_sha: git-sha | null
@@ -241,6 +244,10 @@ task_ledger:
     changed_files: [repo-relative-path]
     validation_record: reference | null
     attempts: integer
+    scope_expansions:
+      - added_files: [repo-relative-path]
+        reason: string
+        at: timestamp
     error_fingerprints: [string]
     observations: [string]
 ```

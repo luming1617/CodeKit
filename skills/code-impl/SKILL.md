@@ -221,7 +221,7 @@ Orchestrator 独立检查：
 
 ## 05 任务调度
 
-从 DAG 中选择依赖已完成的 `READY` 任务。生成独立的 Task Contract，包含任务目标、来源追踪、允许修改文件、禁止项、依赖产物、仓库规范、验收标准、验证命令、任务起始 SHA/Diff 指纹和剩余重试预算。
+从 DAG 中选择依赖已完成的 `PENDING` 任务（`dispatch-task` 会一次性推进 `READY → RUNNING`）。生成独立的 Task Contract，包含任务目标、来源追踪、允许修改文件、禁止项、依赖产物、仓库规范、验收标准、验证命令、任务起始 SHA/Diff 指纹和剩余重试预算。
 
 在派发 Implementer 前先登记 Task 及其精确写入范围：
 
@@ -240,21 +240,15 @@ Orchestrator 独立检查：
 - 隔离工作树中的并行任务必须依赖已满足、写文件集合不重叠，并有明确的集成方式。
 - 只读 Planner、Debugger 不得与正在变化的 Diff 交叉读取；诊断前先固定输入快照。调用 `codekit:code-review` 前必须按 Code Review Handoff 固定完整审查快照。
 
-每次状态迁移必须通过控制器登记（P0-1，状态机定义见控制器 `TASK_STATE_TRANSITIONS`）：
+每次派发必须使用复合命令 `dispatch-task`：它在一次调用、一次状态写入内完成状态机推进和 Implementer 角色登记（P0-1，状态机定义见控制器 `TASK_STATE_TRANSITIONS`），取代原来的 2 次 `update-task` + 1 次 `record-agent`：
 
 ```bash
-# PENDING → READY（依赖已满足，准备派发）
-<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
-  --state "$state_path" --task-id '<task-id>' --status READY
-
-# READY → RUNNING（Implementer Sub-agent 已创建）
-<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
-  --state "$state_path" --task-id '<task-id>' --status RUNNING
-
-# RUNNING → VALIDATING（Implementer 返回 DONE，进入任务验证）
-<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
-  --state "$state_path" --task-id '<task-id>' --status VALIDATING
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" dispatch-task \
+  --state "$state_path" --task-id '<task-id>' \
+  --session-id "$implementer_session_id" --input-digest "$task_contract_digest"
 ```
+
+`dispatch-task` 只接受两种来源状态：`PENDING → READY → RUNNING`（首次派发）和 `FAILED → RUNNING`（重试，任务台账的 `attempts` 自动加 1）；未登记任务或其他来源会以 `ControllerError`（退出码 2）拒绝。返回体只含 `task_id`、`status`、`attempts` 与 `agent` 摘要（`session_id`/`role`/`status`），不要把完整状态文件复述进上下文。特殊迁移（如判定 `BLOCKED`、人工要求 `SUPERSEDED`）仍用 `update-task --state "$state_path" --task-id '<task-id>' --status <STATUS>`。
 
 非法迁移（如 PENDING 直接跳至 PASS、从终态再次转移）控制器会以 `ControllerError` 拒绝并退出码 2，不得绕过。
 
@@ -271,12 +265,12 @@ Orchestrator 独立检查：
 
 Implementer 返回 DONE 不等于任务通过，必须进入步骤 07。
 
-Sub-agent 创建后，Orchestrator 必须登记真实角色名、会话 ID、输入 digest 和返回状态：
+Sub-agent 创建的角色登记已由步骤 05 的 `dispatch-task` 原子完成（等价一次 `record-agent --status RUNNING`）。Implementer 返回后只需更新该会话的收尾状态；同一 session 的角色名与输入 digest 不可变更：
 
 ```bash
 <PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" record-agent \
   --state "$state_path" --role impl-implementer --name impl-implementer \
-  --session-id "$session_id" --input-digest "$task_contract_digest" --status RUNNING
+  --session-id "$session_id" --input-digest "$task_contract_digest" --status ARCHIVED
 ```
 
 ## 07 任务验证
@@ -288,36 +282,47 @@ Orchestrator 使用本地工具对本次任务产生的新 Diff 执行：
 3. 记录精确命令、工作目录、开始/结束时间、退出码、关键日志与未运行原因。
 4. 不把未执行、超时、跳过或日志缺失记为 PASS。
 
-范围检查必须由控制器执行，而不是只看 Implementer 自报：
+范围检查必须由控制器执行，而不是只看 Implementer 自报；检查以 `--task-id` 绑定 Task Ledger，授权集合由控制器按“该任务登记范围 ∪ 已 `PASS` 任务范围”确定性推导，不接受调用方现场声明文件：
 
 ```bash
 <PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" check-scope \
-  --state "$state_path" \
-  --allowed-file '<repo-relative-file>'
+  --state "$state_path" --task-id '<task-id>'
 ```
 
 控制器返回结果中包含以下关键字段：
 
-- `preexisting_modified`：**不在** `allowed_files` 内且内容发生变化的预存文件——这才是真正的越界，导致 `BLOCKED`。
-- `authorized_overlaps`：**在** `allowed_files` 内的预存 dirty 文件发生变化——这是已预期的重叠（已经人工介入后纳入范围），不影响 `PASS` 判定。
+- `preexisting_modified`：**不在** 授权集合内且内容发生变化的预存文件——这才是真正的越界，导致 `BLOCKED`。
+- `authorized_overlaps`：**在** 授权集合内的预存 dirty 文件发生变化——这是已预期的重叠（已经人工介入后纳入范围），不影响 `PASS` 判定。
 - `new_files`：本轮新增的文件（不包含被删除的文件）。
 - `deleted_files`：本轮被删除的跟踪文件（之前不在预存快照中）。
+- 属于尚未 `PASS` 的其他任务登记范围的文件出现在 `unauthorized_files` 中并导致 `BLOCKED`：写入归属未交付的任务之前不得提前落地其文件。
+
+Implementer 返回 `NEEDS_SCOPE` 且 Orchestrator 决定扩充授权时，必须先执行带 `--reason` 的 `expand-scope`（扩充会登记到任务台账并进入最终报告），再重新执行范围检查；不得先写文件再补登记。终态任务（`PASS`/`BLOCKED`/`SUPERSEDED`）不能扩权：
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" expand-scope \
+  --state "$state_path" --task-id '<task-id>' \
+  --add-file '<repo-relative-file>' --reason '<授权来源>'
+```
 
 ## 08 验证判定
 
 仅当范围检查通过、所有必需命令退出码为 0、验收断言有证据且没有新增未解释失败时，将任务判定为 PASS。否则固定失败时的 Task Contract、Diff、日志、环境和错误指纹，进入步骤 09。
 
-判定后必须通过控制器更新 Task 状态：
+判定必须通过复合命令 `settle-task` 写入：它先把 `RUNNING` 推进到 `VALIDATING`，再执行并持久化一次任务绑定的范围检查，最后按你的判定更新状态（把原来的 check-scope + update-task 两次往返合并为一次）：
 
 ```bash
-# 任务通过
-<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
+# 任务通过（范围检查 BLOCKED 时该命令会拒绝 PASS，任务停留在 VALIDATING）
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" settle-task \
   --state "$state_path" --task-id '<task-id>' --status PASS
 
-# 任务失败（验证未通过）
-<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
-  --state "$state_path" --task-id '<task-id>' --status FAILED
+# 任务失败（验证未通过；错误指纹随范围证据一并登记）
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" settle-task \
+  --state "$state_path" --task-id '<task-id>' --status FAILED \
+  --error-fingerprint '<normalized-fingerprint>'
 ```
+
+`settle-task --status FAILED` 不要求范围检查通过；需要先单独排查越界时可用 `check-scope`。被拒绝的 PASS 不会写入任务状态：范围越界要么经 `expand-scope` 合法化后重判，要么按 `FAILED` 进入步骤 09。
 
 ## 09 失败诊断
 
@@ -357,7 +362,7 @@ Orchestrator 根据证据决策：
 `BLOCKED_MISSING_TASK_MAPPING` 并阻止继续修复；多个任务受影响时记录
 `REPLAN_MULTI_TASK_IMPACT`，必须递增 `plan_version` 后重新规划。
 
-同一错误指纹最多重试 3 次。错误指纹至少包含失败命令、测试名或诊断位置、异常类型和归一化关键信息；只改变日志中的时间戳、临时路径或行号漂移不算新错误。
+同一错误指纹最多重试 3 次，且由控制器机械执行：每次失败必须通过 `record-failure` 登记，同一指纹的第 1 次出现记为初始失败，第 2–4 次仍返回 `RETRY_MAPPED_TASK`；第 5 次出现时控制器自动把处置改为 `human_intervention`、resolution 改为 `ATTEMPT_CAP`（见控制器 `MAX_FINGERPRINT_ATTEMPTS`），不得靠改写或换用指纹绕过。错误指纹至少包含失败命令、测试名或诊断位置、异常类型和归一化关键信息；只改变日志中的时间戳、临时路径或行号漂移不算新错误。
 
 ### 重规划（TASK_PLAN 或 REPLAN_MULTI_TASK_IMPACT）
 
@@ -388,6 +393,10 @@ Orchestrator 根据证据决策：
 ```bash
 <PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" freeze-review --state "$state_path"
 ```
+
+冻结次数由控制器强制执行：`state.json` 中 `review_snapshots` 的条目数不得超过
+`MAX_REVIEW_FREEZES`（=3，即首次审查 + 2 轮审查修复）。第 4 次冻结请求会被
+`ControllerError` 拒绝，必须进入步骤 17，不得通过删除历史条目绕过。
 
 Code Review Handoff 的 `base_sha`、`head_sha`、`diff_digest`、预存快照和本轮
 `changed_files` 必须直接取自 `review-snapshot.json`，不得手写或使用旧快照。
@@ -425,7 +434,7 @@ Orchestrator 严格使用 [contracts.md](references/contracts.md) 的 Code Revie
 - `APPROVE_WITH_FOLLOW_UPS`：进入最终报告；Findings、Open Questions、Release Gate 条件和剩余风险作为非阻塞事项登记，不自动扩大本轮范围。
 - `REQUEST_CHANGES` 且修复轮次少于 2：把阻塞 Finding、目标变更导致的 `FAIL_INTRODUCED` 或 `NOT_READY` Release Gate 项转换为修复任务。先按 Finding 的 `locations` 映射到 Task Ledger 中拥有对应文件的任务；无法唯一映射、需要新文件、改变依赖或超出原计划范围时，回到步骤 03 重规划。修复后必须重新执行受影响的任务验证、整体验证，并以新快照重新调用 `codekit:code-review`。
 - `BLOCKED`：进入步骤 17，向用户说明缺失的关键证据、权限、环境或宿主能力。
-- 完成 2 轮审查修复后仍为 `REQUEST_CHANGES`：进入人工介入。
+- 完成 2 轮审查修复后仍为 `REQUEST_CHANGES`：进入人工介入。修复轮的重新冻结与步骤 12 共享 `MAX_REVIEW_FREEZES` 预算，控制器在第 4 次 `freeze-review` 时直接拒绝，作为该上限的机械兜底。
 
 不得把 `BLOCKED`、结构校验失败、快照不一致或 `APPROVE_WITH_FOLLOW_UPS` 中的条件性事项改写成无条件 `APPROVE`。
 
