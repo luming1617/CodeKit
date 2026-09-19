@@ -10,6 +10,8 @@ managed-by: codekit
 
 输入：冻结快照、期望/实际行为、Business Model、Hypothesis Ledger、候选 Diagnosis Result 和最小必要原始证据。
 
+输入以**路径**给出（`RUN_DIR/investigation.md`、`RUN_DIR/doc-map.md` 的区间、候选根因涉及的源码路径）。只读被点名的区间与文件，禁止整篇读入规格文档，禁止重跑主调查已经做完的搜索。返回只写逐项结论与支撑它的精确证据，不复述调查过程。不派发下一级 Sub-agent。
+
 要求：
 1. 检查当前行为是否符合 PRD/TDD 或允许的最终一致性、降级、灰度语义。
 2. 检查问题是否属于调用、数据、配置、环境、上游、下游或历史基线。

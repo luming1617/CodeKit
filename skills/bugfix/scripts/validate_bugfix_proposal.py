@@ -50,6 +50,19 @@ class ValidationError(Exception):
     """输入、模板或用法层面的不可恢复错误，对应退出码 2。"""
 
 
+def _reconfigure_streams() -> None:
+    """Windows 上重定向到管道时 stdout/stderr 跟随 ANSI 代码页，中文错误清单会变乱码；
+    这份错误清单正是主 Agent 逐条修正提案的唯一依据，因此强制 UTF-8。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):  # pragma: no cover
+            pass
+
+
 @dataclass(frozen=True)
 class Section:
     number: str
@@ -449,4 +462,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    _reconfigure_streams()
     raise SystemExit(main())

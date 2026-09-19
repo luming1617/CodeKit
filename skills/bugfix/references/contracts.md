@@ -8,13 +8,26 @@
 
 | 文件 | 内容 | 写入者 |
 |---|---|---|
-| `state.json` | Input Contract 的仓库快照、`fix_proposal` 绑定、`approval_record` | `bugfix_state.py start / record-proposal / verify-approval` |
+| `state.json` | Input Contract 的仓库快照、`fix_proposal` 绑定、`approval_record` | `bugfix_state.py preflight / start / record-proposal / verify-approval` |
+| `doc-map.md` | 每份 PRD/TDD/RPD 的 digest、行数、`approx_tokens` 与标题→行区间 | `bugfix_state.py preflight / start` |
+| `investigation.md` | 步骤 03–07 的 Business Model、Hypothesis Ledger、Diagnosis Result 与反证结论 | Investigator / Challenger 按节追加 |
 | `proposal.md` | Fix Proposal 正文（按 `assets/bugfix-proposal-template.md`） | 主 Agent |
 | `approval.txt` | 用户批准原文（含审批口令） | 主 Agent 逐字保存 |
-| `validation-record.json` | Validation Record（真实执行的命令、退出码、错误指纹） | `bugfix_state.py run-validation` |
+| `implementation-contract.json` | Implementation Contract（允许范围、禁止项、不变量、起始摘要、重试预算） | `bugfix_state.py freeze-contract` |
+| `validation-plan.json` | 从提案第 5 节验证表渲染的命令清单 | `bugfix_state.py freeze-contract` |
+| `validation-record.json` | Validation Record（真实执行的命令、退出码、错误指纹） | `bugfix_state.py run-plan / run-validation` |
 | `delivery-report.md` | 最终交付报告（按 `assets/bugfix-delivery-report-template.md`） | 主 Agent |
 
 标为“写入者：脚本”的契约不得由 Agent 手写或事后补写；脚本不可用时对应阶段为 `BLOCKED`，而不是改用自述文本。
+
+### 0.1 读取与交接预算
+
+契约在阶段之间按**路径**交接，不按内容搬运：
+
+- 派发 Sub-agent 时，任务正文只给 `SKILL_DIR`/`RUN_DIR` 绝对路径、契约文件名和本轮要回答的问题；需要它读的规格文档，给 `doc-map.md` 里的标题区间，让它自己用 `Read` 的 `offset`/`limit` 取那一段。禁止把 PRD/TDD/RPD、提案或上一阶段的完整正文粘进任务正文。
+- 主 Agent 自己读规格文档同样按区间取段；只有裁决冲突或写提案的相关章节才展开。
+- `state.json`、`implementation-contract.json`、`validation-record.json` 的字段以对应子命令的 stdout 摘要为准，不为了“看一眼”而整份读入；需要逐条排查基线时才用 `--verbose` 或读文件。
+- 每条门禁命令的输出面向决策：`preflight`、`verify-gates`、`freeze-contract`、`run-plan` 各一次调用即可完成对应步骤，不得拆成多次调用后由模型逐条复述。
 
 ## 1. Input Contract
 
@@ -64,6 +77,8 @@ input_contract:
 `CONFIRMED_BUG` 的根因通常需要 E2 或 E3。E1 只能作为待验证假设。
 
 ## 3. Business Model
+
+第 3、4、5 节的契约统一写入 `RUN_DIR/investigation.md`，按节追加，不另建文件，也不在派发时复述正文。
 
 ```yaml
 business_model:
@@ -164,6 +179,8 @@ fix_proposal:
   approval_phrase: string
 ```
 
+`record-proposal` 对提案冻结两份摘要：`gate_digest` 覆盖提案里的承重标签与两张表（首列为 `文件/符号` 的计划修改表、首列为 `检查` 的验证计划表）的集合语义——`方案 ID`、`方案版本`、`状态`、`推荐方案`、`绑定快照`、`允许修改文件`、`明确不修改`、`必须保持的行为`、`备选方案及未选择原因`、`回归测试`、`人工验收`、`审批状态`、`审批范围`、`审批口令`，以及 `--review-mode`；全文 `digest` 只做审计留痕。叙述性章节的改写不会推翻 `gate_digest`，因此不必整轮重新审批（见第 7 节）。缺少关键标签时脚本退化为全文绑定，只会更严。
+
 ## 7. Approval Record
 
 ```yaml
@@ -174,32 +191,42 @@ approval_record:
   approval_file: repo-relative-path   # RUN_DIR/approval.txt，保存用户批准原文
   approved_snapshot: {head_sha: git-sha, working_tree_digest: string}
   approved_write_files: [repo-relative-path]
-  approved_solution_digest: string
-  verified_by: bugfix_state.py verify-approval
+  approved_solution_digest: string      # state.json: proposal.digest（全文摘要，审计留痕）
+  approved_gate_digest: string          # state.json: proposal.gate_digest（审批真正绑定的对象）
+  editorial_revisions:                  # 仅叙述修订的放行记录，空数组表示从未豁免
+    - {from_digest: string, to_digest: string, from_gate: string, to_gate: string, at: timestamp, note: string}
+  verified_by: bugfix_state.py verify-approval | verify-gates
   verdict: OK | FAIL
   approved_at: timestamp
 ```
 
-用户的批准必须明确指向当前提案，审批口令逐字包含 `批准执行 <proposal_id> v<proposal_version>`，并由 `verify-approval` 校验提案摘要、快照和口令绑定。若快照或方案发生实质变化，旧 Approval Record 失效。
+用户的批准必须明确指向当前提案，审批口令逐字包含 `批准执行 <proposal_id> v<proposal_version>`，并由 `verify-approval` 校验承重字段摘要、快照和口令绑定。若快照或方案发生实质变化，旧 Approval Record 失效。只有全文 `digest` 变化、`gate_digest` 与章节骨架（标题序列与篇幅）都未变时，才允许用 `--editorial` 放行一次编辑性修订并写入 `editorial_revisions`；`--editorial` 不能救回任何 gate、快照或口令失败，也不构成用户对新方案的批准。
 
 ## 8. Implementation Contract
 
 ```yaml
 implementation_contract:
-  approval_record: reference
+  approval_record: reference          # 提案 ID/版本/全文 digest/gate digest/审批时间
   objective: string
   repo_root: absolute-path
+  review_mode: FULL | LITE
   start_head_sha: git-sha
   start_diff_digest: string
   preexisting_changes: [repo-relative-path]
   allowed_write_files: [repo-relative-path]
-  forbidden_actions: [string]
-  required_changes: [file-symbol-change]
-  behavior_to_preserve: [string]
+  forbidden_changes: [string]         # 提案『明确不修改』
+  behavior_to_preserve: [string]      # 提案『必须保持的行为』
+  planned_changes: [string]           # 提案「文件/符号」表逐行
   acceptance_criteria: [string]
-  validation_commands: [command-cwd-proves]
-  retry: {fingerprint: string | null, used: integer, remaining: integer}   # fingerprint 由 run-validation 计算，不得自行估计
+  validation_commands: [plan-item]    # 提案第 5 节渲染出的验证计划
+  retry: {fingerprint: string | null, used: integer, remaining: integer}   # fingerprint 由 run-plan / run-validation 计算，不得自行估计
+  run_dir: absolute-path
+  doc_map: absolute-path
+  frozen_at: timestamp
+  contract_digest: string             # 除本字段外整份合同的 canonical-json 摘要
 ```
+
+本契约由 `bugfix_state.py freeze-contract` 从 `state.json` 的审批绑定与提案正文渲染成 `RUN_DIR/implementation-contract.json`，并同步生成 `RUN_DIR/validation-plan.json`（其 `contract_digest` 与合同自摘要一致）；主 Agent 只提供覆盖项，不手写摘要或允许范围。`verify-scope --contract` 直接读取该文件的 `allowed_write_files`，并用同样的 canonical-json 摘要复核合同是否被事后改写，结果写入 `contract_integrity`：`OK` / `TAMPERED`（硬失败）/ `MISSING_DIGEST`（升级前的旧合同）/ `NOT_APPLICABLE`（未用 `--contract`）。事后改合同只会让越界判定变得更宽松，因此 `out_of_scope` 为空并不代表范围合法，必须同时看 `contract_integrity`。
 
 ## 9. Validation Record
 
