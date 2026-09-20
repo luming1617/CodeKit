@@ -53,10 +53,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import validate_bugfix_proposal as proposal_validator  # noqa: E402
 
-SCHEMA_VERSION = 1
+# CW2-a①：摘要编码从 "sha256:<hex>" 改为裸 hex，与 code-review、code-impl 同一套；
+# 带前缀时任何跨 SKILL 的 `==` 都恒为 False（审核报告 A5）。SCHEMA_VERSION 随之升到 2：
+# 旧 state.json 里的 digest 值与新编码不可互换，宁可拒绝加载并说明怎么办，也不要把
+# 两种编码混在一次比较里。
+SCHEMA_VERSION = 2
+# 交给 code-review `--handoff` 的那一份自述块自己的版本，与 state.json 的版本各走各的。
+SNAPSHOT_SCHEMA_VERSION = 2
+PRODUCED_BY = "codekit:bugfix/scripts/bugfix_state.py"
+DIGEST_SCHEME = "sha256/hex"
 STATE_NAME = "state.json"
 VALIDATION_NAME = "validation-record.json"
 CONTRACT_NAME = "implementation-contract.json"
+# CW2-a③：交给 code-review 步骤 02 `--handoff` 的那一份自述块，单独成文件，
+# 不与 implementation-contract.json 混在一起（后者是实现合同，字段名服务于实施绑定）。
+REVIEW_HANDOFF_NAME = "review-handoff.json"
 PLAN_NAME = "validation-plan.json"
 DOC_MAP_NAME = "doc-map.md"
 INVESTIGATION_NAME = "investigation.md"
@@ -108,9 +119,21 @@ def now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def target_id_for(root: Path, head_sha_value: object) -> str:
+    """跨 SKILL 的目标连接键 = 规范化仓库根 + 目标 head_sha。
+
+    与 code-review 的 `target_id_for`、code-impl 的 `_handoff_target_id` 同一个表达式。
+    三家没有共享代码路径（各自独立分发），所以一致性由
+    `skills/code-review/tests/test_review_contracts.py` 的字面量漂移测试盯着。
+    """
+    return f"{os.path.normcase(str(root.resolve()))}@{head_sha_value}"
+
+
 def git(root: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(root), *args], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+        # surrogateescape 而不是 replace：`git status` 的路径列可能含非 UTF-8 字节，
+        # 用 replace 会把两条不同路径归一成同一串 U+FFFD，而它是工作树摘要的 material。
+        ["git", "-C", str(root), *args], capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=False,
     )
     if result.returncode != 0:
         raise StateError(f"git {' '.join(args)} 失败：{result.stderr.strip() or result.stdout.strip()}")
@@ -118,7 +141,7 @@ def git(root: Path, *args: str) -> str:
 
 
 def sha256_text(text: str) -> str:
-    return "sha256:" + hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+    return hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
 def sha256_file(path: Path) -> str:
@@ -126,7 +149,7 @@ def sha256_file(path: Path) -> str:
         data = path.read_bytes()
     except OSError as exc:
         raise StateError(f"无法读取 {path}: {exc}") from exc
-    return "sha256:" + hashlib.sha256(data).hexdigest()
+    return hashlib.sha256(data).hexdigest()
 
 
 def status_entries(root: Path, exclude: str | None = None) -> list[str]:
@@ -149,7 +172,7 @@ def is_under(path: str, prefix: str | None) -> bool:
 
 def head_sha(root: Path) -> str:
     result = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+        ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=False,
     )
     return result.stdout.strip() if result.returncode == 0 else ""
 
@@ -185,7 +208,7 @@ def untracked_entries(root: Path, exclude: str | None) -> list[str]:
         try:
             if file.is_file() and file.stat().st_size <= UNTRACKED_HASH_MAX_BYTES:
                 digest = hashlib.sha256(file.read_bytes()).hexdigest()
-                entries.append(f"{rel}\1sha256:{digest}")
+                entries.append(f"{rel}\1{digest}")
             else:
                 entries.append(f"{rel}\1too-large")
         except OSError as exc:
@@ -264,14 +287,14 @@ def write_doc_map(run_dir: Path, documents: list[dict]) -> str | None:
         lines.append(f"## {doc['path']}")
         lines.append(
             f"- 种类 `{doc['kind']}`，{doc.get('lines') or '未知'} 行，"
-            f"{doc['size']} 字节，估算 {doc.get('approx_tokens') or '未知'} tokens，digest `{doc['digest'][:19]}…`"
+            f"{doc['size']} 字节，估算 {doc.get('approx_tokens') or '未知'} tokens，digest `{doc['digest'][:12]}…`"
         )
         if doc.get("outline_truncated"):
             lines.append(f"- 区间索引已截断到前 {OUTLINE_MAX_ENTRIES} 条（`--verbose` 重跑可核对完整清单）")
         lines += [f"- {entry}" for entry in doc.get("outline", [])]
         lines.append("")
     path = run_dir / DOC_MAP_NAME
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8", errors="surrogatepass")
     return str(path)
 
 
@@ -350,13 +373,17 @@ def capture_snapshot(root: Path, documents: list[Path], exclude: str | None = No
     if base:
         result = subprocess.run(
             ["git", "-C", str(root), "diff", "--binary", "HEAD"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=False,
         )
         diff = result.stdout
     return {
         "captured_at": now(),
         "branch": git(root, "rev-parse", "--abbrev-ref", "HEAD").strip(),
         "head_sha": base,
+        # CW2-a①③：自述块。跨 SKILL 比对靠 `target_id` 连接、靠 `digest_scheme` 决定摘要
+        # 可比与否，不再靠"三个字段全等"那条永远为假的规则（审核报告 A5）。
+        "digest_scheme": DIGEST_SCHEME,
+        "target_id": target_id_for(root, base),
         "working_tree_digest": sha256_text(
             "\0".join(status_entries(root, exclude))
             + "\1" + "\0".join(untracked_entries(root, exclude))
@@ -400,20 +427,28 @@ def state_path(value: str | Path) -> Path:
 
 def load_state(path: Path) -> dict:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # errors 与 save_state 的 surrogatepass 成对：state.json 里存的是 `git status`
+        # 原样解码出的路径，非 UTF-8 文件名会以代理码位写出，读回时必须同样还原。
+        data = json.loads(path.read_text(encoding="utf-8", errors="surrogateescape"))
     except OSError as exc:
         raise StateError(f"无法读取 {path}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise StateError(f"{path} 不是合法 JSON：{exc}") from exc
     if data.get("schema_version") != SCHEMA_VERSION:
-        raise StateError(f"{path} 的 schema_version 不受支持：{data.get('schema_version')}")
+        raise StateError(
+            f"{path} 的 schema_version 不受支持：{data.get('schema_version')}；"
+            "本版本改用裸 hex 摘要（去掉 sha256: 前缀），旧 run 的绑定值无法换算，"
+            "请重新 init/capture 并对提案重新审批"
+        )
     return data
 
 
 def save_state(path: Path, data: dict) -> None:
     data["updated_at"] = now()
     temporary = path.parent / f".{path.name}.tmp"
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", errors="surrogatepass"
+    )
     os.replace(temporary, path)
 
 
@@ -469,7 +504,7 @@ def proposal_gate_payload(proposal_path: Path, review_mode: str) -> dict | None:
 
 def canonical_digest(payload: dict) -> str:
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(canonical.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
 def gate_digest_of(payload: dict | None) -> str | None:
@@ -646,7 +681,9 @@ def normalized(text: str) -> str:
 
 def read_text_file(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8")
+        # surrogateescape 与 save_state/契约写盘的 surrogatepass 成对，否则含非 UTF-8
+        # 文件名的 run 会把自家 implementation-contract.json 读回来时直接报错。
+        return path.read_text(encoding="utf-8", errors="surrogateescape")
     except (OSError, UnicodeDecodeError) as exc:
         raise StateError(f"无法读取 {path}: {exc}") from exc
 
@@ -801,19 +838,37 @@ def cmd_freeze_contract(args: argparse.Namespace) -> int:
     contract_digest = canonical_digest(contract)
     contract["contract_digest"] = contract_digest
     contract_path = manifest.parent / CONTRACT_NAME
-    contract_path.write_text(json.dumps(contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    contract_path.write_text(
+        json.dumps(contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", errors="surrogatepass"
+    )
+    handoff = {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "produced_by": PRODUCED_BY,
+        "digest_scheme": DIGEST_SCHEME,
+        # 本 Skill 从不 commit，审查目标始终是工作树差异，所以显式声明"不含已提交范围"
+        # （null，而不是缺键）：code-review 据此判断范围关系，不得据此判 BLOCKED。
+        "committed_range": None,
+        "target_id": target_id_for(Path(state["root"]), contract["start_head_sha"]),
+        # 只声明 head_sha。批准时冻结的 working_tree_digest 描述的是"动手前"的树，
+        # 把它写成审查目标的摘要会是错的。
+        "worktree_state": {"head_sha": contract["start_head_sha"]},
+    }
+    handoff_path = manifest.parent / REVIEW_HANDOFF_NAME
+    handoff_path.write_text(json.dumps(handoff, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     plan_path = None
     if plan:
         plan_path = manifest.parent / PLAN_NAME
         plan_path.write_text(
             json.dumps({"schema_version": SCHEMA_VERSION, "contract_digest": contract_digest, "checks": plan},
                        ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+            encoding="utf-8", errors="surrogatepass",
         )
     return emit({
         "verdict": "OK",
         "contract": str(contract_path),
         "contract_digest": contract_digest,
+        "review_handoff": str(handoff_path),
+        "target_id": handoff["target_id"],
         "plan": str(plan_path) if plan_path else None,
         "allowed_write_files": contract["allowed_write_files"],
         "validation_items": len(plan),
@@ -965,7 +1020,7 @@ def tail(text: str, lines: int = OUTPUT_TAIL_LINES) -> str:
 def load_record(path: Path) -> dict:
     if path.exists():
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8", errors="surrogateescape"))
         except (OSError, json.JSONDecodeError) as exc:
             raise StateError(f"{path} 损坏，无法追加验证记录：{exc}") from exc
     return {"schema_version": SCHEMA_VERSION, "checks": []}
@@ -974,7 +1029,9 @@ def load_record(path: Path) -> dict:
 def save_record(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / f".{path.name}.tmp"
-    temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", errors="surrogatepass"
+    )
     os.replace(temporary, path)
 
 

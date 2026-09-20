@@ -69,7 +69,7 @@ traceback；确需继续时以 `init --allow-lossy-decoding` 重开一个 run，
 
 本 Skill 在整体验证通过后有一个不可跳过的下游 Skill 依赖：必须调用 `codekit:code-review`，并等待它基于冻结快照返回完整审查结果。读取其 `SKILL.md`、复述 `/code-review`、在主 Agent 内自行审查，或只写“应调用”都不算调用。下游 Skill 未实际启动、输入快照不一致、结果不可验证或宿主不支持嵌套 Skill 调用时，必须进入人工介入并将最终状态标记为 `BLOCKED`。
 
-- **Claude Code：**使用宿主原生 `Skill` 工具，目标为插件作用域名 `codekit:code-review`，传入 `feature-directory`、Code Review Handoff（含 `review_mode` 和三份文档的 `access`）、Base/Head SHA、Diff digest 和验证记录；必须在会话记录中看到该 Skill 的真实执行结果。
+- **Claude Code：**使用宿主原生 `Skill` 工具，目标为插件作用域名 `codekit:code-review`，传入 `feature-directory`、Code Review Handoff（含 `review_mode`、三份文档的 `access`，以及 `review-snapshot.json` 的绝对路径供其做 `--handoff` 机械比对）和验证记录；必须在会话记录中看到该 Skill 的真实执行结果。
 - **Codex：**通过宿主的显式 Skill 选择机制发起 `$code-review <feature-directory>`（若当前插件界面显示了命名空间，则使用界面显示的完整名称；本 Skill 的 `feature-directory` 恒为非空需求目录，不得省略），并传入同一 Handoff；Codex 官方只定义了提示词级 `$skill` 显式调用，没有公开的嵌套依赖字段，因此 `$code-review` 未被宿主执行时不得视为成功，必须 `BLOCKED`。
 - **OpenCode：**优先使用原生 `skill` 工具调用 `skill({ name: "code-review" })`，并确认 `permission.skill` 未拒绝该 Skill；若当前 CodeKit 版本把它注册为 `code-review` 命令，则必须通过宿主实际执行该命令并验证其独立结果，不能把命令文本或读取文件当作调用。
 
@@ -399,7 +399,9 @@ Implementer 返回 `NEEDS_SCOPE` 且 Orchestrator 决定扩充授权时，必须
 判定成功时控制器把这一行写进台账：完成时间、结束时的 `final_diff_digest`/`final_head_sha`、
 该任务实际改动的文件（`changed_files`，按任务自己的范围归因，不是全局 Diff）、累计错误
 指纹和本次尝试的收尾结果；返回体只回显 `status`、`scope_result`、越界清单、
-`changed_files` 与 12 位 `diff_digest`。
+`changed_files` 与 12 位 `diff_digest`。这里的 12 位只是回显截断，台账里存的是完整 64 位十六进制；
+任务台账的 `changed_files` 是纯仓库相对路径（拿去和授权清单、Finding `locations` 做映射），
+与快照里 `STATUS:path` 记法的 `changed_files` 不是同一个字段，不要互相复制。
 
 ## 09 失败诊断
 
@@ -492,8 +494,11 @@ Orchestrator 根据证据决策：
 `MAX_REVIEW_FREEZES`（=3，即首次审查 + 2 轮审查修复）。第 4 次冻结请求会被
 `ControllerError` 拒绝，必须进入步骤 17，不得通过删除历史条目绕过。
 
-Code Review Handoff 的 `base_sha`、`head_sha`、`diff_digest`、预存快照和本轮
-`changed_files` 必须直接取自 `review-snapshot.json`，不得手写或使用旧快照。
+Code Review Handoff 的 `snapshot` 整块（`target_id`、`digest_scheme`、`committed_range`、
+`worktree_state` 的 `head_sha`/`diff_digest`/`changed_files`、预存快照）必须直接取自
+`review-snapshot.json`，不得手写或使用旧快照。本 Skill 从不 commit，所以 `committed_range` 恒为
+`null`——这是显式声明"快照不含已提交范围"，不是缺失字段：`code-review` 据此记录 `SCOPE_SUPERSET`
+限制并继续审查，不得因此判 `BLOCKED`。
 
 - 全量本地测试及相关跨模块/集成测试；
 - 编译、Lint、格式和静态检查；
@@ -527,16 +532,17 @@ Orchestrator 先确认系统 Skill 注册表中存在且可调用 `codekit:code-
 
 Code Review Handoff 的输入必须同时固定 `<feature-directory>/product-doc.md`（PRD）、`<feature-directory>/technical-doc.md`（TDD）和 `<feature-directory>/release-doc.md`（RPD），三者均不得缺失或使用未验证版本，并按「审查模式声明」声明 `review_mode: FULL` 且三份文档的 `access` 均为 `available`；`codekit:code-review` 只有在 `FULL` 且这三份文档可访问时才可能返回 `APPROVE`。
 
-调用前按 [contracts.md](references/contracts.md) 生成 Code Review Handoff，固定用户请求、技术方案、发布方案、仓库规范、`Base SHA`、当前 `HEAD SHA`、预检时的已有修改快照、本轮任务自有完整 Diff、Diff digest、Task DAG、Task Ledger、任务级和整体验证证据，并将审查目标限定为 `local_diff`。`codekit:code-review` 必须继承当前权限闭包，禁止修改代码、发布评论、审批、commit、push 或部署。
+调用前按 [contracts.md](references/contracts.md) 生成 Code Review Handoff，固定用户请求、技术方案、发布方案、仓库规范、`target_id`（规范化 `repository_root` + 当前 `HEAD SHA`）、`digest_scheme`、预检时的已有修改快照、本轮任务自有完整 Diff、`worktree_state.diff_digest`、`changed_files`（`STATUS:path` 记法）、Task DAG、Task Ledger、任务级和整体验证证据，并将审查目标限定为 `local_diff`。`codekit:code-review` 必须继承当前权限闭包，禁止修改代码、发布评论、审批、commit、push 或部署。
 
-系统 `codekit:code-review` 必须返回其规范化 JSON 报告和由同一负载渲染的 Markdown 报告，并由它自带的确定性校验器验证结构。Orchestrator 只接收与 Handoff 的 `Base SHA`、`Head SHA` 和 Diff digest 完全一致且结构校验退出码为 0 的报告；不得把旧快照、未校验报告或口头摘要作为审查通过证据。
+系统 `codekit:code-review` 必须返回其规范化 JSON 报告和由同一负载渲染的 Markdown 报告，并由它自带的确定性校验器验证结构。派发时必须把 `review-snapshot.json` 的绝对路径交给它做 `--handoff` 机械比对，Orchestrator 只接收同时满足两条的报告：比对未以退出码 3 报 `BLOCKED`（即 `target_id` 相同、共有字段逐项相等），且结构校验退出码为 0；`SCOPE_SUPERSET`、`HANDOFF_SCHEME_MISMATCH` 与 `uncomparable_digests` 是随报告带走并写进最终报告的限制，不是不匹配，也不是驳回理由。不得把旧快照、未校验报告或口头摘要作为审查通过证据。
 
 ### 机械校验（步骤 14）
 
 发出 Handoff 前必须校验它，收到报告后必须把结论登记进状态；两步都是控制器命令，退出码非 0 时不得继续：
 
 ```bash
-# 1) 冻结 Handoff 的机械校验（review_mode=FULL、三份文档 access=available、locator 真实可读）
+# 1) 冻结 Handoff 的机械校验（review_mode=FULL、三份文档 access=available 且 locator 真实可读、
+#    snapshot 就是 freeze-review 的形状：digest_scheme/committed_range=null/64 位裸 hex，且 target_id 可由 repo_root+head_sha 重算）
 <PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" validate-contract \
   --kind handoff "$handoff_path"
 
@@ -622,7 +628,7 @@ Orchestrator 严格使用 [contracts.md](references/contracts.md) 的 Code Revie
 1. `gate --state "$state_path"` 退出码为 0（`gate-report.json` 的 `status` 为 `PASS`）；
 2. 所有 Task 均登记为 PASS；
 3. 整体验证满足发布方案中的全部本地要求，且证据以 `record-validation` 落盘；
-4. 系统 `codekit:code-review` 返回经结构校验且快照一致的 `APPROVE` 或 `APPROVE_WITH_FOLLOW_UPS`，并以 `record-review` 登记；
+4. 系统 `codekit:code-review` 返回经结构校验且快照匹配的 `APPROVE` 或 `APPROVE_WITH_FOLLOW_UPS`（匹配 = `target_id` 相同且共有字段相等，`SCOPE_SUPERSET` 不算不匹配），并以 `record-review` 登记；
 5. 未决事项均明确归类为非阻塞风险或人工验收项；
 6. 最终报告可以让用户从命令、退出码、Diff 和 SHA 复核结论。
 

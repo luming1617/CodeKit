@@ -23,6 +23,48 @@ from typing import Any, Iterable
 
 
 SCHEMA_VERSION = 1
+# CW2-a: the artifact this controller hands to code-review used to share one filename
+# (``review-snapshot.json``) with code-review's own signed manifest while carrying a
+# different key set (audit finding A5). It now gets its own version counter, and the
+# shape is pinned by ``handoff-snapshot`` contract validation plus the cross-skill
+# drift test -- the two producers stay separate skills with no import path between them.
+SNAPSHOT_SCHEMA_VERSION = 2
+PRODUCED_BY = "codekit:code-impl/scripts/code_impl_controller.py"
+# Byte-for-byte the literal code-review and bugfix declare; a mismatch is exactly the
+# bugfix-prefixed-digest defect that made every cross-skill ``==`` come out False.
+_DIGEST_SCHEME = "sha256/hex"
+# porcelain's XY column collapsed to the single letter code-review's `changed_files`
+# entries carry; ``??`` (untracked) maps to ``A`` there.
+_STATUS_LETTERS = "AMRCDTUX?"
+# ``_DIGEST_SCHEME`` is a promise about the *text*: 64 lowercase hex, no ``sha256:``
+# prefix. Checking the shape is what stops a prefixed digest from passing as one.
+HEX64_RE = re.compile(r"[0-9a-f]{64}")
+# ``STATUS:path`` / ``R:old->new``. Repo-relative paths carry no colon (git stores
+# POSIX-style paths, and Windows file names forbid ':'), so the first colon splits.
+CHANGED_FILE_RE = re.compile(r"[A-Z]:[^\n]+")
+
+
+def _status_letter(status: str) -> str:
+    """One porcelain XY pair -> the status letter of a ``STATUS:path`` entry.
+
+    Deliberately the *first* column, matching code-review's ``parse_name_status``
+    byte for byte; ``??`` has no letter there but is an addition there too.
+    """
+    stripped = status.strip()
+    if not stripped or stripped == "??":
+        return "A"
+    return stripped[0] if stripped[0] in _STATUS_LETTERS else "M"
+
+
+def _handoff_target_id(root: Path, head_sha: object) -> str:
+    """The cross-skill join key: normalized repository root + target head.
+
+    Same expression as code-review's ``target_id_for``; both sides must be able to
+    state it from their own git facts, which is why the run's ``base_sha`` and the
+    feature directory stay out of it.
+    """
+    return f"{os.path.normcase(str(root.resolve()))}@{head_sha}"
+
 RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ROLES = {"impl-planner", "impl-implementer", "impl-debugger", "code-review"}
 ROOT_CAUSES = {
@@ -215,11 +257,18 @@ def _path_digest(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def _status_entries(root: Path) -> dict[str, str]:
+def _status_entries(root: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """Return ``(path -> porcelain XY, new path -> old path)``.
+
+    CW2-a②: the rename's old path sits in the second NUL field. It used to be dropped,
+    which left the handoff artifact unable to write ``R:old->new`` — the notation
+    code-review freezes with — so the two change lists could never be compared.
+    """
     raw = _git(root, "status", "--porcelain=v1", "-z", binary=True)
     assert isinstance(raw, bytes)
     tokens = raw.split(b"\0")
     entries: dict[str, str] = {}
+    renamed: dict[str, str] = {}
     index = 0
     while index < len(tokens) and tokens[index]:
         token = tokens[index].decode("utf-8", errors="surrogateescape")
@@ -232,9 +281,10 @@ def _status_entries(root: Path) -> dict[str, str]:
         if "R" in status or "C" in status:
             index += 1
             if index < len(tokens) and tokens[index]:
-                renamed = tokens[index].decode("utf-8", errors="surrogateescape")
-                if renamed.rstrip("/") != ".codekit" and not renamed.startswith(".codekit/"):
-                    entries[renamed] = status
+                renamed_from = tokens[index].decode("utf-8", errors="surrogateescape")
+                if renamed_from.rstrip("/") != ".codekit" and not renamed_from.startswith(".codekit/"):
+                    entries[renamed_from] = status
+                    renamed[path] = renamed_from
         index += 1
     untracked = _git(root, "ls-files", "--others", "--exclude-standard", "-z", binary=True)
     assert isinstance(untracked, bytes)
@@ -251,12 +301,12 @@ def _status_entries(root: Path) -> dict[str, str]:
                 if directory.endswith("/") and path.startswith(directory):
                     entries.pop(directory, None)
             entries[path] = "??"
-    return entries
+    return entries, renamed
 
 
 def dirty_snapshot(root: Path) -> dict[str, Any]:
     """Capture a stable, content-addressed view of tracked and untracked changes."""
-    entries = _status_entries(root)
+    entries, renamed = _status_entries(root)
     files = []
     for relative, status in sorted(entries.items()):
         path = root / relative
@@ -266,6 +316,10 @@ def dirty_snapshot(root: Path) -> dict[str, Any]:
         "files": files,
     }
     result["digest"] = _json_digest(result)
+    # CW2-a②: rename pairs are carried beside the digest, never inside it — the
+    # content address stays the (path, status, digest) triple, so baselines frozen
+    # before this field existed keep comparing equal.
+    result["renamed"] = {new: old for new, old in sorted(renamed.items())}
     return result
 
 
@@ -1003,17 +1057,40 @@ def freeze_review(state_path: str | Path) -> dict[str, Any]:
             f"preexisting_modified={scope['preexisting_modified']}"
         )
     current = dirty_snapshot(root)
-    changed_files = [
-        item["path"] for item in current["files"] if item["path"] not in baseline_paths
-    ]
+    renamed = current.get("renamed", {})
+    # CW2-a②：`STATUS:path`，重命名写成 `R:old->new`，未跟踪写成 `A:path`——与
+    # code-review 冻结的清单同一记法，两侧才可比。旧的裸路径写法会让集合比较
+    # 恒不等（审核报告 A5 的 `44 项 vs []` 就是这么来的）。
+    # porcelain 把重命名拆成新旧两条，code-review 的 `--name-status` 只有一条
+    # `R:old->new`，所以这里把旧路径那条折进去，不再单独成项。
+    rename_sources = set(renamed.values())
+    changed_files = sorted(
+        {
+            f"{_status_letter(item['status'])}:{renamed[item['path']]}->{item['path']}"
+            if item["path"] in renamed
+            else f"{_status_letter(item['status'])}:{item['path']}"
+            for item in current["files"]
+            if item["path"] not in baseline_paths and item["path"] not in rename_sources
+        }
+    )
+    # CW2-a①③：交给 code-review 的那一份必须是自述的 Handoff 输入，而不是恰好同名的
+    # 内部快照。两个 home 此前都叫 review-snapshot.json，键集却不同（A5）。
     snapshot = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "run_id": state["run_id"],
-        "base_sha": state["repository"]["base_sha"],
-        "head_sha": current["head_sha"],
-        "diff_digest": current["digest"],
+        "repository_root": str(root),
+        "produced_by": PRODUCED_BY,
+        "digest_scheme": _DIGEST_SCHEME,
+        # 本控制器不计算 committed 补丁摘要，所以显式声明"不含已提交范围"（null 而不是
+        # 缺键）：下游据此记 SCOPE_SUPERSET，不得判 BLOCKED。
+        "committed_range": None,
+        "target_id": _handoff_target_id(root, current["head_sha"]),
+        "worktree_state": {
+            "head_sha": current["head_sha"],
+            "diff_digest": current["digest"],
+            "changed_files": changed_files,
+        },
         "preexisting_diff_snapshot": state["preexisting_snapshot"],
-        "changed_files": changed_files,
         "frozen_at": _now(),
     }
     artifact = path.parent / "review-snapshot.json"
@@ -1025,9 +1102,9 @@ def freeze_review(state_path: str | Path) -> dict[str, Any]:
     # duplicating it per freeze grew state.json roughly 40 KB per round.
     state["review_snapshots"].append({
         "path": str(artifact),
-        "base_sha": snapshot["base_sha"],
-        "head_sha": snapshot["head_sha"],
-        "diff_digest": snapshot["diff_digest"],
+        "target_id": snapshot["target_id"],
+        "head_sha": snapshot["worktree_state"]["head_sha"],
+        "diff_digest": snapshot["worktree_state"]["diff_digest"],
         "frozen_at": snapshot["frozen_at"],
     })
     state["phase"] = "REVIEW_FROZEN"
@@ -1246,8 +1323,9 @@ def record_review(
             "to a frozen snapshot, otherwise it certifies an undefined diff"
         )
     last = freezes[-1]
+    root = _require_repo_root(state["repository"]["root"])
     report = Path(report_path).expanduser()
-    report = report if report.is_absolute() else _require_repo_root(state["repository"]["root"]) / report
+    report = report if report.is_absolute() else root / report
     report = report.resolve(strict=False)
     if not report.is_file():
         raise ControllerError(f"review --report-path is not a readable file: {report}")
@@ -1256,7 +1334,10 @@ def record_review(
         "report_path": str(report),
         "report_digest": _path_digest(report),
         "validator_exit_code": int(validator_exit_code),
-        "base_sha": last["base_sha"],
+        # CW2-a①③：结论绑到 target_id（规范化仓库根 + 冻结时的 head_sha），不再抄一个
+        # 本控制器从未冻结过的 base_sha。缺 target_id 的台账是升级前的冻结记录，
+        # 用同样的两个事实重算即可，结果与当时写下的值相同。
+        "target_id": last.get("target_id") or _handoff_target_id(root, last["head_sha"]),
         "head_sha": last["head_sha"],
         "diff_digest": last["diff_digest"],
         "freeze_index": len(freezes),
@@ -1891,8 +1972,56 @@ def validate_contract(payload: dict[str, Any], kind: str) -> None:
             )
         snapshot = payload.get("snapshot")
         _required(snapshot, "snapshot", dict)
-        for field in ("base_sha", "head_sha", "diff_digest"):
-            _required(snapshot.get(field), f"snapshot.{field}", str)
+        # CW2-a①②③：Handoff 里的快照必须与 `freeze-review` 落盘的是同一种形状。
+        # 原来这里只看三个非空字符串，所以模型手写一份、或把 code-review 的
+        # 8 字段 manifest 贴进来都能过门禁——A5 的比对失败就是这么攒出来的。
+        if snapshot.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+            raise ControllerError(
+                f"snapshot.schema_version must be {SNAPSHOT_SCHEMA_VERSION} "
+                f"(this controller's freeze format), got {snapshot.get('schema_version')!r}"
+            )
+        if snapshot.get("digest_scheme") != _DIGEST_SCHEME:
+            raise ControllerError(
+                f"snapshot.digest_scheme must be {_DIGEST_SCHEME!r}, got "
+                f"{snapshot.get('digest_scheme')!r}; the three codekit skills share one "
+                "encoding or their digests can never be compared"
+            )
+        if snapshot.get("committed_range") is not None:
+            raise ControllerError(
+                "snapshot.committed_range must be null in a code-impl freeze: this "
+                "controller never commits, so it has no committed range to declare. "
+                "code-review records SCOPE_SUPERSET from that null, not a BLOCKED."
+            )
+        worktree = snapshot.get("worktree_state")
+        _required(worktree, "snapshot.worktree_state", dict)
+        for field in ("head_sha", "diff_digest"):
+            _required(worktree.get(field), f"snapshot.worktree_state.{field}", str)
+        if not HEX64_RE.fullmatch(worktree["diff_digest"]):
+            raise ControllerError(
+                "snapshot.worktree_state.diff_digest must be 64 lowercase hex characters "
+                f"under digest_scheme {_DIGEST_SCHEME!r}, got {worktree['diff_digest']!r}"
+            )
+        changed = worktree.get("changed_files")
+        _required(changed, "snapshot.worktree_state.changed_files", list)
+        for item in changed:
+            if not isinstance(item, str) or not CHANGED_FILE_RE.fullmatch(item):
+                raise ControllerError(
+                    f"snapshot.worktree_state.changed_files entries must be "
+                    f"'STATUS:path' (rename: 'R:old->new'), got {item!r}"
+                )
+        _required(snapshot.get("target_id"), "snapshot.target_id", str)
+        if root_path is None:
+            raise ControllerError(
+                "handoff.repo_root must be a non-empty absolute path: snapshot.target_id "
+                "is derived from it, so without it there is no cross-skill join key"
+            )
+        expected_id = _handoff_target_id(root_path, worktree["head_sha"])
+        if snapshot["target_id"] != expected_id:
+            raise ControllerError(
+                f"snapshot.target_id {snapshot['target_id']!r} does not match "
+                f"{expected_id!r} derived from repo_root + snapshot head_sha; re-run "
+                "freeze-review instead of composing the Handoff snapshot by hand"
+            )
         return
 
     raise ControllerError(f"unsupported contract kind: {kind}")
@@ -1930,14 +2059,18 @@ def _scope_view(result: dict[str, Any]) -> dict[str, Any]:
 
 def _freeze_view(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Compact freeze output: the embedded preexisting diff was 9 KB per round."""
+    worktree = snapshot["worktree_state"]
     return {
         "path": snapshot.get("path"),
         "freeze_index": snapshot.get("freeze_index"),
-        "base_sha": snapshot["base_sha"],
-        "head_sha": snapshot["head_sha"],
-        "diff_digest": snapshot["diff_digest"],
-        "changed_files": snapshot["changed_files"],
-        "changed_files_count": len(snapshot["changed_files"]),
+        "schema_version": snapshot["schema_version"],
+        "digest_scheme": snapshot["digest_scheme"],
+        "target_id": snapshot["target_id"],
+        "committed_range": snapshot["committed_range"],
+        "head_sha": worktree["head_sha"],
+        "diff_digest": worktree["diff_digest"],
+        "changed_files": worktree["changed_files"],
+        "changed_files_count": len(worktree["changed_files"]),
         "frozen_at": snapshot["frozen_at"],
     }
 

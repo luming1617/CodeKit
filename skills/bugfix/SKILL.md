@@ -42,7 +42,7 @@ allowed-tools: 'Bash, Read, Write, Agent, Grep, Skill'
 
 本 Skill 在实施和本地验证通过后有一个不可跳过的下游 Skill 依赖：必须调用 `codekit:code-review`，并等待它基于冻结快照返回完整审查结果。读取其 `SKILL.md`、复述 `/code-review`、在主 Agent 内自行审查，或只写“应调用”都不算调用。下游 Skill 未实际启动、输入快照不一致、结果不可验证或宿主不支持嵌套 Skill 调用时，最终状态必须为 `BLOCKED`。
 
-- **Claude Code：**使用宿主原生 `Skill` 工具，目标为插件作用域名 `codekit:code-review`，传入 `feature-directory`、Review Handoff（含 `review_mode` 与 `materials.documents`）、Base/Head SHA、Diff digest 和验证记录；本 Skill 未收到 `feature-directory` 时显式传空值，不得自己编造一个目录。必须在会话记录中看到该 Skill 的真实执行结果。
+- **Claude Code：**使用宿主原生 `Skill` 工具，目标为插件作用域名 `codekit:code-review`，传入 `feature-directory`、Review Handoff（含 `review_mode` 与 `materials.documents`）、`review-handoff.json` 的绝对路径（供其 `--handoff` 机械比对）和验证记录；本 Skill 未收到 `feature-directory` 时显式传空值，不得自己编造一个目录。必须在会话记录中看到该 Skill 的真实执行结果。
 - **Codex：**通过宿主的显式 Skill 选择机制发起 `$code-review [<feature-directory>]`（若当前插件界面显示了命名空间，则使用界面显示的完整名称；本 Skill 未收到该参数时不带目录参数调用），并传入同一 Handoff；Codex 官方只定义了提示词级 `$skill` 显式调用，没有公开的嵌套依赖字段，因此 `$code-review` 未被宿主执行时不得视为成功，必须 `BLOCKED`。
 - **OpenCode：**优先使用原生 `skill` 工具调用 `skill({ name: "code-review" })`，并确认 `permission.skill` 未拒绝该 Skill；若当前 CodeKit 版本把它注册为 `code-review` 命令，则必须通过宿主实际执行该命令并验证其独立结果，不能把命令文本或读取文件当作调用。
 
@@ -259,7 +259,7 @@ Implementer 只修改契约允许的文件，先添加或确认能暴露问题�
 
 ### 16 独立复核（系统 Code Review）
 
-验证通过后，主 Agent 必须调用宿主已注册的系统 `codekit:code-review` Skill，目标限定为 `local_diff`，并提供冻结的 PRD/TDD/RPD（或明确的 `documents: NOT_AVAILABLE`）、`review_mode`、仓库规范、Base/Head SHA、完整 Diff digest 和 `validation-record.json`。本 Skill 未收到 `feature-directory` 时，仍按同一次调用把该参数显式置空：`codekit:code-review` 会自己递归收集 `docs/` 下的文档并在确实没有文档时降级，这不能成为跳过或取消调用的理由。系统 Skill 必须直接检查最终 Diff、相关代码和测试，确认根因已消除、没有掩盖症状、修改未越权、回归覆盖充分且 RPD 仍然可执行；Handoff 只给路径与摘要，不得把提案或验证记录正文复制过去，也不得用普通 Subagent 的摘要替代。
+验证通过后，主 Agent 必须调用宿主已注册的系统 `codekit:code-review` Skill，目标限定为 `local_diff`，并提供冻结的 PRD/TDD/RPD（或明确的 `documents: NOT_AVAILABLE`）、`review_mode`、仓库规范、`review-handoff.json` 的绝对路径与 `validation-record.json`。`review-handoff.json` 由 `freeze-contract` 写出，只声明 `target_id`、`digest_scheme: "sha256/hex"` 与 `worktree_state.head_sha`，并把 `committed_range` 显式置为 `null`（本 Skill 从不 commit）；下游据此对本次冻结做机械比对，`SCOPE_SUPERSET` 只是随报告登记的限制，不是 `BLOCKED`。不得手写该文件，也不得把批准时冻结的 `working_tree_digest`（描述的是动手前的树）当作审查目标的摘要写进去。本 Skill 未收到 `feature-directory` 时，仍按同一次调用把该参数显式置空：`codekit:code-review` 会自己递归收集 `docs/` 下的文档并在确实没有文档时降级，这不能成为跳过或取消调用的理由。系统 Skill 必须直接检查最终 Diff、相关代码和测试，确认根因已消除、没有掩盖症状、修改未越权、回归覆盖充分且 RPD 仍然可执行；Handoff 只给路径与摘要，不得把提案或验证记录正文复制过去，也不得用普通 Subagent 的摘要替代。
 
 系统 Code Review 的结果必须保留其结构化报告和校验证据：`FULL` 模式下 `APPROVE` 或 `APPROVE_WITH_FOLLOW_UPS` 才能进入交付；`LITE` 模式只接受 `APPROVE_WITH_FOLLOW_UPS`；`REQUEST_CHANGES` 按系统 Skill 自身的修复流程处理；`BLOCKED`、快照不一致或系统 Skill 不可用时必须停止并报告，不能降级为本地 `APPROVED`。
 

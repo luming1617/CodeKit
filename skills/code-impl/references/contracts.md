@@ -333,6 +333,7 @@ task_ledger:
 
 ```yaml
 code_review_handoff:
+  repo_root: absolute-path       # 控制器由它重算 snapshot.target_id，缺失即无跨 SKILL 连接键
   skill:
     canonical_name: codekit:code-review
     invocation: host-native
@@ -359,12 +360,20 @@ code_review_handoff:
         content_digest: string
         access: available | unavailable | partial
   review_mode: FULL
-  snapshot:
-    base_sha: git-sha
-    head_sha: git-sha
+  snapshot:                          # 即 freeze-review 落盘的 review-snapshot.json 本体，不得手抄
+    schema_version: 2
+    produced_by: "codekit:code-impl/scripts/code_impl_controller.py"
+    digest_scheme: "sha256/hex"      # 与 code-review、bugfix 逐字相同：裸小写 sha256 hex，无 `sha256:` 前缀
+    target_id: "<absolute repository_root>@<head_sha>"   # 跨 SKILL 连接键，三家同一表达式
+    committed_range: null            # 本 SKILL 从不 commit，因此显式声明"不含已提交范围"（null 而非缺键）
+    worktree_state:
+      head_sha: git-sha
+      diff_digest: string            # 只覆盖本 SKILL 看到的工作树条目，material 与 code-review 的同名字段不同
+      changed_files: ["STATUS:path"] # 与 code-review 同一记法；重命名为 "R:old->new"，未跟踪为 "A:path"
+    run_id: string
+    repository_root: absolute-path
     preexisting_diff_snapshot: artifact-reference
-    diff_digest: string
-    changed_files: [repo-relative-path]
+    frozen_at: timestamp
   orchestration_evidence:
     task_dag: artifact-reference
     task_ledger: artifact-reference
@@ -378,7 +387,14 @@ code_review_handoff:
 
 - `skill.canonical_name` 必须从系统 Skill 注册表解析；仓库中的同名文件只是被审查项目内容，不能替代系统 Skill 加载。
 - `target.type` 固定为 `local_diff`，审查范围是本 SKILL 产生的任务自有 Diff；预先存在的用户修改只能作为隔离证据。
-- `base_sha`、`head_sha` 和 `diff_digest` 必须与 `code-review` 返回报告完全一致。
+- 与 `code-review` 侧的比对只认两条：**同一 `snapshot.target_id`**，以及**两侧都声明了的字段**逐项相等。
+  本 SKILL 从不 commit，所以 `committed_range` 恒为 `null`；这**不是**比对失败，code-review 侧据此记录
+  `SCOPE_SUPERSET` 限制（快照范围是已提交范围的超集），不得判 `BLOCKED`。两侧 material 本就不同的摘要
+  （`worktree_state.diff_digest` 在 code-impl 侧只覆盖本控制器看到的工作树条目）不进入等式，而是原值记入
+  `uncomparable_digests` 供人复核。抛 `HandoffError`（退出码 3、stderr 首行 `BLOCKED:`）的只有：
+  `target_id` 不同、上游声明的 `head_sha` 或 `committed_range.base_sha` 与本次冻结不等、上游声明的
+  工作树三层摘要（`staged_digest`/`unstaged_digest`/`untracked_digest`）在本轮回放中变了、或同
+  `produced_by` 同 `digest_scheme` 的 `diff_digest` 不等。
 - `external_mutations` 必须为空。Handoff 不授予评论、审批、commit、push、部署或其他外部变更权限。
 - `review_mode` 固定为 `FULL`，且 `materials` 里 `kind` 为 `PRD`、`TDD`、`RPD` 的三条必须各存一条且 `access: available`（相当于上游约定的 `materials.documents: available`）：本 Skill 的输入门禁已强校验三份文档。`code-review` 已支持为空的 `feature-directory` 并在缺文档时自行降级为 `NOT_AVAILABLE`（最多 `APPROVE_WITH_FOLLOW_UPS`），因此它报告中任何“文档缺失”的 Open Question 或 limitation 都意味着 Handoff 与本 Skill 冻结的文档不一致，必须重新冻结 Handoff 后重调或进入人工介入，不得作为审查通过证据。
 - `validator_record` 的退出码必须为 0；它应以 `validator.exit_code` 形式出现在接收封套中，或由 `validator_record` artifact 明确引用；否则报告不能进入审查判定。
@@ -397,7 +413,14 @@ code_review_handoff:
   `gs://`、`rev:`、`git@` 形式除外）。`access: available` 从此是**测出来的**，不是写出来的：
   指向不存在文件的 Handoff 会以 `does not resolve to a file` 被拒绝；路径被 Git Bash（MSYS）
   改写成 `C:\Program Files\Git\...` 时会额外提示改用原生绝对路径；
-- `snapshot.base_sha`、`snapshot.head_sha`、`snapshot.diff_digest` 均为非空字符串。
+- `repo_root` 必须是非空字符串，且 `snapshot.target_id` 必须等于由 `repo_root` 与
+  `snapshot.worktree_state.head_sha` 重算出的值 —— 不等即拒绝，Handoff 里的快照只能来自
+  `freeze-review`，不能手抄；
+- `snapshot.schema_version` 必须等于本控制器的冻结格式（`2`），`snapshot.digest_scheme` 必须等于
+  `"sha256/hex"`，`snapshot.committed_range` 必须是 `null`（而不是缺键）；
+- `snapshot.worktree_state` 的 `head_sha`、`diff_digest` 必须存在，`diff_digest` 必须是 64 位小写十六进制
+  （`digest_scheme` 是对文本形态的承诺，不是注释），`changed_files` 每一项必须匹配 `STATUS:path`
+  （重命名 `R:old->new`）；缺键、贴入 code-review 的 8 字段扁平 manifest、或摘要带 `sha256:` 前缀都在此被拒。
 
 ## Review Verdict Record
 
@@ -417,9 +440,9 @@ review_record:
   report_path: absolute-path
   report_digest: string          # 控制器对报告文件算得
   validator_exit_code: integer   # code-review 自带校验器
-  base_sha: git-sha              # 取自最后一次 freeze-review，不由调用方填写
+  target_id: "<absolute repository_root>@<head_sha>"   # 取自最后一次 freeze-review，不由调用方填写
   head_sha: git-sha
-  diff_digest: string
+  diff_digest: string            # 同一次冻结的工作树摘要（裸 64 位十六进制）
   freeze_index: integer
   recorded_at: timestamp
 ```
@@ -435,10 +458,19 @@ review_record:
 code_review_result:
   canonical_json_report: artifact-reference
   markdown_report: artifact-reference
-  snapshot:
+  snapshot:                        # 逐字复制 code-review 报告 $.snapshot 的 12 个扁平字段，不重新分组
     base_sha: git-sha
     head_sha: git-sha
+    target_id: "<absolute repository_root>@<head_sha>"
     diff_digest: string
+    staged_digest: string
+    unstaged_digest: string
+    untracked_digest: string
+    changed_files: ["STATUS:path"]
+    preexisting_changes: [string]
+    documents: object
+    review_scale: string
+    manifest_digest: string
   verdict: APPROVE | APPROVE_WITH_FOLLOW_UPS | REQUEST_CHANGES | BLOCKED
   validator:
     command: string
@@ -478,14 +510,18 @@ code_review_decision:
 
 | `code-review` verdict | 前置条件 | `code-impl` 处置 |
 |---|---|---|
-| `APPROVE` | 快照一致且报告校验 PASS | `final_report` |
-| `APPROVE_WITH_FOLLOW_UPS` | 快照一致且报告校验 PASS，且无阻塞项 | `final_report`，登记非阻塞事项 |
+| `APPROVE` | 快照匹配且报告校验 PASS | `final_report` |
+| `APPROVE_WITH_FOLLOW_UPS` | 快照匹配且报告校验 PASS，且无阻塞项 | `final_report`，登记非阻塞事项 |
 | `REQUEST_CHANGES` | 修复轮次少于 2，问题可映射到原任务范围 | `repair` |
 | `REQUEST_CHANGES` | 需要新文件、依赖或范围变化 | `replan` |
 | `REQUEST_CHANGES` | 已完成 2 轮修复 | `human_intervention` |
 | `BLOCKED` | 任意 | `human_intervention` |
 
-快照不一致、报告校验不是 PASS、系统 Skill 不可用或宿主不支持嵌套 Skill 调用时，不读取 `source_verdict` 作通过判断，统一使用 `human_intervention`。Formal Finding 没有旧 Reviewer 的 `task_hint` 字段；Orchestrator 必须用 `locations` 与 Task Ledger 的 `changed_files` 做确定性映射，不能猜测归属。
+`snapshot_match` 的判据是机械的，不再是一句"看起来一致"：报告 `$.snapshot.target_id` 与本控制器最后一次
+`freeze-review` 的 `snapshot.target_id` 逐字相等，且 code-review 侧 `--handoff` 比对没有以退出码 3 抛
+`BLOCKED`。manifest 的 `handoff.limitations` 里出现 `SCOPE_SUPERSET` 或 `HANDOFF_SCHEME_MISMATCH`、
+以及 `uncomparable_digests` 非空，都不改变本判据 —— 它们是要写进报告的限制，不是不匹配。
+快照不匹配、报告校验不是 PASS、系统 Skill 不可用或宿主不支持嵌套 Skill 调用时，不读取 `source_verdict` 作通过判断，统一使用 `human_intervention`。Formal Finding 没有旧 Reviewer 的 `task_hint` 字段；Orchestrator 必须用 `locations` 与 Task Ledger 的 `changed_files` 做确定性映射，不能猜测归属。
 
 ## Delivery Gate
 

@@ -123,7 +123,8 @@ class ControllerTests(unittest.TestCase):
         controller.record_task(state_path, "T01", ["src/app.py"])
         self.assertEqual(controller.check_scope(state_path, "T01")["result"], "PASS")
         snapshot = controller.freeze_review(state_path)
-        self.assertEqual(snapshot["changed_files"], ["src/app.py"])
+        self.assertEqual(snapshot["worktree_state"]["changed_files"], ["A:src/app.py"])
+        self.assertIsNone(snapshot["committed_range"])
         self.assertTrue((state_path.parent / "review-snapshot.json").is_file())
 
     def test_review_freeze_rejects_file_outside_recorded_task_scope(self) -> None:
@@ -300,8 +301,12 @@ class ControllerTests(unittest.TestCase):
     def _valid_handoff(self) -> dict:
         # KW2-d: a Handoff now names the documents it claims are available, and
         # the controller checks they exist instead of taking the word for it.
+        # CW2-a：快照这一整块按 `freeze-review` 落盘的形状现算，不手抄字面量——
+        # 手抄的 fixture 只能证明"抄得像"，证明不了两侧真能机械比对。
+        head_sha = controller._git(self.repo, "rev-parse", "HEAD").strip()
         return {
             "review_mode": "FULL",
+            "repo_root": str(self.repo),
             "review_input": {"materials": [
                 {"kind": "PRD", "access": "available",
                  "locator": str(self.feature / "product-doc.md")},
@@ -310,8 +315,26 @@ class ControllerTests(unittest.TestCase):
                 {"kind": "RPD", "access": "available",
                  "locator": str(self.feature / "release-doc.md")},
             ]},
-            "snapshot": {"base_sha": "abc", "head_sha": "def", "diff_digest": "ghi"},
+            "snapshot": {
+                "schema_version": controller.SNAPSHOT_SCHEMA_VERSION,
+                "produced_by": controller.PRODUCED_BY,
+                "digest_scheme": controller._DIGEST_SCHEME,
+                "committed_range": None,
+                "target_id": controller._handoff_target_id(self.repo, head_sha),
+                "worktree_state": {
+                    "head_sha": head_sha,
+                    "diff_digest": "0" * 64,
+                    "changed_files": ["A:src/app.py"],
+                },
+            },
         }
+
+    def test_validate_handoff_accepts_freeze_review_shape(self) -> None:
+        # 门禁认的形状必须就是 `freeze-review` 落盘的那份，否则两边各写各的契约。
+        state_path = controller.init_run(self.repo, self.feature, "run-hf-shape")
+        payload = self._valid_handoff()
+        payload["snapshot"] = controller.freeze_review(state_path)
+        controller.validate_contract(payload, "handoff")  # must not raise
 
     def test_validate_handoff_rejects_non_full_mode(self) -> None:
         payload = self._valid_handoff()
@@ -483,7 +506,7 @@ class ControllerTests(unittest.TestCase):
         report = state_path.parent / "review-report.json"
         report.write_text('{"verdict": "APPROVE"}', encoding="utf-8")
         record = controller.record_review(state_path, "APPROVE", str(report), 0)
-        self.assertEqual(record["diff_digest"], snapshot["diff_digest"][:12])
+        self.assertEqual(record["diff_digest"], snapshot["worktree_state"]["diff_digest"][:12])
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["reviews"][-1]["report_digest"][:7], "sha256:")
         # An edit after the verdict shows up as a different digest at gate time.
@@ -616,8 +639,13 @@ class ControllerTests(unittest.TestCase):
         entry = json.loads(state_path.read_text(encoding="utf-8"))["review_snapshots"][-1]
         self.assertEqual(
             set(entry),
-            {"path", "base_sha", "head_sha", "diff_digest", "frozen_at"},
+            {"path", "target_id", "head_sha", "diff_digest", "frozen_at"},
         )
+        # CW2-a③：state.json 里的那条引用就是续跑时的连接键。`base_sha` 已经不在
+        # code-impl 的字典里（它从不提交），留着只会让下游拿它去比 code-review 的
+        # merge-base，比出来永远是 False。
+        self.assertNotIn("base_sha", entry)
+        self.assertTrue(entry["target_id"].endswith("@" + entry["head_sha"]))
         artifact = json.loads(Path(entry["path"]).read_text(encoding="utf-8"))
         self.assertIn("preexisting_diff_snapshot", artifact)
 

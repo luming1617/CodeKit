@@ -64,7 +64,7 @@ sequenceDiagram
 
 工作量：备注同步模块 3 人日，依赖工单接口联调。
 
-## 16. 审查闭环记录
+## AI审查闭环记录
 
 台账由 `tech_doc_controller.py render-ledger` 从 `state.json` 生成，勿手改。
 """
@@ -165,7 +165,7 @@ POST /api/v1/notes
     + "风险说明。" * 400
     + """
 
-## 16. 审查闭环记录
+## AI审查闭环记录
 
 台账由 `tech_doc_controller.py render-ledger` 从 `state.json` 生成，勿手改。
 """
@@ -700,7 +700,7 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertEqual(text, tdd.read_text(encoding="utf-8"))
         # one marker pair per section, in chapter order, below the chapter 16 heading
         self.assertEqual(text.count("<!-- codekit:technical-doc:ledger:"), 4)
-        chapter = text.index("## 16. 审查闭环记录")
+        chapter = text.index("## AI审查闭环记录")
         findings = text.index("ledger:findings:start")
         metadata = text.index("ledger:run-metadata:start")
         self.assertTrue(chapter < findings < metadata, (chapter, findings, metadata))
@@ -1289,7 +1289,7 @@ class TechDocControllerTests(unittest.TestCase):
         tdd = self.feature / "technical-doc.md"
         text = tdd.read_text(encoding="utf-8")
         start = text.index("## 15. 风险登记与工作量评估")
-        end = text.index("## 16. 审查闭环记录")
+        end = text.index("## AI审查闭环记录")
         tdd.write_text(text[:start] + text[end:], encoding="utf-8")
         self.assertIn("12", opened["sections"])
         self.approve_round(state, "s-review-3")

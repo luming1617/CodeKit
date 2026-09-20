@@ -42,8 +42,8 @@ class TemplateContractTests(unittest.TestCase):
         """SKILL.md appends history 'at the end of the document'; the template must agree."""
         history = TEMPLATE.index("## 变更历史")
         self.assertGreater(history, TEMPLATE.index("# 评审检查与结论"))
-        self.assertGreater(history, TEMPLATE.index("# 14. 部署拓扑"))
-        self.assertGreater(history, TEMPLATE.index("# 16. 审查闭环记录"))
+        self.assertGreater(history, TEMPLATE.index("# 部署拓扑"))
+        self.assertGreater(history, TEMPLATE.index("# AI审查闭环记录"))
 
     def test_template_no_longer_embeds_previous_version_in_a_fence(self) -> None:
         self.assertNotIn("```markdown", TEMPLATE)

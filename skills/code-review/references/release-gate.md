@@ -23,14 +23,16 @@ Release Gate 是只读发布准备度评估，不执行部署或回滚。只使�
 - `CONDITIONAL`：有明确、可验证且不阻止代码合入的前置条件。
 - `FAIL`：发布计划与目标变更矛盾、缺少必要动作或回滚不可执行。
 - `NOT_VERIFIED`：需要的系统、环境、凭据或资料不可访问。
-- `NOT_APPLICABLE`：该变更确实不涉及此项，并有代码/架构/RPD 证据。
+- `NOT_APPLICABLE`：该变更确实不涉及此项，并有代码/架构/RPD 证据；`condition_or_gap` 必须写明"为什么不适用"，不得留空。
+
+每项还必须登记 `criticality`：`critical` 表示该缺口未核实就让发布决策不可信（回滚、数据修复、停止条件、部署顺序这类），`non_critical` 表示可作为交付后跟进的条件。
 
 总体状态：
 
 - 任一目标变更导致的关键 `FAIL` → `NOT_READY`。
-- 无 `FAIL`，但存在可管理的 `CONDITIONAL` → `READY_WITH_CONDITIONS`。
-- 无 `FAIL/CONDITIONAL` 且所有适用项为 `PASS` → `READY`。
-- 关键项为 `NOT_VERIFIED`，无法判断可发布性 → `NOT_VERIFIED`。
-- 审查目标不产生可部署或运行时变化，且证据充分 → `NOT_APPLICABLE`。
+- 无 `FAIL`，但存在 `critical` 项 `NOT_VERIFIED` → `NOT_VERIFIED`（结论只能是 `BLOCKED`）。
+- 无 `FAIL` 且无关键 `NOT_VERIFIED`，但存在可管理的 `CONDITIONAL` 或 `non_critical` 的 `NOT_VERIFIED` → `READY_WITH_CONDITIONS`，条件写进 `conditions`。
+- 无 `FAIL/CONDITIONAL/NOT_VERIFIED` 且所有适用项为 `PASS` → `READY`。
+- 审查目标不产生可部署或运行时变化，且证据充分 → `NOT_APPLICABLE`，但十项清单仍需逐条以 `NOT_APPLICABLE` + 证据 + 理由登记，不得整体省略。
 
 输出严格使用 contracts.md 的 Release Gate 结构，并保留每个条件、阻塞原因和证据。

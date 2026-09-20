@@ -65,6 +65,13 @@ input_contract:
     forbidden: [string]
 ```
 
+本 Skill 写出的所有摘要（`working_tree_digest`、文档 `digest`、`contract_digest`、`gate_digest`）都是
+`sha256/hex`：64 位小写十六进制、不带 `sha256:` 前缀，读取文本时不丢字节也不替换非法编码 —— 与
+`code-review`、`code-impl` 同一套编码，否则三家的 `==` 永远不成立。`SCHEMA_VERSION` 因此升到 `2`，
+旧 `state.json` 里带前缀的摘要值不可互换，脚本会拒绝加载并说明怎么办，而不是把两种编码混进一次比较。
+跨 SKILL 的 `changed_files` 用 `STATUS:path` 记法；本 Skill 内部的 `preexisting_changes` 与
+`verify-scope` 的 `changed_files` 是纯仓库相对路径（要拿去匹配允许写清单），两者不是一回事。
+
 ## 2. Evidence levels
 
 | 等级 | 定义 | 例子 |
@@ -255,7 +262,19 @@ validation_record:
 
 ```yaml
 review_result:
-  snapshot: {base_sha: git-sha, head_sha: git-sha, diff_digest: string}
+  snapshot:                          # 逐字复制 code-review 报告 $.snapshot 的 12 个扁平字段
+    base_sha: git-sha
+    head_sha: git-sha
+    target_id: "<absolute repository_root>@<head_sha>"
+    diff_digest: string
+    staged_digest: string
+    unstaged_digest: string
+    untracked_digest: string
+    changed_files: ["STATUS:path"]
+    preexisting_changes: [string]
+    documents: object
+    review_scale: string
+    manifest_digest: string
   root_cause_resolved: true | false
   approved_scope_respected: true | false
   preserved_behavior_assessment: string
@@ -269,7 +288,7 @@ review_result:
   verdict: APPROVE | APPROVE_WITH_FOLLOW_UPS | REQUEST_CHANGES | BLOCKED
 ```
 
-系统审查结果必须带有与 Handoff 一致的 `base_sha`、`head_sha` 和 `diff_digest`，并由系统 `codekit:code-review` 自带的结构校验器验证。不得将普通 Subagent 的 `APPROVED` 或 `NEEDS_CHANGES` 摘要转换为系统审查通过。
+系统审查结果必须带有与 Handoff 同一 `target_id` 的快照，并由系统 `codekit:code-review` 自带的结构校验器验证。不得将普通 Subagent 的 `APPROVED` 或 `NEEDS_CHANGES` 摘要转换为系统审查通过。
 
 ## 11. System Code Review Handoff
 
@@ -279,10 +298,7 @@ Bugfix 实施后的独立审查必须交给宿主已注册的 `codekit:code-revi
 code_review_handoff:
   target: local_diff
   repository_root: absolute-path
-  base_sha: git-sha
-  head_sha: git-sha
-  diff_digest: string
-  preexisting_changes: [repo-relative-path]
+  snapshot_handoff: reference        # RUN_DIR/review-handoff.json：下游 `--handoff` 的唯一输入，不得手写
   review_mode: FULL | LITE | WAIVED
   materials:
     documents: available | NOT_AVAILABLE
@@ -293,6 +309,23 @@ code_review_handoff:
   validation_record: reference        # RUN_DIR/validation-record.json
 ```
 
+`review-handoff.json` 由 `freeze-contract` 与实现合同同时写出，形状即 CW2-a 的统一 Handoff 快照：
+
+```yaml
+# RUN_DIR/review-handoff.json
+schema_version: 2
+produced_by: "codekit:bugfix/scripts/bugfix_state.py"
+digest_scheme: "sha256/hex"           # 裸小写 sha256 hex，无 `sha256:` 前缀（三家同一声明）
+target_id: "<absolute repository_root>@<start_head_sha>"
+committed_range: null                 # 本 Skill 从不 commit：显式声明"不含已提交范围"，而非缺键
+worktree_state:
+  head_sha: git-sha                   # 只声明 head_sha
+```
+
+只声明 `head_sha` 是有意的：批准时冻结的 `working_tree_digest` 描述的是"动手前"的树，把它写成审查目标的摘要会是错的。
+
+比对规则（与 `code-review` 的 `--handoff` 实现一致，四条全部机械可判）：同一 `target_id` 才继续；只比两侧都声明了的字段（这里即 `head_sha`）；`digest_scheme` 不等时不比摘要，记 `HANDOFF_SCHEME_MISMATCH`；上游不含 `committed_range` 而本轮含已提交内容时记 `SCOPE_SUPERSET` 限制并继续审查，**不得**判 `BLOCKED`。
+
 `review_mode` 表达本次审查能拿到多完整的规格输入，与 SKILL.md「审查模式与降级门禁」一致：`FULL` 接受 `APPROVE` 或 `APPROVE_WITH_FOLLOW_UPS`；`LITE`（`documents: NOT_AVAILABLE`）只接受 `APPROVE_WITH_FOLLOW_UPS`；`WAIVED` 仅在用户明确批准豁免时使用，并必须在交付报告里写明未独立复核。
 
-只有系统 Skill 返回的、快照与 `diff_digest` 完全一致且通过其结构校验的可接受结论才能作为交付门禁证据；`REQUEST_CHANGES` 和 `BLOCKED` 不得改写成通过。
+只有系统 Skill 返回的、`--handoff` 比对未以退出码 3 报 `BLOCKED`（即 `target_id` 相同且共有字段相等）、且通过其结构校验的可接受结论才能作为交付门禁证据；`SCOPE_SUPERSET`、`HANDOFF_SCHEME_MISMATCH` 与 `uncomparable_digests` 是随报告登记的限制，不是不匹配，也不是驳回理由。`REQUEST_CHANGES` 和 `BLOCKED` 不得改写成通过。

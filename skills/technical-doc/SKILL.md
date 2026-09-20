@@ -86,10 +86,10 @@ flowchart LR
 | `record-agent` | 登记一次具名子代理调用：先用 `--status DISPATCHED`（带 `--session-id` 与 `--input-digest`）开时间窗，再用同一 `--session-id` 以 `COMPLETED`/`BLOCKED`/`ABORTED` 收口并写入墙钟耗时，收口调用可省略 `--input-digest`；派发后什么都没产出也必须用 `ABORTED` 收口；Reviewer 一旦 `DISPATCHED` 就占用本轮名额；`--scope "7.2,4.1"` 声明本次真正注入的章节，读取量由索引算出 |
 | `write-artifact` | 把 `context-pack`、`draft`、`critic-findings`、`refiner-map`、`review-report` 落入运行目录 |
 | `record-finding` / `record-fix` | 登记 Finding 与逐项处置（处置是 Finding 唯一的闭环入口）；`record-fix` 的常规入口是 `REFINER` 阶段，评审结论在桌上时主 Agent 不得自己给改动打分；唯一例外：通过性结论（`APPROVE`/`APPROVE_WITH_FOLLOW_UPS`）挂账后，本轮新报的非阻断 Finding 允许在 `REVIEW`/`DELIVERY` 阶段直接登记 `PENDING_CONFIRMATION`/`REJECTED`（`FIXED` 声称改了正文，仍必须走 Refiner 轮 + 全新 Reviewer） |
-| `record-review` | 把终审结论与被审 TDD 的内容快照绑定，并绑定**本轮的审查范围**（`--scope` 只能复述 `start-stage` 打开的范围，不能把增量轮改写成全量）；第 16 章标记之间的生成台账不计入该快照 |
+| `record-review` | 把终审结论与被审 TDD 的内容快照绑定，并绑定**本轮的审查范围**（`--scope` 只能复述 `start-stage` 打开的范围，不能把增量轮改写成全量）；“审查闭环记录”章节标记之间的生成台账不计入该快照 |
 | `archive-history` | 把被覆盖的上一版 TDD 归档为独立文件 |
 | `index` / `locate` | 重建 `doc-index.json`（章节 → 行区间、符号、Finding 归属），或把一条 Finding 的位置、一个章节号解析成行区间与读取预算；`locate`、`--scope` 派发与 `record-fix` 都会在 TDD 变化后自动重建索引，不必手动先跑 `index`；`locate` 找不到对应标题时返回 `NOT_LOCATED` 并给出兜底读法，不猜 |
-| `render-ledger --state <state> --tdd-file <TDD>` | 从 `state.json` 重写 TDD 第 16 章的生成台账（Finding 处置映射、运行元数据）与“历史版本索引”，并顺带重建索引 |
+| `render-ledger --state <state> --tdd-file <TDD>` | 从 `state.json` 重写 TDD “审查闭环记录”章节的生成台账（Finding 处置映射、运行元数据）与“历史版本索引”，并顺带重建索引 |
 | `gate` / `show` | 交付门禁与运行状态摘要；`show` 按 `prep`/`write`/`audit` 汇总各阶段墙钟耗时，给出派发计数（`timed`/`aborted`/`open`/`scoped`/`over_budget`）、索引摘要、`review_stop` 判定与 `scale` 结论 |
 
 状态与产物落在 `<repo>/.codekit/technical-doc/<run-id>/`（运行时证据目录，不得作为业务变更提交）。**阶段间交接只传文件路径与 digest，不传正文**：子代理自己读文件，主 Agent 不搬运大段文本。
@@ -116,12 +116,12 @@ flowchart LR
 
 ### 规模判定与按规模裁剪
 
-模板的 `方案裁剪规则` 早就写了 S/M/L 三行，但没人判定归属，于是绿地原型也按 L 填满 §12 大盘、§13 告警、§14 部署拓扑，每轮再被整篇读回一遍。
+模板的 `方案裁剪规则` 早就写了 S/M/L 三行，但没人判定归属，于是绿地原型也按 L 填满监控大盘、告警、部署拓扑章节，每轮再被整篇读回一遍。
 
 - `finalize-inputs` 用冻结的 PRD 正文与仓库实测判定：命中的变更类别（数据/接口/消息/定时/配置）为 0 是 `S`，1～3 是 `M`，≥4 是 `L`；`git ls-files` 里没有后端源码且没有登记到任何“已读取的系统证据/既有 TDD”时记为 `greenfield`。这是测量结果，不接受任何角色的自述。
 - `gate` 的 `scale-chapters` 按这张表要求章节，分两档：**最低要求行点名的章节**（`S` 级的基础监控与告警；`M`/`L` 追加完整监控大盘、告警、部署拓扑）在任何规模下都要在位，`M`/`L` 级还必须有实质设计，写 `不涉及` 或短于一节最低标准即 `BLOCKED`——那是拿“变快”冒充“变薄”。被信号点名的 `条件必填` 章节保留模板的 `不涉及 + 原因` 退路：给得出理由就合法（上一轮那种“无 MQ、单进程、附替代方案对比”的一章实测合法），只有一句 `不涉及` 而没给原因的仍判 `BLOCKED`。
 - `greenfield` 时 Context Loader 只做结构探测，**明确跳过“现有实现与可复用模式”检索**（上一次运行在这上面花 36 分钟去找不存在的代码）；缺口照旧写成“未发现证据”，不得改用例填空。
-- 探针结论会进第 16 章“运行元数据”台账（`规模判定` 行）与 `show`，交付报告照抄；`init --scale-enforcement record-only` 只记录不生效，用于回退。
+- 探针结论会进“审查闭环记录”章节“运行元数据”台账（`规模判定` 行）与 `show`，交付报告照抄；`init --scale-enforcement record-only` 只记录不生效，用于回退。
 
 ## 阶段 0：输入门禁与冻结
 
@@ -155,7 +155,7 @@ flowchart LR
 - 每个改造点给出“现有方式 → 新方式”对比；DDL 用完整 `CREATE TABLE`（字段、索引、注释）；新 API 给完整 request/response JSON、错误码、鉴权、幂等与兼容说明；
 - 未知事实写成 `[需人工确认: xxx]` 并说明它影响哪项决策，不得把推断写成确定结论；
 - 模板示例与真实系统冲突时以代码证据为准并删除示例事实；
-- 派发时给出 `scale`：`S` 级可以把 §12/§13 收缩成基础项并写明原因，`M`/`L` 级的“完整监控大盘与告警”“部署拓扑”必须有实质设计；被信号点名的 `条件必填` 章节可以填 `不涉及`，但必须带原因。`gate` 按同一张表核对，不会因为“文档短一点更快”而放行。
+- 派发时给出 `scale`：`S` 级可以把监控大盘与告警收缩成基础项并写明原因，`M`/`L` 级的“完整监控大盘与告警”“部署拓扑”必须有实质设计；被信号点名的 `条件必填` 章节可以填 `不涉及`，但必须带原因。`gate` 按同一张表核对，不会因为“文档短一点更快”而放行。
 
 `draft` 落盘后 Refiner 的派发按“读取预算与按节注入”执行（首次 `locate` 会自己建索引，不用先手动跑 `index`）；Critic 做全量审查，Reviewer 在全量轮也读完整篇——对这些轮次索引只是定位工具，不缩小审查范围；命中严重度门停的增量终审轮例外（见“严重度门停与增量终审”）。
 
@@ -177,7 +177,7 @@ flowchart LR
 
 只按当前轮 Finding 定向修复，不重新发起架构创作、不引入 Finding 之外的发挥、不删除问题伪造已修复。每个 Finding 必须有一条处置：`FIXED`（给位置、改法、验证方式）、`REJECTED`（仅非 `must_fix`，需证据）或 `PENDING_CONFIRMATION`（仅非 `must_fix`，保留 `[需人工确认: xxx]`）。
 
-处置只经 `record-fix` 生效：主控按 Refiner 回报的映射逐条登记，并把映射登记为 `refiner-map` 产物。派发前先按 Finding 所在章节聚类，逐条 `locate` 后把注入的区间随 `--scope` 登记（见“读取预算与按节注入”），Refiner 不再自己翻页找位置。**TDD 第 16 章的两个台账由 `render-ledger` 生成，任何角色都不得手写**；本轮处置登记完成后执行一次 `render-ledger`，再进入 Review——这样 Reviewer 读到的第 16 章与 `state.json` 一致，且第 16 章的刷新不会破坏终审与被审内容之间的绑定。
+处置只经 `record-fix` 生效：主控按 Refiner 回报的映射逐条登记，并把映射登记为 `refiner-map` 产物。派发前先按 Finding 所在章节聚类，逐条 `locate` 后把注入的区间随 `--scope` 登记（见“读取预算与按节注入”），Refiner 不再自己翻页找位置。**TDD “审查闭环记录”章节的两个台账由 `render-ledger` 生成，任何角色都不得手写**；本轮处置登记完成后执行一次 `render-ledger`，再进入 Review——这样 Reviewer 读到的“审查闭环记录”章节与 `state.json` 一致，且“审查闭环记录”章节的刷新不会破坏终审与被审内容之间的绑定。
 
 ## 阶段 5：Independent Reviewer
 
@@ -213,7 +213,7 @@ PRD 当前版本中用户最新明确的方案和逻辑优先于旧 PRD、旧 TD
 
 ## 交付
 
-写入 `<feature-directory>/technical-doc.md`（文件名固定；目录不存在则创建），包含方案正文、ADR、风险登记与工作量评估、审查闭环记录与运行元数据、（变更时）历史版本索引。第 16 章的台账由 `render-ledger` 生成，交付前必须先刷新，再跑门禁：
+写入 `<feature-directory>/technical-doc.md`（文件名固定；目录不存在则创建），包含方案正文、ADR、风险登记与工作量评估、审查闭环记录与运行元数据、（变更时）历史版本索引。“审查闭环记录”章节的台账由 `render-ledger` 生成，交付前必须先刷新，再跑门禁：
 
 ```bash
 <PYTHON> "$SKILL_DIR/scripts/tech_doc_controller.py" render-ledger --state "<state 的绝对路径>" \
@@ -225,9 +225,9 @@ PRD 当前版本中用户最新明确的方案和逻辑优先于旧 PRD、旧 TD
   --tdd-file "$feature_directory/technical-doc.md"
 ```
 
-`gate` 是确定性的，覆盖：输入可用性、五个阶段产物是否落盘、独立终审是否执行、**最后一轮终审是否覆盖当前内容**（终审之后改动手写章节的任何一个字都会被判 `BLOCKED`；第 16 章标记之间的生成台账不计入该比对）、**增量终审是否覆盖了自最后一次全量终审以来变过的每一节（`incremental-review-covers-changes`，变过却没进任何一轮范围即 `BLOCKED`）**、轮次是否越界、`must_fix` Finding 是否全部闭环、每个 Finding 是否有处置、**第 16 章生成台账是否存在（`ledger-blocks-present`）且与 `state.json` 逐字一致（`ledger-matches-state`，手改标记内内容、漏行、或在标记之外另抄一份台账都算失败）**、是否仍含模板占位符（`TBD`/`TODO`/`待定`/`待补充`/`后续补充`/`similar to`/`refer to`/`【填写】`/`【链接】`/`YYYY-MM-DD`；唯一允许的未知表达是 `[需人工确认: xxx]`）、必需章节锚点是否齐备、**按 `state.json` 的规模判定要求的章节是否齐备且有实质内容（`scale-chapters`，M/L 级用 `不涉及` 或短正文收缩即 `BLOCKED`）**、代码围栏是否闭合且语言合法、变更运行是否已归档上一版、是否残留把上下文写回仓库 `AGENTS.md`/`CLAUDE.md` 的痕迹。
+`gate` 是确定性的，覆盖：输入可用性、五个阶段产物是否落盘、独立终审是否执行、**最后一轮终审是否覆盖当前内容**（终审之后改动手写章节的任何一个字都会被判 `BLOCKED`；“审查闭环记录”章节标记之间的生成台账不计入该比对）、**增量终审是否覆盖了自最后一次全量终审以来变过的每一节（`incremental-review-covers-changes`，变过却没进任何一轮范围即 `BLOCKED`）**、轮次是否越界、`must_fix` Finding 是否全部闭环、每个 Finding 是否有处置、**“审查闭环记录”章节生成台账是否存在（`ledger-blocks-present`）且与 `state.json` 逐字一致（`ledger-matches-state`，手改标记内内容、漏行、或在标记之外另抄一份台账都算失败）**、是否仍含模板占位符（`TBD`/`TODO`/`待定`/`待补充`/`后续补充`/`similar to`/`refer to`/`【填写】`/`【链接】`/`YYYY-MM-DD`；唯一允许的未知表达是 `[需人工确认: xxx]`）、必需章节锚点是否齐备、**按 `state.json` 的规模判定要求的章节是否齐备且有实质内容（`scale-chapters`，M/L 级用 `不涉及` 或短正文收缩即 `BLOCKED`）**、代码围栏是否闭合且语言合法、变更运行是否已归档上一版、是否残留把上下文写回仓库 `AGENTS.md`/`CLAUDE.md` 的痕迹。
 
-`gate` 退出码非 0 时不得写入“方案已完成”，应输出阻塞报告与缺口；退出码 0 且无降级才是“已通过独立终审”。`gate` 通过后再执行一次 `render-ledger`，让第 16 章的“交付门禁”行记录本次结论，然后才能进入 `CLOSED`；关闭后文档冻结，`render-ledger` 会被拒绝。图示一律使用模板规定的 Mermaid fenced code block，简单目录树和数据流用 ASCII art；不依赖任何外部渲染服务。
+`gate` 退出码非 0 时不得写入“方案已完成”，应输出阻塞报告与缺口；退出码 0 且无降级才是“已通过独立终审”。`gate` 通过后再执行一次 `render-ledger`，让“审查闭环记录”章节的“交付门禁”行记录本次结论，然后才能进入 `CLOSED`；关闭后文档冻结，`render-ledger` 会被拒绝。图示一律使用模板规定的 Mermaid fenced code block，简单目录树和数据流用 ASCII art；不依赖任何外部渲染服务。
 
 完成后输出交付报告：方案路径、运行目录、`input_status` 与缺口、需求变更三类数量及映射、旧/新 TDD 版本与归档文件、Critic 与 Reviewer 的 Finding 数量和最高严重度、`review_round` 与最终状态、各轮终审范围（全量/增量）与 `gate` 报告里的 `review_stop`、`finalize-inputs` 的规模判定（`scale`/`greenfield`/命中信号）、仍需人工确认事项、`gate` 结果。然后给出下一步：
 

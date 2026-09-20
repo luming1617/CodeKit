@@ -730,10 +730,49 @@ class ContractAndPlan(CliFixture):
         self.assertEqual(contract["start_diff_digest"],
                          self.read(self.manifest)["approval"]["approved_snapshot"]["working_tree_digest"])
         self.assertTrue(contract["forbidden_changes"] and contract["behavior_to_preserve"])
-        self.assertTrue(contract["contract_digest"].startswith("sha256:"))
+        self.assertRegex(contract["contract_digest"], r"^[0-9a-f]{64}$")
+        # CW2-a①③：交给 code-review `--handoff` 的自述块与另两家同一编码、同一形状。
+        handoff = self.read(Path(payload["review_handoff"]))
+        self.assertRegex(handoff["worktree_state"]["head_sha"], r"^[0-9a-f]{40}$")
+        self.assertEqual(handoff["digest_scheme"], "sha256/hex")
+        self.assertIsNone(handoff["committed_range"])
+        self.assertEqual(handoff["produced_by"], "codekit:bugfix/scripts/bugfix_state.py")
+        self.assertTrue(handoff["target_id"].endswith("@" + contract["start_head_sha"]))
+        self.assertEqual(handoff["target_id"], payload["target_id"])
         plan = self.read(Path(payload["plan"]))
         self.assertEqual([c["proves"] for c in plan["checks"]], ["根因已消除"])
         self.assertTrue(plan["checks"][0]["required"])
+
+    def test_review_handoff_survives_code_review_handoff_gate(self):
+        # CW2-a 验收：本 Skill 真产出的 review-handoff.json 交给 code-review 的 `--handoff`
+        # 比对器。A5 时代这条路径上三个 `==` 恒为 False（前缀编码 + 语义不同的 diff_digest），
+        # 按 SKILL 字面执行只能每轮 BLOCKED。
+        code, payload, err = self.cli("freeze-contract", "--manifest", str(self.manifest))
+        self.assertEqual(code, 0, err)
+        freeze = SKILL_DIR.parent / "code-review" / "scripts" / "freeze_review_snapshot.py"
+        self.assertTrue(freeze.is_file(), f"跨 SKILL 验收需要 {freeze}")
+        head = subprocess.check_output(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True
+        ).strip()
+        # 本 Skill 从不 commit，所以 code-review 复用的正是同一份工作树：base == head。
+        manifest_path = self.run_dir / "code-review-snapshot.json"
+        result = subprocess.run(
+            [sys.executable, str(freeze), "--repo", str(self.root),
+             "--base-sha", head, "--head-sha", head,
+             "--target-type", "local_diff", "--target-locator", "test",
+             "--emit-manifest", str(manifest_path), "--handoff", str(payload["review_handoff"])],
+            capture_output=True, text=True, check=False, cwd=self.root,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        block = self.read(manifest_path)["handoff"]
+        self.assertEqual(block["sources"], [state.PRODUCED_BY])
+        self.assertTrue(block["target_id_matched"])
+        self.assertEqual(block["target_id"], payload["target_id"])
+        # 只有双方共有且同一 material 的字段进比对；本 Skill 不带分层摘要，所以到此为止。
+        self.assertEqual(block["compared_fields"], ["head_sha"])
+        self.assertEqual(block["uncomparable_digests"], [])
+        # 上游不含已提交范围而本轮也没有已提交内容 —— 这不是范围超集，不得凭空压低结论。
+        self.assertEqual(block["limitations"], [])
 
     def test_freeze_contract_requires_approval(self):
         manifest = self.start(run_id="no-approval")
