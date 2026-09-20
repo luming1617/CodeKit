@@ -24,6 +24,9 @@ flowchart LR
     S5 -->|"REQUEST_CHANGES<br/>回到 4，review_round +1"| S4
     S5 -->|APPROVE| S6["6 主控：gate 与交付"]
     S5 -->|"第 5 轮仍未通过 / BLOCKED"| B["阻塞交付<br/>不得宣称方案完成"]
+    S2 -.->|"阻断性未知：CONFIRM_NEEDED 提前收口<br/>→ 等待人工 → 全新派发"| S2
+    S4 -.->|"阻断性未知：同上"| S4
+    S6 -.->|"confirmation-log.md 跨 run 存活<br/>下一 run init 自动承接"| S0
 ```
 
 | 阶段 | 负责角色 | 唯一规范源 |
@@ -58,7 +61,7 @@ flowchart LR
 | Qoder | `/codekit:technical-doc <feature-directory>` |
 | Qoder CN | `/codekit:technical-doc <feature-directory>` |
 
-唯一输入参数是当前仓库内的 `<feature-directory>`（例如 `docs/2026-09-09-order-note-sync`）。依赖文档不从参数接收路径，只在该目录按固定文件名查找：输入 PRD `product-doc.md`，输出 TDD `technical-doc.md`；RPD `release-doc.md` 由后续 `release-doc` 生成。
+唯一输入参数是当前仓库内的 `<feature-directory>`（例如 `docs/2026-09-09-order-note-sync`）。依赖文档不从参数接收路径，只在该目录按固定文件名查找：输入 PRD `product-doc.md`，输出 TDD `technical-doc.md`，人工确认账本 `confirmation-log.md`（跨 run 存活的活账，见“人工确认循环”）；RPD `release-doc.md` 由后续 `release-doc` 生成。
 
 ## 不应使用的场景
 
@@ -89,8 +92,11 @@ flowchart LR
 | `record-review` | 把终审结论与被审 TDD 的内容快照绑定，并绑定**本轮的审查范围**（`--scope` 只能复述 `start-stage` 打开的范围，不能把增量轮改写成全量）；“审查闭环记录”章节标记之间的生成台账不计入该快照 |
 | `archive-history` | 把被覆盖的上一版 TDD 归档为独立文件 |
 | `index` / `locate` | 重建 `doc-index.json`（章节 → 行区间、符号、Finding 归属），或把一条 Finding 的位置、一个章节号解析成行区间与读取预算；`locate`、`--scope` 派发与 `record-fix` 都会在 TDD 变化后自动重建索引，不必手动先跑 `index`；`locate` 找不到对应标题时返回 `NOT_LOCATED` 并给出兜底读法，不猜 |
-| `render-ledger --state <state> --tdd-file <TDD>` | 从 `state.json` 重写 TDD “审查闭环记录”章节的生成台账（Finding 处置映射、运行元数据）与“历史版本索引”，并顺带重建索引 |
-| `gate` / `show` | 交付门禁与运行状态摘要；`show` 按 `prep`/`write`/`audit` 汇总各阶段墙钟耗时，给出派发计数（`timed`/`aborted`/`open`/`scoped`/`over_budget`）、索引摘要、`review_stop` 判定与 `scale` 结论 |
+| `render-ledger --state <state> --tdd-file <TDD>` | 从 `state.json` 重写 TDD “审查闭环记录”章节的生成台账（Finding 处置映射、运行元数据、人工确认台账、人工决定台账）与“历史版本索引”，并顺带重建索引；同时把收口条目的应用状态回写确认文件的 `应用:` 行 |
+| `sync-confirmations --file` | 解析确认文件：无 ID 条目分配 `CONF-<NNN>` 并只回写 ID 行，登记进 `state`，`决定:` 非空的置 ANSWERED，未答保持 OPEN；本 run 内引用未登记 Finding 的来源、重复问题文本或解析错误即失败（rc=1），stdout 给出 `open/blocking_open/answered/skipped` 四计数与未答 ID 清单——“确认完毕”只以此为判定，不接受任何自述 |
+| `skip-to-default` / `mark-confirmation-applied` | 前者仅在用户显式指令下把 OPEN 条目按推荐选项登记为 SKIPPED-DEFAULT（`--by` 带指令引文），不允许静默跳过；后者登记收口态（ANSWERED/SKIPPED-DEFAULT）条目的决定已落进正文（章节与摘要），未收口拒绝，落点越过本轮 `--scope` 并集拒绝 |
+| `confirmations` | 只读对账：`state` 条目 ↔ 确认文件 ↔ TDD 正文 marker 现状，供主控与交付报告照抄 |
+| `gate` / `show` | 交付门禁与运行状态摘要；`show` 按 `prep`/`write`/`audit` 汇总各阶段墙钟耗时，给出派发计数（`timed`/`aborted`/`open`/`scoped`/`over_budget`）、索引摘要、`review_stop` 判定与 `scale` 结论、待答与待落地确认条目计数及确认文件路径 |
 
 状态与产物落在 `<repo>/.codekit/technical-doc/<run-id>/`（运行时证据目录，不得作为业务变更提交）。**阶段间交接只传文件路径与 digest，不传正文**：子代理自己读文件，主 Agent 不搬运大段文本。
 
@@ -113,6 +119,57 @@ flowchart LR
 - 增量轮仍要派发**全新 Reviewer**，只是它读的是给定的章节区间；`gate` 的 `incremental-review-covers-changes` 会把最后一次全量终审的逐节摘要和当前正文再比一次，凡是变过却没进任何一轮范围的章节即 `BLOCKED`——终审之后主控亲手补的那一段就是从这里露出来的，不需要靠“保留一次全量收尾”来兜。
 - `review_round` 上限 5 保留为兜底而非目标；`init --review-stop-policy fixed` 回到“每轮全量、跑满轮次”的旧语义。
 - 增量轮的 `over_budget: true` **不能靠拆派发解决**：一轮只允许一个全新 Reviewer 实例（第二个会被控制器拒绝）。上一轮那种 5,046 行的文档实测下来，推导出的范围约占整篇读取量的 52%（约 11.5 万 token），仍高于 0.5×窗口的预算——但整篇读取（约 22 万 token）本来就超出 20 万窗口。此时的正确动作是把 `--context-window` 填成宿主的真实值，或接受这一轮超预算（读取量依旧比全量轮小），而不是把一轮终审切成两个实例。`over_budget` 只是回报里的提示，`start-stage` 与 `gate` 都不因它阻塞。
+
+### 人工确认循环
+
+确认载体是 `<feature-directory>/confirmation-log.md`（下称**确认文件**）：跨 run 存活的“活账”，随 feature 目录提交，与运行目录 `.codekit/` 的“证据不入库”约束无关。TDD 正文里的每个 需人工确认 方括号标记都必须在这里有条目，问答过程留在文件与运行目录，结论只经 `render-ledger` 的托管台账进正文。
+
+**条目格式**（追加式，只追加不删除、不重排；ID 由控制器首次 `sync-confirmations` 时按 `CONF-<NNN>` 分配并只回写 ID 行）：
+
+```text
+CONF-007
+来源: ARCHITECT | REFINER:CRITIC-003 | REVIEWER:REVIEW-2-001 | LEGACY-MARKER
+阻断: true|false
+位置: 7.2
+问题: 下游工单接口的限流阈值
+影响: 
+选项: A 方案一句话 / B 方案一句话
+推荐: A —— 理由
+决定: （用户填写；或会话内由主当代录；或“按推荐”）
+应用: （控制器登记：NONE | 章节+摘要+时间）
+```
+
+「问题」≤80 字符、单行、不含 `]` 与换行，登记后不可改写、本 run 内唯一——它是 marker 与条目配对的键。控制器对该文件只有两种写动作：sync 补 ID 行、`render-ledger` 更新 `应用:` 行；其余都是用户与角色的编辑面。解析容忍 CRLF，UTF-8 解码失败即报错并要求转 UTF-8。
+
+**阻断判据（唯一的暂停理由）**：`此项不拍板，本轮剩余工作（含其余非阻断 Finding 的处置）是否无法继续？` 是 ⇒ 阻断，触发暂停；否 ⇒ 照常挂账走人。由产出角色按该判断式裁决并写进 `阻断:` 栏；单 run 内 Architect/Refiner 的提前收口次数最多与轮次同数，且每次都必须是阻断项。
+
+**暂停协议**：子代理遇到阻断性未知时，先把部分产物落盘（至少 ADR 候选比较与受影响章节骨架；Refiner 先做完本轮其余 Finding，回报“已完成映射 + 未处理清单”两段），再按上述格式追加条目并以 `CONFIRM_NEEDED` 收口返回。主控随后：
+
+1. `sync-confirmations` 登记新条目，核对 stdout 计数；
+2. 向用户发出通知，必须含：确认文件的仓库相对路径、未答阻断条目表（CONF-ID | 问题 | 选项 | 推荐）、作答方式三条：
+   - 通道①：编辑对应条目的 `决定:` 行后回复“继续”；
+   - 通道②：会话内直接回复 `确认 CONF-007: <决定>`，由主控代录进文件再 sync；
+   - “不答但要走完”仅限用户显式指令，由主控 `skip-to-default` 按推荐选项登记 SKIPPED-DEFAULT——不允许静默跳过；
+3. 等待。`sync-confirmations` 的 `blocking_open` 计数与退出码是“确认完毕”的唯一判定，不接受任何自述；收口只认 ANSWERED / SKIPPED-DEFAULT。
+
+**恢复协议**：“继续”= 全新派发，磁盘产物与 `state.json` 是唯一进度，不复活旧会话。恢复派发把确认文件与 state 中的已答决定作为最高优先级输入（高于模型推断，冲突时按决策落并在正文留痕）；角色逐条把正文 marker 改写为 `[已人工确认: 问题 → 决定]` 或删除该段，回报落点，主控 `mark-confirmation-applied` 登记 APPLIED（ANSWERED 与 SKIPPED-DEFAULT 同为收口态，都可且必须被 APPLIED）。
+
+**marker 书写规则**：正文 marker 与条目「问题」归一化（全半角冒号、空白折叠）后逐字相等；单行；不写进代码围栏（对账时围栏内一律视为示例文本，双向忽略）。产出角色的动作顺序固定：**先追加条目，再写 marker**。
+
+**台账入库**：`render-ledger` 在“审查闭环记录”章渲染两个新小节——“人工确认台账”（未收口条目摘要 + 作答指引）与“人工决定台账”（收口条目 | 决定 | 落点）。它们是生成块：手写或漏行会被 `ledger-matches-state` 拒；正文 marker 与条目另过 `markers-match-confirmations` 双向对账（孤儿 marker、条目已收口而 marker 残留，都 `BLOCKED`）。块内引用 Finding ID 是安全的——手写镜像检查只扫标记之外的行。
+
+**跨 run 承接**：`init` 发现 feature 目录已有确认文件时自动 ingest——OPEN 条目全部导入（`来源` 的 Finding 引用只作溯源，不做本 run 存在性校验；in-run 的 sync 照常校验），ANSWERED/SKIPPED-DEFAULT 未 APPLIED 的列入“待落地”，作为阶段 2 Architect 的最高优先级输入强制先消费，并登记为 `HUMAN_DECISION` 输入证据（该通道下一 run 生效；同 run 内新收口的条目由恢复派发直接消费，不回补冻结输入）。存量文档首跑：正文里无条目对应的 bare marker 由 init 按 `来源: LEGACY-MARKER`、`阻断: false` 自动补登，老文档不被孤儿 marker 门禁误杀。
+
+**门禁挂钩**：`start-stage --to CRITIC / REVIEW / DELIVERY` 三处都拒绝阻断态未完成条目（blocking 且 OPEN、或已收口未 APPLIED）；进 `DELIVERY` 另要求所有收口态条目已 APPLIED、must_fix Finding 关联条目不为 OPEN。`gate` 的 `confirmations-file-persisted` 要求交付时确认文件存在、可解析、与 state 逐条一致。
+
+**残留限制（明示，不藏）**：
+
+1. 暂停的“等待”依赖宿主会话存活；跨会话恢复靠下次 run 的 init ingest，恢复点之后仍可能重新派发消息式提问（只补问新产生的阻断项，已答的不重问）。
+2. Reviewer 来源的阻断条目没有轮内落地通道：终审结论已与快照绑定，落它的决定必须走 `REQUEST_CHANGES` → Refiner → 全新终审，烧掉一整轮预算；第 5 轮之后只能挂账，交付报告须如实标注。
+3. 第 5 轮/交付后挂账项（含 `PENDING_CONFIRMATION` 处置与非阻断 OPEN 条目）本 run 无写回通道，由下次 run 消费。
+4. 并行多实例 `tech-context` 与确认循环无交集：context 阶段不设暂停（它只登记“未发现证据”，不做需要拍板的设计选择）。
+5. 配对按文本相等：改写问题措辞而不同步条目会被 `markers-match-confirmations` 挡下，按报错恢复原文或重新登记条目，禁止静默绕过。
+6. 本节命令接线进控制器之前，主控按本节文字逐条执行，并在交付报告如实标注“人工确认未控制器强制”；接线后本条作废。
 
 ### 规模判定与按规模裁剪
 
@@ -148,12 +205,13 @@ flowchart LR
 
 ## 阶段 2：Architect
 
-输入为冻结的 PRD 当前有效正文、`【修改】/【新增】/【删除】` 台账、系统上下文包、`references/technical-doc-template.md` 和已确认人工决策。产出 `draft` 产物（TDD 初稿）。
+输入为冻结的 PRD 当前有效正文、`【修改】/【新增】/【删除】` 台账、系统上下文包、`references/technical-doc-template.md` 和已确认人工决策（含上一 run 承接来的“待落地”收口决定；其优先级高于模型推断，冲突时按决策落进设计并留痕）。产出 `draft` 产物（TDD 初稿）。
 
 - 先定义 service boundary，再覆盖 PRD 功能与非功能性需求；
 - 每个关键选型至少比较 2 个可行方案，说明评价维度、理由、代价与适用边界，并写入 ADR 章节；
 - 每个改造点给出“现有方式 → 新方式”对比；DDL 用完整 `CREATE TABLE`（字段、索引、注释）；新 API 给完整 request/response JSON、错误码、鉴权、幂等与兼容说明；
-- 未知事实写成 `[需人工确认: xxx]` 并说明它影响哪项决策，不得把推断写成确定结论；
+- 未知事实写成 `[需人工确认: xxx]` 并说明它影响哪项决策，不得把推断写成确定结论；写 marker 前先按“人工确认循环”追加确认文件条目；
+- 命中阻断判据的未知不硬写结论再往下走：先落部分产物（ADR 候选比较、受影响章节骨架），按 `CONFIRM_NEEDED` 提前收口，回报携带 `confirmation_items`（CONF-ID | 问题 | 阻断）供主控 sync；恢复派发是全新实例，已答决定为其最高优先级输入；
 - 模板示例与真实系统冲突时以代码证据为准并删除示例事实；
 - 派发时给出 `scale`：`S` 级可以把监控大盘与告警收缩成基础项并写明原因，`M`/`L` 级的“完整监控大盘与告警”必须有实质设计，`部署拓扑` 按 `L` 级要求；被信号点名的 `条件必填` 章节可以填 `不涉及`，但必须带原因。`gate` 按同一张表核对，不会因为“文档短一点更快”而放行。
 
@@ -179,6 +237,8 @@ flowchart LR
 
 处置只经 `record-fix` 生效：主控按 Refiner 回报的映射逐条登记，并把映射登记为 `refiner-map` 产物。派发前先按 Finding 所在章节聚类，逐条 `locate` 后把注入的区间随 `--scope` 登记（见“读取预算与按节注入”），Refiner 不再自己翻页找位置。**TDD “审查闭环记录”章节的两个台账由 `render-ledger` 生成，任何角色都不得手写**；本轮处置登记完成后执行一次 `render-ledger`，再进入 Review——这样 Reviewer 读到的“审查闭环记录”章节与 `state.json` 一致，且“审查闭环记录”章节的刷新不会破坏终审与被审内容之间的绑定。
 
+派发输入固定包含“已确认人工决策”槽（含上一 run 待落地条目）：Refiner 按已登记决策修订正文**不属于**“Finding 之外的发挥”；落点后回报章节与摘要，由主控 `mark-confirmation-applied` 登记——落点越出本轮 `--scope` 并集即被拒绝。新增 需人工确认 标记只允许用于“证据不足无法裁决”，必须先追加确认文件条目（`来源` 挂本轮 Finding）并在回报中给出处置不能进行的理由；不得以新增 marker 代替应做的 `FIXED`。命中阻断判据时按“人工确认循环”的收口协议执行：先完成本轮其余 Finding，再以 `CONFIRM_NEEDED` 收口。
+
 ## 阶段 5：Independent Reviewer
 
 `review_round` 表示**已执行的独立终审次数**，取值 1～5。一轮 = “独立 Reviewer 终审 →（`REQUEST_CHANGES` 时）Refiner 定向修订 → 重新派发全新 Reviewer”。5 是 `severity` 策略下的兜底而非目标，也是 `fixed` 策略下的固定上限。
@@ -189,7 +249,7 @@ flowchart LR
 
 前两轮（以及任何报了 `Blocker`/`High` 或留下未闭环 `must_fix` 的轮次之后）都是**全量终审**，Reviewer 读完整篇。命中“严重度门停”之后（见同名小节）改为**增量终审**：`start-stage --to REVIEW` 的返回值给出 `sections` 与行区间，主控逐节 `locate` 后把这些区间随派发交给全新 Reviewer；范围由控制器推导，主控不得缩小，Reviewer 也不得把增量结论说成全量结论——`record-review` 记录的范围与 `gate` 的覆盖证明都会留下这一轮的边界。
 
-输出 `status: APPROVE | APPROVE_WITH_FOLLOW_UPS | REQUEST_CHANGES | BLOCKED`，新增 Finding 用 `REVIEW-<round>-<NNN>` 登记，结论用 `record-review` 与被审快照、本轮范围绑定。主控不得直接改写 TDD 后宣称 Reviewer 通过。
+输出 `status: APPROVE | APPROVE_WITH_FOLLOW_UPS | REQUEST_CHANGES | BLOCKED`，新增 Finding 用 `REVIEW-<round>-<NNN>` 登记，结论用 `record-review` 与被审快照、本轮范围绑定。主控不得直接改写 TDD 后宣称 Reviewer 通过。Review 阶段不设暂停派发：Reviewer 发现必须人类拍板才能裁决的问题时，照常登记 Finding，并在回报中给出建议的确认条目文本（问题、选项、推荐、是否阻断），由主控 `sync-confirmations` 代录进确认文件；Reviewer 本人不写确认文件、不代人类裁决。该条目要真正落进正文只能走 `REQUEST_CHANGES` → Refiner → 全新终审（烧一轮预算），第 5 轮之后按“人工确认循环”的残留限制挂账。
 
 通过性结论不是本轮 Finding 的终点：`gate` 的 `every-finding-has-a-disposition` 与 `start-stage --to DELIVERY` 都要求每条 Finding 有处置，而第 5 轮之后已无处再开 Refiner 轮。为此控制器允许在 `REVIEW`/`DELIVERY` 阶段（仅限通过性结论挂账时）对**本轮**新报的非阻断 Finding 直接登记 `PENDING_CONFIRMATION`/`REJECTED`，处置落点必须与 Finding 位置一致；`FIXED` 声称改过正文，仍只能由 Refiner 轮产生并配一次全新终审。这个例外是给 follow-up 收口的，不是给主控免审改文档开后门。
 
@@ -201,7 +261,7 @@ flowchart LR
 
 PRD 当前版本中用户最新明确的方案和逻辑优先于旧 PRD、旧 TDD、旧评审意见和模型推断。若最新 PRD 与旧 TDD 冲突，以最新 PRD 重算设计、兼容、迁移、测试和发布影响；若代码、接口契约或安全约束使新逻辑不可安全实现，记录 `[需人工确认: ...]` 及证据，不得静默回退旧方案。
 
-`UPDATE` 运行必须在写入新版本前用 `archive-history` 把上一版有效 TDD 归档为运行目录下的独立文件，“历史版本索引”由 `render-ledger` 依据归档记录与 `finalize-inputs --prd-changes` 的台账生成（版本、归档日期、修改/新增/删除数量、归档文件），任何角色都不得手写索引行。渲染时 `render-ledger` 会先读出文档里上一次运行留下的索引行（按 版本+归档文件 去重、按时间顺序重排序号）再接上本 run 的新行——跨 run 的索引同样只追加、不覆盖。**禁止把旧版正文内嵌进 markdown 围栏**（嵌套围栏会提前截断，且会让文档随每次变更成倍膨胀）；`gate` 会拒绝含嵌套文档围栏的产物。当前正文只保留最新有效方案，历史只追加、不覆盖、不重排。
+`UPDATE` 运行必须在写入新版本前用 `archive-history` 把上一版有效 TDD 归档为运行目录下的独立文件，“历史版本索引”由 `render-ledger` 依据归档记录与 `finalize-inputs --prd-changes` 的台账生成（版本、归档日期、修改/新增/删除数量、归档文件），任何角色都不得手写索引行。渲染时 `render-ledger` 会先读出文档里上一次运行留下的索引行（按 版本+归档文件 去重、按时间顺序重排序号）再接上本 run 的新行——跨 run 的索引同样只追加、不覆盖。**禁止把旧版正文内嵌进 markdown 围栏**（嵌套围栏会提前截断，且会让文档随每次变更成倍膨胀）；`gate` 会拒绝含嵌套文档围栏的产物。当前正文只保留最新有效方案，历史只追加、不覆盖、不重排。确认文件同守这条纪律：条目只追加不删除，已应用（APPLIED）的条目保留作决策史，由下一次 run 的 `init` 一并承接（见“人工确认循环”）。
 
 ## 降级模式
 
@@ -225,11 +285,17 @@ PRD 当前版本中用户最新明确的方案和逻辑优先于旧 PRD、旧 TD
   --tdd-file "$feature_directory/technical-doc.md"
 ```
 
-`gate` 是确定性的，覆盖：输入可用性、五个阶段产物是否落盘、独立终审是否执行、**最后一轮终审是否覆盖当前内容**（终审之后改动手写章节的任何一个字都会被判 `BLOCKED`；“审查闭环记录”章节标记之间的生成台账不计入该比对）、**增量终审是否覆盖了自最后一次全量终审以来变过的每一节（`incremental-review-covers-changes`，变过却没进任何一轮范围即 `BLOCKED`）**、轮次是否越界、`must_fix` Finding 是否全部闭环、每个 Finding 是否有处置、**“审查闭环记录”章节生成台账是否存在（`ledger-blocks-present`）且与 `state.json` 逐字一致（`ledger-matches-state`，手改标记内内容、漏行、或在标记之外另抄一份台账都算失败）**、是否仍含模板占位符（`TBD`/`TODO`/`待定`/`待补充`/`后续补充`/`similar to`/`refer to`/`【填写】`/`【链接】`/`YYYY-MM-DD`；唯一允许的未知表达是 `[需人工确认: xxx]`）、必需章节锚点是否齐备、**按 `state.json` 的规模判定要求的章节是否齐备且有实质内容（`scale-chapters`，M/L 级用 `不涉及` 或短正文收缩即 `BLOCKED`）**、代码围栏是否闭合且语言合法、变更运行是否已归档上一版、是否残留把上下文写回仓库 `AGENTS.md`/`CLAUDE.md` 的痕迹。
+`gate` 是确定性的，覆盖：输入可用性、五个阶段产物是否落盘、独立终审是否执行、**最后一轮终审是否覆盖当前内容**（终审之后改动手写章节的任何一个字都会被判 `BLOCKED`；“审查闭环记录”章节标记之间的生成台账不计入该比对）、**增量终审是否覆盖了自最后一次全量终审以来变过的每一节（`incremental-review-covers-changes`，变过却没进任何一轮范围即 `BLOCKED`）**、轮次是否越界、`must_fix` Finding 是否全部闭环、每个 Finding 是否有处置、**“审查闭环记录”章节生成台账是否存在（`ledger-blocks-present`）且与 `state.json` 逐字一致（`ledger-matches-state`，手改标记内内容、漏行、或在标记之外另抄一份台账都算失败）**、是否仍含模板占位符（`TBD`/`TODO`/`待定`/`待补充`/`后续补充`/`similar to`/`refer to`/`【填写】`/`【链接】`/`YYYY-MM-DD`；唯一允许的未知表达是 `[需人工确认: xxx]`）、必需章节锚点是否齐备、**按 `state.json` 的规模判定要求的章节是否齐备且有实质内容（`scale-chapters`，M/L 级用 `不涉及` 或短正文收缩即 `BLOCKED`）**、代码围栏是否闭合且语言合法、变更运行是否已归档上一版、是否残留把上下文写回仓库 `AGENTS.md`/`CLAUDE.md` 的痕迹、正文 需人工确认 marker 与确认条目是否双向对得上（`markers-match-confirmations`，围栏内一律视为示例文本双向忽略，孤儿 marker 或条目已收口而 marker 残留即 `BLOCKED`）、确认文件是否持久并与 `state.json` 逐条一致（`confirmations-file-persisted`）。
 
 `gate` 退出码非 0 时不得写入“方案已完成”，应输出阻塞报告与缺口；退出码 0 且无降级才是“已通过独立终审”。`gate` 通过后再执行一次 `render-ledger`，让“审查闭环记录”章节的“交付门禁”行记录本次结论，然后才能进入 `CLOSED`；关闭后文档冻结，`render-ledger` 会被拒绝。图示一律使用模板规定的 Mermaid fenced code block，简单目录树和数据流用 ASCII art；不依赖任何外部渲染服务。
 
-完成后输出交付报告：方案路径、运行目录、`input_status` 与缺口、需求变更三类数量及映射、旧/新 TDD 版本与归档文件、Critic 与 Reviewer 的 Finding 数量和最高严重度、`review_round` 与最终状态、各轮终审范围（全量/增量）与 `gate` 报告里的 `review_stop`、`finalize-inputs` 的规模判定（`scale`/`greenfield`/命中信号）、仍需人工确认事项、`gate` 结果。然后给出下一步：
+完成后输出交付报告：方案路径、运行目录、`input_status` 与缺口、需求变更三类数量及映射、旧/新 TDD 版本与归档文件、Critic 与 Reviewer 的 Finding 数量和最高严重度、`review_round` 与最终状态、各轮终审范围（全量/增量）与 `gate` 报告里的 `review_stop`、`finalize-inputs` 的规模判定（`scale`/`greenfield`/命中信号）、`gate` 结果。仍需人工确认事项是**强制表格**（从 `confirmations` 与“人工确认台账”照抄，不得凭记忆重写）：
+
+```text
+| CONF-ID | 问题 | 阻断 | 状态 | 落点 / 作答指引 |
+```
+
+表格后必须附作答方式三条：在哪答（确认文件的仓库相对路径）、怎么答（编辑 `决定:` 行，或会话内回复 `确认 CONF-<NNN>: <决定>`；不答要走完需显式指令，按推荐登记 SKIPPED-DEFAULT）、答完怎么继续（回复“继续”，主控先 `sync-confirmations` 再全新派发落地）。然后给出下一步：
 
 ```text
 方案已生成并保存到 `<feature-directory>/technical-doc.md`（gate: PASS）。建议的下一步：

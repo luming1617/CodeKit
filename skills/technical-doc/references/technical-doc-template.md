@@ -769,6 +769,11 @@ flowchart TB
 >   或在标记之外另抄一份台账，都会阻塞交付。
 > - 标记不能被放进代码围栏，也不要在本章重复给出 Finding 列表。
 > - 正文仍由各角色撰写：处置理由写进对应设计章节，本章只回答“哪些 Finding、如何处置”。
+> - 人工确认机制接线后，本章另含两张生成表：“人工确认台账”（未收口条目摘要与作答指引）与
+>   “人工决定台账”（已收口条目、决定与落点），同样由 `render-ledger` 渲染。作答动作只发生在
+>   feature 目录的 `confirmation-log.md`（方式见 `SKILL.md`“人工确认循环”）；在本章手写台账
+>   内容或把未收口项从正文标记里悄悄抹掉，都会被 `ledger-matches-state` 与
+>   `markers-match-confirmations` 阻塞交付。
 
 <!-- codekit:technical-doc:ledger:findings:start -->
 （由 `render-ledger` 生成，勿手改）
@@ -783,6 +788,10 @@ flowchart TB
 # 待人工确认项（AI维护）
 
 > 本表按编号收敛全文所有**需要人签的设计开放项**及最终确认结果
+>
+> 权威账本与作答入口不在本表：每个开放项必须在同目录 `confirmation-log.md` 有条目，
+> 作答方式见 `SKILL.md`“人工确认循环”。本表只是台账的可读视图，写进本表不构成作答，
+> 也不要用删改本表的方式“解决”未决项。
 
 示例：
 
