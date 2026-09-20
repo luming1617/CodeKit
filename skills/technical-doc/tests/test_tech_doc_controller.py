@@ -36,7 +36,7 @@ TDD_BODY = """# 后端服务技术方案：订单备注同步
 |------|------|----------|
 | 0.1 | 2026-09-09 | 新增 |
 
-## 3.4 需求到设计追踪
+## 3.4 影响范围
 | 需求 | 设计落点 |
 |------|----------|
 | FR-1 | 4.1 主流程 |
@@ -51,20 +51,20 @@ sequenceDiagram
     order-->>kafka: 备注变更
 ```
 
-## 12. 监控大盘设计
+## 12. 可观测设计
 备注同步成功率、P95 同步耗时、重试次数三项指标进现有订单大盘，按服务与错误码分维度。
 
 ## 13. 告警设计
 成功率低于 99% 持续 5 分钟触发 P2 告警，路由到订单值班群，Runbook 指向本方案 13.5。
 
-## 15. 风险登记与工作量评估
+## 15. 里程碑规划
 | 风险 | 等级 | 缓解 |
 |------|------|------|
 | 下游限流 | P2 | 退避重试 |
 
 工作量：备注同步模块 3 人日，依赖工单接口联调。
 
-## AI审查闭环记录
+## 16. 审查闭环记录
 
 台账由 `tech_doc_controller.py render-ledger` 从 `state.json` 生成，勿手改。
 """
@@ -74,8 +74,8 @@ EVIDENCE = (
     "db/migration/V12__note_sync.sql；覆盖度 HIGH，未发现相反证据。\n"
 )
 
-# One structural change class only: the template's M row, so 部署拓扑 and the signalled chapter
-# become required and 监控大盘/告警 lose their 不涉及 escape hatch.
+# One structural change class only: the template's M row, so the signalled chapter becomes required
+# and 可观测设计 loses its 不涉及 escape hatch; 部署拓扑 only joins the floor at L.
 PRD_ONE_SIGNAL = """# 产品需求说明书：客服话术查询
 
 ## 功能需求
@@ -102,8 +102,8 @@ PRD_STRUCTURAL = """# 产品需求说明书：风控规则引擎
 FILLER = "指标口径、告警阈值、责任人与复检方式在此逐条写明，不留只有结论没有做法的空话。"
 CHAPTER_FILL = FILLER * 12
 
-# TDD_BODY at M: the two 监控/告警 chapters carry substance and the signalled chapter plus
-# 部署拓扑 exist at all.
+# TDD_BODY at M: 可观测设计 carries substance and the signalled chapter exists at all
+# (部署拓扑 stays in the body although M no longer demands it, matching a doc written for L).
 M_TDD_BODY = (
     TDD_BODY.replace(
         "备注同步成功率、P95 同步耗时、重试次数三项指标进现有订单大盘，按服务与错误码分维度。",
@@ -113,10 +113,10 @@ M_TDD_BODY = (
         "成功率低于 99% 持续 5 分钟触发 P2 告警，路由到订单值班群，Runbook 指向本方案 13.5。",
         "成功率低于 99% 持续 5 分钟触发 P2 告警，路由到订单值班群。\n" + CHAPTER_FILL,
     ).replace(
-        "## 15. 风险登记与工作量评估",
+        "## 15. 里程碑规划",
         "## 6. 接口与契约设计\n" + CHAPTER_FILL
         + "\n\n## 14. 部署拓扑\n" + CHAPTER_FILL
-        + "\n\n## 15. 风险登记与工作量评估",
+        + "\n\n## 15. 里程碑规划",
     )
 )
 
@@ -138,7 +138,7 @@ DOC_BODY = (
 
 ## 1. 背景
 
-## 3.4 需求到设计追踪
+## 3.4 影响范围
 | 需求 | 设计落点 |
 |------|----------|
 | FR-1 | 见 7.2 节 |
@@ -160,12 +160,12 @@ POST /api/v1/notes
     + "".join(f"CREATE TABLE archive_note_{i} (id bigint);\n" for i in range(14))
     + """```
 
-## 15. 风险登记
+## 15. 里程碑规划
 """
     + "风险说明。" * 400
     + """
 
-## AI审查闭环记录
+## 16. 审查闭环记录
 
 台账由 `tech_doc_controller.py render-ledger` 从 `state.json` 生成，勿手改。
 """
@@ -415,13 +415,13 @@ class TechDocControllerTests(unittest.TestCase):
         controller.record_finding(state, "CRITIC", "CRITIC-001", "Blocker", "4.2", "证据", None, 0)
         controller.record_finding(state, "CRITIC", "CRITIC-002", "Medium", "6.1", "证据", None, 0)
         with self.assertRaises(controller.ControllerError):
-            controller.record_fix(state, "CRITIC-001", "REJECTED", "4.2", "改法", "验证")
+            controller.record_fix(state, "CRITIC-001", "REJECTED", "4.2", "改法")
         with self.assertRaises(controller.ControllerError):
-            controller.record_fix(state, "CRITIC-001", "PENDING_CONFIRMATION", "4.2", "改法", "验证")
+            controller.record_fix(state, "CRITIC-001", "PENDING_CONFIRMATION", "4.2", "改法")
         with self.assertRaises(controller.ControllerError):
-            controller.record_fix(state, "CRITIC-404", "FIXED", "4.2", "改法", "验证")
-        controller.record_fix(state, "CRITIC-001", "FIXED", "4.2", "补退避", "单测")
-        controller.record_fix(state, "CRITIC-002", "REJECTED", "6.1", "不改", "接口契约证据")
+            controller.record_fix(state, "CRITIC-404", "FIXED", "4.2", "改法")
+        controller.record_fix(state, "CRITIC-001", "FIXED", "4.2", "补退避")
+        controller.record_fix(state, "CRITIC-002", "REJECTED", "6.1", "不改")
 
     def test_dispositions_need_the_refiner_stage(self) -> None:
         """The orchestrator may not grade its own edits after a verdict is on the table."""
@@ -429,7 +429,7 @@ class TechDocControllerTests(unittest.TestCase):
         self.to_review(state)
         controller.record_finding(state, "CRITIC", "CRITIC-001", "High", "4.2", "证据", None, 0)
         with self.assertRaises(controller.ControllerError) as ctx:
-            controller.record_fix(state, "CRITIC-001", "FIXED", "4.2", "改法", "验证")
+            controller.record_fix(state, "CRITIC-001", "FIXED", "4.2", "改法")
         self.assertIn("REFINER", str(ctx.exception))
 
     # ---------------------------------------------------------- review rounds
@@ -454,7 +454,7 @@ class TechDocControllerTests(unittest.TestCase):
             controller.start_stage(state, "REFINER")
             self.record(state, "tech-refiner", f"s-refine-{round_}")
             self.artifact(state, "refiner-map", f"第 {round_} 轮变更映射已记录。\n")
-            controller.record_fix(state, f"REVIEW-{round_}-001", "FIXED", "4.2", "改法", "验证")
+            controller.record_fix(state, f"REVIEW-{round_}-001", "FIXED", "4.2", "改法")
             if round_ < controller.MAX_REVIEW_ROUNDS:
                 controller.start_stage(state, "REVIEW")
             else:
@@ -482,7 +482,7 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertIn("refiner-map", str(ctx.exception))
 
         self.artifact(state, "refiner-map", "第 2 轮变更映射：CRITIC 与 REVIEW-1-001 已处置。\n")
-        controller.record_fix(state, "REVIEW-1-001", "FIXED", "4.2", "补指数退避", "压测脚本")
+        controller.record_fix(state, "REVIEW-1-001", "FIXED", "4.2", "补指数退避")
         controller.start_stage(state, "REVIEW")
         self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["review_round"], 2)
         self.approve_round(state, "s-review-2")
@@ -527,7 +527,7 @@ class TechDocControllerTests(unittest.TestCase):
         self.to_refiner(state)
         controller.record_finding(state, "CRITIC", "CRITIC-001", "Blocker", "4.2", "无退避", None, 0)
         controller.record_finding(state, "CRITIC", "CRITIC-002", "Blocker", "5.6", "无幂等键", None, 0)
-        controller.record_fix(state, "CRITIC-001", "FIXED", "4.2", "补退避", "单测")
+        controller.record_fix(state, "CRITIC-001", "FIXED", "4.2", "补退避")
         controller.start_stage(state, "REVIEW")
         self.record(state, "tech-reviewer", "s-review-1")
         report = self.artifact(state, "review-report", "第 1 轮终审报告正文。\n")
@@ -542,7 +542,7 @@ class TechDocControllerTests(unittest.TestCase):
         state = Path(controller.init_run(self.repo, self.feature, "run-10b"))
         self.to_refiner(state)
         controller.record_finding(state, "CRITIC", "CRITIC-001", "Blocker", "4.2", "无退避", None, 0)
-        controller.record_fix(state, "CRITIC-001", "FIXED", "4.2", "补退避", "单测")
+        controller.record_fix(state, "CRITIC-001", "FIXED", "4.2", "补退避")
         controller.start_stage(state, "REVIEW")
         self.write_tdd()
         self.approve_round(state)
@@ -564,7 +564,7 @@ class TechDocControllerTests(unittest.TestCase):
         controller.start_stage(state, "REFINER")
         self.record(state, "tech-refiner", "s-refine-2")
         self.artifact(state, "refiner-map", "第 2 轮变更映射：REVIEW-1-001 已处置。\n")
-        controller.record_fix(state, "REVIEW-1-001", "FIXED", "4.2", "补指数退避", "压测脚本")
+        controller.record_fix(state, "REVIEW-1-001", "FIXED", "4.2", "补指数退避")
         controller.start_stage(state, "REVIEW")
         self.render(state)
         result = controller.gate(state, self.feature / "technical-doc.md")
@@ -681,7 +681,7 @@ class TechDocControllerTests(unittest.TestCase):
         controller.record_finding(
             state, "CRITIC", "CRITIC-001", "Blocker", "4.2 主流程", "无退避", None, 0
         )
-        controller.record_fix(state, "CRITIC-001", "FIXED", "4.2", "补指数退避", "单测 test_backoff")
+        controller.record_fix(state, "CRITIC-001", "FIXED", "4.2", "补指数退避")
         controller.start_stage(state, "REVIEW")
         self.write_tdd(update=update)
         if update:
@@ -700,7 +700,7 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertEqual(text, tdd.read_text(encoding="utf-8"))
         # one marker pair per section, in chapter order, below the chapter 16 heading
         self.assertEqual(text.count("<!-- codekit:technical-doc:ledger:"), 4)
-        chapter = text.index("## AI审查闭环记录")
+        chapter = text.index("## 16. 审查闭环记录")
         findings = text.index("ledger:findings:start")
         metadata = text.index("ledger:run-metadata:start")
         self.assertTrue(chapter < findings < metadata, (chapter, findings, metadata))
@@ -1079,21 +1079,21 @@ class TechDocControllerTests(unittest.TestCase):
         )
         controller.record_finding(state, "CRITIC", "CRITIC-001", "Medium", "7.2", "证据", None, 0)
         controller.record_finding(state, "CRITIC", "CRITIC-002", "Medium", "15", "证据", None, 0)
-        controller.record_fix(state, "CRITIC-001", "FIXED", "7.2", "补唯一索引", "explain 计划")
+        controller.record_fix(state, "CRITIC-001", "FIXED", "7.2", "补唯一索引")
         with self.assertRaises(controller.ControllerError) as ctx:
-            controller.record_fix(state, "CRITIC-002", "FIXED", "15.1", "补退避", "回归")
+            controller.record_fix(state, "CRITIC-002", "FIXED", "15.1", "补退避")
         self.assertIn("outside every --scope", str(ctx.exception))
         # Splitting the round into a second scoped dispatch widens what may be disposed of: the
         # union covers 7.2 and 15, so the fix belongs to whichever dispatch was handed it.
         controller.record_agent(
             state, "tech-refiner", "tech-refiner", "s-refine-3", "sha256:in", "COMPLETED", "15"
         )
-        controller.record_fix(state, "CRITIC-002", "FIXED", "15.1", "补退避", "回归")
+        controller.record_fix(state, "CRITIC-002", "FIXED", "15.1", "补退避")
         # A location no heading resolves to stays disposable: the guard must not invent a scope.
         controller.record_finding(
             state, "CRITIC", "CRITIC-003", "Medium", "未编号的段落", "证据", None, 0
         )
-        controller.record_fix(state, "CRITIC-003", "REJECTED", "未编号的段落", "不改", "接口契约证据")
+        controller.record_fix(state, "CRITIC-003", "REJECTED", "未编号的段落", "不改")
 
     def test_a_scope_window_is_the_round_it_was_declared_in(self) -> None:
         state = Path(controller.init_run(self.repo, self.feature, "run-58"))
@@ -1117,18 +1117,18 @@ class TechDocControllerTests(unittest.TestCase):
         # Round 1 was handed 7.2; that does not license editing it two rounds later without
         # re-reading it, which is how a fix lands on text the role no longer has.
         with self.assertRaises(controller.ControllerError) as ctx:
-            controller.record_fix(state, "REVIEW-1-001", "FIXED", "7.2", "沿用上一轮的认知", "无")
+            controller.record_fix(state, "REVIEW-1-001", "FIXED", "7.2", "沿用上一轮的认知")
         self.assertIn("outside every --scope", str(ctx.exception))
         # The bypass this closes: naming an in-scope section while the finding itself sits
         # outside is still a disposition written without ever reading the original text.
         with self.assertRaises(controller.ControllerError) as ctx:
-            controller.record_fix(state, "REVIEW-1-001", "FIXED", "15.2", "范围内顺手改", "回归")
+            controller.record_fix(state, "REVIEW-1-001", "FIXED", "15.2", "范围内顺手改")
         self.assertIn("finding location", str(ctx.exception))
         # Widening the round with a scoped dispatch for 7.2 makes the same fix legal.
         controller.record_agent(
             state, "tech-refiner", "tech-refiner", "s-refine-3", "sha256:in", "COMPLETED", "7.2"
         )
-        controller.record_fix(state, "REVIEW-1-001", "FIXED", "15.2", "本轮范围内改", "回归")
+        controller.record_fix(state, "REVIEW-1-001", "FIXED", "15.2", "本轮范围内改")
 
     def test_render_ledger_leaves_the_index_fresh(self) -> None:
         state = Path(controller.init_run(self.repo, self.feature, "run-57"))
@@ -1168,8 +1168,7 @@ class TechDocControllerTests(unittest.TestCase):
         self.record(state, "tech-refiner", f"s-refine-{round_}")
         self.artifact(state, "refiner-map", f"第 {round_} 轮处置映射已记录。\n")
         controller.record_fix(
-            state, f"REVIEW-{round_}-001", "FIXED", "12", "补分维度面板", "复检大盘截图"
-        )
+            state, f"REVIEW-{round_}-001", "FIXED", "12", "补分维度面板")
         return controller.start_stage(state, "REVIEW", next_scope)
 
     def after_quiet_rounds(
@@ -1288,8 +1287,8 @@ class TechDocControllerTests(unittest.TestCase):
         state, opened = self.after_quiet_rounds("run-79")
         tdd = self.feature / "technical-doc.md"
         text = tdd.read_text(encoding="utf-8")
-        start = text.index("## 15. 风险登记与工作量评估")
-        end = text.index("## AI审查闭环记录")
+        start = text.index("## 15. 里程碑规划")
+        end = text.index("## 16. 审查闭环记录")
         tdd.write_text(text[:start] + text[end:], encoding="utf-8")
         self.assertIn("12", opened["sections"])
         self.approve_round(state, "s-review-3")
@@ -1313,7 +1312,7 @@ class TechDocControllerTests(unittest.TestCase):
         )
         # FIXED claims a text change: after a verdict that still needs its own round.
         with self.assertRaises(controller.ControllerError) as ctx:
-            controller.record_fix(state, "REVIEW-5-001", "FIXED", "12", "补面板", "截图")
+            controller.record_fix(state, "REVIEW-5-001", "FIXED", "12", "补面板")
         self.assertIn("Refiner round", str(ctx.exception))
         # Delivery is refused while the ledger is unfinished — and it says which finding.
         with self.assertRaises(controller.ControllerError) as ctx:
@@ -1321,21 +1320,20 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertIn("REVIEW-5-001", str(ctx.exception))
         # Older rounds keep the Refiner-only rule; the exception is scoped to this round.
         with self.assertRaises(controller.ControllerError) as ctx:
-            controller.record_fix(state, "REVIEW-1-001", "REJECTED", "12", "重新论证", "复检")
+            controller.record_fix(state, "REVIEW-1-001", "REJECTED", "12", "重新论证")
         self.assertIn("reviewer round 1", str(ctx.exception))
         # A disposition must answer the section the finding was raised against.
         with self.assertRaises(controller.ControllerError) as ctx:
-            controller.record_fix(state, "REVIEW-5-001", "REJECTED", "13", "不改", "证据")
+            controller.record_fix(state, "REVIEW-5-001", "REJECTED", "13", "不改")
         self.assertIn("must answer that finding", str(ctx.exception))
-        controller.record_fix(state, "REVIEW-5-001", "REJECTED", "12", "维持现状", "SRE 复核意见")
+        controller.record_fix(state, "REVIEW-5-001", "REJECTED", "12", "维持现状")
         controller.start_stage(state, "DELIVERY")
         # The window stays open from DELIVERY too, so a late non-blocking finding cannot strand it.
         controller.record_finding(
             state, "REVIEWER", "REVIEW-5-002", "Low", "13", "告警阈值未路由", None, None
         )
         controller.record_fix(
-            state, "REVIEW-5-002", "PENDING_CONFIRMATION", "13", "保留待确认", "上线前人工核对路由"
-        )
+            state, "REVIEW-5-002", "PENDING_CONFIRMATION", "13", "保留待确认")
         self.render(state)
         result = controller.gate(state, self.feature / "technical-doc.md")
         self.assertEqual(result["status"], "PASS", result["failures"])
@@ -1411,15 +1409,15 @@ class TechDocControllerTests(unittest.TestCase):
     def test_not_applicable_escape_is_not_substance_at_M(self) -> None:
         self.write_prd(PRD_ONE_SIGNAL)
         escaped = M_TDD_BODY.replace(
-            "成功率低于 99% 持续 5 分钟触发 P2 告警，路由到订单值班群。\n" + CHAPTER_FILL,
-            "不涉及，本服务暂无告警需求。",
+            "备注同步成功率、P95 同步耗时、重试次数三项指标进现有订单大盘，按服务与错误码分维度。\n" + CHAPTER_FILL,
+            "不涉及，本服务沿用基础大盘即可。",
         )
         self.assertNotEqual(escaped, M_TDD_BODY)
         _, result = self.gate_for("run-86", escaped)
         self.assertIn("scale-chapters", result["failures"])
         detail = str(next(item for item in result["checks"] if item["name"] == "scale-chapters"))
         self.assertIn("不涉及", detail)
-        self.assertIn("告警设计", detail)
+        self.assertIn("可观测设计", detail)
 
     def test_a_reasoned_not_applicable_keeps_a_conditional_chapter_legal_at_M(self) -> None:
         """The probe flags a class; the template still lets a 条件必填 chapter answer 不涉及."""

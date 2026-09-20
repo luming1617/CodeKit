@@ -40,28 +40,29 @@ class TemplateContractTests(unittest.TestCase):
 
     def test_change_history_is_the_last_chapter(self) -> None:
         """SKILL.md appends history 'at the end of the document'; the template must agree."""
-        history = TEMPLATE.index("## 变更历史")
-        self.assertGreater(history, TEMPLATE.index("# 评审检查与结论"))
+        history = TEMPLATE.index("# 变更历史")
         self.assertGreater(history, TEMPLATE.index("# 部署拓扑"))
-        self.assertGreater(history, TEMPLATE.index("# AI审查闭环记录"))
+        self.assertGreater(history, TEMPLATE.index("# 审查闭环记录"))
+        self.assertLess(history, TEMPLATE.index("# 人工评审与结论"))
 
     def test_template_no_longer_embeds_previous_version_in_a_fence(self) -> None:
         self.assertNotIn("```markdown", TEMPLATE)
         self.assertIn("历史版本索引", TEMPLATE)
         self.assertIn("archive-history", TEMPLATE)
 
-    def test_java_specific_chapters_have_an_adaptation_rule(self) -> None:
-        self.assertIn("## 技术栈适配规则", TEMPLATE)
-        self.assertRegex(TEMPLATE, r"5\. Java 详细设计")
+    def test_stack_adaptation_lives_in_the_overview_not_in_java_chapters(self) -> None:
+        """The template dropped its Java-shaped chapters; the stack decision is a 方案概述 section."""
+        self.assertIn("## 技术栈", TEMPLATE)
+        self.assertNotIn("Java 详细设计", TEMPLATE)
 
     def test_mandatory_chapters_survive_the_S_tailoring_rule(self) -> None:
         tailoring = TEMPLATE.split("## 方案裁剪规则", 1)[1].split("##", 1)[0]
-        for anchor in ("ADR", "风险", "工作量", "审查闭环"):
+        for anchor in ("ADR", "风险", "工作量", "里程碑规划", "审查闭环"):
             self.assertIn(anchor, tailoring)
 
 
 class LedgerContractTests(unittest.TestCase):
-    """Chapter 16 is generated, so the template, the anchors, and the prose must agree."""
+    """The 审查闭环记录/变更历史 ledgers are generated, so the template, anchors, and prose must agree."""
 
     def test_template_ships_the_managed_ledger_skeleton(self) -> None:
         blocks = controller._ledger_blocks(TEMPLATE.splitlines())
@@ -316,7 +317,7 @@ class ScaleContractTests(unittest.TestCase):
         self.assertIn("校准严重度", SKILL_MD)
 
     def test_the_two_tier_floor_is_stated_everywhere(self) -> None:
-        """The 条件必填 escape survived the replay: 不涉及 is a decision there, padding in §12-§14."""
+        """The 条件必填 escape survived the replay: 不涉及 is a decision there, padding in the scale-required chapters."""
         self.assertNotEqual(set(controller.SIGNAL_CHAPTERS.values()), set(controller.ALWAYS_CHAPTERS))
         for asset in (TEMPLATE, SKILL_MD, STANDARD, AGENTS["tech-architect"], AGENTS["tech-critic"]):
             self.assertIn("条件必填", asset)

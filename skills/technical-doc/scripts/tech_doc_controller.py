@@ -118,12 +118,12 @@ FORBIDDEN_FENCE_LANGUAGES = {"markdown", "md"}
 LEGACY_CONTEXT_MARKER = "technical-doc-context:"
 REQUIRED_ANCHORS = (
     "变更记录",
-    "需求到设计",
-    "关键技术决策记录",
-    "风险登记与工作量评估",
+    "影响范围",
+    "关键技术决策",
+    "里程碑规划",
     "审查闭环记录",
 )
-UPDATE_ONLY_ANCHORS = ("历史版本索引",)
+UPDATE_ONLY_ANCHORS = ("变更历史",)
 
 # --- generated ledger blocks -----------------------------------------------------------
 # The delivery tables in chapter 16 must match ``state.json`` verbatim, so the controller
@@ -138,7 +138,7 @@ LEDGER_END = "<!-- codekit:technical-doc:ledger:{section}:end -->"
 LEDGER_ANCHOR = {
     "findings": "审查闭环记录",
     "run-metadata": "审查闭环记录",
-    "history-index": "历史版本索引",
+    "history-index": "变更历史",
 }
 # Render order inside one anchor section.
 LEDGER_ORDER = ("findings", "run-metadata", "history-index")
@@ -163,8 +163,8 @@ SECTION_SNAPSHOT = "review-sections-r{round}.json"
 
 # --- delivery scale and greenfield ------------------------------------------------------
 # The template already labels chapters 条件必填 and "M/L 必填", but nothing decided which
-# label applied, so a greenfield prototype-only run wrote §12 监控大盘, §13 告警 and §14 部署
-# topology at full length and every later round read them back.  The probe decides the label
+# label applied, so a greenfield prototype-only run wrote the full 可观测设计 and L-only
+# 部署拓扑 at full length and every later round read them back.  The probe decides the label
 # from the frozen PRD and the repository, not from a self-report.
 SCALE_ENFORCEMENTS = ("enforce", "record-only")
 SCALES = ("S", "M", "L")
@@ -185,15 +185,15 @@ SIGNAL_CHAPTERS = {
     "api": "接口与契约设计",
     "message": "消息设计",
     "scheduled": "定时任务设计",
-    "config": "配置与依赖设计",
+    "config": "环境配置设计",
 }
-# The template's S row already demands 基础监控与告警; 部署拓扑 joins at M.
-ALWAYS_CHAPTERS = ("监控大盘设计", "告警设计")
+# The template's S row already demands 基础监控与告警 (merged into 可观测设计); 部署拓扑 only joins at L.
+ALWAYS_CHAPTERS = ("可观测设计",)
 DEPLOYMENT_CHAPTER = "部署拓扑"
-# The template's escape hatch ("填'不涉及'及原因, see 技术栈适配规则) is legal wherever the
+# The template's escape hatch ("填'不涉及'及原因", the 条件必填 labels it carries) is legal wherever the
 # template itself leaves the chapter conditional: a signal-derived chapter may say 不涉及 with an
-# argument at M/L.  The 最低要求 rows of the 裁剪规则 table name no such escape for the dashboard,
-# the alerts and the deployment topology, so at M/L those open with 不涉及 or a stub are reported --
+# argument at M/L.  The 最低要求 rows of the 裁剪规则 table name no such escape for the observability
+# chapter at M/L or for the deployment topology at L, so those open with 不涉及 or a stub are reported --
 # this is the "变快不等于变薄" guard the wave's acceptance criteria demand.
 NOT_APPLICABLE = "不涉及"
 NOT_APPLICABLE_WINDOW = 300
@@ -817,7 +817,7 @@ def _scale_requirements(state: dict[str, Any]) -> dict[str, str]:
     probe = state.get("scale") or {}
     scale = probe.get("scale") or "M"
     wanted = {chapter: "S 级最低要求" for chapter in ALWAYS_CHAPTERS}
-    if scale != "S":
+    if scale == "L":
         wanted[DEPLOYMENT_CHAPTER] = f"{scale} 级最低要求"
     for signal in probe.get("signals") or {}:
         chapter = SIGNAL_CHAPTERS.get(signal)
@@ -1325,7 +1325,6 @@ def record_fix(
     status: str,
     location: str,
     change: str,
-    verification: str,
 ) -> dict[str, Any]:
     """Map one Finding to a disposition; the Refiner may not silently drop findings.
 
@@ -1343,7 +1342,7 @@ def record_fix(
     finding = next((item for item in state["findings"] if item["id"] == finding_id), None)
     if finding is None:
         raise ControllerError(f"unknown finding id: {finding_id} (record the finding first)")
-    for label, value in (("location", location), ("change", change), ("verification", verification)):
+    for label, value in (("location", location), ("change", change)):
         if not value.strip():
             raise ControllerError(f"{label} is required")
     stage = state["stage"]
@@ -1384,7 +1383,6 @@ def record_fix(
         "status": status,
         "location": location,
         "change": change,
-        "verification": verification,
         "recorded_at": _now(),
     }
     existing = next((item for item in state["fixes"] if item["finding_id"] == finding_id), None)
@@ -1607,25 +1605,24 @@ def _anchor_index(lines: list[str], needle: str) -> int | None:
 def _findings_ledger_body(state: dict[str, Any]) -> list[str]:
     fixes = {item["finding_id"]: item for item in state["fixes"]}
     rows = [
-        "| Finding ID | 来源 | 轮次 | 严重度 | 位置 | 处置 | 验证方式 | 状态 |",
-        "|---|---|---|---|---|---|---|---|",
+        "| Finding ID | 来源 | 轮次 | 严重度 | 位置 | 处置 | 状态 |",
+        "|---|---|---|---|---|---|---|",
     ]
     for finding in sorted(state["findings"], key=lambda item: (item["round"], item["id"])):
         fix = fixes.get(finding["id"])
         rows.append(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+            "| {} | {} | {} | {} | {} | {} | {} |".format(
                 _cell(finding["id"]),
                 _cell("Critic" if finding["source"] == "CRITIC" else "Reviewer"),
                 _cell(finding["round"]),
                 _cell(finding["severity"]),
                 _cell(finding["location"]),
                 _cell(fix["change"] if fix else "—"),
-                _cell(fix["verification"] if fix else "—"),
                 _cell(fix["status"] if fix else finding["status"]),
             )
         )
     if len(rows) == 2:
-        rows.append("| — | 无 | — | — | — | — | — | 本轮未登记 Finding |")
+        rows.append("| — | 无 | — | — | — | — | 本轮未登记 Finding |")
     return [
         "**Finding 处置映射**（由 `tech_doc_controller.py render-ledger` 从 `state.json` 生成，"
         "请勿手改；完整证据见运行目录 `state.json`）",
@@ -2753,7 +2750,6 @@ def _fixer_commands(sub: argparse._SubParsersAction) -> None:
     fix.add_argument("--status", required=True, choices=FIX_STATUSES)
     fix.add_argument("--location", required=True)
     fix.add_argument("--change", required=True)
-    fix.add_argument("--verification", required=True)
 
     review = sub.add_parser("record-review", help="bind a verdict to the reviewed TDD snapshot")
     review.add_argument("--state", required=True)
@@ -2864,7 +2860,7 @@ def main(argv: list[str] | None = None) -> int:
                 ensure_ascii=False,
             ))
         elif args.command == "record-fix":
-            record_fix(args.state, args.finding_id, args.status, args.location, args.change, args.verification)
+            record_fix(args.state, args.finding_id, args.status, args.location, args.change)
         elif args.command == "record-review":
             print(json.dumps(
                 record_review(
