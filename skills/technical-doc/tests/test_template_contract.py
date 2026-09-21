@@ -322,6 +322,56 @@ class ScaleContractTests(unittest.TestCase):
         for asset in (TEMPLATE, SKILL_MD, STANDARD, AGENTS["tech-architect"], AGENTS["tech-critic"]):
             self.assertIn("条件必填", asset)
 
+    def test_the_structure_branch_is_one_rule_shared_by_five_assets(self) -> None:
+        """工程与模块 has two branches; probe, gate, template, SKILL and the architect say the same one.
+
+        The chapter used to be prose only: nothing decided which branch applied, so the rule
+        could live in the template while the gate checked something else, or vice versa.
+        """
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertEqual(controller.STRUCTURE_CHAPTER, "工程与模块")
+        self.assertIn('"project-structure-branch"', source)
+        for asset in (TEMPLATE, SKILL_MD, STANDARD, AGENTS["tech-architect"]):
+            self.assertIn(controller.STRUCTURE_CHAPTER, asset)
+            self.assertIn("project-structure-branch", asset)
+        # the template's pointer has to resolve to a real规范路径, not to "编程语言规范"
+        self.assertIn(".standard/", TEMPLATE)
+        self.assertIn("05-project-structure.md", TEMPLATE)
+        self.assertIn("05-project-structure.md", SKILL_MD)
+        for token in controller.STRUCTURE_SAMPLE_TOKENS:
+            self.assertIn(token, TEMPLATE)
+        self.assertIn("待初始化", TEMPLATE)
+        self.assertIn("待初始化", controller.STRUCTURE_DEFERRALS)
+
+    def test_the_module_table_columns_match_the_template_header(self) -> None:
+        """The gate demands five columns; the template is the only place that lists them."""
+        header = next(
+            line for line in TEMPLATE.splitlines()
+            if line.strip().startswith("|")
+            and all(column in line for column in controller.STRUCTURE_TABLE_COLUMNS)
+        )
+        for column in controller.STRUCTURE_TABLE_COLUMNS:
+            with self.subTest(column=column):
+                self.assertIn(column, header)
+
+    def test_the_greenfield_witnesses_are_the_ones_the_prose_names(self) -> None:
+        """A probe that counts more than the prose admits is a silent reclassification."""
+        self.assertTrue({".js", ".ts", ".mjs", ".cjs"} <= controller.BACKEND_CODE_SUFFIXES)
+        self.assertFalse({".jsx", ".tsx"} & controller.BACKEND_CODE_SUFFIXES)
+        self.assertIn("go.mod", controller.PROJECT_MANIFESTS)
+        self.assertIn("pyproject.toml", controller.PROJECT_MANIFESTS)
+        # a dependency list in an otherwise empty repo is a plan, not an implementation
+        self.assertNotIn("requirements.txt", controller.PROJECT_MANIFESTS)
+        for asset in (SKILL_MD, AGENTS["tech-context"]):
+            self.assertIn("工程清单", asset)
+        # the docs exclusion is part of the same measurement, so every reader of the verdict
+        # has to be able to see that example code under docs/ was set aside on purpose
+        self.assertEqual({"doc", "docs"}, controller.DOC_DIR_NAMES)
+        for asset in (SKILL_MD, TEMPLATE, AGENTS["tech-context"]):
+            self.assertIn("`doc/`、`docs/`", asset)
+        self.assertIn("工程结构分支", SKILL_MD)
+        self.assertIn("工程结构分支", MODULE_PATH.read_text(encoding="utf-8"))
+
     def test_the_confirmation_loop_is_enforced_and_the_template_stays_innocent(self) -> None:
         """Both delivery checks are controller code now, and the template must not mint findings.
 

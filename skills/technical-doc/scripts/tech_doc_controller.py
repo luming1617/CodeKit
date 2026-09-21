@@ -226,9 +226,47 @@ MIN_SUBSTANTIVE_CHARS = 400
 BACKEND_CODE_SUFFIXES = {
     ".py", ".java", ".go", ".kt", ".kts", ".rb", ".php", ".cs", ".scala", ".c", ".cc", ".cpp",
     ".hpp", ".rs",
+    # A Node/Swift service is an existing implementation just as much as a Java one; a repo whose
+    # only sources are such files used to read as 绿地, which sent the design down the
+    # 初始化工程结构 branch of a repository that already ships code.  .jsx/.tsx stay out on purpose
+    # -- those are UI components and do not witness a backend skeleton.
+    ".js", ".mjs", ".cjs", ".ts", ".swift", ".ex", ".dart", ".lua",
 }
+# Second witness: a build/package manifest proves the project exists even when its sources use a
+# suffix the whitelist misses.  ``requirements.txt`` is deliberately absent -- a dependency list in
+# an otherwise empty repo is a plan, not an implementation.
+PROJECT_MANIFESTS = frozenset({
+    "pyproject.toml", "setup.py", "setup.cfg", "pom.xml", "build.gradle", "build.gradle.kts",
+    "settings.gradle", "go.mod", "Cargo.toml", "composer.json", "Gemfile", "mix.exs",
+    "Package.swift", "pubspec.yaml", "project.clj", "rebar.config",
+})
+PROJECT_MANIFEST_SUFFIXES = frozenset({".csproj", ".sln", ".podspec", ".gemspec"})
+MANIFEST_REPORT_LIMIT = 8
 # A bounded listing: the probe must never become the slow thing it is measuring.
 CODE_SCAN_FILE_LIMIT = 20_000
+# Root-level documentation directories are excluded from the code witnesses.  This skill itself
+# puts PRD/TDD/RPD drafts, example snippets and demo projects under ``doc/``/``docs/``; counting
+# those made a repository that has no real implementation read as an existing one, which pushed
+# the design down the 改动模块清单 branch of a project that still has to lay out its skeleton.
+# Only a top-level segment qualifies -- ``src/docs/`` holds generated-from-code docs and
+# ``service/docs/`` is part of the service, so neither may hide a witness.
+DOC_DIR_NAMES = frozenset({"doc", "docs"})
+
+# --- the 工程与模块 branch ------------------------------------------------------------
+# The template has carried two mutually exclusive answers for this chapter for a long time --
+# initialize the project layout, or list the modules to change -- and nothing decided which one
+# applied, so the judgement was advice: a greenfield run could fill the module table with
+# placeholders and an existing-service run could hand the whole question to a later 初始化.
+# ``greenfield`` from the input probe now picks the branch and ``gate`` checks the answer.
+STRUCTURE_CHAPTER = "工程与模块"
+STRUCTURE_TREE_GLYPHS = ("├", "└", "│", "╠", "╚")
+STRUCTURE_MIN_TREE_LINES = 3
+# The template's own sample layout; verbatim sample text in a delivered document means the
+# chapter was copied, not decided.
+STRUCTURE_SAMPLE_TOKENS = ("my-project", "my_project")
+STRUCTURE_TABLE_COLUMNS = ("仓库", "模块", "包路径", "职责", "变更类型")
+STRUCTURE_DEFERRALS = ("待初始化", "后续初始化", "暂不初始化", "工程初始化阶段再补")
+STRUCTURE_STANDARD_PATH = re.compile(r"\.standard/[^\s`|)）<>]+\.md")
 
 
 class ControllerError(ValueError):
@@ -566,25 +604,113 @@ def _scale_signals(prd_text: str) -> dict[str, list[str]]:
     return found
 
 
-def _backend_code_files(repo: Path) -> tuple[int, str]:
-    """Tracked or untracked backend source files, from a bounded listing."""
+def _is_project_manifest(entry: str) -> bool:
+    name = Path(entry).name
+    return name in PROJECT_MANIFESTS or Path(name).suffix.lower() in PROJECT_MANIFEST_SUFFIXES
+
+
+def _in_doc_dir(entry: str) -> bool:
+    """Whether a listed path sits under a root-level ``doc``/``docs`` directory.
+
+    ``git ls-files`` always reports forward-slash paths, so the split is on the separator the
+    listing uses rather than the host's.
+    """
+    first, _, rest = entry.replace("\\", "/").lstrip("/").partition("/")
+    return bool(rest) and first.lower() in DOC_DIR_NAMES
+
+
+def _code_witnesses(repo: Path) -> dict[str, Any]:
+    """What the repository's own file listing says about an existing implementation.
+
+    Both witnesses are counts over one bounded ``git ls-files`` pass, so the judgement can be
+    re-derived by the reader: sources whose suffix is backend-shaped, and build/package manifests
+    that name a project even when its sources use a suffix the whitelist misses.  Root-level
+    documentation trees are dropped before counting -- a ``docs/`` full of example code is this
+    skill's own output, not evidence the repo already has an implementation.
+    """
     try:
         listed = _git(repo, "ls-files", "--cached", "--others", "--exclude-standard")
     except ControllerError as exc:
-        return -1, f"git ls-files unavailable: {exc}"
-    files = [line for line in listed.splitlines() if line.strip()][:CODE_SCAN_FILE_LIMIT]
-    count = sum(1 for line in files if Path(line).suffix.lower() in BACKEND_CODE_SUFFIXES)
-    note = "complete" if len(files) < CODE_SCAN_FILE_LIMIT else f"truncated at {CODE_SCAN_FILE_LIMIT} entries"
-    return count, note
+        return {
+            "backend_code_files": -1,
+            "project_manifests": [],
+            "project_manifest_count": 0,
+            "scanned_entries": 0,
+            "doc_excluded_code_files": 0,
+            "doc_excluded_manifests": 0,
+            "code_scan": f"git ls-files unavailable: {exc}",
+        }
+    listed_entries = [line.strip() for line in listed.splitlines() if line.strip()]
+    excluded = [item for item in listed_entries if _in_doc_dir(item)]
+    entries = [item for item in listed_entries if not _in_doc_dir(item)]
+    scanned = entries[:CODE_SCAN_FILE_LIMIT]
+    code_files = sum(1 for item in scanned if Path(item).suffix.lower() in BACKEND_CODE_SUFFIXES)
+    manifests = sorted({item for item in scanned if _is_project_manifest(item)})
+    note = (
+        "complete"
+        if len(entries) <= CODE_SCAN_FILE_LIMIT
+        else f"truncated at {CODE_SCAN_FILE_LIMIT} of {len(entries)} entries"
+    )
+    return {
+        "backend_code_files": code_files,
+        "project_manifests": manifests[:MANIFEST_REPORT_LIMIT],
+        "project_manifest_count": len(manifests),
+        "scanned_entries": len(scanned),
+        "doc_excluded_code_files": sum(
+            1 for item in excluded if Path(item).suffix.lower() in BACKEND_CODE_SUFFIXES
+        ),
+        "doc_excluded_manifests": len({item for item in excluded if _is_project_manifest(item)}),
+        "code_scan": note,
+    }
+
+
+def _greenfield_basis(probe: dict[str, Any]) -> str:
+    """Restate a greenfield verdict as the numbers that produced it.
+
+    The probe is a measurement over a file listing, so the listing is what a reader -- or a
+    Reviewer who disagrees -- has to be able to see without rerunning ``git ls-files``.
+    """
+    if not probe:
+        return "未判定"
+    code_files = probe.get("backend_code_files")
+    if code_files == -1:
+        return f"未能枚举仓库文件（{probe.get('code_scan')}）"
+    manifests = probe.get("project_manifests") or []
+    evidence = probe.get("system_evidence_read") or []
+    parts = [f"代码文件 {code_files} 个"]
+    if manifests:
+        parts.append(
+            f"工程清单 {probe.get('project_manifest_count', len(manifests))} 份："
+            + "、".join(f"`{item}`" for item in manifests[:3])
+        )
+    else:
+        parts.append("无工程清单")
+    parts.append(f"既有实现证据 {len(evidence)} 项")
+    doc_code = probe.get("doc_excluded_code_files") or 0
+    doc_manifests = probe.get("doc_excluded_manifests") or 0
+    if doc_code or doc_manifests:
+        # reported only when the excluded tree actually held would-be witnesses, so a reader can
+        # see both what counted and what the docs exclusion set aside
+        hidden = []
+        if doc_code:
+            hidden.append(f"代码 {doc_code} 个")
+        if doc_manifests:
+            hidden.append(f"清单 {doc_manifests} 份")
+        parts.append("文档目录另有" + "、".join(hidden) + "，不计入")
+    basis = "、".join(parts)
+    if probe.get("code_scan") and probe["code_scan"] != "complete":
+        basis += f"；文件枚举 {probe['code_scan']}"
+    return ("绿地：" if probe.get("greenfield") else "既有实现：") + basis
 
 
 def _probe_scale(state: dict[str, Any]) -> dict[str, Any]:
     """Decide S/M/L and greenfield from measured inputs, once, at the input gate.
 
-    Everything downstream keys off this record: which chapters ``gate`` demands, whether the
-    Context Loader hunts for existing implementations at all, and what the run-metadata ledger
-    tells the reader.  It is a measurement, not a declaration -- the only inputs are the frozen
-    PRD bytes, the sources already verified against the filesystem, and ``git ls-files``.
+    Everything downstream keys off this record: which chapters ``gate`` demands, which branch of
+    工程与模块 the document has to answer, whether the Context Loader hunts for existing
+    implementations at all, and what the run-metadata ledger tells the reader.  It is a
+    measurement, not a declaration -- the only inputs are the frozen PRD bytes, the sources
+    already verified against the filesystem, and ``git ls-files``.
     """
     prd = Path(state["materials"]["product_requirements"]["locator"])
     prd_text = _read_document(prd, "PRD")
@@ -604,20 +730,26 @@ def _probe_scale(state: dict[str, Any]) -> dict[str, Any]:
         scale = "M"
     else:
         scale = "L"
-    code_files, scan = _backend_code_files(_require_repo_root(state["repository"]["root"]))
+    witnesses = _code_witnesses(_require_repo_root(state["repository"]["root"]))
+    code_files = witnesses["backend_code_files"]
     evidence_read = [
         item["source_id"]
         for item in state["sources"]
         if item["kind"] in {"SYSTEM_EVIDENCE", "EXISTING_TDD"} and item["read_status"] == "READ"
     ]
-    greenfield = code_files == 0 and not evidence_read
+    greenfield = code_files == 0 and not witnesses["project_manifests"] and not evidence_read
     return {
         "scale": scale,
         "signals": signals,
         "signal_count": count,
         "greenfield": greenfield,
         "backend_code_files": code_files,
-        "code_scan": scan,
+        "project_manifests": witnesses["project_manifests"],
+        "project_manifest_count": witnesses["project_manifest_count"],
+        "scanned_entries": witnesses["scanned_entries"],
+        "doc_excluded_code_files": witnesses["doc_excluded_code_files"],
+        "doc_excluded_manifests": witnesses["doc_excluded_manifests"],
+        "code_scan": witnesses["code_scan"],
         "system_evidence_read": evidence_read,
         "existing_tdd": state["mode"] == "UPDATE",
         "prd_chars": len(prd_text),
@@ -674,6 +806,7 @@ def finalize_inputs(
         "scale": {
             "scale": probe["scale"],
             "greenfield": probe["greenfield"],
+            "basis": _greenfield_basis(probe),
             "signals": sorted(probe["signals"]),
             "enforcement": probe["enforcement"],
         },
@@ -913,6 +1046,103 @@ def _scale_chapter_check(
     if missing or thin:
         return False, "; ".join(missing + thin)
     return True, f"scale={scale}，{len(wanted)} 个规模相关章节齐备且有实质内容"
+
+
+def _structure_tree_lines(body: str) -> list[str]:
+    """Lines that read as a directory entry, inside a fence or as a plain list."""
+    found: list[str] = []
+    for line in body.splitlines():
+        text = line.strip().strip("`").strip()
+        if not text:
+            continue
+        if any(glyph in line for glyph in STRUCTURE_TREE_GLYPHS):
+            found.append(text)
+        elif text.endswith("/") and len(text.rstrip("/")) > 1:
+            found.append(text)
+    return found
+
+
+def _structure_table_problems(body: str) -> list[str]:
+    """The 改动模块清单 branch: a table that actually names modules."""
+    rows = [line.strip() for line in body.splitlines() if line.strip().startswith("|")]
+    header = next((row for row in rows if all(col in row for col in STRUCTURE_TABLE_COLUMNS)), None)
+    if header is None:
+        return [
+            f"没有 {STRUCTURE_CHAPTER} 模块表（表头须含 {'、'.join(STRUCTURE_TABLE_COLUMNS)}）"
+        ]
+    data = [row for row in rows if row != header and set(row) - set("|-: ")]
+    if not data:
+        return [f"{STRUCTURE_CHAPTER} 模块表只有表头，没有一行模块"]
+    problems: list[str] = []
+    blank = next((row for row in data if any(not cell.strip() for cell in row.strip("|").split("|"))), None)
+    if blank:
+        problems.append(f"模块表有空格子：{blank[:60]}")
+    half = next((row for row in data if PLACEHOLDER.search(row)), None)
+    if half:
+        problems.append(f"模块表仍留有占位内容：{half[:60]}")
+    return problems
+
+
+def _repo_has_standard(state: dict[str, Any]) -> bool:
+    """Whether the repository carries the规范 tree the template's pointer points at."""
+    try:
+        root = _require_repo_root(state["repository"]["root"])
+    except ControllerError:
+        return False
+    return (root / ".standard").is_dir()
+
+
+def _project_structure_check(
+    path: Path, state: dict[str, Any], tdd: Path, doc_text: str
+) -> tuple[bool, Any]:
+    """Give 工程与模块's two branches a decision procedure.
+
+    The chapter has exactly one legal answer per repository: a repo whose only content is its
+    documents is a new project and must have its layout decided here, while a repo that already
+    ships code must say which modules move.  The template stated both branches as prose and
+    nothing checked the choice, so the branch that got written depended on who typed first.
+    ``greenfield`` from the input probe picks it now, and every verdict quotes the listing it was
+    measured from, so a reader can disagree with the classification instead of the check.
+    """
+    if (state.get("scale_enforcement") or SCALE_ENFORCEMENTS[0]) != "enforce":
+        return True, "规模探针仅记录，未核对工程与模块分支"
+    probe = state.get("scale") or {}
+    if not probe:
+        return True, "scale 探针未运行（finalize-inputs 之前的门禁）"
+    try:
+        index = _fresh_index(path, state, tdd)
+    except ControllerError as exc:
+        return False, f"文档索引不可用，无法核对工程与模块分支：{exc}"
+    section = next(
+        (item for item in index["sections"] if item["title"].startswith(STRUCTURE_CHAPTER)), None
+    )
+    if section is None:
+        return False, f"缺少 {STRUCTURE_CHAPTER} 章节（探针：{_greenfield_basis(probe)}）"
+    body = "\n".join(doc_text.splitlines()[section["start"]: section["end"]])
+    problems: list[str] = []
+    if probe["greenfield"]:
+        tree = _structure_tree_lines(body)
+        if len(tree) < STRUCTURE_MIN_TREE_LINES:
+            problems.append(
+                f"绿地仓库的 {STRUCTURE_CHAPTER} 没有工程结构方案（识别到 {len(tree)} 行目录条目，"
+                f"至少 {STRUCTURE_MIN_TREE_LINES} 行）"
+            )
+        copied = [token for token in STRUCTURE_SAMPLE_TOKENS if token in body]
+        if copied:
+            problems.append(f"结构方案照抄模板示例（{'、'.join(copied)}），没有按本项目决定")
+        if _repo_has_standard(state) and not STRUCTURE_STANDARD_PATH.search(body):
+            problems.append("未点名所依据的工程结构规范文件（形如 `.standard/02-stack/<语言>/05-project-structure.md`）")
+    else:
+        deferred = [token for token in STRUCTURE_DEFERRALS if token in body]
+        if deferred:
+            problems.append(
+                f"既有实现把模块信息推给“{deferred[0]}”"
+            )
+        problems.extend(_structure_table_problems(body))
+    if problems:
+        return False, "；".join(problems) + f"（探针：{_greenfield_basis(probe)}）"
+    branch = "初始化工程结构" if probe["greenfield"] else "改动模块清单"
+    return True, f"{STRUCTURE_CHAPTER} 按{branch}分支填写（{_greenfield_basis(probe)}）"
 
 
 def start_stage(state_path: str | Path, target_stage: str, review_scope: str | None = None) -> dict[str, Any]:
@@ -2483,8 +2713,13 @@ def _run_metadata_body(state: dict[str, Any], doc_text: str, run_dir: str) -> li
         scale_cell = "{} 级（{}；{}）".format(
             probe["scale"], signals, "绿地仓库" if probe["greenfield"] else "既有实现"
         )
+        structure_cell = "{}：{}".format(
+            "初始化工程结构" if probe["greenfield"] else "改动模块清单",
+            _greenfield_basis(probe),
+        )
     else:
         scale_cell = "尚未判定"
+        structure_cell = "探针未运行"
     scopes = "、".join(
         f"r{item['round']} {item.get('scope') or 'full'}" for item in state["reviews"]
     ) or "尚无终审"
@@ -2497,6 +2732,7 @@ def _run_metadata_body(state: dict[str, Any], doc_text: str, run_dir: str) -> li
         f"| 独立终审结论 | {_cell(verdict)} |",
         f"| 终审范围 | {_cell(scopes)} |",
         f"| 规模判定 | {_cell(scale_cell)} |",
+        f"| 工程结构分支 | {_cell(structure_cell)} |",
         f"| 交付门禁 | {_cell(gate_summary)} |",
         "| Finding 合计 | {}（Blocker {} / High {} / Medium {} / Low {}；must_fix 未闭环 {}） |".format(
             len(state["findings"]),
@@ -3403,6 +3639,8 @@ def gate(state_path: str | Path, tdd_file: str | Path) -> dict[str, Any]:
         add("ledger-matches-state", not stale, stale or "chapter 16 mirrors state.json")
         ok, detail = _scale_chapter_check(path, state, tdd, doc_text)
         add("scale-chapters", ok, detail)
+        ok, detail = _project_structure_check(path, state, tdd, doc_text)
+        add("project-structure-branch", ok, detail)
         if state["reviews"]:
             ok, detail = _incremental_coverage(path, state, tdd)
             add("incremental-review-covers-changes", ok, detail)
@@ -3424,11 +3662,18 @@ def gate(state_path: str | Path, tdd_file: str | Path) -> dict[str, Any]:
         # Both are read-only here on purpose: they tell the caller why the next round is scoped
         # and which chapters the scale probe will demand, without either becoming a gate failure.
         "review_stop": _severity_stop(state),
-        "scale": {
-            key: value
-            for key, value in (state.get("scale") or {}).items()
-            if key in {"scale", "signals", "greenfield", "enforcement"}
-        } or None,
+        "scale": (
+            {
+                **{
+                    key: value
+                    for key, value in probe.items()
+                    if key in {"scale", "signals", "greenfield", "enforcement"}
+                },
+                "basis": _greenfield_basis(probe),
+            }
+            if (probe := state.get("scale"))
+            else None
+        ),
         "passed": [item["name"] for item in checks if item["ok"]],
         "failures": [item["name"] for item in failures],
         "checks": checks,
@@ -3496,6 +3741,7 @@ def show(state_path: str | Path) -> dict[str, Any]:
         "review_stop": _severity_stop(state),
         "scale": (
             {key: probe[key] for key in ("scale", "signal_count", "greenfield", "enforcement")}
+            | {"basis": _greenfield_basis(probe)}
             if probe
             else None
         ),

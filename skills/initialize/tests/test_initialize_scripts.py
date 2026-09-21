@@ -482,6 +482,111 @@ class ManagedBlockTests(unittest.TestCase):
                 prepare.parse_languages("python,python", Path(directory))
 
 
+class LanguageDetectionTests(unittest.TestCase):
+    """语言识别必须是测量结果，并且测不出来时停在任何写入之前。
+
+    ``standard/02-stack`` 只有 java、python、go、cpp 四套模板，早期实现在什么都没测到时
+    静默回落成 java，于是文档型仓库会被写进一套和本项目无关的规范，还会一路带进
+    AGENTS.md 索引与后续 subagent。现在改成报错停下，由主 Agent 问人。
+    """
+
+    def parse(self, root: Path, raw: str | None = None):
+        return prepare.parse_languages(raw, root)
+
+    def test_an_explicit_language_is_recorded_as_the_user_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            languages, source, basis = self.parse(Path(directory), "python,go")
+        self.assertEqual(["python", "go"], languages)
+        self.assertEqual("explicit", source)
+        self.assertIn("用户指定", basis)
+
+    def test_detection_names_the_manifests_and_sources_it_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # 清单在子目录（多模块仓库）也算证据，早期只看根目录
+            (root / "services" / "order").mkdir(parents=True)
+            (root / "services" / "order" / "pom.xml").write_text("<project/>\n", encoding="utf-8")
+            (root / "src" / "main" / "java").mkdir(parents=True)
+            (root / "src" / "main" / "java" / "Order.java").write_text("class Order {}\n", encoding="utf-8")
+            languages, source, basis = self.parse(root)
+        self.assertEqual(["java"], languages)
+        self.assertEqual("detected", source)
+        self.assertIn("services/order/pom.xml", basis)
+        self.assertIn("源码 1 个", basis)
+
+    def test_example_code_under_the_docs_tree_does_not_pick_a_language(self) -> None:
+        """``docs/`` 里的示例片段是这套技能自己的产物，不是本项目已经选定的语言。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs" / "examples").mkdir(parents=True)
+            (root / "docs" / "examples" / "demo.py").write_text("print(1)\n", encoding="utf-8")
+            (root / "docs" / "examples" / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+            with self.assertRaises(prepare.PrepareError) as refused:
+                self.parse(root)
+            message = str(refused.exception)
+            self.assertIn("无法识别仓库的编程语言", message)
+            self.assertIn("按文档排除", message)
+            self.assertNotIn("--language java\n", message)
+
+    def test_a_repo_of_unsupported_sources_says_so_before_asking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "web").mkdir()
+            for name in ("app.ts", "server.ts", "legacy.js"):
+                (root / "web" / name).write_text("export const x = 1;\n", encoding="utf-8")
+            with self.assertRaises(prepare.PrepareError) as refused:
+                self.parse(root)
+            message = str(refused.exception)
+        self.assertIn("仓库里只找到非支持语言源码（ts 2 个、js 1 个）", message)
+        self.assertIn("当前只支持 4 种语言：java、python、go、cpp", message)
+        self.assertIn("必须由主 Agent 停下来向用户确认", message)
+        self.assertIn("--language", message)
+
+    def test_stray_cpp_sources_are_not_a_cpp_project_without_a_build_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "jni").mkdir()
+            (root / "jni" / "bridge.cpp").write_text("int main(){}\n", encoding="utf-8")
+            with self.assertRaises(prepare.PrepareError) as refused:
+                self.parse(root)
+            self.assertIn("未计为 cpp 工程", str(refused.exception))
+            (root / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8")
+            languages, _, basis = self.parse(root)
+        self.assertEqual(["cpp"], languages)
+        self.assertIn("CMakeLists.txt", basis)
+
+    def test_the_docs_exclusion_and_the_refusal_are_still_in_the_prose(self) -> None:
+        """SKILL.md must describe the tri-state the code implements, not the old two-state one.
+
+        「检测不到时使用 java」 was once true; left in the prose it is an instruction the main
+        agent follows by pre-filling --language and the refusal never runs.
+        """
+        skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        report = (SKILL_DIR / "references" / "final-report.md").read_text(encoding="utf-8")
+        self.assertNotIn("检测不到时使用", skill)
+        for text in (skill, report):
+            self.assertIn("language_source", text)
+            self.assertIn("language_basis", text)
+        self.assertIn("不存在默认语言", skill)
+        self.assertIn("非支持语言源码", skill)
+        self.assertIn("恰好这四个选项（`java`、`python`、`go`、`cpp`", skill.replace("**", ""))
+        # 文档目录口径与 technical-doc 的 greenfield 探针保持一致
+        self.assertEqual({"doc", "docs"}, prepare.DOC_DIR_NAMES)
+        self.assertIn("跳过根下的 `doc`/`docs`", skill)
+
+    def test_recognition_failure_happens_before_the_repository_is_touched(self) -> None:
+        """The whole point of refusing is that nothing was written yet."""
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            (root / "README.md").write_text("# 只有文档\n", encoding="utf-8")
+            with self.assertRaises(prepare.PrepareError):
+                prepare.main(["--root", str(root), "--no-git-hooks"], emit=False)
+            self.assertFalse((root / ".standard").exists())
+            self.assertFalse((root / ".codekit").exists())
+            self.assertEqual([], list(root.glob("AGENTS.md")))
+
+
 class GraphifyCapabilityTests(unittest.TestCase):
     def test_graphify_capabilities_detect_flags_and_ast_process_pool(self):
         with tempfile.TemporaryDirectory() as directory:

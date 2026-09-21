@@ -7,7 +7,7 @@
 只能通过 `scripts/controller.py start` 启动。任何写入前完成并记录：
 
 1. `git rev-parse --show-toplevel` 的绝对仓库根。
-2. 已规范化的语言集合与 `--embeddings`、`--force`、`--allow-partial`、`--allow-global-writes`、`--strict-tools`、`--commit`、`--no-git-hooks`（冻结为 `options.graph_git_hooks`，默认 `true`）。
+2. 已规范化的语言集合，连同它的来源（`language_source`：`explicit` 来自 `--language`，`detected` 来自仓库实测）与实测依据原文（`language_basis`）；两者都拿不到时 `start` 在第 1 项之后、任何写入之前就报错退出，manifest 与锁都不会创建。其余参数为 `--embeddings`、`--force`、`--allow-partial`、`--allow-global-writes`、`--strict-tools`、`--commit`、`--no-git-hooks`（冻结为 `options.graph_git_hooks`，默认 `true`）。
 3. `HEAD` SHA、branch，以及 staged、unstaged、untracked 的 NUL-safe 状态快照。
 4. 所有可能托管文件的存在性、内容摘要和运行前 dirty 状态。
 5. 本地 GitNexus runner、全局 GitNexus、Graphify Agent Skill/CLI 的版本和 help 能力。

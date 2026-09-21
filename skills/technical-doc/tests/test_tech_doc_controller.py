@@ -51,6 +51,17 @@ sequenceDiagram
     order-->>kafka: 备注变更
 ```
 
+## 9. 工程与模块
+仓库除本目录文档外没有代码，按新建工程初始化：
+
+```
+order-note-sync/
+├── src/main/java/com/example/ordernote/api/
+├── src/main/java/com/example/ordernote/service/
+├── src/main/java/com/example/ordernote/repository/
+└── src/test/java/com/example/ordernote/
+```
+
 ## 12. 可观测设计
 备注同步成功率、P95 同步耗时、重试次数三项指标进现有订单大盘，按服务与错误码分维度。
 
@@ -1399,6 +1410,67 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertFalse(with_code["greenfield"])
         self.assertEqual(with_code["backend_code_files"], 1)
 
+    def test_a_build_manifest_alone_means_the_repo_is_not_greenfield(self) -> None:
+        """A service written in a language the suffix list misses still ships code."""
+        (self.repo / "go.mod").write_text("module example.invalid/note\n", encoding="utf-8")
+        probe = self.probe("run-82b", PRD)
+        self.assertFalse(probe["greenfield"], probe["code_scan"])
+        self.assertEqual(probe["backend_code_files"], 0)
+        self.assertEqual(probe["project_manifests"], ["go.mod"])
+        self.assertIn("go.mod", probe["reported"]["basis"])
+
+    def test_a_node_or_swift_service_counts_as_an_existing_implementation(self) -> None:
+        (self.repo / "server.ts").write_text("export const handler = 1;\n", encoding="utf-8")
+        (self.repo / "AppDelegate.swift").write_text("import UIKit\n", encoding="utf-8")
+        probe = self.probe("run-82c", PRD)
+        self.assertFalse(probe["greenfield"])
+        self.assertEqual(probe["backend_code_files"], 2)
+
+    def test_example_code_under_the_docs_tree_is_not_an_implementation(self) -> None:
+        """Sample snippets travel with the PRD and TDD, and they must not decide the branch.
+
+        A docs directory full of example code reads as a repo that already has a skeleton, which
+        sends a greenfield run to the 改动模块清单 branch of a layout nobody has chosen yet.
+        """
+        for name in ("demo.py", "DemoService.java"):
+            (self.feature / name).write_text("print('示例')\n", encoding="utf-8")
+        (self.feature / "go.mod").write_text("module example.invalid/demo\n", encoding="utf-8")
+        probe = self.probe("run-82e", PRD)
+        self.assertTrue(probe["greenfield"], probe["code_scan"])
+        self.assertEqual(probe["backend_code_files"], 0)
+        self.assertEqual(probe["project_manifests"], [])
+        self.assertEqual(probe["doc_excluded_code_files"], 2)
+        self.assertEqual(probe["doc_excluded_manifests"], 1)
+
+        (self.repo / "src" / "main.py").parent.mkdir(parents=True)
+        (self.repo / "src" / "main.py").write_text("print('service')\n", encoding="utf-8")
+        with_code = self.probe("run-82f", PRD)
+        self.assertFalse(with_code["greenfield"])
+        self.assertEqual(with_code["backend_code_files"], 1)
+        # the excluded witnesses show up whenever they exist, so a reader sees what the
+        # exclusion hid even on the branch where it did not change the verdict
+        self.assertIn("文档目录另有代码 2 个、清单 1 份", probe["reported"]["basis"])
+        self.assertIn("文档目录另有代码 2 个、清单 1 份", with_code["reported"]["basis"])
+        self.assertFalse(with_code["greenfield"])
+        self.assertEqual(with_code["doc_excluded_code_files"], 2)
+
+    def test_a_nested_docs_directory_still_witnesses_the_service_below_it(self) -> None:
+        """Only the root-level documentation tree is excluded; ``src/docs`` is generated-from-code."""
+        nested = self.repo / "src" / "docs"
+        nested.mkdir(parents=True)
+        (nested / "client.go").write_text("package client\n", encoding="utf-8")
+        probe = self.probe("run-82g", PRD)
+        self.assertFalse(probe["greenfield"])
+        self.assertEqual(probe["backend_code_files"], 1)
+
+    def test_the_greenfield_verdict_reports_the_listing_it_came_from(self) -> None:
+        """A classification nobody can re-derive is a declaration, so the numbers ship with it."""
+        probe = self.probe("run-82d", PRD)
+        self.assertTrue(probe["greenfield"])
+        self.assertEqual(
+            probe["reported"]["basis"], "绿地：代码文件 0 个、无工程清单、既有实现证据 0 项"
+        )
+
     def test_scale_probe_refuses_a_prd_that_drifted_after_init(self) -> None:
         """Designing against bytes the run never froze is exactly what the probe exists to stop."""
         state = Path(controller.init_run(self.repo, self.feature, "run-83b"))
@@ -1462,6 +1534,101 @@ class TechDocControllerTests(unittest.TestCase):
         detail = str(next(item for item in result["checks"] if item["name"] == "scale-chapters"))
         self.assertIn("没给原因", detail)
 
+    # ------------------------------------------------ 工程与模块: the branch the probe picks
+
+    def structure_doc(self, chapter: str) -> str:
+        """``TDD_BODY`` with its 工程与模块 chapter swapped for ``chapter``."""
+        start = TDD_BODY.index("## 9. 工程与模块")
+        end = TDD_BODY.index("## 12. 可观测设计")
+        return TDD_BODY[:start] + chapter + TDD_BODY[end:]
+
+    def structure_check(self, result: dict[str, Any]) -> dict[str, Any]:
+        return next(
+            item for item in result["checks"] if item["name"] == "project-structure-branch"
+        )
+
+    def reset_deliverable(self) -> None:
+        """Drop the delivered document so the next ``gate_for`` is still a NEW run."""
+        (self.feature / "technical-doc.md").unlink(missing_ok=True)
+
+    def test_a_greenfield_run_must_decide_its_project_layout(self) -> None:
+        """The template's 初始化 branch is now a delivery condition, not a suggestion."""
+        deferred = "## 9. 工程与模块\n本次新建服务，工程结构在实现阶段再定。\n\n"
+        _, result = self.gate_for("run-90", self.structure_doc(deferred))
+        self.assertIn("project-structure-branch", result["failures"])
+        detail = str(self.structure_check(result)["detail"])
+        self.assertIn("没有工程结构方案", detail)
+        self.assertIn("绿地：代码文件 0 个", detail)
+
+    def test_the_templates_own_sample_tree_is_not_an_answer(self) -> None:
+        sample = (
+            "## 9. 工程与模块\n"
+            "```\nmy-project/\n├── src/\n│   └── my_project/\n└── tests/\n```\n\n"
+        )
+        _, result = self.gate_for("run-91", self.structure_doc(sample))
+        detail = str(self.structure_check(result)["detail"])
+        self.assertIn("照抄模板示例", detail)
+
+    def test_the_layout_cites_the_repositories_own_structure_standard(self) -> None:
+        """The template points at 编程语言规范; where such a file exists the chapter must name it."""
+        standard = self.repo / ".standard" / "02-stack" / "python" / "05-project-structure.md"
+        standard.parent.mkdir(parents=True)
+        standard.write_text("# 工程结构规范\n", encoding="utf-8")
+        _, unnamed = self.gate_for("run-92", TDD_BODY)
+        self.assertIn(
+            "未点名所依据的工程结构规范文件", str(self.structure_check(unnamed)["detail"])
+        )
+
+        cited = TDD_BODY.replace(
+            "仓库除本目录文档外没有代码，按新建工程初始化：",
+            "仓库除本目录文档外没有代码，按 `.standard/02-stack/python/05-project-structure.md` 初始化：",
+        )
+        self.assertNotEqual(cited, TDD_BODY)
+        self.reset_deliverable()
+        _, passed = self.gate_for("run-93", cited)
+        self.assertEqual(passed["status"], "PASS", passed["failures"])
+
+    def test_an_existing_repo_must_name_the_modules_it_changes(self) -> None:
+        (self.repo / "app.py").write_text("print('service')\n", encoding="utf-8")
+        _, result = self.gate_for("run-94", TDD_BODY)
+        self.assertIn("project-structure-branch", result["failures"])
+        self.assertIn("模块表", str(self.structure_check(result)["detail"]))
+
+        table = (
+            "## 9. 工程与模块\n"
+            "| 仓库 | 模块 | 包路径 | 职责 | 变更类型 |\n"
+            "|------|------|--------|------|----------|\n"
+            "| ordernote | 备注同步 | `com.example.ordernote.service` | 消费订单事件并写工单 | 新增 |\n\n"
+        )
+        self.reset_deliverable()
+        _, passed = self.gate_for("run-95", self.structure_doc(table))
+        self.assertEqual(passed["status"], "PASS", passed["failures"])
+        self.assertIn("改动模块清单", str(self.structure_check(passed)["detail"]))
+
+    def test_an_existing_repo_may_not_hand_the_chapter_back_to_initialization(self) -> None:
+        (self.repo / "app.py").write_text("print('service')\n", encoding="utf-8")
+        deferred = (
+            "## 9. 工程与模块\n工程结构待初始化，本次不列模块。\n"
+            "| 仓库 | 模块 | 包路径 | 职责 | 变更类型 |\n"
+            "|------|------|--------|------|----------|\n"
+            "| ordernote | 备注同步 | `com.example.ordernote.service` | 消费订单事件 | 新增 |\n\n"
+        )
+        _, result = self.gate_for("run-96", self.structure_doc(deferred))
+        detail = str(self.structure_check(result)["detail"])
+        self.assertIn("推给", detail)
+        self.assertIn("既有实现：代码文件 1 个", detail)
+
+    def test_a_missing_structure_chapter_is_reported_on_both_branches(self) -> None:
+        without = self.structure_doc("")
+        self.assertNotIn("工程与模块", without)
+        _, greenfield = self.gate_for("run-97", without)
+        self.assertIn("缺少 工程与模块 章节", str(self.structure_check(greenfield)["detail"]))
+
+        (self.repo / "app.py").write_text("print('service')\n", encoding="utf-8")
+        self.reset_deliverable()
+        _, existing = self.gate_for("run-98", without)
+        self.assertIn("缺少 工程与模块 章节", str(self.structure_check(existing)["detail"]))
+
     def test_record_only_enforcement_reports_without_blocking(self) -> None:
         self.write_prd(PRD_STRUCTURAL)
         state = Path(controller.init_run(
@@ -1481,6 +1648,7 @@ class TechDocControllerTests(unittest.TestCase):
         text = (self.feature / "technical-doc.md").read_text(encoding="utf-8")
         self.assertIn("| 规模判定 | L 级", text)
         self.assertIn("绿地仓库", text)
+        self.assertIn("| 工程结构分支 | 初始化工程结构：绿地：代码文件 0 个", text)
         self.assertIn("r1 full", text)
 
     def test_cli_carries_the_rollback_switches(self) -> None:

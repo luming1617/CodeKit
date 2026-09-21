@@ -288,9 +288,17 @@ flowchart TD
 # 详细设计
 
 ## 工程与模块
-> 如果是一个空的仓库，要按照编程语言规范给定的项目结构进行初始化。
 
-示例：
+本章只有两条分支，走哪条不由撰写者自选：`finalize-inputs` 的规模探针按 `git ls-files` 实测给出
+`greenfield`（跳过仓库根下的 `doc/`、`docs/` 之后，既无源码也无工程清单，且未登记已读取的系统证据/
+既有 TDD），`gate` 的 `project-structure-branch` 按该结论核对本章，判错分支或缺少分支要求的产物即
+`BLOCKED`。文档目录里的示例工程不算现有实现，本章要设计的是本项目真正落地的骨架。
+
+**绿地分支（`greenfield`）**：这是一个新工程，先给出初始化后的目录结构，并点名所依据的工程结构规范
+文件（仓库带 `.standard/` 规范树时写实际路径，如 `.standard/02-stack/<语言>/05-project-structure.md`；
+没有该目录时写清依据来自哪里）。下面的示例只说明形态，照抄 `my-project`/`my_project` 会被判为未做决定，
+必须按本项目改名并补全：
+
 ```
 my-project/
 ├── pyproject.toml          # 依赖管理 + 构建配置（替代 setup.py + requirements.txt）
@@ -315,7 +323,8 @@ my-project/
     └── docker-compose.yml
 ```
 
-> 否则，按下面的格式填写要改动的模块信息。
+**既有实现分支（非 `greenfield`）**：仓库已有代码，本章按下面的格式逐行列出本次要改动的模块，
+五列都要填实，不得以“待初始化”“实现阶段再定”交差（`project-structure-branch` 直接判 `BLOCKED`）：
 示例：
 
 | 仓库 | 模块 | 包路径 | 职责 | 变更类型 |

@@ -84,7 +84,7 @@ flowchart LR
 
 | 命令 | 用途 |
 |------|------|
-| `record-source` / `finalize-inputs` | 登记每项资料的 `source_id`、定位符、`READ/NOT_FOUND/NOT_ACCESSIBLE`、摘要与可信度，并给出 `input_status`；定位符会被磁盘核对，与声明不符即失败；`UPDATE` 运行必须同时用 `--prd-changes 修改数/新增数/删除数`（如 `3/1/0`）登记需求变更规模；`finalize-inputs` 顺带跑一次**规模探针**并把 `scale`/`signals`/`greenfield` 写进 `state.json`，返回值里就有，主控把它原样传给 Context Loader 与 Architect |
+| `record-source` / `finalize-inputs` | 登记每项资料的 `source_id`、定位符、`READ/NOT_FOUND/NOT_ACCESSIBLE`、摘要与可信度，并给出 `input_status`；定位符会被磁盘核对，与声明不符即失败；`UPDATE` 运行必须同时用 `--prd-changes 修改数/新增数/删除数`（如 `3/1/0`）登记需求变更规模；`finalize-inputs` 顺带跑一次**规模探针**并把 `scale`/`signals`/`greenfield`（连同判定依据 `basis`）写进 `state.json`，返回值里就有，主控把它原样传给 Context Loader 与 Architect |
 | `start-stage --to <STAGE>` | 推进阶段状态机；前置证据不足即失败；进入 `REVIEW` 时可带 `--review-scope full|incremental`，增量轮只能由控制器在严重度门停后推导，不接受主控自报范围（想强制全量就省略该参数，由控制器决定最小可证范围）；进入 `DELIVERY` 前每条 Finding 都必须已登记处置；`CRITIC`/`REVIEW` 两道审计门前，已收口（ANSWERED/SKIPPED-DEFAULT）的人工决定必须已落地，`DELIVERY` 只拒绝阻断态未完成条目（见“人工确认循环”“门禁挂钩”） |
 | `record-agent` | 登记一次具名子代理调用：先用 `--status DISPATCHED`（带 `--session-id` 与 `--input-digest`）开时间窗，再用同一 `--session-id` 以 `COMPLETED`/`BLOCKED`/`ABORTED` 收口并写入墙钟耗时，收口调用可省略 `--input-digest`；派发后什么都没产出也必须用 `ABORTED` 收口；Reviewer 一旦 `DISPATCHED` 就占用本轮名额；`--scope "7.2,4.1"` 声明本次真正注入的章节，读取量由索引算出 |
 | `write-artifact` | 把 `context-pack`、`draft`、`critic-findings`、`refiner-map`、`review-report` 落入运行目录 |
@@ -175,16 +175,17 @@ CONF-007
 
 模板的 `方案裁剪规则` 早就写了 S/M/L 三行，但没人判定归属，于是绿地原型也按 L 填满可观测设计与部署拓扑章节，每轮再被整篇读回一遍。
 
-- `finalize-inputs` 用冻结的 PRD 正文与仓库实测判定：命中的变更类别（数据/接口/消息/定时/配置）为 0 是 `S`，1～3 是 `M`，≥4 是 `L`；`git ls-files` 里没有后端源码且没有登记到任何“已读取的系统证据/既有 TDD”时记为 `greenfield`。这是测量结果，不接受任何角色的自述。
+- `finalize-inputs` 用冻结的 PRD 正文与仓库实测判定：命中的变更类别（数据/接口/消息/定时/配置）为 0 是 `S`，1～3 是 `M`，≥4 是 `L`；`git ls-files` 里既没有源码（后端与 Node/Swift 等语言后缀，`.jsx`/`.tsx` 这类纯 UI 文件不算）、也没有工程清单（`pyproject.toml`、`pom.xml`、`go.mod`、`Cargo.toml`、`*.csproj` 等），并且没有登记到任何“已读取的系统证据/既有 TDD”时，才记为 `greenfield`。**枚举时跳过仓库根下的 `doc/`、`docs/` 目录**：PRD/TDD/示例工程片段就住在这里，把它们当代码会让一个还没定工程结构的仓库被判成“既有实现”；`src/docs/` 这类非根目录的 `docs` 不算跳过。这是测量结果，不接受任何角色的自述；判定依据（代码文件数、点名的清单文件、证据条数、文档目录内被排除的代码文件与清单个数）随结论一起给出，`finalize-inputs` 返回值的 `scale.basis`、`show`、`gate` 报告和第 16 章台账都能看到。
 - `gate` 的 `scale-chapters` 按这张表要求章节，分两档：**最低要求行点名的章节**（`S` 级的基础监控与告警，`M`/`L` 追加完整监控大盘与告警，即“可观测设计”一章）在任何规模下都要在位，`M`/`L` 级还必须有实质设计，写 `不涉及` 或短于一节最低标准即 `BLOCKED`——那是拿“变快”冒充“变薄”；`部署拓扑` 只按 `L` 级要求。被信号点名的 `条件必填` 章节保留模板的 `不涉及 + 原因` 退路：给得出理由就合法（上一轮那种“无 MQ、单进程、附替代方案对比”的一章实测合法），只有一句 `不涉及` 而没给原因的仍判 `BLOCKED`。
+- 模板在 `工程与模块` 一章留了两条互斥分支（空仓库先初始化工程结构 / 否则列出改动模块），从来没人判定走哪条，于是同一章既能被填成占位表格、也能被推给“待初始化”。现在分支由 `greenfield` 选定，`gate` 的 `project-structure-branch` 照它核对：绿地必须给出本项目的目录结构方案（≥3 行目录条目，照抄模板示例的 `my-project`/`my_project` 不算，仓库里有 `.standard/` 规范树时还须点名所依据的规范文件）；既有实现必须给全模块表（`仓库`/`模块`/`包路径`/`职责`/`变更类型` 五列齐、无空格子无占位），且不得把本章推回“待初始化”。`init --scale-enforcement record-only` 一并豁免这两项。
 - `greenfield` 时 Context Loader 只做结构探测，**明确跳过“现有实现与可复用模式”检索**（上一次运行在这上面花 36 分钟去找不存在的代码）；缺口照旧写成“未发现证据”，不得改用例填空。
-- 探针结论会进“审查闭环记录”章节“运行元数据”台账（`规模判定` 行）与 `show`，交付报告照抄；`init --scale-enforcement record-only` 只记录不生效，用于回退。
+- 探针结论会进“审查闭环记录”章节“运行元数据”台账（`规模判定` 行与 `工程结构分支` 行）与 `show`，交付报告照抄；`init --scale-enforcement record-only` 只记录不生效，用于回退。
 
 ## 阶段 0：输入门禁与冻结
 
 `init` 会拒绝缺失、不可读、无实质内容或以模板占位为主的 `product-doc.md`，并记录其 digest；目录中已有的 `technical-doc.md` 不是阻塞性输入，但会被快照并把运行标记为 `UPDATE`。
 
-冻结每项资料后用 `record-source` 登记，至少覆盖：PRD 与变更台账、仓库规范（`AGENTS.md`、`CLAUDE.md`、README、构建与测试约定）、系统证据（代码、接口契约、Schema/迁移、部署配置、环境变量、监控）、本 Skill 资源、已确认人工决策、既有 TDD。随后 `finalize-inputs`：
+冻结每项资料后用 `record-source` 登记，至少覆盖：PRD 与变更台账、仓库规范（`AGENTS.md`、`CLAUDE.md`、README、`.standard/` 规范索引与其 `02-stack/<语言>/05-project-structure.md` 工程结构规范、构建与测试约定）、系统证据（代码、接口契约、Schema/迁移、部署配置、环境变量、监控）、本 Skill 资源、已确认人工决策、既有 TDD。随后 `finalize-inputs`：
 
 - PRD 未被读取 ⇒ 只能 `BLOCKED`，立即停止并说明缺口；
 - 存在未读取资料却声明 `PASS` ⇒ 控制器直接失败；
@@ -285,11 +286,11 @@ PRD 当前版本中用户最新明确的方案和逻辑优先于旧 PRD、旧 TD
   --tdd-file "$feature_directory/technical-doc.md"
 ```
 
-`gate` 是确定性的，覆盖：输入可用性、五个阶段产物是否落盘、独立终审是否执行、**最后一轮终审是否覆盖当前内容**（终审之后改动手写章节的任何一个字都会被判 `BLOCKED`；“审查闭环记录”章节标记之间的生成台账不计入该比对）、**增量终审是否覆盖了自最后一次全量终审以来变过的每一节（`incremental-review-covers-changes`，变过却没进任何一轮范围即 `BLOCKED`）**、轮次是否越界、`must_fix` Finding 是否全部闭环、每个 Finding 是否有处置、**“审查闭环记录”章节生成台账是否存在（`ledger-blocks-present`）且与 `state.json` 逐字一致（`ledger-matches-state`，手改标记内内容、漏行、或在标记之外另抄一份台账都算失败）**、是否仍含模板占位符（`TBD`/`TODO`/`待定`/`待补充`/`后续补充`/`similar to`/`refer to`/`【填写】`/`【链接】`/`YYYY-MM-DD`；唯一允许的未知表达是 `[需人工确认: xxx]`，且该豁免只对**手写正文里**的 marker 生效——代码围栏内与生成台账内的字面量是示例文本，既不记账也不替该行挡下占位符）、必需章节锚点是否齐备、**按 `state.json` 的规模判定要求的章节是否齐备且有实质内容（`scale-chapters`，M/L 级用 `不涉及` 或短正文收缩即 `BLOCKED`）**、代码围栏是否闭合且语言合法、变更运行是否已归档上一版、是否残留把上下文写回仓库 `AGENTS.md`/`CLAUDE.md` 的痕迹、正文 需人工确认 marker 与确认条目是否双向对得上（`markers-match-confirmations`，围栏内一律视为示例文本双向忽略；孤儿 marker、以及**已登记落地**的条目残留的 marker 即 `BLOCKED`，OPEN 与本 run 挂账条目的 marker 保留合法）、确认文件是否持久并与 `state.json` 逐条一致（`confirmations-file-persisted`）。
+`gate` 是确定性的，覆盖：输入可用性、五个阶段产物是否落盘、独立终审是否执行、**最后一轮终审是否覆盖当前内容**（终审之后改动手写章节的任何一个字都会被判 `BLOCKED`；“审查闭环记录”章节标记之间的生成台账不计入该比对）、**增量终审是否覆盖了自最后一次全量终审以来变过的每一节（`incremental-review-covers-changes`，变过却没进任何一轮范围即 `BLOCKED`）**、轮次是否越界、`must_fix` Finding 是否全部闭环、每个 Finding 是否有处置、**“审查闭环记录”章节生成台账是否存在（`ledger-blocks-present`）且与 `state.json` 逐字一致（`ledger-matches-state`，手改标记内内容、漏行、或在标记之外另抄一份台账都算失败）**、是否仍含模板占位符（`TBD`/`TODO`/`待定`/`待补充`/`后续补充`/`similar to`/`refer to`/`【填写】`/`【链接】`/`YYYY-MM-DD`；唯一允许的未知表达是 `[需人工确认: xxx]`，且该豁免只对**手写正文里**的 marker 生效——代码围栏内与生成台账内的字面量是示例文本，既不记账也不替该行挡下占位符）、必需章节锚点是否齐备、**按 `state.json` 的规模判定要求的章节是否齐备且有实质内容（`scale-chapters`，M/L 级用 `不涉及` 或短正文收缩即 `BLOCKED`）**、**`工程与模块` 是否走了探针选定的那条分支（`project-structure-branch`：绿地没有目录结构方案、照抄模板示例、仓库有 `.standard/` 却不点名规范文件，或既有实现缺模块表、有空格子、把本章推给“待初始化”，即 `BLOCKED`；失败详情会把探针实测的代码文件数与清单文件一起给出，质疑分支时先反驳这组数字**、代码围栏是否闭合且语言合法、变更运行是否已归档上一版、是否残留把上下文写回仓库 `AGENTS.md`/`CLAUDE.md` 的痕迹、正文 需人工确认 marker 与确认条目是否双向对得上（`markers-match-confirmations`，围栏内一律视为示例文本双向忽略；孤儿 marker、以及**已登记落地**的条目残留的 marker 即 `BLOCKED`，OPEN 与本 run 挂账条目的 marker 保留合法）、确认文件是否持久并与 `state.json` 逐条一致（`confirmations-file-persisted`）。
 
 `gate` 退出码非 0 时不得写入“方案已完成”，应输出阻塞报告与缺口；退出码 0 且无降级才是“已通过独立终审”。`gate` 通过后再执行一次 `render-ledger`，让“审查闭环记录”章节的“交付门禁”行记录本次结论，然后才能进入 `CLOSED`；关闭后文档冻结，`render-ledger` 会被拒绝。图示一律使用模板规定的 Mermaid fenced code block，简单目录树和数据流用 ASCII art；不依赖任何外部渲染服务。
 
-完成后输出交付报告：方案路径、运行目录、`input_status` 与缺口、需求变更三类数量及映射、旧/新 TDD 版本与归档文件、Critic 与 Reviewer 的 Finding 数量和最高严重度、`review_round` 与最终状态、各轮终审范围（全量/增量）与 `gate` 报告里的 `review_stop`、`finalize-inputs` 的规模判定（`scale`/`greenfield`/命中信号）、`gate` 结果。仍需人工确认事项是**强制表格**（从 `confirmations` 与“人工确认台账”照抄，不得凭记忆重写）；`start-stage --to DELIVERY` 返回的 `pending_landing` 里的每一行都必须在表内——它们已经有答案但本 run 无处落地，把“已答”当成“已闭环”而把它们从报告里抹掉，就是这套机制要防的那件事，落点栏写“本 run 无落地通道，下一次 run 承接”：
+完成后输出交付报告：方案路径、运行目录、`input_status` 与缺口、需求变更三类数量及映射、旧/新 TDD 版本与归档文件、Critic 与 Reviewer 的 Finding 数量和最高严重度、`review_round` 与最终状态、各轮终审范围（全量/增量）与 `gate` 报告里的 `review_stop`、`finalize-inputs` 的规模判定（`scale`/`greenfield`/命中信号，连同 `basis` 给出的实测依据与由此选定的 `工程与模块` 分支）、`gate` 结果。仍需人工确认事项是**强制表格**（从 `confirmations` 与“人工确认台账”照抄，不得凭记忆重写）；`start-stage --to DELIVERY` 返回的 `pending_landing` 里的每一行都必须在表内——它们已经有答案但本 run 无处落地，把“已答”当成“已闭环”而把它们从报告里抹掉，就是这套机制要防的那件事，落点栏写“本 run 无落地通道，下一次 run 承接”：
 
 ```text
 | CONF-ID | 问题 | 阻断 | 状态 | 落点 / 作答指引 |

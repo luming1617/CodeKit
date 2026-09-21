@@ -40,6 +40,37 @@ from _common import (
 )
 
 LANGUAGES = ("java", "python", "go", "cpp")
+# 语言识别的证据表：工程清单证明该语言确实是一个工程，源码后缀补足"清单在子目录"的多模块仓库。
+LANGUAGE_MANIFESTS: dict[str, tuple[str, ...]] = {
+    "java": ("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle"),
+    "python": ("pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"),
+    "go": ("go.mod",),
+    "cpp": ("CMakeLists.txt",),
+}
+LANGUAGE_SUFFIXES: dict[str, frozenset[str]] = {
+    "java": frozenset({".java"}),
+    "python": frozenset({".py"}),
+    "go": frozenset({".go"}),
+    # 裸 ``.h`` 不算：它同样属于 C/Objective-C，会把只带一个头文件的仓库判成 cpp。
+    "cpp": frozenset({".cpp", ".cc", ".cxx", ".hpp", ".hh"}),
+}
+# 有源码但没有对应规范模板的语言，只用于"仓库里只找到非支持语言源码"这句说明。
+UNSUPPORTED_SUFFIXES = frozenset({
+    ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte",
+    ".kt", ".kts", ".scala", ".rb", ".php", ".cs", ".rs", ".swift", ".m", ".mm",
+    ".ex", ".exs", ".dart", ".lua", ".pl", ".sh", ".ml", ".zig",
+})
+# 仓库根下的文档目录不计入语言证据：PRD/TDD/示例工程片段住在这里，
+# 把它们当源码会让一个空项目被判成已有工程（与 technical-doc 的 greenfield 探针同口径）。
+DOC_DIR_NAMES = frozenset({"doc", "docs"})
+# 构建产物、工具目录与 vendored 代码：里面常有生成出来的源码，不作为语言证据。
+# 根下的 ``doc``/``docs`` 不在这里——它们要遍历、但单独计数，见 scan_language_evidence。
+PRUNED_DIR_NAMES = frozenset({
+    ".git", ".gitnexus", ".gradle", ".idea", ".mypy_cache", ".pytest_cache", ".standard",
+    ".venv", "build", "dist", "graphify-out", "node_modules", "out", "target", "venv",
+})
+SOURCE_SCAN_LIMIT = 50_000
+MANIFEST_EVIDENCE_LIMIT = 3
 # Areas a Worker may populate; ``worker_tree_roots`` is watched at top-level
 # entry granularity, never per file (see snapshot_worker_scopes).
 WORKER_TREE_ROOTS = [".gitnexus", "graphify-out", ".claude/skills", ".agents/skills"]
@@ -187,7 +218,13 @@ def repository_root(path: Path) -> Path:
     return Path(output).resolve()
 
 
-def parse_languages(raw: str | None, root: Path) -> list[str]:
+def parse_languages(raw: str | None, root: Path) -> tuple[list[str], str, str]:
+    """返回 ``(语言列表, 来源, 判定依据)``；``来源`` 是 ``explicit`` 或 ``detected``。
+
+    检测不到时不再静默回落到某一种语言：仓库里有什么语言是测量结果，不是可以替用户做的决定，
+    而复制错语言的规范模板会一路带进 AGENTS.md 索引和后续所有 subagent。这里抛错，让主 Agent
+    在任何写入发生前停下来问人。
+    """
     if raw is not None:
         parts = [item.strip().lower() for item in raw.split(",")]
         if not parts or any(not item for item in parts):
@@ -197,24 +234,162 @@ def parse_languages(raw: str | None, root: Path) -> list[str]:
         invalid = [item for item in parts if item not in LANGUAGES]
         if invalid:
             raise PrepareError(f"unsupported language(s): {', '.join(invalid)}")
-        return parts
+        return parts, "explicit", f"用户指定：{'、'.join(parts)}"
 
-    found: set[str] = set()
-    if any((root / name).exists() for name in ("pom.xml", "build.gradle", "build.gradle.kts")):
-        found.add("java")
-    if any((root / name).exists() for name in ("pyproject.toml", "requirements.txt")):
-        found.add("python")
-    elif next((p for p in root.rglob("*.py") if ".git" not in p.parts and "graphify-out" not in p.parts), None):
-        found.add("python")
-    if (root / "go.mod").exists():
-        found.add("go")
-    makefile = root / "Makefile"
-    if (root / "CMakeLists.txt").exists() or (
-        makefile.exists()
-        and next((p for suffix in ("*.cpp", "*.cc") for p in root.rglob(suffix)), None)
-    ):
-        found.add("cpp")
-    return [language for language in LANGUAGES if language in found] or ["java"]
+    evidence = scan_language_evidence(root)
+    found = [language for language in LANGUAGES if evidence["languages"].get(language)]
+    if not found:
+        raise PrepareError(unrecognized_language_message(evidence, root))
+    return found, "detected", describe_language_evidence(evidence)
+
+
+def describe_language_evidence(evidence: dict) -> str:
+    """把一次实测写成一句可复核的依据：语言、源码计数与点名的清单文件。"""
+    parts = []
+    for language in LANGUAGES:
+        if not evidence["languages"].get(language):
+            continue
+        detail = evidence["languages"][language]
+        chunk = f"{language}（源码 {detail['sources']} 个"
+        manifests = detail["manifests"]
+        if manifests:
+            listed = "、".join(f"`{item}`" for item in manifests[:MANIFEST_EVIDENCE_LIMIT])
+            more = "" if len(manifests) <= MANIFEST_EVIDENCE_LIMIT else f" 等 {len(manifests)} 份"
+            chunk += f"、工程清单 {len(manifests)} 份：{listed}{more}"
+        else:
+            chunk += "、无工程清单"
+        parts.append(chunk + "）")
+    basis = "实测识别到：" + "；".join(parts)
+    for note in evidence["notes"]:
+        basis += f"；{note}"
+    if evidence["doc_source_files"] or evidence["doc_manifests"]:
+        basis += (
+            f"；`doc`/`docs` 内 {evidence['doc_source_files']} 个源码、"
+            f"{evidence['doc_manifests']} 份清单不计入"
+        )
+    if evidence["truncated"]:
+        basis += f"；枚举在第 {evidence['scanned_entries']} 个条目截断"
+    return basis
+
+
+def unrecognized_language_message(evidence: dict, root: Path) -> str:
+    """识别失败时给人机都能读的一段：测到了什么、为什么不算、下一步问什么。"""
+    lines = [
+        "无法识别仓库的编程语言：根下的 `doc`/`docs` 之外，没有 java、python、go、cpp 的源码或工程清单。",
+        f"实测范围：{evidence['scanned_entries']} 个仓库条目"
+        + ("（已截断，后面还有文件）" if evidence["truncated"] else "（完整）")
+        + f"；`doc`/`docs` 内另有 {evidence['doc_source_files']} 个源码、{evidence['doc_manifests']} 份清单，按文档排除。",
+    ]
+    unsupported = sorted(
+        evidence["unsupported"].items(), key=lambda item: (-item[1], item[0])
+    )
+    if unsupported:
+        counted = "、".join(f"{suffix.lstrip('.')} {count} 个" for suffix, count in unsupported[:6])
+        more = "" if len(unsupported) <= 6 else f" 等 {len(unsupported)} 类"
+        lines.append(
+            f"仓库里只找到非支持语言源码（{counted}{more}），"
+            f"当前只支持 {len(LANGUAGES)} 种语言：{'、'.join(LANGUAGES)}。"
+        )
+    else:
+        lines.append(
+            f"仓库里没有可识别的源码，可能只有文档或尚未初始化；当前只支持 {len(LANGUAGES)} 种语言："
+            f"{'、'.join(LANGUAGES)}。"
+        )
+    for note in evidence["notes"]:
+        # 差一点就算成功的证据要说出来，否则用户只会看到"没识别出来"，而仓库里明明有 .cpp
+        lines.append(f"另有：{note}。")
+    lines.append(
+        "必须由主 Agent 停下来向用户确认要初始化哪种语言的规范，再带 --language 重跑同一条 start："
+    )
+    lines.append(
+        f"  controller.py start --root {root} --language <" + "|".join(LANGUAGES) + "[,...]>"
+    )
+    lines.append("在得到答复前不得写入任何托管文件。")
+    return "\n".join(lines)
+
+
+def scan_language_evidence(root: Path) -> dict:
+    """Walk the repository once and collect the language evidence the detection rests on.
+
+    Root-level ``doc``/``docs`` trees are walked but counted separately: their example snippets are
+    this suite's own deliverables, and counting them would let a project that has not picked a
+    language yet look like an existing one -- which is exactly how a wrong ``.standard/02-stack``
+    template set gets copied in.
+    """
+    root = Path(root).resolve()
+    languages: dict[str, dict] = {
+        language: {"sources": 0, "manifests": []} for language in LANGUAGES
+    }
+    suffix_owner = {
+        suffix: language for language, suffixes in LANGUAGE_SUFFIXES.items() for suffix in suffixes
+    }
+    manifest_owner = {
+        name: language for language, names in LANGUAGE_MANIFESTS.items() for name in names
+    }
+    unsupported: dict[str, int] = {}
+    doc_source_files = 0
+    doc_manifests = 0
+    scanned = 0
+    truncated = False
+    root_has_makefile = (root / "Makefile").is_file()
+    for dirpath, dirnames, filenames in os.walk(root):
+        directory = Path(dirpath)
+        dirnames[:] = sorted(name for name in dirnames if name.lower() not in PRUNED_DIR_NAMES)
+        in_docs = _first_relative_segment(directory, root) in DOC_DIR_NAMES
+        for name in sorted(filenames):
+            scanned += 1
+            if scanned > SOURCE_SCAN_LIMIT:
+                truncated = True
+                break
+            path = directory / name
+            owner = manifest_owner.get(name)
+            if owner is not None:
+                if in_docs:
+                    doc_manifests += 1
+                else:
+                    languages[owner]["manifests"].append(path.relative_to(root).as_posix())
+                continue
+            suffix = path.suffix.lower()
+            if suffix in suffix_owner:
+                if in_docs:
+                    doc_source_files += 1
+                else:
+                    languages[suffix_owner[suffix]]["sources"] += 1
+            elif suffix in UNSUPPORTED_SUFFIXES and not in_docs:
+                unsupported[suffix] = unsupported.get(suffix, 0) + 1
+        if truncated:
+            break
+
+    active: dict[str, dict] = {}
+    notes: list[str] = []
+    for language in LANGUAGES:
+        detail = languages[language]
+        if language == "cpp" and not detail["manifests"] and not root_has_makefile:
+            # 单个 .cpp（JNI 桥、benchmark）撑不起一个 C++ 工程，cpp 的证据必须带构建文件
+            if detail["sources"]:
+                notes.append(
+                    f"{detail['sources']} 个 C/C++ 源码没有配 CMakeLists.txt/Makefile，未计为 cpp 工程"
+                )
+            continue
+        if detail["sources"] or detail["manifests"]:
+            active[language] = detail
+    return {
+        "languages": active,
+        "unsupported": unsupported,
+        "doc_source_files": doc_source_files,
+        "doc_manifests": doc_manifests,
+        "notes": notes,
+        "scanned_entries": min(scanned, SOURCE_SCAN_LIMIT),
+        "truncated": truncated,
+    }
+
+
+def _first_relative_segment(path: Path, root: Path) -> str:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return ""
+    return relative.parts[0].lower() if relative.parts else ""
 
 
 def require_repository_target(root: Path, path: Path) -> None:
@@ -866,7 +1041,7 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
 
     root = repository_root(Path(args.root).resolve())
     skill_dir = Path(__file__).resolve().parents[1]
-    languages = parse_languages(args.language, root)
+    languages, language_source, language_basis = parse_languages(args.language, root)
     run_id = args.run_id or utc_run_id_timestamp() + "-" + uuid.uuid4().hex[:8]
 
     baseline_status = status_entries(root)
@@ -940,6 +1115,8 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
         "head": head_result.stdout.strip() if head_result.returncode == 0 else None,
         "branch": run(["git", "branch", "--show-current"], root).stdout.strip(),
         "languages": languages,
+        "language_source": language_source,
+        "language_basis": language_basis,
         "options": {
             "embeddings": args.embeddings,
             "force": args.force,
@@ -1035,7 +1212,14 @@ def main(argv: list[str] | None = None, *, emit: bool = True) -> int:
         raise
 
     if emit:
-        print(json.dumps({"status": "success", "run_id": run_id, "manifest": str(manifest_path), "languages": languages}, ensure_ascii=False))
+        print(json.dumps({
+            "status": "success",
+            "run_id": run_id,
+            "manifest": str(manifest_path),
+            "languages": languages,
+            "language_source": language_source,
+            "language_basis": language_basis,
+        }, ensure_ascii=False))
     return 0
 
 

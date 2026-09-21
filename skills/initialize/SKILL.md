@@ -14,6 +14,7 @@ allowed-tools: 'Bash, Read, Write, Edit, Glob, Grep, Agent, Skill'
 ## 成功标准
 
 - 单一确定性控制器在任何写入前冻结 Git 与托管文件基线，并取得 initialize 独占锁。
+- 使用的编程语言要么来自用户显式指定（`language_source=explicit`），要么来自仓库实测（`detected`）；两者都拿不到时 `start` 在任何写入前报错停止，主 Agent 必须把实测转述给用户、问到答复后带 `--language` 重跑，不得静默采用任何一种语言或只有文档示例的仓库被当成已有工程初始化。
 - `controller.py analyze` 与 `controller.py graphify` 作为控制器的两个确定性步骤按序执行、只读 `initialize-context-scanner` 作为独立 Sub-agent，三者统一遵循同一 Worker contract；并发度随宿主容量调整。
 - 主 Agent 独立核验 Worker 状态、写入范围与 artifact，不把 `partial`/`failed` 转译为 `success`。
 - `AGENTS.md`、`CLAUDE.md` 只有主 Agent在 Barrier 之后写入，且仅更新 CodeKit managed block。
@@ -24,7 +25,7 @@ allowed-tools: 'Bash, Read, Write, Edit, Glob, Grep, Agent, Skill'
 
 ## 参数
 
-- `--language <set>`：逗号分隔的 `java | python | go | cpp`；省略时收集仓库内全部匹配语言，检测不到时使用 `java`。
+- `--language <set>`：逗号分隔的 `java | python | go | cpp`。省略时由控制器**实测**仓库（源码后缀 + 各层级工程清单，跳过根下的 `doc`/`docs`），把识别到的全部语言一次带上；**测不出来时 `start` 在任何写入前报错停止，不存在默认语言**——主 Agent 必须就此向用户确认后带 `--language` 重跑（见 Phase 0）。`manifest` 里的 `language_source`（`explicit` / `detected`）与 `language_basis`（实测依据原文）记录这次结论的来源，报告照抄。
 - `--embeddings`：显式要求 GitNexus 构建语义索引；默认关闭。
 - `--force`：显式重建 GitNexus/Graphify，不绕过验证或写入边界。重复执行 initialize 本身不需要该参数，缺省时索引与图谱按 current 复用。
 - `--allow-partial`：允许**前提性**降级继续生成上下文。注册现在是「先真尝试、被拒才升级」（见 `--allow-global-writes`），所以它只剩一种用法：**用户明确拒绝那次仓库外写入**，本次不写注册表并按 `partial/registry-missing` 继续；embedding 前提同属这一类。**工具在本宿主不可用（未安装 / 读不到 / 跑不起来 / 缺注册）不再需要它**，那类降级自动处理（见下条）。无论哪种，都不得把整体标记为 success，也不得放行真实失败。协作不可用必须映射为 `skipped + collab-unavailable`，整体保持 `blocked`。
@@ -35,7 +36,7 @@ allowed-tools: 'Bash, Read, Write, Edit, Glob, Grep, Agent, Skill'
   - **注册前提**：`list`/`query`/`context`/`impact`/`trace`/`cypher`/`check`/`detect-changes` 与 MCP 图查询只从该注册表解析仓库，缺注册时索引有效但一律报 `No indexed repositories found`。因此 gitnexus 步骤会先自己尝试一次 `gitnexus index <root>`（幂等、只写注册表）：成功即继续，不需要任何人点头；**宿主拒绝时以可恢复的 `registry-denied`（退出码 77）停下**，保持 run 与锁并给出 `retry_command`，主 Agent 必须按宿主提权通道原样重跑这条命令（宿主差异见 [references/tool-adapters.md](references/tool-adapters.md) 的「全局注册」），成功后重跑 `analyze`；重试仍被拒才询问用户，用户拒绝时带 `--allow-partial` 接受 `partial/registry-missing`。
   - **embedding 前提**：按 `gitnexus_embedding_mode=drop` 显式降级，不失败；显式 `--embeddings` 而 runner 缺本地栈时才要求本授权（这一条仍是 fail-closed，与注册不同）。
 
-未知参数、空/重复/不支持的语言必须在任何写入前报错。
+未知参数、空/重复/不支持的语言必须在任何写入前报错。省略 `--language` 且实测不出语言时同样在任何写入前报错，并按 Phase 0 的规定停下来问人——**没有默认语言**。
 
 ## 路径解析约定
 
@@ -131,6 +132,16 @@ flowchart TD
 
 控制器创建 manifest、取得锁并进入 `prepared`。`prepare.py`、`reconcile.py`、`validate-result.py` 是控制器内部模块，不作为编排入口直接调用。
 
+**语言识别是三态，不是两态**：`start` 要么按 `--language` 采用用户指定的语言，要么实测出语言（源码后缀 + 各层级工程清单，**跳过仓库根下的 `doc`/`docs`**——那里的示例片段是这套技能自己的产物，不是已经选定的语言），要么**报错退出且什么都不写**。第三种情况下不得替用户挑一种语言：`standard/02-stack/` 只有 `java`、`python`、`go`、`cpp` 四套模板，选错会把和本项目无关的规范复制进 `.standard/`、写进 `AGENTS.md`/`CLAUDE.md` 的索引块，并被后续所有 subagent 当作项目规范读取；而「识别不出来」最常见的真实原因正是仓库还没有代码或只有文档示例，这恰是要不要初始化工程结构的问题，必须由人回答。
+
+报错文本已经给出实测依据（枚举条目数、被排除的文档目录源码数、非支持语言源码的后缀与计数，例如「仓库里只找到非支持语言源码（ts 2 个、js 1 个）」），主 Agent 的处理是固定的：
+
+1. 把这段实测原样转述给用户，**不要**改写成「已默认按 java 处理」之类的说法，也不要凭 README、目录名或自己的印象替用户决定；
+2. 用宿主提供的提问能力给出**恰好这四个选项**（`java`、`python`、`go`、`cpp`，允许多选）；宿主没有提问工具面时，在正文里提出同样的问题并**结束本轮**等回答，不得一边提问一边继续写入。会不会弹出选择框由宿主决定（有提问工具面的宿主会弹窗，Codex/OpenCode 只能正文提问），本 Skill 保证的是「停下来问、拿到答复才继续」，不是弹窗本身。
+3. 拿到答复后带 `--language <答复>` 重跑同一条 `start`，并把 `language_source=explicit` 与最终选择的语言写进报告；用户拒绝选择或拒绝提供语言时停止，报告 `blocked`，不留下任何托管文件变更。
+
+`manifest` 的 `language_source`（`explicit` / `detected`）与 `language_basis`（实测原文）是这次决定的证据，报告必须原样列出——只写 `languages: [python]` 分不出它是用户说的还是测出来的。
+
 **工具不可用时的处置**：`prepare.py` 从**已实测**的四态得出结论并写进 `resolution_hint` 与 `tools.<tool>.state`——`ok` / `not-installed` / `not-readable` / `not-executable`，判据与处置见 [references/tool-adapters.md](references/tool-adapters.md)。解析顺序是 `CODEKIT_<TOOL>_RUNNER` → 安装器写出的 `toolchain.json` → `PATH` → CodeKit 已知目录；**清单优先于 `PATH`**，所以结果跨宿主确定。
 
 后两态在 Codex 桌面端是常态而不是配置错误：它的沙箱**按路径拒绝文件系统访问**（实测 `%APPDATA%\npm` 的 `stat` 即 EACCES、`%LOCALAPPDATA%\Programs\Python` 整目录不可达），而 `PATH` 里用户级条目其实是全的——所以**把目录加进 `PATH` 无效**，问题不在 `PATH`。真正的解法是让工具落在已实测可读可执行的 CodeKit 工具链根 `<home>/.local/share/CodeKit/` 里，那由安装器负责：提示必须给出「重跑安装器（`install.cmd install` / `install.sh install`）并勾选该组件」或 `CODEKIT_GITNEXUS_RUNNER` / `CODEKIT_GRAPHIFY_RUNNER` 这两条真出路。诊断时可用 `$SKILLS_ROOT/_shared/scripts/resolve-runner.py --tool <gitnexus|graphify>`（退出码 0/3/4/5 分别对应四态）在**同一个会话里**复测，不要再靠猜路径。
@@ -139,7 +150,7 @@ flowchart TD
 
 Phase 0 解析 GitNexus runner 并把 embedding 与**全局注册**两个前提写进 manifest：`tools.gitnexus`（`command` / `runner` / `identity_stable` / `local_embeddings`）、`gitnexus_index`（`present` / `pdg` / `embeddings`）、`gitnexus_embedding_mode`、`gitnexus_registry`（`dir` / `path` / `registered` / `writable` / `action`）、`options.allow_global_writes`。`action` 是本次的处理计划，取值与处置见 [references/tool-adapters.md](references/tool-adapters.md) 的「全局注册」：`none` / `authorized` / `declined` / `attempt`。
 
-**Phase 0 不拦人也不提问**：预检用的 `os.access` 在按路径拒绝文件系统访问的沙箱里会谎报可写，用「看起来写得进去吗」决定要不要问人，会把本来能自己完成的运行也停下。注册由一次真实写入来满足或暴露（`attempt`），被拒才升级。补齐本地 embedding 栈是可降级前提，显式 `--embeddings` 时仍是 fail-closed。
+**Phase 0 不为工具前提拦人也不提问**：预检用的 `os.access` 在按路径拒绝文件系统访问的沙箱里会谎报可写，用「看起来写得进去吗」决定要不要问人，会把本来能自己完成的运行也停下。注册由一次真实写入来满足或暴露（`attempt`），被拒才升级。补齐本地 embedding 栈是可降级前提，显式 `--embeddings` 时仍是 fail-closed。这一条只约束工具前提；**语言识别失败是唯一的例外**，它必须停下来问人（见上），因为没有任何一次实测能替用户决定项目该用哪种语言的规范。
 
 ### Phase 1：分析与只读扫描
 
