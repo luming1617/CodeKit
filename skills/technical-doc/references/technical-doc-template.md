@@ -40,7 +40,7 @@
 | M    | 跨模块或跨服务、接口/数据库/缓存/MQ 任一变化 | S 级全部内容，并补充总体架构、时序图、完整兼容性矩阵、容量、完整监控大盘与告警   |
 | L    | 核心链路、架构调整、大规模迁移或高风险变更    | M 级全部内容，并补充部署拓扑、容量测算、故障处置、安全专项设计、数据演进和跨团队关键技术决策依据       |
 
-规模归属不是作者偏好：`finalize-inputs` 用冻结 PRD 正文与仓库实测判定命中的变更类别（数据 / 接口 / 消息 / 定时 / 配置），0 类为 `S`、1～3 类为 `M`、≥4 类为 `L`，结论写入 `state.json` 并登记在“审查闭环记录”章节的“运行元数据”台账，文档信息表的“方案规模”一格照抄该结论。`gate` 的 `scale-chapters` 按上表机械核对，分两档：任何规模下“最低要求”点名的章节都要在位；`M`/`L` 级的可观测设计必须有实质设计，`L` 级的部署拓扑同样，写“不涉及”或短于一节最低标准即 `BLOCKED`。被命中类别对应的 `条件必填` 章节（接口与契约设计、数据库设计、消息设计、定时任务设计、环境配置设计）保留“不涉及 + 原因”的退路——只写结论不给原因同样阻塞。判定确实错了时写 `[需人工确认: 规模应为 X，理由…]` 并照常按判定的规模写，不要自行下调后交付。
+规模归属不是作者偏好：`finalize-inputs` 用冻结 PRD 正文与仓库实测判定命中的变更类别（数据 / 接口 / 消息 / 定时 / 配置），0 类为 `S`、1～3 类为 `M`、≥4 类为 `L`，结论写入 `state.json` 并登记在“审查闭环记录”章节的“运行元数据”台账，文档信息表的“方案规模”一格照抄该结论。`gate` 的 `scale-chapters` 按上表机械核对，分两档：任何规模下“最低要求”点名的章节都要在位；`M`/`L` 级的可观测设计必须有实质设计，`L` 级的部署拓扑同样，写“不涉及”或短于一节最低标准即 `BLOCKED`。被命中类别对应的 `条件必填` 章节（接口与契约设计、数据库设计、消息设计、定时任务设计、环境配置设计）保留“不涉及 + 原因”的退路——只写结论不给原因同样阻塞。判定确实错了时挂一条 `需人工确认` marker（写法与登记见 SKILL 的“人工确认循环”：正文一行、条目先登记进 `confirmation-log.md`）并照常按判定的规模写，不要自行下调后交付；正文里出现没有条目对应的 marker，`gate` 的 `markers-match-confirmations` 会直接判 `BLOCKED`，所以本模板不把该格式的示例原样写在这里。
 
 
 ## 变更记录
@@ -769,11 +769,13 @@ flowchart TB
 >   或在标记之外另抄一份台账，都会阻塞交付。
 > - 标记不能被放进代码围栏，也不要在本章重复给出 Finding 列表。
 > - 正文仍由各角色撰写：处置理由写进对应设计章节，本章只回答“哪些 Finding、如何处置”。
-> - 人工确认机制接线后，本章另含两张生成表：“人工确认台账”（未收口条目摘要与作答指引）与
+> - 本章另含两张生成表：“人工确认台账”（未收口条目摘要与作答指引）与
 >   “人工决定台账”（已收口条目、决定与落点），同样由 `render-ledger` 渲染。作答动作只发生在
->   feature 目录的 `confirmation-log.md`（方式见 `SKILL.md`“人工确认循环”）；在本章手写台账
->   内容或把未收口项从正文标记里悄悄抹掉，都会被 `ledger-matches-state` 与
->   `markers-match-confirmations` 阻塞交付。
+>   feature 目录的 `confirmation-log.md`（方式见 `SKILL.md`“人工确认循环”）：在本章手写台账内容
+>   会被 `ledger-matches-state` 阻塞交付；正文写了 marker 却没有对应条目、或条目已登记落地而
+>   marker 仍留在正文，都会被 `markers-match-confirmations` 阻塞交付。未收口条目由本表逐条列出，
+>   从正文里删掉它的 marker 并不会让问题消失——设计变化使该未知不再成立时，在处置理由里写明它
+>   不再成立，而不是留一处空白让下一轮审查去找。
 
 <!-- codekit:technical-doc:ledger:findings:start -->
 （由 `render-ledger` 生成，勿手改）
@@ -782,6 +784,10 @@ flowchart TB
 <!-- codekit:technical-doc:ledger:run-metadata:start -->
 （由 `render-ledger` 生成，勿手改）
 <!-- codekit:technical-doc:ledger:run-metadata:end -->
+
+<!-- codekit:technical-doc:ledger:confirmations:start -->
+（由 `render-ledger` 生成，勿手改；作答只在 `confirmation-log.md`）
+<!-- codekit:technical-doc:ledger:confirmations:end -->
 
 ---
 

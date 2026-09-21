@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -129,7 +130,7 @@ UPDATE_ONLY_ANCHORS = ("变更历史",)
 # The delivery tables in chapter 16 must match ``state.json`` verbatim, so the controller
 # writes them instead of the model.  A hand-copied mirror cost ~47,000 characters of prose
 # and produced 14 of the 53 findings in the reference run, all of them about the mirror.
-LEDGER_SECTIONS = ("findings", "run-metadata", "history-index")
+LEDGER_SECTIONS = ("findings", "run-metadata", "confirmations", "history-index")
 LEDGER_MARKERS = re.compile(
     r"^<!--\s*codekit:technical-doc:ledger:([a-z0-9-]+):(start|end)\s*-->\s*$"
 )
@@ -138,14 +139,38 @@ LEDGER_END = "<!-- codekit:technical-doc:ledger:{section}:end -->"
 LEDGER_ANCHOR = {
     "findings": "审查闭环记录",
     "run-metadata": "审查闭环记录",
+    "confirmations": "审查闭环记录",
     "history-index": "变更历史",
 }
 # Render order inside one anchor section.
-LEDGER_ORDER = ("findings", "run-metadata", "history-index")
+LEDGER_ORDER = ("findings", "run-metadata", "confirmations", "history-index")
 LEDGER_CELL_LIMIT = 300
 # ``--prd-changes`` is the change ledger the history index mirrors: modified/added/deleted
 # requirement lines, counted once by the orchestrator instead of prose-written per round.
 PRD_CHANGES = re.compile(r"\d+/\d+/\d+")
+
+# --- human confirmation loop ------------------------------------------------------------
+# ``confirmation-log.md`` under the feature directory is the cross-run living ledger of
+# decisions only a human can make.  The model writes prose entries there; the controller
+# is the only writer of the ``CONF-<NNN>`` ID lines (``sync-confirmations``), the ``决定:``
+# line of ``skip-to-default``, and the ``应用:`` line of ``mark-confirmation-applied`` --
+# all three in that file, never in the body it mirrors.  Statuses:
+# ``OPEN`` waits for a verdict; ``ANSWERED`` carries a human decision; ``SKIPPED-DEFAULT``
+# means the human chose to take the recommended option verbatim.  A settled entry is not
+# closed until a dispatch reports it back with ``mark-confirmation-applied``.
+CONFIRMATION_FILE = "confirmation-log.md"
+CONFIRMATION_ID = re.compile(r"^CONF-(\d{3})$")
+CONFIRMATION_FIELD = re.compile(r"^(来源|阻断|位置|问题|影响|选项|推荐|决定|应用)\s*[:：]\s*(.*?)\s*$")
+CONFIRMATION_SOURCE = re.compile(
+    r"^(ARCHITECT|REFINER:CRITIC-\d{3}|REVIEWER:REVIEW-\d{1,2}-\d{3}|LEGACY-MARKER)$"
+)
+CONFIRMATION_SETTLED = ("ANSWERED", "SKIPPED-DEFAULT")
+# ``决定:`` starting with this token means "take the recommended option as-is"; the
+# controller then records the entry as SKIPPED-DEFAULT and resolves the decision text
+# from the entry's own ``推荐:`` field.
+DEFAULT_DECISION = "按推荐"
+CONFIRMATION_QUESTION_LIMIT = 80
+CONFIRMATION_REQUIRED_FIELDS = ("来源", "阻断", "位置", "问题")
 
 # --- review rounds: severity-gated stop and incremental final review ---------------------
 # Replayed against the reference run (26 Critic findings, then 12 → 7 → 5 → 3 per review round,
@@ -300,6 +325,9 @@ def load_state(path: str | Path) -> tuple[Path, dict[str, Any]]:
         raise ControllerError(f"cannot read state file: {state_path}: {exc}") from exc
     if state.get("schema_version") != SCHEMA_VERSION:
         raise ControllerError(f"unsupported state schema: {state.get('schema_version')}")
+    # Runs opened before the confirmation loop shipped resume with an empty ledger.
+    state.setdefault("confirmation_file", None)
+    state.setdefault("confirmations", [])
     return state_path, state
 
 
@@ -361,6 +389,7 @@ def init_run(
 
     existing = feature / TDD_FILE
     mode = "NEW"
+    tdd_text: str | None = None
     materials: dict[str, dict[str, Any]] = {
         "product_requirements": {
             "locator": str(prd),
@@ -380,7 +409,6 @@ def init_run(
     target = _run_dir(repo, run_id)
     if target.exists():
         raise ControllerError(f"run already exists; resume it instead of overwriting: {target}")
-    (target / "artifacts").mkdir(parents=True)
     state = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -416,7 +444,16 @@ def init_run(
         "gates": [],
         "prd_changes": None,
         "ledger": None,
+        "confirmation_file": None,
+        "confirmations": [],
+        "confirmation_import": None,
     }
+    # The confirmation ledger is a cross-run living file: whatever a previous run left open
+    # (or answered but never landed) is an input to this one, frozen before stage 1.  It is
+    # ingested *before* the run directory exists so a corrupt ledger fails init without
+    # leaving a targetless run behind that could never be resumed or retried.
+    state["confirmation_import"] = _ingest_confirmations(feature, state, tdd_text)
+    (target / "artifacts").mkdir(parents=True)
     _atomic_json(target / "state.json", state)
     return target / "state.json"
 
@@ -904,12 +941,14 @@ def start_stage(state_path: str | Path, target_stage: str, review_scope: str | N
         _require_evidence(state, "CONTEXT", "context-pack")
     elif target == "CRITIC":
         _require_evidence(state, "ARCHITECT", "draft")
+        _require_no_blocking_confirmations(state, target)
     elif target == "REFINER":
         if current == "CRITIC":
             _require_evidence(state, "CRITIC", "critic-findings")
         else:
             _require_open_reviewer_findings(state)
     elif target == "REVIEW":
+        _require_no_blocking_confirmations(state, target)
         _require_evidence(state, "REFINER", "refiner-map", artifact_round=round_)
         if round_ + 1 > state["max_review_rounds"]:
             raise ControllerError(
@@ -959,6 +998,7 @@ def start_stage(state_path: str | Path, target_stage: str, review_scope: str | N
     elif target == "DELIVERY":
         _require_approved_review(state)
         _require_all_findings_tracked(state)
+        _require_no_blocking_confirmations(state, target)
     elif target == "CLOSED":
         _require_gate_pass(state)
 
@@ -968,6 +1008,20 @@ def start_stage(state_path: str | Path, target_stage: str, review_scope: str | N
     )
     _save(path, state)
     result: dict[str, Any] = {"stage": target, "review_round": state["review_round"], "mode": state["mode"]}
+    if target == "DELIVERY":
+        # The delivery report must copy these, not re-derive them from memory: this is the
+        # only place the run admits it answered a question it could no longer land.
+        carried = [
+            item["id"] for item in state.get("confirmations") or []
+            if item["status"] in CONFIRMATION_SETTLED and not item["applied"]
+        ]
+        if carried:
+            result["pending_landing"] = carried
+            result["hint"] = (
+                "settled decision(s) answered after the last review door have no landing "
+                "channel left in this run; they stay 挂账 (未落地) in the chapter-16 ledger, "
+                "must be copied into the delivery report, and the next run's init consumes them"
+            )
     if target == "REVIEW":
         pending = state["pending_review"]
         result["review_scope"] = pending["scope"]
@@ -1347,7 +1401,10 @@ def record_fix(
             raise ControllerError(f"{label} is required")
     stage = state["stage"]
     if stage == "REFINER":
-        _refiner_scope_covers(path, state, finding, location)
+        _dispatch_scope_covers(
+            path, state, "REFINER",
+            [("disposition", location), ("finding", finding["location"])],
+        )
     elif stage in {"REVIEW", "DELIVERY"} and _passing_verdict_open(state):
         if status == "FIXED":
             raise ControllerError(
@@ -1521,6 +1578,758 @@ def archive_history(state_path: str | Path, version: str) -> dict[str, Any]:
     return entry
 
 
+# --- human confirmation loop -------------------------------------------------------------
+
+def _norm_question(text: str) -> str:
+    """The pairing key between a body marker and a ledger entry (D9).
+
+    Width, colon style and whitespace are invisible here, so a marker retyped with a
+    half-width colon still pairs with the entry registered for it; a genuinely reworded
+    question does not, which is exactly what the marker reconciliation is for.
+    """
+    folded = unicodedata.normalize("NFKC", text or "")
+    folded = folded.replace("：", ":").replace("︰", ":")
+    return " ".join(folded.split())
+
+
+def _document_markers(text: str) -> list[tuple[str, int, str]]:
+    """CONFIRMATION markers in the hand-written body, as (normalised, line, inner text).
+
+    Fenced and generated-ledger occurrences are example text in both directions (D9): they
+    neither require nor grant an entry, so a template sample and a refreshed ledger cannot
+    be mistaken for an unanswered question.
+    """
+    lines = text.splitlines()
+    mask = _ledger_line_mask(lines)
+    found: list[tuple[str, int, str]] = []
+    inside_fence = False
+    for index, line in enumerate(lines):
+        if FENCE.match(line.strip()):
+            inside_fence = not inside_fence
+            continue
+        if inside_fence or index in mask:
+            continue
+        for match in CONFIRMATION.finditer(line):
+            inner = re.sub(r"^需人工确认\s*[:：]\s*", "", match.group(0)[1:-1])
+            found.append((_norm_question(inner), index + 1, inner))
+    return found
+
+
+def _confirmation_ref(source: str) -> str:
+    """The Finding id a ``来源`` cites, or ``''`` for ARCHITECT / LEGACY-MARKER."""
+    _, _, ref = source.partition(":")
+    return ref
+
+
+def _confirmation_status(fields: dict[str, str]) -> tuple[str, str]:
+    """Derive ``(status, applied)`` from the file fields.
+
+    A ``决定`` opening with 按推荐 is the SKIPPED-DEFAULT channel: the human declined to
+    author a verdict and took the entry's own recommendation verbatim.  Both that and a
+    written decision are settled states; neither is closed until ``应用`` carries a landing.
+    """
+    decision = (fields.get("决定") or "").strip()
+    applied = (fields.get("应用") or "").strip()
+    if applied.upper() == "NONE":
+        applied = ""
+    if not decision:
+        return "OPEN", applied
+    if _norm_question(decision).startswith(_norm_question(DEFAULT_DECISION)):
+        return "SKIPPED-DEFAULT", applied
+    return "ANSWERED", applied
+
+
+def _settled_decision(entry: dict[str, Any]) -> str:
+    if entry["status"] == "SKIPPED-DEFAULT":
+        return f"{entry['recommend']}（按推荐）"
+    return entry["decision"]
+
+
+def _read_confirmation_text(path: Path) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise ControllerError(f"confirmation file is missing or not a regular file: {path}")
+    try:
+        return path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ControllerError(
+            f"confirmation file is not valid UTF-8: {path}; re-save it as UTF-8 "
+            "(a file saved in GBK by an older editor fails here)"
+        ) from exc
+
+
+def _save_confirmation_text(path: Path, lines: list[str], crlf: bool) -> None:
+    ending = "\r\n" if crlf else "\n"
+    payload = ending.join(lines) + ending
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="", dir=path.parent,
+        prefix=f".{path.name}.", delete=False,
+    ) as handle:
+        handle.write(payload)
+        temporary = Path(handle.name)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def _validate_confirmation_fields(item: dict[str, Any]) -> None:
+    fields = item["fields"]
+    missing = [key for key in CONFIRMATION_REQUIRED_FIELDS if key not in fields]
+    if missing:
+        raise ControllerError(
+            f"confirmation entry at line {item['start']} is missing field(s): "
+            f"{'、'.join(missing)}"
+        )
+    for key in CONFIRMATION_REQUIRED_FIELDS:
+        if not fields[key].strip():
+            raise ControllerError(
+                f"confirmation entry at line {item['start']} has an empty required field '{key}'"
+            )
+    if not CONFIRMATION_SOURCE.fullmatch(fields["来源"]):
+        raise ControllerError(
+            f"confirmation entry {item['id'] or item['start']}: 来源 must be ARCHITECT, "
+            "REFINER:CRITIC-<NNN>, REVIEWER:REVIEW-<round>-<NNN> or LEGACY-MARKER, "
+            f"got {fields['来源']!r}"
+        )
+    if fields["阻断"] not in {"true", "false"}:
+        raise ControllerError(
+            f"confirmation entry {item['id'] or item['start']}: 阻断 must be true or false, "
+            f"got {fields['阻断']!r}"
+        )
+    question = fields["问题"]
+    if "]" in question:
+        raise ControllerError(
+            f"confirmation entry {item['id'] or item['start']}: 问题 must not contain ']' "
+            "(it is the pairing key inside body markers)"
+        )
+    # A migrated LEGACY-MARKER entry quotes whatever the old document said; charging it the
+    # length limit would refuse to ingest documents that predate the loop.
+    if fields["来源"] != "LEGACY-MARKER" and len(question) > CONFIRMATION_QUESTION_LIMIT:
+        raise ControllerError(
+            f"confirmation entry {item['id'] or item['start']}: 问题 is {len(question)} chars, "
+            f"over the {CONFIRMATION_QUESTION_LIMIT}-char pairing key limit"
+        )
+
+
+def _parse_confirmation_log(text: str) -> list[dict[str, Any]]:
+    """Split the confirmation file into entries, tolerating CRLF and unassigned ID lines.
+
+    An entry starts at its ``CONF-<NNN>`` line, or -- before the controller has stamped an
+    ID -- at a ``来源:`` line that follows an entry which already has one.  ``#`` and ``>``
+    lines are file furniture (headings, the guidance quote) and are skipped; any other
+    unparsable line is an error with its line number, because silently folding a typo'd
+    field into the previous entry would move a decision onto the wrong question.
+    """
+    entries: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+
+    def close() -> None:
+        nonlocal current
+        if current is not None:
+            entries.append(current)
+            current = None
+
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#") or line.startswith(">"):
+            continue
+        if CONFIRMATION_ID.fullmatch(line):
+            if current is not None and "来源" not in current["fields"]:
+                raise ControllerError(
+                    f"confirmation line {number}: ID '{line}' sits inside an entry that never "
+                    "reached its 来源 field"
+                )
+            close()
+            current = {"id": line, "start": number, "fields": {}, "lines": {}}
+            continue
+        match = CONFIRMATION_FIELD.match(line)
+        if not match:
+            raise ControllerError(
+                f"confirmation line {number} is not a field line: {line[:60]!r}"
+            )
+        key, value = match.group(1), match.group(2)
+        if key == "来源" and current is not None and "来源" in current["fields"]:
+            close()
+        if current is None:
+            current = {"id": None, "start": number, "fields": {}, "lines": {}}
+        if key in current["fields"]:
+            raise ControllerError(
+                f"confirmation line {number}: field '{key}' repeats inside entry "
+                f"{current['id'] or f'at line {current['start']}'}"
+            )
+        current["fields"][key] = value
+        current["lines"][key] = number
+    close()
+    seen: dict[str, int] = {}
+    for item in entries:
+        if item["id"] is not None:
+            if item["id"] in seen:
+                raise ControllerError(
+                    f"confirmation ID {item['id']} appears twice (lines {seen[item['id']]} "
+                    f"and {item['start']})"
+                )
+            seen[item["id"]] = item["start"]
+        _validate_confirmation_fields(item)
+    return entries
+
+
+def _confirmation_counts(state: dict[str, Any]) -> dict[str, Any]:
+    entries = state.get("confirmations") or []
+    return {
+        "total": len(entries),
+        "open": sum(1 for e in entries if e["status"] == "OPEN"),
+        "answered": sum(1 for e in entries if e["status"] == "ANSWERED"),
+        "skipped_to_default": sum(1 for e in entries if e["status"] == "SKIPPED-DEFAULT"),
+        "applied": sum(1 for e in entries if e["applied"]),
+        "blocking_open": [e["id"] for e in entries if e["blocking"] and e["status"] == "OPEN"],
+        "settled_unapplied": [
+            e["id"] for e in entries
+            if e["status"] in CONFIRMATION_SETTLED and not e["applied"]
+        ],
+        "blocking_incomplete": [
+            e["id"] for e in entries
+            if e["blocking"] and (e["status"] == "OPEN" or not e["applied"])
+        ],
+    }
+
+
+def _confirmation_file_location(
+    state: dict[str, Any], declared: str | Path | None
+) -> tuple[Path, str]:
+    """Resolve the one confirmation file of this run: ``<feature-directory>/confirmation-log.md``."""
+    repo = _require_repo_root(state["repository"]["root"])
+    expected = Path(state["feature_directory"]["absolute"]) / CONFIRMATION_FILE
+    if declared is not None:
+        candidate, _ = _inside(repo, declared)
+        if candidate != expected:
+            raise ControllerError(
+                f"--file must be the feature directory's confirmation file: {expected}"
+            )
+    else:
+        candidate = expected
+    try:
+        rel = candidate.relative_to(repo).as_posix()
+    except ValueError:
+        rel = str(candidate)
+    return candidate, rel
+
+
+def _absorb_confirmations(
+    state: dict[str, Any], conf_path: Path, *, validate_refs: bool, mark_imported: bool = False
+) -> dict[str, Any]:
+    """Parse the confirmation file, stamp IDs onto new entries, and refresh ``state``.
+
+    The file is the source of truth and this is a full re-derivation, so re-running it after
+    any controller write (ID stamp, ``决定:`` line, ``应用:`` line) keeps both sides equal by
+    construction.  ``validate_refs`` is what separates the in-run sync -- where a
+    ``REFINER:CRITIC-003`` provenance must name a finding this run registered -- from the
+    ``init`` ingest, which reads a ledger whose findings live in a previous run's state (D12).
+    """
+    text = _read_confirmation_text(conf_path)
+    crlf = "\r\n" in text
+    lines = text.splitlines()
+    parsed = _parse_confirmation_log(text)
+    known = {item["id"]: item for item in state.get("confirmations") or []}
+    taken = [int(item["id"].split("-")[1]) for item in parsed if item["id"]]
+    taken += [int(item.split("-")[1]) for item in known]
+    next_num = max(taken, default=0) + 1
+    new_ids: list[str] = []
+    inserts: list[tuple[int, str]] = []
+    for item in parsed:
+        if item["id"] is None:
+            item["id"] = f"CONF-{next_num:03d}"
+            next_num += 1
+            new_ids.append(item["id"])
+            inserts.append((item["start"] - 1, item["id"]))
+    if validate_refs:
+        for item in parsed:
+            if item["id"] in known:
+                continue
+            ref = _confirmation_ref(item["fields"]["来源"])
+            if ref and not any(f["id"] == ref for f in state["findings"]):
+                raise ControllerError(
+                    f"confirmation {item['id']} cites 来源 {item['fields']['来源']!r} but {ref} is "
+                    "not a finding registered in this run; record the finding, then sync"
+                )
+    for item in parsed:
+        previous = known.get(item["id"])
+        if previous is None:
+            continue
+        for key, stored in (
+            ("来源", "source"), ("位置", "location"),
+        ):
+            if item["fields"][key] != previous[stored]:
+                raise ControllerError(
+                    f"confirmation {item['id']}: field '{key}' was rewritten after registration "
+                    f"({previous[stored]!r} -> {item['fields'][key]!r}); registered fields are "
+                    "immutable, append a new entry instead"
+                )
+        if (item["fields"]["阻断"] == "true") != previous["blocking"]:
+            raise ControllerError(
+                f"confirmation {item['id']}: 阻断 was rewritten after registration "
+                f"({previous['blocking']} -> {item['fields']['阻断'] == 'true'})"
+            )
+        if _norm_question(item["fields"]["问题"]) != _norm_question(previous["question"]):
+            raise ControllerError(
+                f"confirmation {item['id']}: 问题 was rewritten after registration; it is the "
+                "pairing key for body markers and stays fixed once registered"
+            )
+    file_ids = {item["id"] for item in parsed}
+    deleted = sorted(set(known) - file_ids)
+    if deleted:
+        raise ControllerError(
+            f"confirmation entr{'y' if len(deleted) == 1 else 'ies'} {', '.join(deleted)} "
+            f"disappeared from {conf_path}; the ledger is append-only -- restore the "
+            "line(s), or register a new entry alongside"
+        )
+    norms: dict[str, str] = {}
+    for item in parsed:
+        norm = _norm_question(item["fields"]["问题"])
+        if norm in norms:
+            raise ControllerError(
+                f"confirmation entries {norms[norm]} and {item['id']} ask the same question; "
+                "the question text is the pairing key and must be unique per run"
+            )
+        norms[norm] = item["id"]
+    if inserts:
+        for index, conf_id in sorted(inserts, reverse=True):
+            lines.insert(index, conf_id)
+        _save_confirmation_text(conf_path, lines, crlf)
+    _, conf_rel = _confirmation_file_location(state, conf_path)
+    fresh: list[dict[str, Any]] = []
+    for item in parsed:
+        fields = item["fields"]
+        status, applied = _confirmation_status(fields)
+        previous = known.get(item["id"]) or {}
+        fresh.append({
+            "id": item["id"],
+            "source": fields["来源"],
+            "blocking": fields["阻断"] == "true",
+            "location": fields["位置"],
+            "question": fields["问题"],
+            "impact": fields.get("影响", ""),
+            "options": fields.get("选项", ""),
+            "recommend": fields.get("推荐", ""),
+            "decision": fields.get("决定", ""),
+            "applied": applied,
+            "status": status,
+            "imported": True if mark_imported else bool(previous.get("imported")),
+            "registered_at": previous.get("registered_at") or _now(),
+            "synced_at": _now(),
+        })
+    state["confirmations"] = fresh
+    state["confirmation_file"] = conf_rel
+    counts = _confirmation_counts(state)
+    counts["new_ids"] = new_ids
+    return counts
+
+
+def sync_confirmations(state_path: str | Path, file_path: str | Path) -> dict[str, Any]:
+    """Register the confirmation file's entries, stamp IDs, and report the pause verdict.
+
+    ``blocking_open == 0`` in this output is the single accepted verdict that the humans
+    are done answering (SKILL 暂停协议); no self-report replaces it.
+    """
+    path, state = load_state(state_path)
+    if state["stage"] not in {"ARCHITECT", "REFINER", "REVIEW"}:
+        raise ControllerError(
+            "sync-confirmations runs in stage ARCHITECT, REFINER or REVIEW (a dispatch "
+            f"raised entries, or a reviewer verdict needs one transcribed), current stage is {state['stage']}"
+        )
+    conf_path, _ = _confirmation_file_location(state, file_path)
+    counts = _absorb_confirmations(state, conf_path, validate_refs=True)
+    _save(path, state)
+    return counts
+
+
+def _set_confirmation_field(
+    conf_path: Path, conf_id: str, key: str, value: str
+) -> None:
+    """Rewrite one field line of one entry, inserting it when the entry omitted it."""
+    text = _read_confirmation_text(conf_path)
+    crlf = "\r\n" in text
+    lines = text.splitlines()
+    item = next(
+        (entry for entry in _parse_confirmation_log(text) if entry["id"] == conf_id), None
+    )
+    if item is None:
+        raise ControllerError(
+            f"confirmation {conf_id} is not present in {conf_path}; sync-confirmations first"
+        )
+    if item["fields"].get(key, "").strip():
+        raise ControllerError(
+            f"confirmation {conf_id} already has a non-empty '{key}' line in the file; "
+            "run sync-confirmations so state and file agree before overwriting it"
+        )
+    if key in item["lines"]:
+        lines[item["lines"][key] - 1] = f"{key}: {value}"
+    else:
+        lines.insert(max(item["lines"].values()), f"{key}: {value}")
+    _save_confirmation_text(conf_path, lines, crlf)
+
+
+def skip_to_default(state_path: str | Path, conf_id: str, by: str) -> dict[str, Any]:
+    """Record 按推荐 as the human's verdict for one open entry (explicit, never silent)."""
+    path, state = load_state(state_path)
+    if state["stage"] == "CLOSED":
+        raise ControllerError("the run is closed; the delivered document is frozen")
+    if not by.strip():
+        raise ControllerError("--by is required (who said so / the user's instruction verbatim)")
+    entry = next(
+        (item for item in state.get("confirmations") or [] if item["id"] == conf_id), None
+    )
+    if entry is None:
+        raise ControllerError(
+            f"unknown confirmation id: {conf_id}; sync the entry first with sync-confirmations"
+        )
+    if entry["status"] != "OPEN":
+        raise ControllerError(f"{conf_id} already carries a decision ({entry['status']})")
+    if not entry["recommend"].strip():
+        raise ControllerError(
+            f"{conf_id} has no 推荐 field, so 按推荐 has no referent; the question needs an answer"
+        )
+    conf_path, _ = _confirmation_file_location(state, state["confirmation_file"])
+    _set_confirmation_field(
+        conf_path, conf_id, "决定", f"{DEFAULT_DECISION}（skip-to-default: {by.strip()}）"
+    )
+    counts = _absorb_confirmations(state, conf_path, validate_refs=True)
+    _save(path, state)
+    return {"id": conf_id, "status": "SKIPPED-DEFAULT", **counts}
+
+
+def mark_confirmation_applied(
+    state_path: str | Path, conf_id: str, location: str, summary: str
+) -> dict[str, Any]:
+    """Bind a settled decision to the section a resumed dispatch actually rewrote.
+
+    The ``应用:`` line is written by this command, not inferred: an ANSWERED decision that
+    nobody landed is an open risk at delivery, and only the dispatch that rewrote the
+    body can say where it landed -- which is also why its ``--scope`` must cover it.
+    """
+    path, state = load_state(state_path)
+    stage = state["stage"]
+    if stage not in {"ARCHITECT", "REFINER"}:
+        raise ControllerError(
+            "mark-confirmation-applied runs in stage ARCHITECT or REFINER (the resumed "
+            f"dispatch reports its landing), current stage is {stage}"
+        )
+    entry = next(
+        (item for item in state.get("confirmations") or [] if item["id"] == conf_id), None
+    )
+    if entry is None:
+        raise ControllerError(f"unknown confirmation id: {conf_id}")
+    if entry["status"] == "OPEN":
+        raise ControllerError(
+            f"{conf_id} is still OPEN; a decision must be settled before it can be applied"
+        )
+    if entry["applied"]:
+        raise ControllerError(
+            f"{conf_id} is already applied at '{entry['applied']}'; a landing is recorded once"
+        )
+    for label, value in (("location", location), ("summary", summary)):
+        if not value.strip():
+            raise ControllerError(f"--{label} is required")
+    _dispatch_scope_covers(path, state, stage, [("landing", location)])
+    conf_path, _ = _confirmation_file_location(state, state["confirmation_file"])
+    _set_confirmation_field(
+        conf_path, conf_id, "应用", f"{location}；{summary.strip()}（{_now()[:19]}）"
+    )
+    counts = _absorb_confirmations(state, conf_path, validate_refs=True)
+    _save(path, state)
+    landed = next(item for item in state["confirmations"] if item["id"] == conf_id)
+    return {"id": conf_id, "applied": landed["applied"], **counts}
+
+
+def confirmations(state_path: str | Path) -> dict[str, Any]:
+    """The read-only view: file location, per-entry state and the pause verdict counts."""
+    _, state = load_state(state_path)
+    return {
+        "file": state.get("confirmation_file"),
+        "stage": state["stage"],
+        **_confirmation_counts(state),
+        "entries": [
+            {
+                "id": item["id"],
+                "source": item["source"],
+                "blocking": item["blocking"],
+                "question": item["question"],
+                "status": item["status"],
+                "decision": _settled_decision(item) if item["status"] != "OPEN" else "",
+                "applied": item["applied"],
+                "imported": item["imported"],
+            }
+            for item in state.get("confirmations") or []
+        ],
+    }
+
+
+def _confirmation_file_problems(state: dict[str, Any]) -> list[str]:
+    """Compare the living ledger on disk with what this run registered, field by field.
+
+    Read-only on purpose -- ``gate`` runs on a document that may already be delivered, and a
+    check that re-absorbed the file would silently move the run's own record.  What it is
+    looking for is drift after the last sync: an answer typed into the file that never made
+    it into ``state`` (so the ledger in chapter 16 says something else), an entry deleted
+    from a file that is supposed to be append-only, or the file removed outright while the
+    run still carries its entries.
+    """
+    conf_path, rel = _confirmation_file_location(state, None)
+    entries = state.get("confirmations") or []
+    if not conf_path.is_file():
+        if entries:
+            return [f"{rel} is missing but {len(entries)} confirmation entries are registered"]
+        return []
+    try:
+        parsed = _parse_confirmation_log(_read_confirmation_text(conf_path))
+    except ControllerError as exc:
+        return [str(exc)]
+    problems: list[str] = []
+    by_id = {item["id"]: item for item in entries}
+    seen: set[str] = set()
+    for item in parsed:
+        if item["id"] is None:
+            problems.append(
+                f"{rel}: 问题 {item['fields']['问题'][:40]!r} has no CONF-ID; "
+                "run sync-confirmations before delivering"
+            )
+            continue
+        seen.add(item["id"])
+        stored = by_id.get(item["id"])
+        if stored is None:
+            problems.append(
+                f"{item['id']} is in {rel} but not registered in this run's state; "
+                "run sync-confirmations"
+            )
+            continue
+        status, applied = _confirmation_status(item["fields"])
+        for label, file_value, state_value in (
+            ("来源", item["fields"]["来源"], stored["source"]),
+            ("阻断", item["fields"]["阻断"] == "true", stored["blocking"]),
+            ("位置", item["fields"]["位置"], stored["location"]),
+            ("问题", _norm_question(item["fields"]["问题"]), _norm_question(stored["question"])),
+            ("决定", item["fields"].get("决定", ""), stored["decision"]),
+            ("应用", applied, stored["applied"]),
+        ):
+            if file_value != state_value:
+                problems.append(
+                    f"{item['id']}: {label} differs between {rel} ({file_value!r}) and "
+                    f"state ({state_value!r}); run sync-confirmations so the two agree"
+                )
+    problems += [
+        f"{conf_id} is registered in state but absent from {rel}; the ledger is append-only"
+        for conf_id in sorted(set(by_id) - seen)
+    ]
+    return problems
+
+
+def _require_no_blocking_confirmations(state: dict[str, Any], target: str) -> None:
+    """Refuse to advance while a blocking confirmation is unresolved (D11).
+
+    Checked at every audit hand-off (CRITIC, REVIEW) and at DELIVERY, not just before the
+    first audit: a decision that was answered but never landed is exactly as unfinished as
+    one still open.  Landing is only demanded where a landing channel still exists -- in
+    front of the CRITIC and REVIEW doors the document is one dispatch away from a Refiner,
+    but at DELIVERY the passing verdict is bound to the snapshot and the stage machine has no
+    way back, so an answer that arrived during a review round could not land here at all;
+    requiring it would dead-lock the run rather than fix the document.  Those entries are
+    carried over instead: they stay in the chapter-16 ledger as 待落地, are listed by
+    ``start-stage --to DELIVERY`` and ``confirmations``, and the next run's ``init`` consumes
+    them as frozen human decisions.  A must_fix finding may still not lean on an open entry.
+    """
+    entries = state.get("confirmations") or []
+    blockers = [
+        f"{item['id']} [{'OPEN' if item['status'] == 'OPEN' else item['status'] + ' 未落地'}]"
+        for item in entries
+        if item["blocking"] and (item["status"] == "OPEN" or not item["applied"])
+    ]
+    if blockers:
+        raise ControllerError(
+            f"start-stage --to {target} refused: {len(blockers)} blocking confirmation(s) "
+            f"not closed out ({', '.join(blockers)}); answer them in the confirmation file "
+            "(or skip-to-default), then sync-confirmations, and land settled decisions with "
+            "mark-confirmation-applied"
+        )
+    unlanded = [
+        item["id"] for item in entries
+        if item["status"] in CONFIRMATION_SETTLED and not item["applied"]
+    ]
+    if unlanded and target != "DELIVERY":
+        raise ControllerError(
+            f"start-stage --to {target} refused: settled decision(s) {', '.join(unlanded)} "
+            "never landed in the body; this door still has a landing channel, so consume them "
+            "in a resumed dispatch and mark-confirmation-applied before handing the document "
+            "to an auditor"
+        )
+    if target != "DELIVERY":
+        return
+    must_fix_open = {
+        finding["id"] for finding in state["findings"]
+        if finding["must_fix"] and not _closed(state, finding["id"])
+    }
+    leaning = [
+        item["id"] for item in entries
+        if item["status"] == "OPEN" and _confirmation_ref(item["source"]) in must_fix_open
+    ]
+    if leaning:
+        raise ControllerError(
+            f"DELIVERY refused: open confirmation(s) {', '.join(leaning)} hang on unclosed "
+            "must_fix findings; a human answer plus a landed edit closes both"
+        )
+
+
+LEGACY_CONFIRMATION_HEADER = (
+    "# 人工确认账本（confirmation-log）",
+    "",
+    "> 由 technical-doc 维护的跨 run 活账：条目只追加、不删除、不重排。",
+    "> CONF-<NNN> ID 行、skip-to-default 写的 决定: 行与 mark-confirmation-applied 写的 应用: 行由控制器回写，",
+    "> 其余字段由产出角色与人工维护；作答方式见 SKILL「人工确认循环」。",
+)
+
+
+def _append_legacy_confirmations(
+    conf_path: Path, items: list[tuple[str, int]]
+) -> list[str]:
+    """Adopt body markers that predate the loop as LEGACY-MARKER entries (migration).
+
+    Written without an ID line: the following ``_absorb_confirmations`` stamps IDs through
+    the same path a model-authored entry takes, so the migration cannot mint IDs that
+    drift from the sync rule.
+    """
+    lines: list[str] = []
+    crlf = False
+    if conf_path.is_file():
+        text = _read_confirmation_text(conf_path)
+        crlf = "\r\n" in text
+        lines = text.splitlines()
+    else:
+        lines = list(LEGACY_CONFIRMATION_HEADER)
+    for question, number in items:
+        lines += [
+            "",
+            "来源: LEGACY-MARKER",
+            "阻断: false",
+            f"位置: 正文第 {number} 行",
+            f"问题: {question}",
+            "影响:",
+            "决定:",
+            "应用:",
+        ]
+    _save_confirmation_text(conf_path, lines, crlf)
+    return [question for question, _ in items]
+
+
+def _ingest_confirmations(
+    feature: Path, state: dict[str, Any], tdd_text: str | None
+) -> dict[str, Any]:
+    """Carry the living ledger into a fresh run (stage 0 of the confirmation loop).
+
+    Three jobs, none of them optional: import whatever the file holds (``来源`` finding
+    references are provenance here, not a claim to verify -- D12), freeze every settled
+    but unlanded decision as ``HUMAN_DECISION`` input evidence the Architect must consume
+    first, and register the bare markers of a pre-loop document so the marker
+    reconciliation does not kill an old TDD on its first update run.
+    """
+    conf = feature / CONFIRMATION_FILE
+    summary: dict[str, Any] = {
+        "file": None, "imported": 0, "pending_landing": [], "legacy_registered": [],
+    }
+    if conf.is_file():
+        _absorb_confirmations(state, conf, validate_refs=False, mark_imported=True)
+    norms = {
+        _norm_question(item["question"]) for item in state.get("confirmations") or []
+    }
+    seen: set[str] = set()
+    bare: list[tuple[str, int]] = []
+    if tdd_text is not None:
+        for norm, number, inner in _document_markers(tdd_text):
+            if norm in norms or norm in seen:
+                continue
+            seen.add(norm)
+            bare.append((inner, number))
+    if bare:
+        summary["legacy_registered"] = _append_legacy_confirmations(conf, bare)
+        _absorb_confirmations(state, conf, validate_refs=False, mark_imported=True)
+    if state.get("confirmations"):
+        summary["file"] = state["confirmation_file"]
+        summary["imported"] = len(state["confirmations"])
+    for entry in state.get("confirmations") or []:
+        if entry["status"] in CONFIRMATION_SETTLED and not entry["applied"]:
+            entry["pending_landing"] = True
+            state["sources"].append({
+                "source_id": f"CONFIRMATION-{entry['id']}",
+                "kind": "HUMAN_DECISION",
+                "locator": str(conf),
+                "read_status": "READ",
+                "revision": entry["registered_at"],
+                "summary": (
+                    f"{entry['id']}: {entry['question']} → {_settled_decision(entry)}"
+                ),
+                "confidence": "HIGH",
+                "recorded_at": _now(),
+            })
+            summary["pending_landing"].append(entry["id"])
+    return summary
+
+
+def _confirmations_ledger_body(state: dict[str, Any]) -> list[str]:
+    entries = state.get("confirmations") or []
+    conf_rel = state.get("confirmation_file") or CONFIRMATION_FILE
+    outstanding = [
+        item for item in entries
+        if item["status"] == "OPEN" or not item["applied"]
+    ]
+    rows = [
+        "| CONF-ID | 问题 | 阻断 | 状态 | 落点 / 作答指引 |",
+        "|---|---|---|---|---|",
+    ]
+    for item in outstanding:
+        if item["status"] == "OPEN":
+            guidance = (
+                f"在 `{conf_rel}` 的 {item['id']} 条目填写 决定:（或在会话内回复"
+                f"「确认 {item['id']}: <决定>」由主控代录）"
+            )
+            status_cell = "OPEN"
+        else:
+            guidance = "已裁定待落地：恢复派发消费后由主控 mark-confirmation-applied 登记"
+            status_cell = item["status"]
+        rows.append(
+            "| {} | {} | {} | {} | {} |".format(
+                _cell(item["id"]),
+                _cell(item["question"]),
+                _cell("是" if item["blocking"] else "否"),
+                _cell(status_cell),
+                _cell(guidance),
+            )
+        )
+    settled_rows = [
+        "| CONF-ID | 决定 | 落点 |",
+        "|---|---|---|",
+    ]
+    for item in entries:
+        if item["status"] == "OPEN":
+            continue
+        settled_rows.append(
+            "| {} | {} | {} |".format(
+                _cell(item["id"]),
+                _cell(_settled_decision(item)),
+                _cell(item["applied"] or "待落地"),
+            )
+        )
+    body = [
+        "**人工确认台账**（未收口条目；生成，勿手改，作答只在确认文件）",
+        "",
+    ]
+    body += rows if outstanding else ["当前没有未收口的人工确认条目。"]
+    body += ["", "**人工决定台账**（生成，勿手改）", ""]
+    body += settled_rows if len(settled_rows) > 2 else ["暂无人工决定。"]
+    return [
+        "**人工确认与决定台账**（由 `tech_doc_controller.py render-ledger` 从 `state.json` "
+        "生成，请勿手改）",
+        "",
+        *body,
+    ]
+
+
 def _cell(value: Any, limit: int = LEDGER_CELL_LIMIT) -> str:
     text = " ".join(str(value).split()).replace("|", r"\|")
     if len(text) > limit:
@@ -1648,11 +2457,15 @@ def _run_metadata_body(state: dict[str, Any], doc_text: str, run_dir: str) -> li
         gate_summary = f"{state['gates'][-1]['status']} @ {state['gates'][-1]['evaluated_at'][:19]}"
     else:
         gate_summary = "尚未运行"
-    confirmations: list[str] = []
-    for line in doc_text.splitlines():
-        for match in CONFIRMATION.finditer(line):
-            if match.group(0) not in confirmations:
-                confirmations.append(match.group(0))
+    # The ledger names entries by CONF-ID instead of echoing marker text: an echoed marker
+    # would itself read as an unanswered question, and the pairing key lives in the
+    # confirmation file now, not in this mirror.
+    entries = state.get("confirmations") or []
+    pending = [
+        item for item in entries if item["status"] == "OPEN" or not item["applied"]
+    ]
+    norms = {_norm_question(item["question"]) for item in entries}
+    stray = sum(1 for norm, _number, _inner in _document_markers(doc_text) if norm not in norms)
     degraded = (
         "是：" + "、".join(_cell(item["role"]) for item in state["degradations"])
         if state["degraded"]
@@ -1696,12 +2509,21 @@ def _run_metadata_body(state: dict[str, Any], doc_text: str, run_dir: str) -> li
         f"| 降级模式 | {_cell(degraded)} |",
     ]
     body = ["**运行元数据**（生成，勿手改）", "", *rows, ""]
-    if confirmations:
-        body += [f"仍需人工确认（{len(confirmations)} 项）："] + [
-            f"- `{_cell(item)}`" for item in confirmations[:40]
-        ]
-    else:
-        body.append("仍需人工确认：无。")
+    notes: list[str] = []
+    if pending:
+        notes.append(
+            f"仍需人工确认（{len(pending)} 项）：" + "、".join(
+                "{} {}".format(
+                    item["id"], "OPEN" if item["status"] == "OPEN" else item["status"] + " 未落地"
+                )
+                for item in pending[:40]
+            )
+        )
+    if stray:
+        notes.append(
+            f"正文另有 {stray} 处未登记的人工确认 marker（不回显文本；先在确认文件登记条目再刷新台账）"
+        )
+    body += notes or ["仍需人工确认：无。"]
     return body
 
 
@@ -1777,6 +2599,7 @@ def _expected_ledger(state: dict[str, Any], doc_text: str, run_dir: str) -> dict
     return {
         "findings": _findings_ledger_body(state),
         "run-metadata": _run_metadata_body(state, strip_ledger_bodies(doc_text), run_dir),
+        "confirmations": _confirmations_ledger_body(state),
         "history-index": _history_index_body(state, _prior_history_rows(doc_text)),
     }
 
@@ -2341,19 +3164,19 @@ def _index_numbers(state_path: Path) -> dict[str, str]:
         return {}
 
 
-def _refiner_scope_covers(
-    state_path: Path, state: dict[str, Any], finding: dict[str, Any], location: str
+def _dispatch_scope_covers(
+    state_path: Path, state: dict[str, Any], stage: str, pairs: list[tuple[str, str]]
 ) -> None:
-    """A per-section Refiner dispatch may not dispose of a finding it was never handed.
+    """A per-section dispatch may not dispose of, or land a decision in, a section it was never handed.
 
-    Both ends are checked: the section the disposition claims to have touched *and* the
-    section the finding was raised against.  A fix may land in a different chapter than
-    the finding names, but the round still has to have been handed the finding's own
-    location -- naming an in-scope section while the finding sits outside would otherwise
-    stay a bypass.  A location that resolves to no heading stays disposable: the guard
-    must not invent a scope for it.
+    Both ends are checked when a Finding is involved: the section the disposition claims to
+    have touched *and* the section the finding was raised against.  A fix may land in a
+    different chapter than the finding names, but the round still has to have been handed the
+    finding's own location -- naming an in-scope section while the finding sits outside would
+    otherwise stay a bypass.  A location that resolves to no heading stays disposable: the
+    guard must not invent a scope for it.
 
-    The window is the current REFINER stage, which is what makes a split round legal: several
+    The window is the current stage entry, which is what makes a split round legal: several
     scoped dispatches contribute the union of their sections, while a scope declared in an
     earlier round does not license this round's edit.  One dispatch that declares no ``--scope``
     does not stand the guard down either -- it would be an escape hatch, and the ledger already
@@ -2363,12 +3186,13 @@ def _refiner_scope_covers(
     entered = [
         _parse_at(item.get("at"))
         for item in state.get("stage_history", [])
-        if item.get("stage") == "REFINER"
+        if item.get("stage") == stage
     ]
     since = next((stamp for stamp in reversed(entered) if stamp is not None), None)
+    role = ROLES[stage]
     scopes: list[str] = []
     for item in state["agents"]:
-        if item["role"] != ROLES["REFINER"]:
+        if item["role"] != role:
             continue
         if since is not None and (_parse_at(item.get("recorded_at")) or since) < since:
             continue
@@ -2378,12 +3202,12 @@ def _refiner_scope_covers(
     if not scopes:
         return
     numbers = _fresh_index(state_path, state, _resolve_tdd(state, None))["numbers"]
-    for label, value in (("disposition", location), ("finding", finding["location"])):
+    for label, value in pairs:
         key, _ = _resolve_location(numbers, [], value)
         if key is not None and key not in scopes:
             raise ControllerError(
                 f"'{value}' ({label} location) resolves to section {key}, outside every --scope "
-                f"this round's Refiner dispatches were handed ({', '.join(scopes)}); widen it or "
+                f"this round's {role} dispatches were handed ({', '.join(scopes)}); widen it or "
                 "read that section first"
             )
 
@@ -2392,9 +3216,14 @@ def _scan_document(text: str, state: dict[str, Any]) -> list[dict[str, Any]]:
     """Deterministic delivery checks over the TDD body."""
     checks: list[dict[str, Any]] = []
 
+    # Only a marker in the hand-written body excuses a placeholder on its own line: a sample
+    # inside a code fence, or one the ledger just echoed back, is example text and excuses
+    # nothing.
+    markers = _document_markers(text)
+    marker_lines = {line for _, line, _ in markers}
     placeholders: list[str] = []
     for number, line in enumerate(text.splitlines(), start=1):
-        if CONFIRMATION.search(line):
+        if number in marker_lines:
             continue
         if PLACEHOLDER.search(line):
             placeholders.append(f"line {number}: {line.strip()[:80]}")
@@ -2451,7 +3280,43 @@ def _scan_document(text: str, state: dict[str, Any]) -> list[dict[str, Any]]:
         "detail": legacy or "context pack stayed inside the feature directory",
     })
 
+    checks.append(_marker_reconciliation_check(markers, state))
     return checks
+
+
+def _marker_reconciliation_check(
+    markers: list[tuple[str, int, str]], state: dict[str, Any]
+) -> dict[str, Any]:
+    """Both directions of the marker/entry pairing, at delivery (D9).
+
+    An unregistered marker is the bypass this exists to close: a role that writes
+    ``[需人工确认: …]`` without appending the entry leaves the question out of the ledger,
+    unanswered and unpersisted.  A landed entry whose marker is still in the body is the
+    mirror image -- the dispatch claims it consumed the answer, yet the document still asks.
+    A marker whose entry is still unsettled, or settled but carried over because this run
+    had no landing channel left, stays legal: the question really is still open on the page.
+    """
+    registered = {_norm_question(item["question"]) for item in state.get("confirmations") or []}
+    first_line: dict[str, int] = {}
+    unregistered: list[str] = []
+    for norm, number, inner in markers:
+        first_line.setdefault(norm, number)
+        if norm not in registered:
+            unregistered.append(f"line {number}: {inner[:60]}")
+    residue = [
+        f"{item['id']} landed at {item['applied'][:40]!r} but its marker is still in the "
+        f"body, line {first_line[_norm_question(item['question'])]}"
+        for item in state.get("confirmations") or []
+        if item["applied"] and _norm_question(item["question"]) in first_line
+    ]
+    return {
+        "name": "markers-match-confirmations",
+        "ok": not unregistered and not residue,
+        "detail": (
+            unregistered[:12] + residue[:12]
+            or "every body marker has a ledger entry, and every settled entry's marker is gone"
+        ),
+    }
 
 
 def gate(state_path: str | Path, tdd_file: str | Path) -> dict[str, Any]:
@@ -2515,6 +3380,15 @@ def gate(state_path: str | Path, tdd_file: str | Path) -> dict[str, Any]:
         if not any(fix["finding_id"] == item["id"] for fix in state["fixes"])
     ]
     add("every-finding-has-a-disposition", not untracked, untracked or "complete")
+
+    conf_problems = _confirmation_file_problems(state)
+    add(
+        "confirmations-file-persisted",
+        not conf_problems,
+        conf_problems[:12]
+        or ("confirmation file agrees with state" if state.get("confirmations")
+            else "no confirmation entries this run"),
+    )
 
     if state["mode"] == "UPDATE":
         add("previous-tdd-archived", bool(state["history"]), "UPDATE run needs a history snapshot")
@@ -2606,6 +3480,7 @@ def show(state_path: str | Path) -> dict[str, Any]:
             "open": sum(1 for item in state["findings"] if item["status"] == "OPEN"),
             "total": len(state["findings"]),
         },
+        "confirmations": _confirmation_counts(state),
         "reviews": [
             f"r{item['round']}:{item['status']}({item.get('scope') or 'full'})"
             for item in state["reviews"]
@@ -2769,6 +3644,33 @@ def _fixer_commands(sub: argparse._SubParsersAction) -> None:
     degraded.add_argument("--role", required=True)
     degraded.add_argument("--reason", required=True)
 
+    sync_conf = sub.add_parser(
+        "sync-confirmations",
+        help="register confirmation-file entries, stamp CONF IDs, and report the pause verdict",
+    )
+    sync_conf.add_argument("--state", required=True)
+    sync_conf.add_argument("--file", required=True)
+
+    skip_conf = sub.add_parser(
+        "skip-to-default",
+        help="record 按推荐 as the human's verdict for one open entry (explicit instruction only)",
+    )
+    skip_conf.add_argument("--state", required=True)
+    skip_conf.add_argument("--conf-id", required=True, dest="conf_id")
+    skip_conf.add_argument("--by", required=True)
+
+    applied_conf = sub.add_parser(
+        "mark-confirmation-applied",
+        help="bind a settled decision to the section a resumed dispatch rewrote",
+    )
+    applied_conf.add_argument("--state", required=True)
+    applied_conf.add_argument("--conf-id", required=True, dest="conf_id")
+    applied_conf.add_argument("--location", required=True)
+    applied_conf.add_argument("--summary", required=True)
+
+    conf_show = sub.add_parser("confirmations", help="print the confirmation ledger and counts")
+    conf_show.add_argument("--state", required=True)
+
     history = sub.add_parser("archive-history", help="store the superseded TDD as a file")
     history.add_argument("--state", required=True)
     history.add_argument("--version", required=True)
@@ -2871,6 +3773,21 @@ def main(argv: list[str] | None = None) -> int:
             ))
         elif args.command == "degrade":
             print(json.dumps(degrade(args.state, args.role, args.reason), ensure_ascii=False))
+        elif args.command == "sync-confirmations":
+            print(json.dumps(sync_confirmations(args.state, args.file), ensure_ascii=False))
+        elif args.command == "skip-to-default":
+            print(json.dumps(
+                skip_to_default(args.state, args.conf_id, args.by), ensure_ascii=False
+            ))
+        elif args.command == "mark-confirmation-applied":
+            print(json.dumps(
+                mark_confirmation_applied(
+                    args.state, args.conf_id, args.location, args.summary
+                ),
+                ensure_ascii=False,
+            ))
+        elif args.command == "confirmations":
+            print(json.dumps(confirmations(args.state), ensure_ascii=False, indent=2))
         elif args.command == "archive-history":
             print(json.dumps(archive_history(args.state, args.version), ensure_ascii=False))
         elif args.command == "render-ledger":

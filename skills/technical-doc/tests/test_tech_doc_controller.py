@@ -609,10 +609,23 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertIn("review-report-matches-delivered-tdd", result["passed"])
 
     def test_human_confirmation_lines_are_allowed(self) -> None:
+        # a marker line is not a template placeholder, but a marker with no ledger entry
+        # behind it is exactly what the delivery reconciliation refuses to deliver on
         _, result = self.gate_for(
             "run-13", TDD_BODY + "\n[需人工确认: 下游工单接口的限流阈值]\n"
         )
         self.assertIn("no-template-placeholders", result["passed"])
+        self.assertIn("markers-match-confirmations", result["failures"])
+
+    def test_a_fenced_marker_excuses_nothing(self) -> None:
+        # sample text inside a code fence is invisible to the marker rules in both
+        # directions, so it cannot be used to park a placeholder past the gate
+        _, result = self.gate_for(
+            "run-13a",
+            TDD_BODY + "\n```text\n[需人工确认: 围栏内示例] 【填写】\n```\n",
+        )
+        self.assertIn("no-template-placeholders", result["failures"])
+        self.assertIn("markers-match-confirmations", result["passed"])
 
     def test_gate_flags_unbalanced_fences(self) -> None:
         _, result = self.gate_for("run-13b", TDD_BODY + "\n```mermaid\nsequenceDiagram\n")
@@ -694,16 +707,20 @@ class TechDocControllerTests(unittest.TestCase):
         first = controller.render_ledger(state, tdd)
         text = tdd.read_text(encoding="utf-8")
         second = controller.render_ledger(state, tdd)
-        self.assertEqual(first["rendered"], ["findings", "run-metadata"])
+        self.assertEqual(first["rendered"], ["findings", "run-metadata", "confirmations"])
         self.assertTrue(first["changed"])
         self.assertFalse(second["changed"])
         self.assertEqual(text, tdd.read_text(encoding="utf-8"))
         # one marker pair per section, in chapter order, below the chapter 16 heading
-        self.assertEqual(text.count("<!-- codekit:technical-doc:ledger:"), 4)
+        self.assertEqual(text.count("<!-- codekit:technical-doc:ledger:"), 6)
         chapter = text.index("## 16. 审查闭环记录")
         findings = text.index("ledger:findings:start")
         metadata = text.index("ledger:run-metadata:start")
-        self.assertTrue(chapter < findings < metadata, (chapter, findings, metadata))
+        confirmations = text.index("ledger:confirmations:start")
+        self.assertTrue(
+            chapter < findings < metadata < confirmations,
+            (chapter, findings, metadata, confirmations),
+        )
         self.assertEqual(first["handwritten_mirror"], [])
         result = controller.gate(state, tdd)
         self.assertEqual(result["status"], "PASS", result["failures"])
@@ -796,7 +813,7 @@ class TechDocControllerTests(unittest.TestCase):
 
         state, tdd = self.closed_loop("run-27", update=True)
         rendered = controller.render_ledger(state, tdd)
-        self.assertEqual(rendered["rendered"], ["findings", "run-metadata", "history-index"])
+        self.assertEqual(rendered["rendered"], ["findings", "run-metadata", "confirmations", "history-index"])
         text = tdd.read_text(encoding="utf-8")
         self.assertIn("| 1 | 0.9 |", text)
         self.assertIn("2/1/0", text)
@@ -863,7 +880,10 @@ class TechDocControllerTests(unittest.TestCase):
             capture_output=True, text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["rendered"], ["findings", "run-metadata"])
+        self.assertEqual(
+            json.loads(result.stdout)["rendered"],
+            ["findings", "run-metadata", "confirmations"],
+        )
         # a NEW run has no superseded version, so the history index stays out of the document
         self.assertNotIn("ledger:history-index:start", tdd.read_text(encoding="utf-8"))
 
@@ -1488,6 +1508,655 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertEqual(summary["review_stop"], {"policy": "fixed", "forced": False, "quiet": False,
                                                  "quiet_rounds": [], "open_must_fix": []})
         self.assertIsNone(summary["scale"])
+
+
+CONF_FIXTURE = """来源: ARCHITECT
+阻断: true
+位置: 3.4
+问题: 下游工单接口的限流阈值
+影响: 
+选项: A 固定 50 QPS / B 令牌桶自适应
+推荐: B —— 与现有网关一致
+决定: 
+应用: 
+
+来源: ARCHITECT
+阻断: false
+位置: 13
+问题: 告警值班群归属团队
+影响: 
+选项: 订单值班群 / 客服值班群
+推荐: 订单值班群
+决定: 
+应用: 
+"""
+
+CONF_TWO_DECIDED = """CONF-001
+来源: ARCHITECT
+阻断: false
+位置: 3.4
+问题: 告警值班群归属团队
+影响: 
+选项: 订单值班群 / 客服值班群
+推荐: 订单值班群
+决定: 订单值班群
+应用: 
+
+CONF-002
+来源: REFINER:CRITIC-007
+阻断: false
+位置: 7.2
+问题: 归档表分区策略
+影响: 
+选项: 按月 / 按周
+推荐: 按月分区
+决定: 按周
+应用: 7.2；已按周分区改写 DDL（2026-09-19T10:00:00）
+"""
+
+# A fenced sample marker and a bare one: only the bare one may be adopted on ingest.
+MARKER_TDD = TDD_BODY.replace(
+    "## 12. 可观测设计",
+    "## 12. 可观测设计\n[需人工确认: 下游限流阈值需业务方确认]\n"
+    "```text\n[需人工确认: 围栏内示例不算待办]\n```",
+)
+
+
+class ConfirmationLoopTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.repo = Path(self.temp.name)
+        git(self.repo, "init", "-q")
+        git(self.repo, "config", "user.email", "test@example.invalid")
+        git(self.repo, "config", "user.name", "CodeKit Test")
+        (self.repo / "README.md").write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-qm", "base")
+        self.feature = self.repo / "docs" / "feature"
+        self.feature.mkdir(parents=True)
+        (self.feature / "product-doc.md").write_text(PRD, encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    # ---------------------------------------------------------------- helpers
+
+    def write_tdd(self, body: str = TDD_BODY) -> Path:
+        """Every run here is an UPDATE run, so the body carries the history chapter."""
+        path = self.feature / "technical-doc.md"
+        path.write_text(body + HISTORY_TAIL, encoding="utf-8")
+        return path
+
+    def write_conf(self, text: str, newline: str = "\n") -> Path:
+        path = self.feature / "confirmation-log.md"
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text.replace("\n", newline) if newline != "\n" else text)
+        return path
+
+    def record(self, state: Path, role: str, session: str, scope: str = "") -> None:
+        controller.record_agent(state, role, role, session, "sha256:input", "COMPLETED", scope)
+
+    def artifact(self, state: Path, kind: str) -> dict[str, Any]:
+        origin = self.repo / f"tmp-{kind}.md"
+        origin.write_text(EVIDENCE, encoding="utf-8")
+        return controller.write_artifact(state, kind, origin, None, None)
+
+    def to_architect(self, run_id: str) -> Path:
+        self.write_tdd()
+        state = Path(controller.init_run(self.repo, self.feature, run_id))
+        controller.record_source(
+            state, "SRC-1", "PRD", str(self.feature / "product-doc.md"),
+            "READ", "v1", "订单备注同步需求", "HIGH",
+        )
+        controller.finalize_inputs(state, "PASS", "全部关键资料已读取", "1/0/0")
+        controller.start_stage(state, "CONTEXT")
+        self.record(state, "tech-context", "s-context")
+        self.artifact(state, "context-pack")
+        controller.start_stage(state, "ARCHITECT")
+        self.record(state, "tech-architect", "s-arch")
+        self.artifact(state, "draft")
+        return state
+
+    def to_refiner(self, state: Path) -> None:
+        controller.start_stage(state, "CRITIC")
+        self.record(state, "tech-critic", "s-critic")
+        self.artifact(state, "critic-findings")
+        controller.start_stage(state, "REFINER")
+        self.record(state, "tech-refiner", "s-refine")
+        self.artifact(state, "refiner-map")
+
+    def approve_round(self, state: Path, session: str = "s-review-1") -> None:
+        self.record(state, "tech-reviewer", session)
+        report = self.artifact(state, "review-report")
+        controller.record_review(
+            state, "APPROVE", report["path"], self.feature / "technical-doc.md", session
+        )
+
+    def sync(self, state: Path) -> dict[str, Any]:
+        return controller.sync_confirmations(state, self.feature / "confirmation-log.md")
+
+    def entries(self, state: Path) -> list[dict[str, Any]]:
+        return json.loads(state.read_text(encoding="utf-8"))["confirmations"]
+
+    # ------------------------------------------------------------------- sync
+
+    def test_sync_stamps_ids_and_reports_pause_counts(self) -> None:
+        state = self.to_architect("conf-1")
+        self.write_conf(CONF_FIXTURE)
+        counts = self.sync(state)
+        self.assertEqual(counts["new_ids"], ["CONF-001", "CONF-002"])
+        self.assertEqual(counts["total"], 2)
+        self.assertEqual(counts["open"], 2)
+        self.assertEqual(counts["blocking_open"], ["CONF-001"])
+        self.assertEqual(counts["settled_unapplied"], [])
+        data = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual(data["confirmation_file"], "docs/feature/confirmation-log.md")
+        self.assertEqual([item["id"] for item in data["confirmations"]], ["CONF-001", "CONF-002"])
+        self.assertTrue(data["confirmations"][0]["blocking"])
+        # IDs were written back as their own line, above each entry's 来源
+        text = (self.feature / "confirmation-log.md").read_text(encoding="utf-8")
+        self.assertIn("CONF-001\n来源: ARCHITECT", text)
+        self.assertIn("CONF-002\n来源: ARCHITECT", text)
+        # re-syncing is a no-op on disk and mints no new IDs
+        second = self.sync(state)
+        self.assertEqual(second["new_ids"], [])
+        self.assertEqual(text, (self.feature / "confirmation-log.md").read_text(encoding="utf-8"))
+
+    def test_sync_rejects_garbage_bad_enums_duplicates_and_mutations(self) -> None:
+        state = self.to_architect("conf-2")
+        self.write_conf(CONF_FIXTURE + "\n这行不是字段行\n")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            self.sync(state)
+        self.assertIn("not a field line", str(ctx.exception))
+
+        self.write_conf(
+            CONF_FIXTURE.replace("来源: ARCHITECT", "来源: CRITIC-001", 1)
+        )
+        with self.assertRaises(controller.ControllerError) as ctx:
+            self.sync(state)
+        self.assertIn("来源", str(ctx.exception))
+
+        self.write_conf(CONF_FIXTURE.replace("阻断: true", "阻断: 是", 1))
+        with self.assertRaises(controller.ControllerError) as ctx:
+            self.sync(state)
+        self.assertIn("true or false", str(ctx.exception))
+
+        # the same question twice cannot both be the pairing key
+        self.write_conf(CONF_FIXTURE + "\n" + CONF_FIXTURE)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            self.sync(state)
+        self.assertIn("same question", str(ctx.exception))
+
+        self.write_conf(
+            "来源: ARCHITECT\n阻断: false\n位置: 3.4\n问题: "
+            + "很长" * 45
+            + "\n决定: \n"
+        )
+        with self.assertRaises(controller.ControllerError) as ctx:
+            self.sync(state)
+        self.assertIn("pairing key limit", str(ctx.exception))
+
+        # register first, then tamper: 问题 is immutable once stamped
+        self.write_conf("来源: ARCHITECT\n阻断: false\n位置: 3.4\n问题: 值班群归属\n决定: \n应用: \n")
+        self.sync(state)
+        conf = self.feature / "confirmation-log.md"
+        conf.write_text(
+            conf.read_text(encoding="utf-8").replace("问题: 值班群归属", "问题: 换了个措辞"),
+            encoding="utf-8",
+        )
+        with self.assertRaises(controller.ControllerError) as ctx:
+            self.sync(state)
+        self.assertIn("rewritten after registration", str(ctx.exception))
+
+        # and an entry may not vanish either
+        conf.write_text(
+            "\n".join(
+                line for line in conf.read_text(encoding="utf-8").splitlines()
+                if line != "CONF-001"
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(controller.ControllerError) as ctx:
+            self.sync(state)
+        self.assertIn("append-only", str(ctx.exception))
+
+    def test_sync_validates_finding_provenance_in_run(self) -> None:
+        state = self.to_architect("conf-3")
+        self.to_refiner(state)
+        controller.record_finding(
+            state, "CRITIC", "CRITIC-007", "High", "3.4 影响范围", "阈值缺失", None, 0
+        )
+        self.write_conf(
+            "来源: REFINER:CRITIC-099\n阻断: false\n位置: 3.4\n问题: 未登记的出处\n决定: \n"
+        )
+        with self.assertRaises(controller.ControllerError) as ctx:
+            self.sync(state)
+        self.assertIn("CRITIC-099", str(ctx.exception))
+        # the refused sync registered nothing: replace the file and sync the valid entry
+        self.write_conf(
+            "来源: REFINER:CRITIC-007\n阻断: false\n位置: 3.4\n问题: 阈值取哪个数\n决定: \n"
+        )
+        counts = self.sync(state)
+        self.assertEqual(counts["new_ids"], ["CONF-001"])
+
+    def test_sync_stage_and_path_are_not_free_choices(self) -> None:
+        self.write_conf(CONF_FIXTURE)
+        state = Path(controller.init_run(self.repo, self.feature, "conf-4"))
+        with self.assertRaises(controller.ControllerError) as ctx:
+            self.sync(state)
+        self.assertIn("stage", str(ctx.exception))
+        # a confirmation file elsewhere in the repo is not this feature's ledger
+        elsewhere = self.repo / "docs" / "other-confirmation-log.md"
+        elsewhere.write_text(CONF_FIXTURE, encoding="utf-8")
+        (self.feature / "confirmation-log.md").unlink()
+        state = Path(controller.init_run(self.repo, self.feature, "conf-5"))
+        controller.record_source(
+            state, "SRC-1", "PRD", str(self.feature / "product-doc.md"),
+            "READ", "v1", "订单备注同步需求", "HIGH",
+        )
+        controller.finalize_inputs(state, "PASS", "全部关键资料已读取", None)
+        controller.start_stage(state, "CONTEXT")
+        self.record(state, "tech-context", "s-context")
+        self.artifact(state, "context-pack")
+        controller.start_stage(state, "ARCHITECT")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.sync_confirmations(state, elsewhere)
+        self.assertIn("confirmation file", str(ctx.exception))
+
+    # ------------------------------------------------------- decision channels
+
+    def test_blocking_entry_gates_until_answered_and_landed(self) -> None:
+        state = self.to_architect("conf-6")
+        self.write_conf(CONF_FIXTURE)
+        self.sync(state)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(state, "CRITIC")
+        self.assertIn("CONF-001", str(ctx.exception))
+        conf = self.feature / "confirmation-log.md"
+        conf.write_text(
+            conf.read_text(encoding="utf-8").replace("决定: \n应用: ", "决定: 选 B，令牌桶\n应用: ", 1),
+            encoding="utf-8",
+        )
+        counts = self.sync(state)
+        self.assertEqual(counts["blocking_open"], [])
+        self.assertEqual(counts["settled_unapplied"], ["CONF-001"])
+        # an answered-but-never-landed blocking decision is still unfinished work
+        with self.assertRaises(controller.ControllerError):
+            controller.start_stage(state, "CRITIC")
+        applied = controller.mark_confirmation_applied(
+            state, "CONF-001", "3.4", "写入 ADR-001 采用令牌桶"
+        )
+        self.assertEqual(applied["settled_unapplied"], [])
+        controller.start_stage(state, "CRITIC")
+        text = conf.read_text(encoding="utf-8")
+        self.assertIn("应用: 3.4；写入 ADR-001 采用令牌桶（", text)
+        entry = next(item for item in self.entries(state) if item["id"] == "CONF-001")
+        self.assertEqual(entry["status"], "ANSWERED")
+        self.assertTrue(entry["applied"])
+
+    def test_skip_to_default_is_explicit_and_writes_the_decision_line(self) -> None:
+        state = self.to_architect("conf-7")
+        self.write_conf(CONF_FIXTURE)
+        self.sync(state)
+        result = controller.skip_to_default(state, "CONF-002", "用户在会话中回复：不答但要走完")
+        self.assertEqual(result["skipped_to_default"], 1)
+        entry = next(item for item in self.entries(state) if item["id"] == "CONF-002")
+        self.assertEqual(entry["status"], "SKIPPED-DEFAULT")
+        text = (self.feature / "confirmation-log.md").read_text(encoding="utf-8")
+        self.assertIn("决定: 按推荐（skip-to-default: 用户在会话中回复：不答但要走完）", text)
+        # an entry that already carries a decision cannot be skipped again
+        with self.assertRaises(controller.ControllerError):
+            controller.skip_to_default(state, "CONF-002", "再跳一次")
+        # ...and 按推荐 needs a referent: an entry without 推荐 cannot take this channel
+        conf = self.feature / "confirmation-log.md"
+        conf.write_text(
+            text + "\n来源: ARCHITECT\n阻断: false\n位置: 15\n问题: 里程碑归属\n"
+            "选项: A / B\n决定: \n应用: \n",
+            encoding="utf-8",
+        )
+        self.sync(state)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.skip_to_default(state, "CONF-003", "跳过")
+        self.assertIn("no 推荐", str(ctx.exception))
+
+    def test_skip_to_default_before_any_sync_is_refused(self) -> None:
+        state = self.to_architect("conf-8")
+        self.write_conf(CONF_FIXTURE)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.skip_to_default(state, "CONF-001", "跳过")
+        self.assertIn("unknown confirmation id", str(ctx.exception))
+
+    # ------------------------------------------------------------ windows/bytes
+
+    def test_crlf_is_parsed_and_preserved_and_gbk_is_named(self) -> None:
+        state = self.to_architect("conf-9")
+        self.write_conf(CONF_FIXTURE, newline="\r\n")
+        self.sync(state)
+        raw = (self.feature / "confirmation-log.md").read_bytes()
+        self.assertTrue(raw.startswith(b"CONF-001\r\n"))
+        self.assertIn(b"\r\nCONF-002\r\n", raw)
+        self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
+        (self.feature / "confirmation-log.md").write_bytes(
+            "来源: ARCHITECT\n阻断: false\n位置: 3.4\n问题: 编码\n".encode("gbk")
+        )
+        with self.assertRaises(controller.ControllerError) as ctx:
+            self.sync(state)
+        self.assertIn("UTF-8", str(ctx.exception))
+
+    def test_cli_reports_blocked_and_exits_nonzero(self) -> None:
+        state = self.to_architect("conf-10")
+        self.write_conf(CONF_FIXTURE + "\n乱写的行\n")
+        result = subprocess.run(
+            [sys.executable, str(MODULE_PATH), "sync-confirmations", "--state", str(state),
+             "--file", str(self.feature / "confirmation-log.md")],
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        # bytes, not text: the child's stderr codec is the platform's, and the message
+        # names a Chinese fragment
+        self.assertIn(b"BLOCKED:", result.stderr)
+
+    # ------------------------------------------------------------------- gates
+
+    def test_review_and_delivery_gates(self) -> None:
+        state = self.to_architect("conf-11")
+        self.write_conf(
+            "来源: ARCHITECT\n阻断: true\n位置: 3.4\n问题: 值班群归属\n推荐: 订单群\n决定: \n"
+        )
+        self.sync(state)
+        # an OPEN entry cannot be landed: there is no decision to bind yet
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.mark_confirmation_applied(state, "CONF-001", "3.4", "OPEN 不能被落地")
+        self.assertIn("still OPEN", str(ctx.exception))
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(state, "CRITIC")
+        self.assertIn("CONF-001 [OPEN]", str(ctx.exception))
+        controller.skip_to_default(state, "CONF-001", "用户在会话中回复：按推荐走")
+        # skip-to-default settles the decision but does not land it -- still a blocker
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(state, "CRITIC")
+        self.assertIn("CONF-001 [SKIPPED-DEFAULT 未落地]", str(ctx.exception))
+        controller.mark_confirmation_applied(state, "CONF-001", "3.4", "ADR 记录决策")
+        self.to_refiner(state)
+        # a non-blocking answer that never landed is refused here too, because this door still
+        # has a landing channel: the Refiner dispatch is one call away
+        conf = self.feature / "confirmation-log.md"
+        conf.write_text(
+            conf.read_text(encoding="utf-8")
+            + "来源: ARCHITECT\n阻断: false\n位置: 13\n问题: 队列积压告警的触发时长\n推荐: 5 分钟\n"
+            "决定: 按推荐\n应用: \n",
+            encoding="utf-8",
+        )
+        self.sync(state)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(state, "REVIEW")
+        self.assertIn("CONF-002 never landed", str(ctx.exception))
+        controller.mark_confirmation_applied(state, "CONF-002", "13", "告警阈值按 5 分钟落地")
+        controller.start_stage(state, "REVIEW")
+        self.approve_round(state)
+        # An answer that arrives after the last review door has no landing channel left in this
+        # run: REFINE needs an open finding and DELIVERY is one-way, so refusing here would
+        # dead-lock the run instead of fixing the document.  It is carried over and disclosed.
+        conf.write_text(
+            conf.read_text(encoding="utf-8")
+            + "来源: ARCHITECT\n阻断: false\n位置: 7.2\n问题: 归档表是否随本期上线\n推荐: 随本期\n"
+            "决定: 按推荐\n应用: \n",
+            encoding="utf-8",
+        )
+        counts = self.sync(state)
+        self.assertEqual(counts["settled_unapplied"], ["CONF-003"])
+        result = controller.start_stage(state, "DELIVERY")
+        self.assertEqual(result["pending_landing"], ["CONF-003"])
+
+    def test_a_blocking_answer_still_refuses_delivery(self) -> None:
+        """Carry-over is for decisions the document can ship without; 阻断 is not one of them."""
+        state = self.to_architect("conf-21")
+        self.to_refiner(state)
+        controller.start_stage(state, "REVIEW")
+        self.approve_round(state)
+        self.write_conf(
+            "来源: ARCHITECT\n阻断: true\n位置: 3.4\n问题: 分库分表键取哪个\n推荐: 订单号\n"
+            "决定: 订单号\n应用: \n"
+        )
+        self.sync(state)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(state, "DELIVERY")
+        self.assertIn("blocking confirmation", str(ctx.exception))
+        self.assertIn("CONF-001 [ANSWERED 未落地]", str(ctx.exception))
+
+    def test_landing_must_stay_inside_the_dispatch_scope(self) -> None:
+        state = self.to_architect("conf-12")
+        self.write_conf(
+            "来源: ARCHITECT\n阻断: false\n位置: 3.4\n问题: 值班群归属\n推荐: 订单群\n决定: \n"
+        )
+        self.sync(state)
+        self.to_refiner(state)
+        # answered while the Refiner is on stage -- an OPEN entry does not stop an audit
+        # hand-off, only a settled one that never landed does
+        conf = self.feature / "confirmation-log.md"
+        conf.write_text(
+            conf.read_text(encoding="utf-8").replace("决定: ", "决定: 订单群", 1),
+            encoding="utf-8",
+        )
+        self.sync(state)
+        # this stage's Refiner dispatch was handed 3.4 only; 15 is outside the window
+        self.record(state, "tech-refiner", "s-refine-scoped", scope="3.4")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.mark_confirmation_applied(state, "CONF-001", "15", "改到了范围外")
+        self.assertIn("outside every --scope", str(ctx.exception))
+        controller.mark_confirmation_applied(state, "CONF-001", "3.4", "在范围内落地")
+        self.assertTrue(self.entries(state)[0]["applied"])
+        # the same settled decision now lets the review door open
+        controller.start_stage(state, "REVIEW")
+
+    # ----------------------------------------------------------------- gate: B2
+
+    def gate_check(self, state: Path, name: str) -> dict[str, Any]:
+        """One named delivery check; the rest of the report is irrelevant to these tests."""
+        result = controller.gate(state, self.feature / "technical-doc.md")
+        return next(item for item in result["checks"] if item["name"] == name)
+
+    def test_markers_and_entries_must_pair_in_both_directions(self) -> None:
+        state = self.to_architect("conf-19")
+        tdd = self.feature / "technical-doc.md"
+        tdd.write_text(
+            tdd.read_text(encoding="utf-8") + "\n[需人工确认: 下游限流阈值取哪个数]\n",
+            encoding="utf-8",
+        )
+        check = self.gate_check(state, "markers-match-confirmations")
+        self.assertFalse(check["ok"])
+        self.assertIn("下游限流阈值取哪个数", str(check["detail"]))
+        # registering the entry pairs them up, and an OPEN question may still stand in the body
+        self.write_conf(
+            "来源: ARCHITECT\n阻断: false\n位置: 3.4\n问题: 下游限流阈值取哪个数\n决定: \n"
+        )
+        self.sync(state)
+        self.assertTrue(self.gate_check(state, "markers-match-confirmations")["ok"])
+        # the asymmetry is deliberate: an OPEN question the draft no longer raises may lose its
+        # marker and stay in the ledger -- only an auditor can judge that erase
+        tdd.write_text(
+            tdd.read_text(encoding="utf-8").replace("[需人工确认: 下游限流阈值取哪个数]\n", ""),
+            encoding="utf-8",
+        )
+        self.assertTrue(self.gate_check(state, "markers-match-confirmations")["ok"])
+        tdd.write_text(
+            tdd.read_text(encoding="utf-8") + "\n[需人工确认: 下游限流阈值取哪个数]\n",
+            encoding="utf-8",
+        )
+        # answering is not consuming: the question is still open on the page, so its marker
+        # stays legal until a dispatch says it landed
+        conf = self.feature / "confirmation-log.md"
+        conf.write_text(
+            conf.read_text(encoding="utf-8").replace("决定: ", "决定: 令牌桶 50 QPS", 1),
+            encoding="utf-8",
+        )
+        self.sync(state)
+        self.assertTrue(self.gate_check(state, "markers-match-confirmations")["ok"])
+        # once the landing is registered the document may still not ask
+        controller.mark_confirmation_applied(state, "CONF-001", "3.4", "按令牌桶 50 QPS 落地")
+        check = self.gate_check(state, "markers-match-confirmations")
+        self.assertFalse(check["ok"])
+        self.assertIn("CONF-001", str(check["detail"]))
+        self.assertIn("landed", str(check["detail"]))
+        # the resolved form is no longer a marker, which is what closes it
+        tdd.write_text(
+            tdd.read_text(encoding="utf-8").replace(
+                "[需人工确认: 下游限流阈值取哪个数]",
+                "[已人工确认: 下游限流阈值取哪个数 → 令牌桶 50 QPS]",
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(self.gate_check(state, "markers-match-confirmations")["ok"])
+
+    def test_the_confirmation_ledger_has_to_survive_to_delivery(self) -> None:
+        state = self.to_architect("conf-20")
+        self.write_conf(
+            "来源: ARCHITECT\n阻断: false\n位置: 3.4\n问题: 值班群归属\n推荐: 订单群\n决定: \n应用: \n"
+        )
+        self.sync(state)
+        self.assertTrue(self.gate_check(state, "confirmations-file-persisted")["ok"])
+        conf = self.feature / "confirmation-log.md"
+        # an answer typed into the file after the last sync: state still says OPEN
+        conf.write_text(
+            conf.read_text(encoding="utf-8").replace("决定: ", "决定: 客服值班群", 1),
+            encoding="utf-8",
+        )
+        check = self.gate_check(state, "confirmations-file-persisted")
+        self.assertFalse(check["ok"])
+        self.assertIn("CONF-001", str(check["detail"]))
+        self.assertIn("决定", str(check["detail"]))
+        self.sync(state)
+        self.assertTrue(self.gate_check(state, "confirmations-file-persisted")["ok"])
+        # rewriting the file down to an ID-less entry is not how an entry is withdrawn
+        conf.write_text(
+            "来源: ARCHITECT\n阻断: false\n位置: 3.4\n问题: 值班群归属\n推荐: 订单群\n"
+            "决定: 客服值班群\n应用: \n",
+            encoding="utf-8",
+        )
+        check = self.gate_check(state, "confirmations-file-persisted")
+        self.assertFalse(check["ok"])
+        self.assertIn("CONF-ID", str(check["detail"]))
+        # ...and neither is deleting the file the run registered against
+        conf.unlink()
+        check = self.gate_check(state, "confirmations-file-persisted")
+        self.assertFalse(check["ok"])
+        self.assertIn("is missing", str(check["detail"]))
+
+    # ------------------------------------------------------------------- ledger
+
+    def test_confirmations_ledger_is_rendered_and_idempotent(self) -> None:
+        state = self.to_architect("conf-13")
+        tdd = self.feature / "technical-doc.md"
+        rendered = controller.render_ledger(state, tdd)
+        text = tdd.read_text(encoding="utf-8")
+        self.assertIn("confirmations", rendered["rendered"])
+        self.assertIn("当前没有未收口的人工确认条目。", text)
+        self.assertIn("暂无人工决定。", text)
+        self.write_conf(CONF_FIXTURE)
+        self.sync(state)
+        controller.render_ledger(state, tdd)
+        text = tdd.read_text(encoding="utf-8")
+        self.assertIn("CONF-001", text)
+        self.assertIn("人工确认台账", text)
+        # the run-metadata echo names IDs, never raw marker text
+        self.assertNotIn("[需人工确认", text)
+        self.assertIn("仍需人工确认（2 项）：CONF-001 OPEN、CONF-002 OPEN", text)
+        again = controller.render_ledger(state, tdd)
+        self.assertFalse(again["changed"])
+
+    def test_full_closed_loop_with_landed_decision_stays_clean(self) -> None:
+        state = self.to_architect("conf-14")
+        self.write_conf(
+            "来源: ARCHITECT\n阻断: true\n位置: 3.4\n问题: 值班群归属\n推荐: 订单群\n决定: \n应用: \n"
+        )
+        self.sync(state)
+        conf = self.feature / "confirmation-log.md"
+        conf.write_text(
+            conf.read_text(encoding="utf-8").replace("决定: \n", "决定: 订单群\n", 1),
+            encoding="utf-8",
+        )
+        self.sync(state)
+        controller.mark_confirmation_applied(state, "CONF-001", "3.4", "ADR 记录决策")
+        self.to_refiner(state)
+        controller.start_stage(state, "REVIEW")
+        self.approve_round(state)
+        controller.start_stage(state, "DELIVERY")
+        controller.archive_history(state, "0.1")
+        tdd = self.feature / "technical-doc.md"
+        controller.render_ledger(state, tdd)
+        text = tdd.read_text(encoding="utf-8")
+        self.assertIn("人工决定台账", text)
+        self.assertIn("ADR 记录决策", text)
+        self.assertIn("CONF-001", text)
+        self.assertNotIn("暂无人工决定。", text)
+        result = controller.gate(state, tdd)
+        self.assertEqual(result["status"], "PASS", result["failures"])
+        shown = controller.show(state)
+        self.assertEqual(shown["confirmations"]["applied"], 1)
+
+    # ------------------------------------------------------------------- init
+
+    def test_init_ingests_ledger_freezes_pending_decisions_and_adopts_bare_markers(self) -> None:
+        self.write_tdd(MARKER_TDD)
+        self.write_conf(CONF_TWO_DECIDED)
+        state = Path(controller.init_run(self.repo, self.feature, "conf-15"))
+        data = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual(data["mode"], "UPDATE")
+        by_id = {item["id"]: item for item in data["confirmations"]}
+        self.assertEqual(sorted(by_id), ["CONF-001", "CONF-002", "CONF-003"])
+        self.assertTrue(all(item["imported"] for item in by_id.values()))
+        # CONF-002 cites a finding from the previous run's state -- imported without
+        # existence validation (D12); CONF-002's own application carries over verbatim.
+        self.assertEqual(by_id["CONF-002"]["status"], "ANSWERED")
+        self.assertTrue(by_id["CONF-002"]["applied"])
+        self.assertFalse(by_id["CONF-001"]["applied"])
+        # the bare body marker became a non-blocking LEGACY-MARKER entry; the fenced one did not
+        self.assertEqual(by_id["CONF-003"]["source"], "LEGACY-MARKER")
+        self.assertFalse(by_id["CONF-003"]["blocking"])
+        self.assertEqual(by_id["CONF-003"]["question"], "下游限流阈值需业务方确认")
+        conf_text = (self.feature / "confirmation-log.md").read_text(encoding="utf-8")
+        self.assertIn("问题: 下游限流阈值需业务方确认", conf_text)
+        self.assertNotIn("围栏内示例", conf_text)
+        # the settled-but-unlanded decision is frozen as HUMAN_DECISION input evidence
+        sources = {item["source_id"]: item for item in data["sources"]}
+        self.assertIn("CONFIRMATION-CONF-001", sources)
+        self.assertNotIn("CONFIRMATION-CONF-002", sources)
+        self.assertEqual(sources["CONFIRMATION-CONF-001"]["kind"], "HUMAN_DECISION")
+        self.assertIn("订单值班群", sources["CONFIRMATION-CONF-001"]["summary"])
+        self.assertEqual(
+            data["confirmation_import"]["pending_landing"], ["CONF-001"]
+        )
+        # the carried-over decision does not stop this stage: it is the first audit hand-off
+        # (CRITIC, then REVIEW) that demands every settled decision have landed by then
+        controller.record_source(
+            state, "SRC-1", "PRD", str(self.feature / "product-doc.md"),
+            "READ", "v1", "订单备注同步需求", "HIGH",
+        )
+        controller.finalize_inputs(state, "PASS", "全部关键资料已读取", "1/0/0")
+        controller.start_stage(state, "CONTEXT")
+        self.assertEqual(controller.show(state)["confirmations"]["total"], 3)
+
+    def test_init_without_ledger_is_a_no_op_and_a_corrupt_ledger_fails_before_mkdir(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "conf-16"))
+        data = json.loads(state.read_text(encoding="utf-8"))
+        self.assertIsNone(data["confirmation_file"])
+        self.assertEqual(data["confirmations"], [])
+        self.write_conf(CONF_FIXTURE.replace("来源: ARCHITECT", "垃圾行", 1))
+        with self.assertRaises(controller.ControllerError):
+            controller.init_run(self.repo, self.feature, "conf-17")
+        self.assertFalse((self.repo / ".codekit" / "technical-doc" / "conf-17").exists())
+
+    def test_resumed_old_state_without_confirmation_keys_still_loads(self) -> None:
+        state = self.to_architect("conf-18")
+        data = json.loads(state.read_text(encoding="utf-8"))
+        del data["confirmations"]
+        del data["confirmation_file"]
+        state.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        summary = controller.show(state)
+        self.assertEqual(summary["confirmations"]["total"], 0)
+        self.write_conf("来源: ARCHITECT\n阻断: false\n位置: 3.4\n问题: 老 run 续用\n决定: \n")
+        self.assertEqual(self.sync(state)["new_ids"], ["CONF-001"])
 
 
 if __name__ == "__main__":

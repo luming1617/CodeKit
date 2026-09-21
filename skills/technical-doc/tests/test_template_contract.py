@@ -322,6 +322,38 @@ class ScaleContractTests(unittest.TestCase):
         for asset in (TEMPLATE, SKILL_MD, STANDARD, AGENTS["tech-architect"], AGENTS["tech-critic"]):
             self.assertIn("条件必填", asset)
 
+    def test_the_confirmation_loop_is_enforced_and_the_template_stays_innocent(self) -> None:
+        """Both delivery checks are controller code now, and the template must not mint findings.
+
+        The marker format is instruction text in SKILL.md and the role prompts; pasted into
+        the template it would reach every drafted TDD verbatim, and an unregistered marker is
+        exactly what ``markers-match-confirmations`` blocks delivery on.
+        """
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        for name in ("markers-match-confirmations", "confirmations-file-persisted"):
+            self.assertIn(f'"{name}"', source)
+            self.assertIn(name, SKILL_MD)
+        self.assertNotIn("[需人工确认", TEMPLATE)
+        self.assertIn("confirmation-log.md", TEMPLATE)
+        self.assertIn("confirmation-log.md", SKILL_MD)
+
+    def test_the_landing_channel_rule_is_stated_where_each_reader_needs_it(self) -> None:
+        """One rule about where a settled decision may still land, read from three assets.
+
+        The controller enforces it at the audit doors and lets a review-vintage answer carry;
+        if only the code says so, the orchestrator keeps chasing a decision with no channel
+        left and the Reviewer keeps marking such items 阻断.  The judgement half belongs to the
+        auditors' standard, not to a gate that cannot see it.
+        """
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertIn("pending_landing", source)
+        self.assertIn("pending_landing", SKILL_MD)
+        self.assertIn("人工决定与 marker", STANDARD)
+        self.assertIn("人工决定与 marker", AGENTS["tech-reviewer"])
+        self.assertIn("阻断", AGENTS["tech-reviewer"])
+        # the template must not promise more than markers-match-confirmations actually blocks
+        self.assertNotIn("悄悄抹掉", TEMPLATE)
+
 
 if __name__ == "__main__":
     unittest.main()
