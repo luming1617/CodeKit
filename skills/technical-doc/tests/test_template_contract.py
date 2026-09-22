@@ -9,6 +9,7 @@ now asserted here so it fails loudly instead of resurfacing as a runtime surpris
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import re
 import unittest
@@ -25,8 +26,16 @@ SPEC.loader.exec_module(controller)
 SKILL_MD = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
 TEMPLATE = (SKILL_DIR / "references" / "technical-doc-template.md").read_text(encoding="utf-8")
 STANDARD = (SKILL_DIR / "references" / "check-standard.md").read_text(encoding="utf-8")
+MANUAL = (SKILL_DIR / "references" / "controller-contract.md").read_text(encoding="utf-8")
 AGENTS = {path.stem: path.read_text(encoding="utf-8") for path in sorted((SKILL_DIR / "agents").glob("*.md"))}
 ROLE_LINE = re.compile(r"^\|\s*\d\s*\|\s*`(tech-[a-z]+)`", re.MULTILINE)
+CONTROLLER_SRC = MODULE_PATH.read_text(encoding="utf-8")
+
+
+def _pattern_terms(pattern: str) -> list[str]:
+    """Bare literals of an alternation regex, so prose can be checked against a scanner."""
+    body = pattern.removeprefix("(?:").removesuffix(")")
+    return [term for term in (raw.replace(r"\b", "").strip() for raw in body.split("|")) if term]
 
 
 class TemplateContractTests(unittest.TestCase):
@@ -54,6 +63,23 @@ class TemplateContractTests(unittest.TestCase):
         """The template dropped its Java-shaped chapters; the stack decision is a 方案概述 section."""
         self.assertIn("## 技术栈", TEMPLATE)
         self.assertNotIn("Java 详细设计", TEMPLATE)
+
+    def test_the_template_ships_no_copyable_value_literal_in_prose(self) -> None:
+        """A date format written as prose travels into every draft and then fails the gate.
+
+        Value-shaped tokens (``todo``, ``YYYY-MM-DD``) read as data only where the document
+        renders them as code, so the skeleton must not hand the Architect a row the delivery
+        check will bounce back.
+        """
+        lines = TEMPLATE.splitlines()
+        code_lines = controller._fence_line_mask(lines)
+        offenders = [
+            f"line {index + 1}: {line.strip()[:70]}"
+            for index, line in enumerate(lines)
+            if controller.PLACEHOLDER_VALUES.search(line)
+            and controller._is_unfilled_slot(line, index in code_lines)
+        ]
+        self.assertEqual([], offenders)
 
     def test_mandatory_chapters_survive_the_S_tailoring_rule(self) -> None:
         tailoring = TEMPLATE.split("## 方案裁剪规则", 1)[1].split("##", 1)[0]
@@ -134,6 +160,91 @@ class DocIndexContractTests(unittest.TestCase):
         self.assertIn("Critic 做全量审查", SKILL_MD)
         self.assertIn("不缩小审查范围", SKILL_MD)
         self.assertIn("增量终审轮例外", SKILL_MD)
+
+
+class PolishRoundContractTests(unittest.TestCase):
+    """The two rules that decide whether a round is worth burning must live in one place."""
+
+    def test_the_disposition_shortcut_names_the_fields_the_controller_returns(self) -> None:
+        """The prose promises a copyable list; a renamed field makes every report rely on memory."""
+        for name in ("undisposed", "open_non_blocking_followups", "undisposed_blocking"):
+            with self.subTest(name=name):
+                self.assertIn(name, SKILL_MD)
+                self.assertIn(f'"{name}"', CONTROLLER_SRC)
+
+    def test_the_shortcut_stays_bound_to_non_blocking_findings(self) -> None:
+        self.assertIn("`must_fix` 与 `Blocker`/`High` 不在豁免范围内", SKILL_MD)
+        self.assertIn("只有用户明确要求", SKILL_MD)
+        self.assertIn("触及正确性、安全、数据一致性", SKILL_MD)
+
+    def test_parallel_refiners_and_the_replay_subset_are_stated(self) -> None:
+        self.assertIn("并行派发多个 Refiner 实例", SKILL_MD)
+        self.assertIn("按**实例**分别声明", SKILL_MD)
+        self.assertIn("不做整轮回放", SKILL_MD)
+        self.assertIn("findings.undisposed", SKILL_MD)
+
+    def test_placeholder_classes_are_listed_the_way_the_gate_scans_them(self) -> None:
+        """The gate sentence enumerates both token classes; a new literal has to show up there."""
+        for token in _pattern_terms(controller.PLACEHOLDER_SLOTS.pattern):
+            with self.subTest(token=token):
+                self.assertIn(token, SKILL_MD)
+        for token in _pattern_terms(controller.PLACEHOLDER_VALUES.pattern):
+            with self.subTest(token=token):
+                self.assertIn(token, SKILL_MD)
+        self.assertIn("槽位字面量", SKILL_MD)
+        self.assertIn("取值字面量", SKILL_MD)
+
+
+class ControllerManualTests(unittest.TestCase):
+    """PR-3/PR-4 moved command knowledge into one thin page; the page must stay complete."""
+
+    def test_every_subcommand_has_a_line_in_the_manual(self) -> None:
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command")
+        controller._fixer_commands(sub)
+        names = sorted(sub.choices)
+        self.assertIn("record-findings", names)
+        self.assertIn("dump", names)
+        for name in names:
+            with self.subTest(command=name):
+                self.assertIn(name, MANUAL)
+
+    def test_the_manual_is_the_command_source_and_the_template_is_not(self) -> None:
+        self.assertIn("references/controller-contract.md", SKILL_MD)
+        self.assertIn("不要在 run 中途回读", SKILL_MD)
+        self.assertIn("不要在 run 中途回读", MANUAL)
+        # 主控不再读整份模板：章节齐整性靠 gate 的锚点清单
+        self.assertNotIn("主控与 Architect 读取完整模板", SKILL_MD)
+        self.assertIn("只有 Architect 读取完整模板", SKILL_MD)
+        self.assertIn("template-anchors", SKILL_MD)
+
+    def test_the_batch_faces_are_named_where_the_orchestrator_reads(self) -> None:
+        for token in (
+            "record-findings", "record-fixes", "--from-file", "--batch", "show --next",
+            "evidence_chars",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, SKILL_MD)
+        self.assertIn("不推进任何东西", SKILL_MD)
+
+    def test_the_report_markers_are_taught_to_every_writer(self) -> None:
+        for role, marker, face in (
+            ("tech-critic", "@@FIND", "record-findings"),
+            ("tech-reviewer", "@@FIND", "record-findings"),
+            ("tech-refiner", "@@FIX", "record-fixes"),
+        ):
+            with self.subTest(role=role):
+                self.assertIn(marker, AGENTS[role])
+                self.assertIn(face, AGENTS[role])
+                self.assertIn(marker, MANUAL)
+
+    def test_the_marker_fields_the_manual_lists_are_the_parser_s(self) -> None:
+        documented = set(controller.MARKED_FIELDS["FIND"]) | set(controller.MARKED_FIELDS["FIX"])
+        for kind, fields in controller.MARKED_OPTIONAL.items():
+            documented |= set(fields)
+        for field in sorted(documented):
+            with self.subTest(field=field):
+                self.assertIn(f"{field}=", MANUAL)
 
 
 class StandardContractTests(unittest.TestCase):
@@ -403,6 +514,87 @@ class ScaleContractTests(unittest.TestCase):
         self.assertIn("阻断", AGENTS["tech-reviewer"])
         # the template must not promise more than markers-match-confirmations actually blocks
         self.assertNotIn("悄悄抹掉", TEMPLATE)
+
+    def test_the_delivery_rewind_is_the_only_way_back_and_says_what_it_costs(self) -> None:
+        """`DELIVERY -> REFINER` is one edge with one purpose; both prose surfaces must say so.
+
+        The edge is the difference between "an answer that arrives after the final review is
+        unshippable" and "it costs one more review round".  If the code, the orchestrator's
+        manual and the auditor's standard stop agreeing on the price, the rewind either gets
+        used as a general re-edit channel or nobody dares to take it.
+        """
+        self.assertEqual({"REFINER", "CLOSED"}, controller.STAGE_TRANSITIONS["DELIVERY"])
+        self.assertTrue(callable(getattr(controller, "_require_landing_only_rewind", None)))
+        self.assertIn("落地回退", SKILL_MD)
+        self.assertIn("落地回退", MANUAL)
+        self.assertIn("landing_rewind", MANUAL)
+        # the two refusals: nothing to land, and no budget left to pay for the fresh review
+        self.assertIn("no entry is waiting to be landed", CONTROLLER_SRC)
+        self.assertIn("last one the review budget allows", CONTROLLER_SRC)
+        self.assertIn("没有待落地条目", MANUAL)
+        self.assertIn("轮次预算已耗尽", MANUAL)
+        self.assertIn("落地回退", STANDARD)
+
+
+class GrowthAndMirrorContractTests(unittest.TestCase):
+    """PR-5: the two per-round costs nobody used to pay attention to get a stated owner.
+
+    A hand-copied ledger was only refused at delivery, so the orchestrator strip-edited it by
+    hand every run; body growth was not measured at all, so +15% of reading per round showed up
+    nowhere. Both rules are controller code now, and the prose that tells the orchestrator when
+    it will be refused has to name the same moment the code refuses at.
+    """
+
+    def test_the_mirror_refusal_is_one_predicate_called_at_three_moments(self) -> None:
+        self.assertTrue(callable(getattr(controller, "_reject_stray_ledger_rows", None)))
+        self.assertIn("hand-written Finding table", CONTROLLER_SRC)
+        # early refusal: the two registrations that write into the TDD, and the disposition that
+        # claims the body was edited
+        self.assertEqual(
+            3,
+            CONTROLLER_SRC.count("_reject_stray_ledger_rows(state)"),
+            "the early mirror check is expected at write-artifact, record-fix and record-fixes",
+        )
+        for asset in (SKILL_MD, MANUAL):
+            self.assertIn("手抄的 Finding 表", asset)
+        self.assertIn("对整批只判一次", SKILL_MD)
+        self.assertIn("对整批只判一次", MANUAL)
+        # the role prompt must promise the early refusal, not only the delivery-time one
+        self.assertIn("前移", AGENTS["tech-refiner"])
+
+    def test_growth_is_a_soft_check_that_the_delivery_report_must_quote(self) -> None:
+        self.assertTrue(callable(getattr(controller, "_document_growth_check", None)))
+        self.assertIn("document-growth", SKILL_MD)
+        self.assertIn("document-growth", MANUAL)
+        self.assertIn('"document-growth"', CONTROLLER_SRC)
+        self.assertEqual(8.0, controller.GROWTH_WARN_PERCENT)
+        self.assertIn("GROWTH_WARN_PERCENT", MANUAL)
+        self.assertIn("8%", SKILL_MD)
+        # ``ok`` is always True, so the only teeth the check has is being quoted in the report
+        self.assertIn("软检查", SKILL_MD)
+        self.assertIn("软检查", MANUAL)
+        self.assertIn("强制照抄", SKILL_MD)
+        self.assertIn('"warnings"', CONTROLLER_SRC)
+        self.assertIn("warnings", SKILL_MD)
+        self.assertIn("warnings", MANUAL)
+
+    def test_the_reference_size_is_frozen_before_any_round_adds_to_it(self) -> None:
+        self.assertIn('"document_growth"', CONTROLLER_SRC)
+        self.assertTrue(callable(getattr(controller, "_freeze_growth_baseline", None)))
+        for asset in (SKILL_MD, MANUAL):
+            self.assertIn("体积参照", asset)
+            self.assertIn("冻结参照", asset)
+
+    def test_the_orchestrator_is_told_not_to_read_whole_documents(self) -> None:
+        """PR-5c is a rule about the controller's own output surfaces, so both pages state it."""
+        self.assertIn("主控侧不整读原文", SKILL_MD)
+        self.assertIn("主控侧不整读原文", MANUAL)
+        for token in ("locate", "dump", "render-ledger"):
+            with self.subTest(token=token):
+                self.assertIn(f"`{token}`", SKILL_MD)
+        # the field measurement the rule is justified by must be the same number on both pages
+        self.assertIn("58K", SKILL_MD)
+        self.assertIn("58K", MANUAL)
 
 
 if __name__ == "__main__":

@@ -81,6 +81,9 @@ INPUT_STATUSES = ("PASS", "PARTIAL", "BLOCKED")
 SEVERITIES = ("Blocker", "High", "Medium", "Low")
 MUST_FIX_SEVERITIES = ("Blocker", "High")
 FIX_STATUSES = ("FIXED", "PENDING_CONFIRMATION", "REJECTED")
+# Body growth that no blocking finding paid for, above this share of the reference version, is
+# flagged as a soft ``gate`` warning -- see ``_document_growth_check``.
+GROWTH_WARN_PERCENT = 8.0
 REVIEW_STATUSES = ("APPROVE", "APPROVE_WITH_FOLLOW_UPS", "REQUEST_CHANGES", "BLOCKED")
 PASSING_REVIEW_STATUSES = ("APPROVE", "APPROVE_WITH_FOLLOW_UPS")
 
@@ -92,7 +95,10 @@ STAGE_TRANSITIONS: dict[str, set[str]] = {
     "REFINER": {"REVIEW"},
     # A rejected review reopens the Refiner; an approved one moves to delivery.
     "REVIEW": {"REFINER", "DELIVERY"},
-    "DELIVERY": {"CLOSED"},
+    # Delivery closes the run; it may also reopen the Refiner, but only to land a settled
+    # human decision, and only at the price of one fresh review round -- see
+    # ``_require_landing_only_rewind``.
+    "DELIVERY": {"REFINER", "CLOSED"},
     "CLOSED": set(),
 }
 FINDING_ID = {
@@ -100,12 +106,38 @@ FINDING_ID = {
     "REVIEWER": re.compile(r"^REVIEW-(\d{1,2})-(\d{3})$"),
 }
 
+# --- batch registration lines -------------------------------------------------------------
+# A role returns its items as text; registering them one CLI call per item is what put 45
+# probe scripts in the reference run's directory.  The roles now end each item with one
+# machine line and the controller reads the file:
+#     @@FIND id=CRITIC-007 sev=High must_fix=true loc=9.3
+#     证据: 第 1022 行称 …
+#     @@FIX id=CRITIC-007 status=FIXED loc=9.3
+#     变更: 补 GET /api/cards?primary_topic=null …
+# Parsing is a transport, not a second validator: every item still goes through
+# ``record_finding``/``record_fix``, so id discipline, stage rules and the per-round
+# ``--scope`` union keep exactly the teeth they have on the single-item path.
+MARKED_ITEM = re.compile(r"^@@(FIND|FIX)\s+(\S.*?)\s*$")
+MARKED_FIELD = re.compile(r"([a-z_]+)=(\S+)")
+MARKED_FIELDS = {
+    "FIND": ("id", "sev", "loc"),
+    "FIX": ("id", "status", "loc"),
+}
+MARKED_OPTIONAL = {"FIND": ("must_fix",), "FIX": ()}
+
 PRD_FILE = "product-doc.md"
 TDD_FILE = "technical-doc.md"
-# The template ships these placeholders; a delivered TDD must not still contain them.
+# The template ships these placeholders; a delivered TDD must not still contain them.  Two
+# classes, because the scan has to tell an unfilled slot from a colliding data literal: a slot
+# token is an instruction to the author and never belongs in the delivered document, while
+# TODO/TBD/YYYY-MM-DD are also legitimate values ('todo' as a status enum, the date format
+# itself), so those read as slots only where the document speaks prose.
+PLACEHOLDER_SLOTS = re.compile(
+    r"(?:待定|待补充|后续补充|\bsimilar to\b|\brefer to\b|【填写】|【链接】)", re.IGNORECASE
+)
+PLACEHOLDER_VALUES = re.compile(r"(?:\bTBD\b|\bTODO\b|YYYY-MM-DD)", re.IGNORECASE)
 PLACEHOLDER = re.compile(
-    r"(?:\bTBD\b|\bTODO\b|待定|待补充|后续补充|\bsimilar to\b|\brefer to\b|【填写】|【链接】|YYYY-MM-DD)",
-    re.IGNORECASE,
+    f"(?:{PLACEHOLDER_SLOTS.pattern}|{PLACEHOLDER_VALUES.pattern})", re.IGNORECASE
 )
 CONFIRMATION = re.compile(r"\[需人工确认[:：].*?\]")
 FENCE = re.compile(r"^```([A-Za-z0-9_+-]*)\s*$")
@@ -482,6 +514,9 @@ def init_run(
         "gates": [],
         "prd_changes": None,
         "ledger": None,
+        "document_growth": (
+            _growth_baseline(tdd_text, "previous-version") if tdd_text is not None else None
+        ),
         "confirmation_file": None,
         "confirmations": [],
         "confirmation_import": None,
@@ -825,6 +860,31 @@ def _open_must_fix(state: dict[str, Any]) -> list[str]:
         item["id"] for item in state["findings"]
         if item["must_fix"] and not _closed(state, item["id"])
     ]
+
+
+def _polish_followups(state: dict[str, Any]) -> dict[str, list[str]]:
+    """What the undisposed findings actually cost: a disposition, or a whole round?
+
+    Measured on the reference run, rounds 2 and 3 spent ~100 minutes of model time closing
+    findings that were all Medium/Low, because "book the answer" and "reopen the document" were
+    treated as the same act.  ``record-fix`` already accepts a disposition for a non-blocking
+    finding in the REVIEW/DELIVERY stage, so the cheap half needs no round; only the blocking
+    half (``must_fix`` or Blocker/High) can justify spending one.  ``undisposed`` is also the
+    subset a replayed dispatch must carry after an aborted one -- the FIXED part is on disk.
+    """
+    disposed = {item["finding_id"] for item in state["fixes"]}
+    undisposed = [item for item in state["findings"] if item["id"] not in disposed]
+    blocking = [
+        item["id"] for item in undisposed
+        if item["must_fix"] or item["severity"] in MUST_FIX_SEVERITIES
+    ]
+    return {
+        "undisposed": [item["id"] for item in undisposed],
+        "open_non_blocking_followups": [
+            item["id"] for item in undisposed if item["id"] not in blocking
+        ],
+        "undisposed_blocking": blocking,
+    }
 
 
 def _severity_stop(state: dict[str, Any]) -> dict[str, Any]:
@@ -1172,9 +1232,13 @@ def start_stage(state_path: str | Path, target_stage: str, review_scope: str | N
     elif target == "CRITIC":
         _require_evidence(state, "ARCHITECT", "draft")
         _require_no_blocking_confirmations(state, target)
+        # Last chance to measure the document before anyone is allowed to add to it.
+        _freeze_growth_baseline(state)
     elif target == "REFINER":
         if current == "CRITIC":
             _require_evidence(state, "CRITIC", "critic-findings")
+        elif current == "DELIVERY":
+            _require_landing_only_rewind(state)
         else:
             _require_open_reviewer_findings(state)
     elif target == "REVIEW":
@@ -1238,20 +1302,36 @@ def start_stage(state_path: str | Path, target_stage: str, review_scope: str | N
     )
     _save(path, state)
     result: dict[str, Any] = {"stage": target, "review_round": state["review_round"], "mode": state["mode"]}
+    if target == "REFINER" and current == "DELIVERY":
+        result["landing_rewind"] = {
+            "confirmations": _unlanded_decisions(state),
+            "cost": f"review round {state['review_round'] + 1} of {state['max_review_rounds']}",
+            "then": "land each decision in the body, record-fix --status FIXED for the finding it "
+                    "answers, mark-confirmation-applied for it, then start-stage --to REVIEW: the "
+                    "REVIEW door refuses while an answer is still unlanded and DELIVERY will not "
+                    "reopen on the previous round's verdict",
+        }
     if target == "DELIVERY":
         # The delivery report must copy these, not re-derive them from memory: this is the
-        # only place the run admits it answered a question it could no longer land.
-        carried = [
-            item["id"] for item in state.get("confirmations") or []
-            if item["status"] in CONFIRMATION_SETTLED and not item["applied"]
-        ]
+        # place the run admits it answered a question it has not landed.
+        carried = _unlanded_decisions(state)
         if carried:
             result["pending_landing"] = carried
-            result["hint"] = (
-                "settled decision(s) answered after the last review door have no landing "
-                "channel left in this run; they stay 挂账 (未落地) in the chapter-16 ledger, "
-                "must be copied into the delivery report, and the next run's init consumes them"
-            )
+            if state["review_round"] < state["max_review_rounds"]:
+                result["hint"] = (
+                    "settled decision(s) answered after the last review door are not in the body "
+                    "yet; `start-stage --to REFINER` reopens this run to land them and costs one "
+                    "fresh review round, which is a cost judgement, not a delivery precondition - "
+                    "either land them or leave them 挂账 (未落地) in the chapter-16 ledger, copy "
+                    "them into the delivery report, and let the next run's init consume them"
+                )
+            else:
+                result["hint"] = (
+                    f"settled decision(s) {', '.join(carried)} are not in the body and round "
+                    f"{state['review_round']} is the last one the budget allows, so the landing "
+                    "rewind is out of reach: they stay 挂账 (未落地) in the chapter-16 ledger, must "
+                    "be copied into the delivery report, and the next run's init consumes them"
+                )
     if target == "REVIEW":
         pending = state["pending_review"]
         result["review_scope"] = pending["scope"]
@@ -1260,6 +1340,16 @@ def start_stage(state_path: str | Path, target_stage: str, review_scope: str | N
             result["tokens_estimated"] = pending["tokens_estimated"]
             result["over_budget"] = pending["over_budget"]
             result["hint"] = "locate each section for its line range, then dispatch one reviewer over that set"
+        followups = _polish_followups(state)
+        if followups["open_non_blocking_followups"]:
+            result["followups"] = followups
+            result["followup_hint"] = (
+                "these undisposed findings are neither must_fix nor Blocker/High: close them with "
+                "record-fix (PENDING_CONFIRMATION/REJECTED) and deliver on the passing verdict, "
+                "so this round buys the review they cannot excuse rather than the prose they "
+                "cannot change -- open a Refiner round for them only on an explicit human request "
+                "or when one touches correctness, security, or data consistency"
+            )
     return result
 
 
@@ -1288,6 +1378,52 @@ def _require_open_reviewer_findings(state: dict[str, Any]) -> None:
         raise ControllerError(
             f"round {round_} review did not raise findings; deliver the current TDD "
             "instead of opening another Refiner round"
+        )
+
+
+def _unlanded_decisions(state: dict[str, Any]) -> list[str]:
+    """Settled human decisions whose answer has not been written into the TDD yet.
+
+    One predicate, four readers: the audit doors refuse while it is non-empty, ``DELIVERY``
+    hands the list out as ``pending_landing``, the delivery rewind is legal only because of it,
+    and ``confirmations`` counts it.  They have to agree exactly -- a rewind check that reads a
+    looser definition would refuse to reopen the run for the very entries it advertises.
+    """
+    return [
+        item["id"] for item in state.get("confirmations") or []
+        if item["status"] in CONFIRMATION_SETTLED and not item["applied"]
+    ]
+
+
+def _require_landing_only_rewind(state: dict[str, Any]) -> None:
+    """DELIVERY may reopen the Refiner for one thing only: a settled decision with no landing.
+
+    Before this edge existed, an answer that arrived after the last review door could not reach
+    the body in the same run at all: the run either shipped it as 挂账 for the next ``init`` to
+    consume, or wrote a blocking report.  The rewind is deliberately not a cheap second opinion
+    on the design.  ``start-stage --to REVIEW`` refuses while any settled decision is still
+    unlanded, so the answer has to actually be written, and ``start-stage --to DELIVERY``
+    refuses on a verdict from an older round, so the new text has to be reviewed again --
+    exactly one round of budget, which is why the budget and not the orchestrator's willingness
+    is what this check guards.  At the last round the price cannot be paid, so the rewind would
+    strand the run in a stage it cannot leave; refusing keeps 挂账 reachable instead.
+    """
+    unlanded = _unlanded_decisions(state)
+    if not unlanded:
+        raise ControllerError(
+            "start-stage --to REFINER refused from DELIVERY: the rewind exists to land a "
+            "settled human decision and no entry is waiting to be landed "
+            "('confirmations' lists them, and pending_landing is empty); prose you want changed "
+            "goes back through REQUEST_CHANGES at the REVIEW stage, and an unanswered question "
+            "is answered in the confirmation file and sync-confirmations first"
+        )
+    if state["review_round"] >= state["max_review_rounds"]:
+        raise ControllerError(
+            f"start-stage --to REFINER refused from DELIVERY: round {state['review_round']} is "
+            f"the last one the review budget allows and a rewind must be paid for with a fresh "
+            f"review round, so this run cannot land {', '.join(unlanded)}; keep them 待落地 in the "
+            "chapter-16 ledger, copy them into the delivery report, and the next run's init "
+            "consumes them as frozen human decisions"
         )
 
 
@@ -1494,6 +1630,13 @@ def write_artifact(
         raise ControllerError(
             f"refusing to store '{kind}': no COMPLETED {ROLES[stage]} agent recorded"
         )
+    if kind in {"draft", "refiner-map"}:
+        # The two roles that write into the TDD are the only registrations that can sit beside a
+        # hand-copied ledger, and the draft is where a NEW run's reference size gets frozen --
+        # before any review round has had a chance to inflate the document.
+        _reject_stray_ledger_rows(state)
+        if kind == "draft":
+            _freeze_growth_baseline(state)
     relative = f"{kind}-r{round_}.md" if stage == "REVIEW" else f"{kind}.md"
     destination = path.parent / "artifacts" / relative
     if destination.exists() and destination.read_text(encoding="utf-8") == text:
@@ -1665,6 +1808,9 @@ def record_fix(
         raise ControllerError(
             f"{finding_id} is {finding['severity']}; a pending human decision keeps the round open"
         )
+    # The disposition claims the body was edited, so this is the earliest point at which a
+    # hand-copied ledger beside that edit can be refused -- see ``_reject_stray_ledger_rows``.
+    _reject_stray_ledger_rows(state)
     entry = {
         "finding_id": finding_id,
         "status": status,
@@ -1680,6 +1826,162 @@ def record_fix(
     finding["status"] = status
     _save(path, state)
     return entry
+
+
+def _parse_marked_items(text: str, kind: str) -> list[dict[str, Any]]:
+    """Split a role report into ``@@KIND k=v …`` items plus the body under each header.
+
+    A header with no body, an unknown key or a missing required key is an error rather than
+    a skipped item: the batch face exists to remove glue, and silently dropping one finding
+    would trade a visible parse failure for an invisible closure gap.
+    """
+    items: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for number, line in enumerate(text.splitlines(), start=1):
+        match = MARKED_ITEM.match(line)
+        if match:
+            if match.group(1) != kind:
+                raise ControllerError(
+                    f"line {number}: this file is registered as @@{kind}, not @@{match.group(1)}"
+                )
+            fields = dict(MARKED_FIELD.findall(match.group(2)))
+            allowed = set(MARKED_FIELDS[kind]) | set(MARKED_OPTIONAL[kind])
+            unknown = sorted(set(fields) - allowed)
+            if unknown:
+                raise ControllerError(
+                    f"line {number}: unknown @@{kind} field(s) {', '.join(unknown)} "
+                    f"(allowed: {', '.join(sorted(allowed))})"
+                )
+            missing = [name for name in MARKED_FIELDS[kind] if name not in fields]
+            if missing:
+                raise ControllerError(
+                    f"line {number}: @@{kind} is missing {', '.join(missing)}"
+                )
+            current = {"line": number, "fields": fields, "body": []}
+            items.append(current)
+            continue
+        if current is not None and line.strip():
+            current["body"].append(line.strip())
+    if not items:
+        example = (
+            "@@FIND id=CRITIC-001 sev=High must_fix=true loc=9.3"
+            if kind == "FIND"
+            else "@@FIX id=CRITIC-001 status=FIXED loc=9.3"
+        )
+        raise ControllerError(f"no @@{kind} lines in the file; expected one per item, e.g. {example}")
+    for item in items:
+        if not item["body"]:
+            raise ControllerError(
+                f"line {item['line']}: @@{kind} {item['fields']['id']} has no "
+                f"{'证据' if kind == 'FIND' else '变更'} body under its header"
+            )
+    return items
+
+
+def record_findings(
+    state_path: str | Path, file: str | Path
+) -> dict[str, Any]:
+    """Register every ``@@FIND`` item in a role report in one call.
+
+    Idempotent on re-run: an item already recorded with the same severity, ``must_fix`` and
+    location is reported under ``already_registered`` instead of failing the whole batch, so
+    repairing line 17 of a 20-item file does not mean re-registering the first 16.  Any other
+    clash with the stored entry is a failure, because that is the shape a silently diverging
+    ledger takes.  ``loc`` may cite several sections; the finding is registered against the
+    first and the rest stay in the artifact, listed under ``multi_location`` so the caller
+    sees what was dropped rather than discovering it in the next round.
+    """
+    path, state = load_state(state_path)
+    items = _parse_marked_items(_read_document(Path(file), "findings report"), "FIND")
+    stored = {item["id"]: item for item in state["findings"]}
+    registered: list[str] = []
+    already: list[str] = []
+    failed: list[dict[str, Any]] = []
+    multi: dict[str, str] = {}
+    for item in items:
+        fields, body = item["fields"], "\n".join(item["body"])
+        finding_id = fields["id"]
+        locations = [token.strip() for token in fields["loc"].split(",") if token.strip()]
+        if len(locations) > 1:
+            multi[finding_id] = ",".join(locations[1:])
+        must_fix = fields.get("must_fix")
+        if must_fix is not None and must_fix not in {"true", "false"}:
+            failed.append({"id": finding_id, "error": f"must_fix must be true or false: {must_fix}"})
+            continue
+        wanted = {
+            "severity": fields["sev"],
+            "must_fix": (
+                fields["sev"] in MUST_FIX_SEVERITIES if must_fix is None else must_fix == "true"
+            ),
+            "location": locations[0],
+        }
+        existing = stored.get(finding_id)
+        if existing is not None:
+            same = all(existing[key] == value for key, value in wanted.items())
+            if same:
+                already.append(finding_id)
+                continue
+            failed.append({
+                "id": finding_id,
+                "error": "already recorded with different severity/must_fix/location; "
+                         "the stored entry is authoritative, so fix the report instead",
+            })
+            continue
+        try:
+            record_finding(
+                path, "CRITIC" if finding_id.startswith("CRITIC") else "REVIEWER", finding_id,
+                wanted["severity"], wanted["location"], body,
+                None if must_fix is None else must_fix == "true", None,
+            )
+            registered.append(finding_id)
+        except ControllerError as exc:
+            failed.append({"id": finding_id, "error": str(exc)})
+    return _batch_report("FIND", registered, already, failed, multi)
+
+
+def record_fixes(state_path: str | Path, file: str | Path) -> dict[str, Any]:
+    """Register every ``@@FIX`` disposition in a Refiner report in one call.
+
+    Each line still goes through ``record_fix``, so the stage rules and the per-round
+    ``--scope`` union are checked item by item exactly as on the single-item path; a Refiner
+    that registered 15 dispositions in one call is not owed 15 fewer questions than one that
+    made 15 calls.  Dispositions are last-write-wins, so re-running a repaired file is safe.
+    """
+    path, state = load_state(state_path)
+    # Once for the batch: a hand-copied ledger in the body fails every item the same way, and
+    # 20 identical ``failed`` entries would read as 20 problems instead of the one they are.
+    _reject_stray_ledger_rows(state)
+    items = _parse_marked_items(_read_document(Path(file), "disposition report"), "FIX")
+    known = {item["id"] for item in state["findings"]}
+    registered: list[str] = []
+    failed: list[dict[str, Any]] = []
+    for item in items:
+        fields = item["fields"]
+        finding_id = fields["id"]
+        if finding_id not in known:
+            failed.append({"id": finding_id, "error": "no such finding (record it first)"})
+            continue
+        try:
+            record_fix(path, finding_id, fields["status"], fields["loc"].split(",")[0].strip(),
+                       "\n".join(item["body"]))
+            registered.append(finding_id)
+        except ControllerError as exc:
+            failed.append({"id": finding_id, "error": str(exc)})
+    return _batch_report("FIX", registered, [], failed, {})
+
+
+def _batch_report(
+    kind: str, registered: list[str], already: list[str],
+    failed: list[dict[str, Any]], multi: dict[str, str],
+) -> dict[str, Any]:
+    return {
+        "status": "PARTIAL" if failed else "OK",
+        "marker": f"@@{kind}",
+        "registered": registered,
+        "already_registered": already,
+        "failed": failed,
+        **({"multi_location": multi} if multi else {}),
+    }
 
 
 def record_review(
@@ -2012,10 +2314,7 @@ def _confirmation_counts(state: dict[str, Any]) -> dict[str, Any]:
         "skipped_to_default": sum(1 for e in entries if e["status"] == "SKIPPED-DEFAULT"),
         "applied": sum(1 for e in entries if e["applied"]),
         "blocking_open": [e["id"] for e in entries if e["blocking"] and e["status"] == "OPEN"],
-        "settled_unapplied": [
-            e["id"] for e in entries
-            if e["status"] in CONFIRMATION_SETTLED and not e["applied"]
-        ],
+        "settled_unapplied": _unlanded_decisions(state),
         "blocking_incomplete": [
             e["id"] for e in entries
             if e["blocking"] and (e["status"] == "OPEN" or not e["applied"])
@@ -2357,12 +2656,13 @@ def _require_no_blocking_confirmations(state: dict[str, Any], target: str) -> No
 
     Checked at every audit hand-off (CRITIC, REVIEW) and at DELIVERY, not just before the
     first audit: a decision that was answered but never landed is exactly as unfinished as
-    one still open.  Landing is only demanded where a landing channel still exists -- in
-    front of the CRITIC and REVIEW doors the document is one dispatch away from a Refiner,
-    but at DELIVERY the passing verdict is bound to the snapshot and the stage machine has no
-    way back, so an answer that arrived during a review round could not land here at all;
-    requiring it would dead-lock the run rather than fix the document.  Those entries are
-    carried over instead: they stay in the chapter-16 ledger as 待落地, are listed by
+    one still open.  Landing is only demanded where a landing channel is one dispatch away
+    -- in front of the CRITIC and REVIEW doors the document is a resumed dispatch from a
+    Refiner.  DELIVERY is the exception on purpose: its rewind
+    (``_require_landing_only_rewind``) exists, but it costs a whole fresh review round, so
+    whether an answer is worth that price is a delivery judgement rather than a precondition
+    of shipping.  This door therefore refuses only on blocking entries and hands the rest out
+    as ``pending_landing``; they stay in the chapter-16 ledger as 待落地, are listed by
     ``start-stage --to DELIVERY`` and ``confirmations``, and the next run's ``init`` consumes
     them as frozen human decisions.  A must_fix finding may still not lean on an open entry.
     """
@@ -2379,10 +2679,7 @@ def _require_no_blocking_confirmations(state: dict[str, Any], target: str) -> No
             "(or skip-to-default), then sync-confirmations, and land settled decisions with "
             "mark-confirmation-applied"
         )
-    unlanded = [
-        item["id"] for item in entries
-        if item["status"] in CONFIRMATION_SETTLED and not item["applied"]
-    ]
+    unlanded = _unlanded_decisions(state)
     if unlanded and target != "DELIVERY":
         raise ControllerError(
             f"start-stage --to {target} refused: settled decision(s) {', '.join(unlanded)} "
@@ -2639,6 +2936,116 @@ def _anchor_index(lines: list[str], needle: str) -> int | None:
     if inside_fence:
         raise ControllerError("the TDD has an unclosed code fence; ledger anchors are unreliable")
     return None
+
+
+def _body_lines(text: str) -> int:
+    """Line count of the model-authored body; the generated ledger is the controller's own output.
+
+    Unreadable marker pairs fall back to the raw count rather than raising: the number feeds a
+    soft growth warning, and an unclosed fence is ``diagram-fences``' finding, not a reason for
+    the size metric to disappear.
+    """
+    try:
+        return len(strip_ledger_bodies(text).splitlines())
+    except ControllerError:
+        return len(text.splitlines())
+
+
+def _growth_baseline(text: str, basis: str) -> dict[str, Any]:
+    """Freeze the reference body size every later round is measured against.
+
+    ``previous-version`` is taken by ``init`` on the TDD an UPDATE run is about to rewrite;
+    ``draft`` by the Architect's first artifact registration in a NEW run.  Both are captured
+    before any review round can add to the document, so a later ``+15%`` reads as "the loop
+    inflated it" instead of "this design happens to be long".
+    """
+    return {"baseline_lines": _body_lines(text), "baseline": basis, "recorded_at": _now()}
+
+
+def _freeze_growth_baseline(state: dict[str, Any]) -> None:
+    """Record the draft's body size once, at the first moment the document is on disk.
+
+    Two callers, one purpose: ``write-artifact --kind draft`` is the honest instant, and
+    ``start-stage --to CRITIC`` is the last instant that still precedes any Refiner edit -- a run
+    that saved the TDD after registering the artifact would otherwise carry no reference size at
+    all, and the growth check would have nothing to measure without saying so.
+    """
+    if state.get("document_growth"):
+        return
+    tdd = Path(state["output_document"]["absolute"])
+    if tdd.is_file():
+        text = _read_document(tdd, "the TDD")
+        state["document_growth"] = _growth_baseline(text, "draft")
+
+
+def _document_growth_check(state: dict[str, Any], doc_text: str) -> dict[str, Any]:
+    """Soft size-discipline check: body growth the review loop did not pay for.
+
+    Never a failure, in either direction.  A long document is not a defect, and the roles that
+    must read it in full are the ones that pay for it -- but the bill is per round, so "每轮往里
+    加两段" is invisible in any single round's diff and was the largest read-cost multiplier in
+    the last run (1834 → 2111 body lines).  Putting the number in the gate report is what makes
+    the delivery report able to state it.
+    """
+    body = _body_lines(doc_text)
+    baseline = state.get("document_growth") or {}
+    base = baseline.get("baseline_lines")
+    if not base:
+        return {
+            "name": "document-growth", "ok": True, "warn": False,
+            "detail": [
+                f"body {body} lines; no reference version recorded yet (init for an UPDATE run, "
+                "write-artifact --kind draft or start-stage --to CRITIC for a NEW run)",
+            ],
+        }
+    assert isinstance(base, int)
+    percent = (body - base) / base * 100
+    round_ = state["review_round"]
+    drivers = [
+        item for item in state["findings"]
+        if item["round"] == round_ or (round_ <= 1 and item["round"] == 0)
+    ]
+    only_minor = bool(drivers) and all(
+        item["severity"] not in MUST_FIX_SEVERITIES for item in drivers
+    )
+    warn = percent > GROWTH_WARN_PERCENT and only_minor
+    detail = [
+        "body {} lines vs baseline {} ({:+.1f}%, baseline: {})".format(
+            body, base, percent, baseline.get("baseline", "?")
+        ),
+        (
+            "round {} raised {} finding(s), none of them Blocker/High: the growth was not paid "
+            "for -- quote this in the delivery report (soft check, does not block)".format(
+                round_, len(drivers)
+            ) if warn else (
+                f"growth within the {GROWTH_WARN_PERCENT:g}% threshold"
+                if percent <= GROWTH_WARN_PERCENT else
+                "a Blocker/High finding of this round pays for the growth"
+                if drivers else "no finding of this round to attribute the growth to"
+            )
+        ),
+    ]
+    return {"name": "document-growth", "ok": True, "warn": warn, "detail": detail}
+
+
+def _reject_stray_ledger_rows(state: dict[str, Any]) -> None:
+    """The mirror detection moved forward from delivery, to the registration right after the edit.
+
+    ``render-ledger`` and ``gate`` keep running the same predicate -- this only changes when the
+    first refusal lands, which is where deleting a hand-copied table costs one line instead of a
+    strip pass at delivery.  Nothing else about the document is checked here: an unreadable
+    marker pair is ``ledger-blocks-present``'s finding, and refusing a disposition for it would
+    hide one failure behind an unrelated command.
+    """
+    tdd = Path(state["output_document"]["absolute"])
+    if not tdd.is_file():
+        return
+    lines = _read_document(tdd, "the TDD").splitlines()
+    try:
+        blocks = _ledger_blocks(lines)
+    except ControllerError:
+        return
+    _reject_handwritten_mirror(lines, blocks)
 
 
 def _findings_ledger_body(state: dict[str, Any]) -> list[str]:
@@ -3273,6 +3680,7 @@ def locate(
     tdd_file: str | Path | None,
     finding_id: str | None = None,
     section: str | None = None,
+    batch: str | None = None,
 ) -> dict[str, Any]:
     """Answer "which lines do I have to read" for one finding or one section number.
 
@@ -3282,6 +3690,8 @@ def locate(
     """
     path, state = load_state(state_path)
     tdd = _resolve_tdd(state, tdd_file)
+    if batch:
+        return _locate_batch(path, state, tdd, batch)
     index = _fresh_index(path, state, tdd)
     by_key = {item["key"]: item for item in index["sections"]}
     numbers = index["numbers"]
@@ -3300,7 +3710,7 @@ def locate(
         key = wanted if wanted in by_key else numbers.get(wanted)
         match = "section" if key else "none"
     else:
-        raise ControllerError("one of --finding or --section is required")
+        raise ControllerError("one of --finding, --section or --batch is required")
 
     if key is None or key not in by_key:
         return {
@@ -3338,6 +3748,52 @@ def locate(
         "tokens_estimated": tokens,
         "budget_tokens": budget,
         "over_budget": tokens > budget,
+        "fallback": LOCATE_FALLBACK,
+    }
+
+
+def _locate_batch(
+    state_path: Path, state: dict[str, Any], tdd: Path, raw: str
+) -> dict[str, Any]:
+    """One index read for a whole cluster: the survey that used to cost one call per section.
+
+    Deliberately narrower than the single-target path: no citation expansion, no symbol list.
+    A cluster is chosen from this answer and then handed to a role, and the per-target
+    ``locate`` is still the call that says what a section cites.
+    """
+    index = _fresh_index(state_path, state, tdd)
+    by_key = {item["key"]: item for item in index["sections"]}
+    numbers = index["numbers"]
+    findings = {item["id"]: item for item in state["findings"]}
+    titles = [(item["title"], item["key"]) for item in index["sections"]]
+    chosen: dict[str, dict[str, Any]] = {}
+    unresolved: list[str] = []
+    for token in (item.strip() for item in re.split(r"[,\s]+", raw) if item.strip()):
+        if token in findings:
+            key, _ = _resolve_location(numbers, titles, findings[token]["location"])
+        else:
+            key = token if token in by_key else numbers.get(token)
+        item = by_key.get(key or "")
+        if item is None:
+            unresolved.append(token)
+            continue
+        chosen[item["key"]] = item
+    views = [_section_view(entry, "batch target") for entry in chosen.values()]
+    tokens = sum(item["tokens_estimated"] for item in views)
+    window = int(state.get("context_window") or DEFAULT_CONTEXT_WINDOW)
+    budget = int(window * BUDGET_SHARE)
+    return {
+        "status": "OK" if views else "NOT_LOCATED",
+        "mode": "batch",
+        "requested": [item.strip() for item in re.split(r"[,\s]+", raw) if item.strip()],
+        "unresolved": unresolved,
+        "sections": views,
+        "total_chars": sum(item["chars"] for item in views),
+        "tokens_estimated": tokens,
+        "budget_tokens": budget,
+        "over_budget": tokens > budget,
+        "cached": index.get("cached", False),
+        "reason": None if views else "no heading in the TDD resolves any of these",
         "fallback": LOCATE_FALLBACK,
     }
 
@@ -3448,20 +3904,78 @@ def _dispatch_scope_covers(
             )
 
 
+def _fence_line_mask(lines: list[str]) -> set[int]:
+    """0-based indices of the lines a code fence encloses.
+
+    The delimiter lines themselves stay unmasked: text outside the fence is hand-written prose.
+    """
+    mask: set[int] = set()
+    inside = False
+    for index, line in enumerate(lines):
+        if FENCE.match(line.strip()):
+            inside = not inside
+            continue
+        if inside:
+            mask.add(index)
+    return mask
+
+
+def _inline_code_spans(line: str) -> list[tuple[int, int]]:
+    """Character ranges the line renders as inline code, matched on the backtick run length."""
+    spans: list[tuple[int, int]] = []
+    position = 0
+    while True:
+        start = line.find("`", position)
+        if start < 0:
+            return spans
+        run = len(line[start:]) - len(line[start:].lstrip("`"))
+        closing = line.find("`" * run, start + run)
+        if closing < 0:
+            # An unterminated run is prose with a stray backtick, not an escape hatch.
+            return spans
+        spans.append((start, closing + run))
+        position = closing + run
+
+
+def _is_unfilled_slot(line: str, quoted_as_code: bool) -> bool:
+    """Whether one hand-written line still carries a template placeholder.
+
+    A slot token is never legitimate final text, so it counts wherever it sits.  A value token is
+    only a slot while the document speaks prose: the same characters inside a code fence or an
+    inline code span are data -- a status enum, a date format -- and are what the template tells
+    the architect to write there.
+    """
+    if PLACEHOLDER_SLOTS.search(line):
+        return True
+    if quoted_as_code:
+        return False
+    spans = _inline_code_spans(line)
+    return any(
+        not any(start <= match.start() and match.end() <= end for start, end in spans)
+        for match in PLACEHOLDER_VALUES.finditer(line)
+    )
+
+
 def _scan_document(text: str, state: dict[str, Any]) -> list[dict[str, Any]]:
     """Deterministic delivery checks over the TDD body."""
     checks: list[dict[str, Any]] = []
 
-    # Only a marker in the hand-written body excuses a placeholder on its own line: a sample
-    # inside a code fence, or one the ledger just echoed back, is example text and excuses
-    # nothing.
+    # Three readers of one line: the hand-written prose, code the document quotes, and the
+    # generated ledger.  Only the first can leave a slot behind -- the second carries data, and
+    # the third echoes ``state.json`` back, so failing on it would fault the controller for
+    # writing what it was told (hand edits inside those markers are ``ledger-matches-state``'s
+    # business).  A marker on its own line is a question the run is still carrying.
     markers = _document_markers(text)
     marker_lines = {line for _, line, _ in markers}
+    lines = text.splitlines()
+    fenced = _fence_line_mask(lines)
+    generated = _ledger_line_mask(lines)
     placeholders: list[str] = []
-    for number, line in enumerate(text.splitlines(), start=1):
-        if number in marker_lines:
+    for number, line in enumerate(lines, start=1):
+        index = number - 1
+        if index in generated or number in marker_lines:
             continue
-        if PLACEHOLDER.search(line):
+        if _is_unfilled_slot(line, index in fenced):
             placeholders.append(f"line {number}: {line.strip()[:80]}")
     checks.append({
         "name": "no-template-placeholders",
@@ -3641,6 +4155,9 @@ def gate(state_path: str | Path, tdd_file: str | Path) -> dict[str, Any]:
         add("scale-chapters", ok, detail)
         ok, detail = _project_structure_check(path, state, tdd, doc_text)
         add("project-structure-branch", ok, detail)
+        # Soft by construction: ``ok`` is always True, so it can never join ``failures``; it
+        # rides on ``warn`` and out through the report's ``warnings`` list.
+        checks.append(_document_growth_check(state, doc_text))
         if state["reviews"]:
             ok, detail = _incremental_coverage(path, state, tdd)
             add("incremental-review-covers-changes", ok, detail)
@@ -3648,6 +4165,7 @@ def gate(state_path: str | Path, tdd_file: str | Path) -> dict[str, Any]:
         add("tdd-exists", False, str(tdd))
 
     failures = [item for item in checks if not item["ok"]]
+    warnings = [{"name": item["name"], "detail": item["detail"]} for item in checks if item.get("warn")]
     if state["degraded"]:
         status = "PARTIAL_DEGRADED"
     else:
@@ -3659,6 +4177,9 @@ def gate(state_path: str | Path, tdd_file: str | Path) -> dict[str, Any]:
         "degraded": state["degraded"],
         "degradations": state["degradations"],
         "gaps": state.get("input_gaps", []),
+        # Soft checks: they never join ``failures`` and never change ``status``, but the delivery
+        # report has to quote them, which is the only way a per-round cost shows up anywhere.
+        "warnings": warnings,
         # Both are read-only here on purpose: they tell the caller why the next round is scoped
         # and which chapters the scale probe will demand, without either becoming a gate failure.
         "review_stop": _severity_stop(state),
@@ -3700,8 +4221,258 @@ def _cached_index(state_path: Path) -> dict[str, Any] | None:
         return {"status": "unreadable", "path": str(cached)}
 
 
-def show(state_path: str | Path) -> dict[str, Any]:
+KIND_OF_STAGE = {
+    "CONTEXT": "context-pack",
+    "ARCHITECT": "draft",
+    "CRITIC": "critic-findings",
+    "REFINER": "refiner-map",
+    "REVIEW": "review-report",
+}
+DUMP_FIELDS = (
+    "id", "source", "round", "severity", "must_fix", "location", "status", "evidence",
+    "recorded_at",
+)
+DUMP_DEFAULT_FIELDS = DUMP_FIELDS[:7]
+
+
+def dump(
+    state_path: str | Path, finding_id: str, fields: str | None = None
+) -> dict[str, Any]:
+    """One Finding with its disposition, from ``state.json`` and not from the transcript.
+
+    ``evidence`` stays out of the default view because it is the field that would put a whole
+    paragraph back into the orchestrator's context; ask for it by name when the text is what
+    is needed, and the size of what was withheld is reported either way.
+    """
     path, state = load_state(state_path)
+    finding = next((item for item in state["findings"] if item["id"] == finding_id), None)
+    if finding is None:
+        raise ControllerError(f"unknown finding id: {finding_id} (record the finding first)")
+    wanted = list(DUMP_DEFAULT_FIELDS)
+    if fields:
+        wanted = []
+        for token in (item.strip() for item in fields.split(",") if item.strip()):
+            if token == "all":
+                wanted.extend(DUMP_FIELDS)
+                continue
+            if token not in DUMP_FIELDS:
+                raise ControllerError(
+                    f"unknown field: {token} (choose from {', '.join(DUMP_FIELDS)}, or all)"
+                )
+            wanted.append(token)
+    view = {key: finding[key] for key in wanted if key in finding}
+    if "evidence" not in view:
+        view["evidence_chars"] = len(finding["evidence"])
+    fix = next((item for item in state["fixes"] if item["finding_id"] == finding_id), None)
+    view["disposition"] = (
+        {key: fix[key] for key in ("status", "location", "change")} if fix else "NONE"
+    )
+    view["confirmations"] = [
+        item["id"] for item in state.get("confirmations") or []
+        if item["source"].endswith(finding_id)
+    ]
+    return {"status": "OK", "finding": view}
+
+
+def _next_action(path: Path, state: dict[str, Any]) -> dict[str, Any]:
+    """The command the run is waiting on, derived from the same predicates ``start-stage`` checks.
+
+    This is a read of the state machine, not a fourth gate: it never advances anything, and a
+    command it names can still be refused.  It exists because the alternative was the
+    orchestrator opening the controller source to work out which of its ~30 arguments was
+    missing -- fourteen read-backs in the reference run, all of them answering this question.
+    """
+    stage = state["stage"]
+    round_ = state["review_round"]
+    tdd = _resolve_tdd(state, None)
+    tdd_arg = f'--tdd-file "{tdd}"'
+
+    def stamp(value: Any) -> datetime:
+        # A missing stamp reads as the oldest possible moment rather than a comparison to
+        # skip: the first gate has nothing to compare against, and treating None as equal
+        # would strand the run on a refresh that can never be scheduled.
+        return _parse_at(value) or datetime.min
+
+    def run(text: str) -> str:
+        return f'{text} --state "{path}"'
+
+    def advance(target: str, why: str) -> dict[str, Any]:
+        return {"command": run(f"start-stage --to {target}"), "why": why, "missing": []}
+
+    def delegated(role: str, kind: str, agent_round: int, artifact_round: int | None,
+                  after: dict[str, Any]) -> dict[str, Any]:
+        if not _completed_agents(state, role, agent_round):
+            return {
+                "command": run(
+                    f"record-agent --role {role} --name <实例名> --session-id <会话 id> "
+                    "--input-digest <sha256:…> --status DISPATCHED"
+                ),
+                "why": f"{role}@{agent_round} has not been dispatched and completed",
+                "missing": [f"COMPLETED {role}@{agent_round}"],
+            }
+        if not _artifacts(state, kind, artifact_round):
+            return {
+                "command": run(f"write-artifact --kind {kind} --file <该角色的回报文件>"),
+                "why": f"stage {stage} has no persisted '{kind}' artifact",
+                "missing": [f"artifact '{kind}'"],
+            }
+        return after
+
+    if stage == "CLOSED":
+        return {"command": None, "why": "run closed; the delivered document is frozen", "missing": []}
+    if stage == "INPUT":
+        if not state["sources"]:
+            return {
+                "command": run(
+                    "record-source --source-id SRC-1 --kind PRD --locator <PRD 路径> "
+                    "--status READ --revision <版本> --summary <一句话> --confidence HIGH"
+                ),
+                "why": "no input has been registered; the locator is checked against disk",
+                "missing": ["at least one record-source"],
+            }
+        if state["input_status"] not in {"PASS", "PARTIAL"}:
+            prd = (
+                ' --prd-changes "<修改/新增/删除 行数，如 3/1/0>"'
+                if state["mode"] == "UPDATE" else ""
+            )
+            return {
+                "command": run(f"finalize-inputs --status PASS --reason <依据>{prd}"),
+                "why": "input_status is still unset; the scale probe runs here too",
+                "missing": ["input_status"],
+            }
+        return advance("CONTEXT", "inputs frozen")
+    if stage == "CONTEXT":
+        return delegated(
+            ROLES["CONTEXT"], "context-pack", 0, None, advance("ARCHITECT", "context pack persisted")
+        )
+    if stage == "ARCHITECT":
+        return delegated(
+            ROLES["ARCHITECT"], "draft", 0, None, advance("CRITIC", "draft persisted")
+        )
+    if stage == "CRITIC":
+        waiting = delegated(
+            ROLES["CRITIC"], "critic-findings", 0, None,
+            advance("REFINER", "critic findings persisted"),
+        )
+        if waiting["missing"]:
+            return waiting
+        if not [item for item in state["findings"] if item["round"] == 0]:
+            return {
+                "command": run('record-findings --from-file <critic-findings 文件>'),
+                "why": "the Critic artifact is on disk but no CRITIC-NNN finding is registered",
+                "missing": ["round 0 findings"],
+            }
+        return waiting
+    if stage == "REFINER":
+        followups = _polish_followups(state)
+        waiting = delegated(
+            ROLES["REFINER"], "refiner-map", 0, round_,
+            advance("REVIEW", "this round's dispositions are in"),
+        )
+        if waiting["missing"]:
+            return waiting
+        if followups["undisposed"]:
+            return {
+                "command": run('record-fixes --from-file <refiner-map 文件>'),
+                "why": f"{len(followups['undisposed'])} finding(s) still have no disposition: "
+                       + ", ".join(followups["undisposed"]),
+                "missing": ["a disposition per finding"],
+            }
+        return waiting
+    if stage == "REVIEW":
+        verdict = next(
+            (item for item in state["reviews"] if item["round"] == round_), None
+        )
+        if verdict is None:
+            return delegated(
+                ROLES["REVIEW"], "review-report", round_, round_,
+                {
+                    "command": run(
+                        "record-review --status <APPROVE|APPROVE_WITH_FOLLOW_UPS|REQUEST_CHANGES|BLOCKED>"
+                        f" --report <终审报告路径> {tdd_arg} --session-id <会话 id>"
+                    ),
+                    "why": f"round {round_} has a reviewer and a report but no verdict",
+                    "missing": ["this round's verdict"],
+                },
+            )
+        if verdict["status"] not in PASSING_REVIEW_STATUSES:
+            return advance("REFINER", f"round {round_} came back {verdict['status']}")
+        followups = _polish_followups(state)
+        if followups["undisposed_blocking"]:
+            return advance(
+                "REFINER", "a passing verdict still leaves blocking findings that no Refiner "
+                "round has answered: " + ", ".join(followups["undisposed_blocking"])
+            )
+        if followups["open_non_blocking_followups"]:
+            return {
+                "command": run(
+                    f"record-fix --finding-id {followups['open_non_blocking_followups'][0]}"
+                    " --status REJECTED --location <该 Finding 的位置> --change <不阻断交付的理由>"
+                ),
+                "why": f"{len(followups['open_non_blocking_followups'])} non-blocking follow-up(s)"
+                       " booked in place, not taken into a new round (see the SKILL's default"
+                       " policy); the list is in findings.open_non_blocking_followups",
+                "missing": ["a disposition per follow-up"],
+            }
+        return advance("DELIVERY", "the round passed and every finding has a disposition")
+    if stage == "DELIVERY":
+        gate = state["gates"][-1] if state["gates"] else None
+        ledger = state.get("ledger") or {}
+        if not ledger:
+            # 第 16 章的生成块先要存在，`gate` 才谈得上通过——顺序反过来的话这条命令会
+            # 一直指向同一道拒绝，主控要跑两次才知道缺的是台账。
+            waiting = {
+                "command": run(f"render-ledger {tdd_arg}"),
+                "why": "chapter 16 has no generated blocks yet, which ledger-blocks-present "
+                       "and ledger-matches-state both demand before the gate can pass",
+                "missing": ["the ledger render"],
+            }
+        elif gate is None:
+            waiting = {
+                "command": run(f"gate {tdd_arg}"),
+                "why": "no gate report has been recorded yet",
+                "missing": ["a passing gate"],
+            }
+        elif gate["status"] not in {"PASS", "PARTIAL_DEGRADED"}:
+            waiting = {
+                "command": run(f"gate {tdd_arg}"),
+                "why": f"the last gate came back {gate['status']}: "
+                       + ", ".join(gate.get("failures") or ()),
+                "missing": ["a passing gate"],
+            }
+        elif stamp(ledger["rendered_at"]) < stamp(gate["evaluated_at"]):
+            waiting = {
+                "command": run(f"render-ledger {tdd_arg}"),
+                "why": "the gate passed; chapter 16 must carry that verdict before the run closes",
+                "missing": ["the post-gate ledger refresh"],
+            }
+        else:
+            waiting = advance("CLOSED", f"last gate: {gate['status']}, recorded in the ledger")
+        unlanded = _unlanded_decisions(state)
+        if unlanded and state["review_round"] < state["max_review_rounds"]:
+            # Not the next command -- closing stays legal while these ride the ledger, and
+            # spending a review round on them is a human judgement.  It is disclosed on every
+            # step this stage takes, because the alternative is the orchestrator remembering,
+            # mid-delivery, that a channel it stopped believing in still exists.
+            waiting["landing_rewind"] = {
+                "command": run("start-stage --to REFINER"),
+                "confirmations": unlanded,
+                "cost": f"a fresh review round ({state['review_round']} → "
+                        f"{state['review_round'] + 1}/{state['max_review_rounds']})",
+            }
+        return waiting
+    return {"command": None, "why": f"no next step defined for stage {stage}", "missing": []}
+
+
+def show(state_path: str | Path, next_only: bool = False) -> dict[str, Any]:
+    """The run summary, or -- with ``next_only`` -- the one command the run is waiting on."""
+    path, state = load_state(state_path)
+    if next_only:
+        return {
+            "stage": state["stage"],
+            "review_round": f"{state['review_round']}/{state['max_review_rounds']}",
+            "next": _next_action(path, state),
+        }
     minutes: dict[str, float] = {}
     for item in state["agents"]:
         wall = item.get("wall_seconds")
@@ -3724,6 +4495,7 @@ def show(state_path: str | Path) -> dict[str, Any]:
         "findings": {
             "open": sum(1 for item in state["findings"] if item["status"] == "OPEN"),
             "total": len(state["findings"]),
+            **_polish_followups(state),
         },
         "confirmations": _confirmation_counts(state),
         "reviews": [
@@ -3855,7 +4627,10 @@ def _fixer_commands(sub: argparse._SubParsersAction) -> None:
     artifact.add_argument("--role", default=None)
     artifact.add_argument("--round", type=int, default=None, dest="round_override")
 
-    finding = sub.add_parser("record-finding", help="add a Critic or Reviewer finding")
+    finding = sub.add_parser(
+        "record-finding",
+        help="add one Critic or Reviewer finding (a whole report: record-findings)",
+    )
     finding.add_argument("--state", required=True)
     finding.add_argument("--source", required=True, choices=("CRITIC", "REVIEWER"))
     finding.add_argument("--id", required=True, dest="finding_id")
@@ -3865,12 +4640,38 @@ def _fixer_commands(sub: argparse._SubParsersAction) -> None:
     finding.add_argument("--must-fix", choices=("true", "false"), default=None)
     finding.add_argument("--round", type=int, default=None, dest="round_override")
 
+    findings_batch = sub.add_parser(
+        "record-findings",
+        help="register every @@FIND item in one role report",
+    )
+    findings_batch.add_argument("--state", required=True)
+    findings_batch.add_argument(
+        "--from-file",
+        required=True,
+        dest="file",
+        help="the Critic/Reviewer report as written: one '@@FIND id=… sev=… loc=…' line per "
+        "finding with its evidence below; exits 2 with the per-item errors when any line fails",
+    )
+
     fix = sub.add_parser("record-fix", help="map one finding to a disposition")
     fix.add_argument("--state", required=True)
     fix.add_argument("--finding-id", required=True)
     fix.add_argument("--status", required=True, choices=FIX_STATUSES)
     fix.add_argument("--location", required=True)
     fix.add_argument("--change", required=True)
+
+    fixes_batch = sub.add_parser(
+        "record-fixes",
+        help="register every @@FIX disposition in one Refiner report",
+    )
+    fixes_batch.add_argument("--state", required=True)
+    fixes_batch.add_argument(
+        "--from-file",
+        required=True,
+        dest="file",
+        help="the Refiner report as written: one '@@FIX id=… status=… loc=…' line per "
+        "disposition with the change below; each line still passes the --scope check",
+    )
 
     review = sub.add_parser("record-review", help="bind a verdict to the reviewed TDD snapshot")
     review.add_argument("--state", required=True)
@@ -3944,9 +4745,34 @@ def _fixer_commands(sub: argparse._SubParsersAction) -> None:
     locate_cmd.add_argument("--tdd-file", default=None, help="defaults to the path init froze")
     locate_cmd.add_argument("--finding", default=None, dest="finding_id")
     locate_cmd.add_argument("--section", default=None)
+    locate_cmd.add_argument(
+        "--batch",
+        default=None,
+        help="several targets at once ('7.2,9.3,CRITIC-004'): one index read for the whole "
+        "cluster, returns the merged line ranges and one budget verdict",
+    )
+
+    dump_cmd = sub.add_parser(
+        "dump", help="print one finding with its disposition, from state.json"
+    )
+    dump_cmd.add_argument("--state", required=True)
+    dump_cmd.add_argument("--finding", required=True, dest="finding_id")
+    dump_cmd.add_argument(
+        "--fields",
+        default=None,
+        help="comma list of 'id,source,round,severity,must_fix,location,status,evidence,"
+        "recorded_at' (default: everything but 'evidence'); 'all' selects every field",
+    )
 
     shown = sub.add_parser("show", help="print a compact run summary")
     shown.add_argument("--state", required=True)
+    shown.add_argument(
+        "--next",
+        action="store_true",
+        dest="next_only",
+        help="skip the summary and print only the one command this run is waiting on, "
+        "already carrying the arguments it needs",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -4007,8 +4833,18 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 ensure_ascii=False,
             ))
+        elif args.command == "record-findings":
+            report = record_findings(args.state, args.file)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            if report["status"] == "PARTIAL":
+                return 2
         elif args.command == "record-fix":
             record_fix(args.state, args.finding_id, args.status, args.location, args.change)
+        elif args.command == "record-fixes":
+            report = record_fixes(args.state, args.file)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            if report["status"] == "PARTIAL":
+                return 2
         elif args.command == "record-review":
             print(json.dumps(
                 record_review(
@@ -4044,14 +4880,22 @@ def main(argv: list[str] | None = None) -> int:
             # ``NOT_LOCATED`` exits 0 on purpose: it is an answer that tells the caller to read
             # wider, not a gate failure, and a non-zero code would put it on the same path as
             # "this run may not proceed".
-            print(json.dumps(locate(args.state, args.tdd_file, args.finding_id, args.section), ensure_ascii=False))
+            print(json.dumps(
+                locate(args.state, args.tdd_file, args.finding_id, args.section, args.batch),
+                ensure_ascii=False,
+            ))
+        elif args.command == "dump":
+            print(json.dumps(dump(args.state, args.finding_id, args.fields), ensure_ascii=False))
         elif args.command == "gate":
             report = gate(args.state, args.tdd_file)
             print(json.dumps(report, ensure_ascii=False, indent=2))
             if report["status"] == "BLOCKED":
                 return 2
         elif args.command == "show":
-            print(json.dumps(show(args.state), ensure_ascii=False, indent=2))
+            payload = show(args.state, args.next_only)
+            # ``--next`` is the one face called dozens of times per run for a five-line answer,
+            # so it skips the indent the full summary pays for.
+            print(json.dumps(payload, ensure_ascii=False, indent=None if args.next_only else 2))
         return 0
     except (ControllerError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         print(f"BLOCKED: {exc}", file=sys.stderr)

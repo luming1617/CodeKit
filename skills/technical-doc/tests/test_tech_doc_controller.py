@@ -113,6 +113,19 @@ PRD_STRUCTURAL = """# 产品需求说明书：风控规则引擎
 FILLER = "指标口径、告警阈值、责任人与复检方式在此逐条写明，不留只有结论没有做法的空话。"
 CHAPTER_FILL = FILLER * 12
 
+# The same draft with ``n`` extra body lines spliced into chapter 13, i.e. what a Refiner round
+# leaves behind when it answers a Medium finding by adding prose: written where prose belongs, so
+# the growth check is measured against a document that is still template-clean.
+def grown_body(lines: int) -> str:
+    filler = "重试窗口取 30 秒，退避上限 5 次，幂等键由订单号与版本号拼接。\n" * lines
+    return TDD_BODY.replace("## 15. 里程碑规划", filler + "## 15. 里程碑规划")
+
+
+# A disposition table copied into the body beside the generated ledger -- the shape
+# ``_reject_handwritten_mirror`` exists to refuse, and the three tests below check that it is
+# refused while the Refiner can still fix it rather than at delivery.
+MIRROR_ROWS = "\n| Finding | 处置 |\n|---|---|\n| CRITIC-001 | 已补退避 |\n"
+
 # TDD_BODY at M: 可观测设计 carries substance and the signalled chapter exists at all
 # (部署拓扑 stays in the body although M no longer demands it, matching a doc written for L).
 M_TDD_BODY = (
@@ -224,8 +237,8 @@ class TechDocControllerTests(unittest.TestCase):
         )
         return controller.write_artifact(state, kind, origin, None, None)
 
-    def to_refiner(self, state: Path, prd_changes: str | None = None) -> None:
-        """Drive INPUT -> REFINER with every delegated agent and artifact logged."""
+    def to_architect(self, state: Path, prd_changes: str | None = None) -> None:
+        """INPUT -> ARCHITECT: inputs frozen, context pack persisted, architect completed."""
         controller.record_source(
             state, "SRC-1", "PRD", str(self.feature / "product-doc.md"),
             "READ", "v1", "订单备注同步需求", "HIGH",
@@ -236,6 +249,10 @@ class TechDocControllerTests(unittest.TestCase):
         self.artifact(state, "context-pack")
         controller.start_stage(state, "ARCHITECT")
         self.record(state, "tech-architect", "s-arch")
+
+    def to_refiner(self, state: Path, prd_changes: str | None = None) -> None:
+        """Drive INPUT -> REFINER with every delegated agent and artifact logged."""
+        self.to_architect(state, prd_changes)
         self.artifact(state, "draft")
         controller.start_stage(state, "CRITIC")
         self.record(state, "tech-critic", "s-critic")
@@ -262,6 +279,13 @@ class TechDocControllerTests(unittest.TestCase):
         controller.record_review(
             state, "APPROVE", report["path"], self.feature / "technical-doc.md", session
         )
+
+    def cli(self, *args: str, state: Path | None = None) -> subprocess.CompletedProcess[str]:
+        """Run one subcommand the way the orchestrator does: argv, pipes, exit code."""
+        argv = [sys.executable, str(MODULE_PATH), *args]
+        if state is not None:
+            argv += ["--state", str(state)]
+        return subprocess.run(argv, capture_output=True, text=True)
 
     # ------------------------------------------------------------------- init
 
@@ -442,6 +466,67 @@ class TechDocControllerTests(unittest.TestCase):
         with self.assertRaises(controller.ControllerError) as ctx:
             controller.record_fix(state, "CRITIC-001", "FIXED", "4.2", "改法")
         self.assertIn("REFINER", str(ctx.exception))
+
+    # ------------------------------------------------------- polish follow-ups
+
+    def test_show_splits_findings_by_what_they_cost(self) -> None:
+        """Three lists, so the orchestrator copies a verdict instead of recomputing one.
+
+        The reference run spent two review rounds (~100 min) prose-editing findings that only
+        needed a disposition; ``undisposed`` is also the replay subset after an aborted dispatch.
+        """
+        state = Path(controller.init_run(self.repo, self.feature, "run-100"))
+        self.to_refiner(state)
+        controller.record_finding(state, "CRITIC", "CRITIC-001", "High", "4.2", "缺退避", None, 0)
+        controller.record_finding(state, "CRITIC", "CRITIC-002", "Medium", "6.1", "缺索引", None, 0)
+        controller.record_finding(state, "CRITIC", "CRITIC-003", "Medium", "7.2", "口径歧义", None, 0)
+        controller.record_fix(state, "CRITIC-003", "REJECTED", "7.2", "不改，PRD 已定义口径")
+
+        findings = controller.show(state)["findings"]
+        self.assertEqual(["CRITIC-001", "CRITIC-002"], findings["undisposed"])
+        self.assertEqual(["CRITIC-002"], findings["open_non_blocking_followups"])
+        self.assertEqual(["CRITIC-001"], findings["undisposed_blocking"])
+
+    def test_opening_a_round_reports_the_debts_that_need_no_prose(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "run-101"))
+        self.write_tdd()
+        self.to_review(state)
+        controller.record_finding(state, "REVIEWER", "REVIEW-1-001", "High", "4.2", "缺退避", None, None)
+        controller.record_finding(
+            state, "REVIEWER", "REVIEW-1-002", "Medium", "7.2", "面板少一个维度", None, None
+        )
+        self.record(state, "tech-reviewer", "s-review-1")
+        report = self.artifact(state, "review-report", "第 1 轮报告：修订重试策略。\n")
+        controller.record_review(
+            state, "REQUEST_CHANGES", report["path"], self.feature / "technical-doc.md", "s-review-1"
+        )
+        controller.start_stage(state, "REFINER")
+        self.record(state, "tech-refiner", "s-refine-2")
+        self.artifact(state, "refiner-map", "第 2 轮变更映射：REVIEW-1-001 已处置。\n")
+        controller.record_fix(state, "REVIEW-1-001", "FIXED", "4.2", "补指数退避")
+
+        result = controller.start_stage(state, "REVIEW")
+        self.assertEqual(["REVIEW-1-002"], result["followups"]["open_non_blocking_followups"])
+        self.assertIn("record-fix", result["followup_hint"])
+
+    def test_the_shortcut_is_silent_while_a_blocker_is_open(self) -> None:
+        """A round opened for a Blocker/High carries no disposition-only suggestion at all."""
+        state = Path(controller.init_run(self.repo, self.feature, "run-102"))
+        self.write_tdd()
+        self.to_review(state)
+        controller.record_finding(state, "REVIEWER", "REVIEW-1-001", "High", "4.2", "缺退避", None, None)
+        self.record(state, "tech-reviewer", "s-review-1")
+        report = self.artifact(state, "review-report", "第 1 轮报告：修订重试策略。\n")
+        controller.record_review(
+            state, "REQUEST_CHANGES", report["path"], self.feature / "technical-doc.md", "s-review-1"
+        )
+        controller.start_stage(state, "REFINER")
+        self.record(state, "tech-refiner", "s-refine-2")
+        self.artifact(state, "refiner-map", "第 2 轮变更映射：待登记。\n")
+
+        result = controller.start_stage(state, "REVIEW")
+        self.assertNotIn("followups", result)
+        self.assertNotIn("followup_hint", result)
 
     # ---------------------------------------------------------- review rounds
 
@@ -638,6 +723,54 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertIn("no-template-placeholders", result["failures"])
         self.assertIn("markers-match-confirmations", result["passed"])
 
+    def test_data_literals_written_as_code_are_not_placeholders(self) -> None:
+        # The reference run lost a delivery round here: a status enum in a DDL and the date
+        # format itself are data, and the gate read them as unfilled slots.
+        body = TDD_BODY.replace(
+            "## 16. 审查闭环记录",
+            "## 8. 数据库设计\n"
+            "| 字段 | 说明 |\n|------|------|\n"
+            "| prep_status | 取值 `todo` / `doing` / `done` |\n\n"
+            "```sql\n"
+            "CREATE TABLE prep_task (\n"
+            "    prep_status TEXT NOT NULL DEFAULT 'todo',\n"
+            "    task_date   TEXT NOT NULL,  -- 日期按自然日 YYYY-MM-DD\n"
+            ");\n"
+            "```\n\n"
+            "## 16. 审查闭环记录",
+        )
+        _, result = self.gate_for("run-13c", body)
+        self.assertIn("no-template-placeholders", result["passed"], result["failures"])
+
+    def test_a_value_literal_left_in_prose_is_still_a_placeholder(self) -> None:
+        # exemption follows the code convention, not the token: a copied template date row that
+        # never got its real date stays an unfilled slot wherever it sits in the hand-written body
+        _, result = self.gate_for(
+            "run-13d", TDD_BODY + "\n## 人工确认\n| 确认日期 | YYYY-MM-DD |\n"
+        )
+        self.assertIn("no-template-placeholders", result["failures"])
+
+    def test_text_the_ledger_echoed_from_state_is_not_a_placeholder(self) -> None:
+        """render-ledger copies state.json into chapter 16, so the gate cannot fail on that copy.
+
+        A disposition quoting the slot it removed ('把 待补充 换成…') reaches the generated block
+        verbatim; blocking there would fault the controller for writing what it was told.
+        """
+        state = Path(controller.init_run(self.repo, self.feature, "run-13e"))
+        self.write_tdd()
+        self.to_refiner(state)
+        controller.record_finding(
+            state, "CRITIC", "CRITIC-001", "Medium", "4.2", "日期列仍是模板格式", None, 0
+        )
+        controller.record_fix(
+            state, "CRITIC-001", "FIXED", "4.2", "把待补充与 YYYY-MM-DD 两格换成实际值"
+        )
+        controller.start_stage(state, "REVIEW")
+        self.approve_round(state)
+        self.render(state)
+        result = controller.gate(state, self.feature / "technical-doc.md")
+        self.assertIn("no-template-placeholders", result["passed"], result["failures"])
+
     def test_gate_flags_unbalanced_fences(self) -> None:
         _, result = self.gate_for("run-13b", TDD_BODY + "\n```mermaid\nsequenceDiagram\n")
         self.assertIn("diagram-fences", result["failures"])
@@ -797,6 +930,144 @@ class TechDocControllerTests(unittest.TestCase):
         result = controller.gate(state, tdd)
         self.assertIn("ledger-matches-state", result["failures"])
 
+    # ---------------------------------------- PR-5: 镜像检测前移，体积增幅进交付报告
+
+    def test_a_copied_ledger_is_refused_the_moment_the_draft_is_registered(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "run-mirror-1"))
+        self.to_architect(state)
+        self.write_tdd(TDD_BODY + MIRROR_ROWS)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            self.artifact(state, "draft")
+        self.assertIn("hand-written Finding table", str(ctx.exception))
+        # 产物没落盘，阶段也就停在 ARCHITECT —— 拒绝发生在写下它的那一步，不是交付当天
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(state, "CRITIC")
+        self.assertIn("draft", str(ctx.exception))
+        self.write_tdd(TDD_BODY)
+        self.assertEqual("draft", self.artifact(state, "draft")["kind"])
+
+    def test_a_copied_ledger_is_refused_on_the_first_disposition(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "run-mirror-2"))
+        self.write_tdd()
+        self.to_refiner(state)
+        controller.record_finding(
+            state, "CRITIC", "CRITIC-001", "High", "9.3", "缺退避与压测口径", None, 0
+        )
+        self.write_tdd(TDD_BODY + MIRROR_ROWS)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_fix(state, "CRITIC-001", "FIXED", "9.3", "补 30 秒退避窗口")
+        self.assertIn("hand-written Finding table", str(ctx.exception))
+        # 被拒的这条处置没有进 state：半本台账留在原地才是更难查的状态
+        self.assertEqual([], json.loads(state.read_text(encoding="utf-8"))["fixes"])
+        self.write_tdd(TDD_BODY)
+        controller.record_fix(state, "CRITIC-001", "FIXED", "9.3", "补 30 秒退避窗口")
+
+    def test_the_batch_refuses_a_copied_ledger_once_not_once_per_item(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "run-mirror-3"))
+        self.write_tdd()
+        self.to_refiner(state)
+        for finding_id, location in (("CRITIC-001", "9.3"), ("CRITIC-002", "7.2")):
+            controller.record_finding(
+                state, "CRITIC", finding_id, "Medium", location, "证据摘要", None, 0
+            )
+        self.write_tdd(TDD_BODY + MIRROR_ROWS)
+        report = self.repo / "refiner-map.md"
+        report.write_text(
+            "@@FIX id=CRITIC-001 status=FIXED loc=9.3\n补写退避与压测口径。\n"
+            "@@FIX id=CRITIC-002 status=FIXED loc=7.2\n补写索引与查询口径。\n",
+            encoding="utf-8",
+        )
+        result = self.cli("record-fixes", "--from-file", str(report), state=state)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("hand-written Finding table", result.stderr)
+        # 一条问题一次拒绝：两份 failed 会把人的注意力从同一个删除动作上引开
+        self.assertEqual("", result.stdout)
+        self.assertEqual([], json.loads(state.read_text(encoding="utf-8"))["fixes"])
+
+    def delivered_with_growth(
+        self, run_id: str, added: int, severity: str
+    ) -> tuple[Path, dict[str, Any]]:
+        """Deliver a TDD whose body the Refiner inflated by ``added`` lines over its draft."""
+        state = Path(controller.init_run(self.repo, self.feature, run_id))
+        self.write_tdd()
+        self.to_refiner(state)
+        controller.record_finding(
+            state, "CRITIC", "CRITIC-001", severity, "9.3", "缺退避与压测口径", None, 0
+        )
+        self.write_tdd(grown_body(added))
+        controller.record_fix(state, "CRITIC-001", "FIXED", "9.3", "补 30 秒退避窗口与压测口径")
+        controller.start_stage(state, "REVIEW")
+        self.approve_round(state)
+        self.render(state)
+        return state, controller.gate(state, self.feature / "technical-doc.md")
+
+    def growth_check(self, report: dict[str, Any]) -> dict[str, Any]:
+        return next(item for item in report["checks"] if item["name"] == "document-growth")
+
+    def test_growth_the_findings_did_not_pay_for_is_warned_without_blocking(self) -> None:
+        _state, report = self.delivered_with_growth("run-grow-1", 8, "Medium")
+        self.assertEqual(report["status"], "PASS", report["failures"])
+        check = self.growth_check(report)
+        self.assertTrue(check["warn"], check["detail"])
+        self.assertIn("document-growth", [item["name"] for item in report["warnings"]])
+        # 软检查：ok 恒为真，所以它进 passed 而不是 failures —— 长文档不是缺陷，是要人看见的账
+        self.assertIn("document-growth", report["passed"])
+        self.assertNotIn("document-growth", report["failures"])
+        self.assertIn("none of them Blocker/High", str(check["detail"]))
+
+    def test_a_blocking_finding_pays_for_the_same_growth(self) -> None:
+        _state, report = self.delivered_with_growth("run-grow-2", 8, "High")
+        self.assertEqual(report["status"], "PASS", report["failures"])
+        check = self.growth_check(report)
+        self.assertFalse(check["warn"])
+        self.assertEqual([], report["warnings"])
+        self.assertIn("pays for the growth", str(check["detail"]))
+
+    def test_growth_inside_the_threshold_is_recorded_without_a_warning(self) -> None:
+        _state, report = self.delivered_with_growth("run-grow-3", 1, "Medium")
+        self.assertEqual(report["status"], "PASS", report["failures"])
+        check = self.growth_check(report)
+        self.assertFalse(check["warn"])
+        self.assertIn("threshold", str(check["detail"]))
+
+    def test_the_reference_size_is_frozen_before_any_review_round_adds_to_it(self) -> None:
+        state, report = self.delivered_with_growth("run-grow-4", 8, "Medium")
+        data = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual("draft", data["document_growth"]["baseline"])
+        draft_lines = controller._body_lines(TDD_BODY)
+        self.assertEqual(draft_lines, data["document_growth"]["baseline_lines"])
+        # 正文涨了 8 行之后再比：参照值还是初稿那个数字，说明它只记一次、不会跟着滚
+        self.assertIn(f"vs baseline {draft_lines}", str(self.growth_check(report)["detail"]))
+
+    def test_an_update_run_measures_growth_against_the_version_it_is_rewriting(self) -> None:
+        self.write_tdd(update=True)
+        state = Path(controller.init_run(self.repo, self.feature, "run-grow-5"))
+        data = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual("previous-version", data["document_growth"]["baseline"])
+        self.assertEqual(
+            controller._body_lines(TDD_BODY + HISTORY_TAIL),
+            data["document_growth"]["baseline_lines"],
+        )
+
+    def test_entering_the_critic_freezes_the_size_when_the_draft_landed_late(self) -> None:
+        # Architect 先回报后落盘：write-artifact 时正文还不存在，start-stage --to CRITIC 补一次，
+        # 否则这一场整份门禁报告里都不会有体积这个数字。
+        state = Path(controller.init_run(self.repo, self.feature, "run-grow-6"))
+        self.to_architect(state)
+        self.artifact(state, "draft")
+        self.assertIsNone(json.loads(state.read_text(encoding="utf-8"))["document_growth"])
+        self.write_tdd()
+        controller.start_stage(state, "CRITIC")
+        self.assertEqual(
+            "draft", json.loads(state.read_text(encoding="utf-8"))["document_growth"]["baseline"]
+        )
+
+    def test_a_run_with_no_reference_version_says_so_instead_of_reporting_zero_growth(self) -> None:
+        _state, report = self.gate_for("run-grow-7")
+        check = self.growth_check(report)
+        self.assertFalse(check["warn"])
+        self.assertIn("no reference version", str(check["detail"]))
+
     def test_ledger_markers_must_stay_outside_code_fences(self) -> None:
         state, tdd = self.closed_loop("run-25")
         text = tdd.read_text(encoding="utf-8")
@@ -883,6 +1154,70 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertEqual(bad.returncode, 2)
         self.assertIn("BLOCKED:", bad.stderr)
 
+    def test_show_next_walks_the_run_without_inventing_or_omitting_a_step(self) -> None:
+        """The named command is the one that then succeeds — at every stage, on a real run."""
+        state = Path(controller.init_run(self.repo, self.feature, "run-119"))
+        tdd = self.feature / "technical-doc.md"
+
+        def waiting() -> dict[str, Any]:
+            return controller.show(state, next_only=True)["next"]
+
+        def expect(token: str) -> None:
+            self.assertIn(token, waiting()["command"], waiting()["why"])
+
+        expect("record-source")
+        controller.record_source(
+            state, "SRC-1", "PRD", str(self.feature / "product-doc.md"),
+            "READ", "v1", "订单备注同步需求", "HIGH",
+        )
+        expect("finalize-inputs")
+        controller.finalize_inputs(state, "PASS", "全部关键资料已读取")
+        for stage, role, kind in (
+            ("CONTEXT", "tech-context", "context-pack"),
+            ("ARCHITECT", "tech-architect", "draft"),
+            ("CRITIC", "tech-critic", "critic-findings"),
+        ):
+            expect(f"start-stage --to {stage}")
+            controller.start_stage(state, stage)
+            expect(f"--role {role}")
+            self.record(state, role, f"s-{stage.lower()}")
+            expect(f"--kind {kind}")
+            self.artifact(state, kind)
+        expect("record-findings")
+        controller.record_finding(
+            state, "CRITIC", "CRITIC-001", "Blocker", "4.2 主流程", "无退避", None, 0
+        )
+        expect("start-stage --to REFINER")
+        controller.start_stage(state, "REFINER")
+        expect("--role tech-refiner")
+        self.record(state, "tech-refiner", "s-refine")
+        expect("--kind refiner-map")
+        self.artifact(state, "refiner-map")
+        expect("record-fixes")
+        controller.record_fix(state, "CRITIC-001", "FIXED", "4.2", "补指数退避")
+        expect("start-stage --to REVIEW")
+        controller.start_stage(state, "REVIEW")
+        self.write_tdd()
+        expect("--role tech-reviewer")
+        self.record(state, "tech-reviewer", "s-review-1")
+        expect("--kind review-report")
+        report = self.artifact(state, "review-report")
+        expect("record-review")
+        controller.record_review(
+            state, "APPROVE", report["path"], tdd, "s-review-1"
+        )
+        expect("start-stage --to DELIVERY")
+        controller.start_stage(state, "DELIVERY")
+        expect("render-ledger")
+        controller.render_ledger(state, tdd)
+        expect("gate")
+        self.assertEqual(controller.gate(state, tdd)["status"], "PASS")
+        expect("render-ledger")
+        controller.render_ledger(state, tdd)
+        expect("start-stage --to CLOSED")
+        controller.start_stage(state, "CLOSED")
+        self.assertIsNone(waiting()["command"])
+
     def test_cli_render_ledger_writes_the_blocks(self) -> None:
         state, tdd = self.closed_loop("run-31")
         result = subprocess.run(
@@ -898,7 +1233,202 @@ class TechDocControllerTests(unittest.TestCase):
         # a NEW run has no superseded version, so the history index stays out of the document
         self.assertNotIn("ledger:history-index:start", tdd.read_text(encoding="utf-8"))
 
-    # --------------------------------------------------------- agent dispatch
+    # ---------------------------------------------------------- batch faces
+
+    def test_record_findings_cli_registers_a_whole_report_in_one_call(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "run-110"))
+        report = self.repo / "critic-findings.md"
+        report.write_text(
+            "## 阻断项\n"
+            "@@FIND id=CRITIC-001 sev=Blocker loc=9.3\n"
+            "会话超时与容量目标都没有定义，非功能需求无法验收。\n"
+            "@@FIND id=CRITIC-002 sev=Medium must_fix=false loc=7.2,4.2\n"
+            "重试次数与幂等键的口径不一致。\n",
+            encoding="utf-8",
+        )
+        first = self.cli("record-findings", "--from-file", str(report), state=state)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        payload = json.loads(first.stdout)
+        self.assertEqual(payload["status"], "OK")
+        self.assertEqual(payload["registered"], ["CRITIC-001", "CRITIC-002"])
+        # 一条 Finding 引多个章节时只登记第一条，其余回显而不是静默丢掉
+        self.assertEqual(payload["multi_location"], {"CRITIC-002": "4.2"})
+        stored = json.loads(state.read_text(encoding="utf-8"))["findings"]
+        self.assertEqual([item["must_fix"] for item in stored], [True, False])
+
+        # 修好文件里的一行后重跑整份报告：已登记的条目不再报错，也不会被记两次
+        again = self.cli("record-findings", "--from-file", str(report), state=state)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(
+            json.loads(again.stdout)["already_registered"], ["CRITIC-001", "CRITIC-002"]
+        )
+        self.assertEqual(len(json.loads(state.read_text(encoding="utf-8"))["findings"]), 2)
+
+    def test_record_findings_cli_keeps_the_good_items_and_names_the_bad_one(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "run-111"))
+        report = self.repo / "critic-findings.md"
+        report.write_text(
+            "@@FIND id=CRITIC-001 sev=High loc=9.3\n"
+            "降级策略缺失，高峰期会打穿下游。\n"
+            "@@FIND id=CRITIC-002 sev=Critical loc=7.2\n"
+            "严重度写错的那一条。\n",
+            encoding="utf-8",
+        )
+        result = self.cli("record-findings", "--from-file", str(report), state=state)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "PARTIAL")
+        self.assertEqual(payload["registered"], ["CRITIC-001"])
+        self.assertEqual(payload["failed"][0]["id"], "CRITIC-002")
+        self.assertIn("severity", payload["failed"][0]["error"])
+
+    def test_record_findings_cli_refuses_a_report_without_markers(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "run-112"))
+        report = self.repo / "critic-findings.md"
+        report.write_text(
+            "# Critic 审查报告\n"
+            "CRITIC-001：High，位于 9.3，会话超时未定义，容量目标无法验证，证据见 3.4。\n",
+            encoding="utf-8",
+        )
+        result = self.cli("record-findings", "--from-file", str(report), state=state)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("@@FIND", result.stderr)
+
+    def test_record_findings_cli_fails_a_silently_diverging_replay(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "run-113"))
+        controller.record_finding(
+            state, "CRITIC", "CRITIC-001", "Medium", "7.2", "已登记的口径。", None, 0
+        )
+        report = self.repo / "critic-findings.md"
+        report.write_text(
+            "@@FIND id=CRITIC-001 sev=Blocker loc=7.2\n"
+            "同一 ID 被改成了阻断级，必须让人看见这处分歧。\n",
+            encoding="utf-8",
+        )
+        result = self.cli("record-findings", "--from-file", str(report), state=state)
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["failed"][0]["id"], "CRITIC-001")
+        self.assertIn("different", payload["failed"][0]["error"])
+        self.assertEqual(
+            json.loads(state.read_text(encoding="utf-8"))["findings"][0]["severity"], "Medium"
+        )
+
+    def test_record_fixes_cli_disposes_every_item_in_the_report(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "run-114"))
+        self.write_tdd()
+        self.to_refiner(state)
+        for finding_id, severity, location in (
+            ("CRITIC-001", "Blocker", "9.3"),
+            ("CRITIC-002", "Medium", "7.2"),
+        ):
+            controller.record_finding(
+                state, "CRITIC", finding_id, severity, location, "证据摘要", None, 0
+            )
+        report = self.repo / "refiner-map.md"
+        report.write_text(
+            "@@FIX id=CRITIC-001 status=FIXED loc=9.3\n"
+            "补充会话超时 30s、容量目标与压测口径。\n"
+            "@@FIX id=CRITIC-002 status=REJECTED loc=7.2\n"
+            "重试只在幂等接口开启，已给出理由。\n",
+            encoding="utf-8",
+        )
+        result = self.cli("record-fixes", "--from-file", str(report), state=state)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "OK")
+        self.assertEqual(payload["registered"], ["CRITIC-001", "CRITIC-002"])
+        summary = controller.show(state)
+        self.assertEqual(summary["findings"]["undisposed"], [])
+        # 处置登记完之后 dump 就是这条 Finding 的完整状态，不需要回翻 Refiner 的回报
+        self.assertEqual(
+            controller.dump(state, "CRITIC-002")["finding"]["disposition"]["status"], "REJECTED"
+        )
+
+    def test_record_fixes_cli_reports_the_dispositions_that_did_not_land(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "run-115"))
+        self.write_tdd()
+        self.to_refiner(state)
+        controller.record_finding(
+            state, "CRITIC", "CRITIC-001", "High", "9.3", "证据摘要", None, 0
+        )
+        controller.record_finding(
+            state, "CRITIC", "CRITIC-002", "Medium", "7.2", "证据摘要", None, 0
+        )
+        report = self.repo / "refiner-map.md"
+        report.write_text(
+            "@@FIX id=CRITIC-001 status=FIXED loc=9.3\n"
+            "补写了超时与降级口径。\n"
+            "@@FIX id=CRITIC-009 status=FIXED loc=9.3\n"
+            "这条 Finding 从来没有登记过。\n",
+            encoding="utf-8",
+        )
+        result = self.cli("record-fixes", "--from-file", str(report), state=state)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["registered"], ["CRITIC-001"])
+        self.assertIn("no such finding", payload["failed"][0]["error"])
+        # 批次没有把不存在的 ID 编成一条处置，也没有让那条没被点名的 Finding 悄悄关掉
+        self.assertEqual(controller.show(state)["findings"]["undisposed"], ["CRITIC-002"])
+
+    def test_locate_batch_cli_answers_a_cluster_in_one_call(self) -> None:
+        self.write_tdd(DOC_BODY)
+        state = Path(controller.init_run(self.repo, self.feature, "run-116"))
+        controller.record_finding(
+            state, "CRITIC", "CRITIC-001", "High", "数据模型", "证据摘要", None, 0
+        )
+        result = self.cli("locate", "--batch", "CRITIC-001,15,99.9", state=state)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["mode"], "batch")
+        self.assertEqual([item["key"] for item in payload["sections"]], ["7.2", "15"])
+        self.assertEqual(payload["unresolved"], ["99.9"])
+        self.assertGreater(payload["total_chars"], 0)
+        self.assertEqual(payload["budget_tokens"], 100000)
+        self.assertFalse(payload["over_budget"])
+
+    def test_dump_cli_keeps_evidence_out_until_it_is_asked_for(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "run-117"))
+        controller.record_finding(
+            state, "CRITIC", "CRITIC-001", "High", "9.3", "证据" * 40, None, 0
+        )
+        plain = self.cli("dump", "--finding", "CRITIC-001", state=state)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        view = json.loads(plain.stdout)["finding"]
+        self.assertNotIn("evidence", view)
+        self.assertEqual(view["evidence_chars"], 80)
+        self.assertEqual(view["severity"], "High")
+        self.assertEqual(view["disposition"], "NONE")
+
+        asked = self.cli("dump", "--finding", "CRITIC-001", "--fields", "all", state=state)
+        full = json.loads(asked.stdout)["finding"]
+        self.assertEqual(len(full["evidence"]), 80)
+        self.assertNotIn("evidence_chars", full)
+
+        bad = self.cli("dump", "--finding", "CRITIC-001", "--fields", "evidance", state=state)
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("unknown field", bad.stderr)
+
+    def test_show_next_names_the_one_command_the_run_waits_on(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "run-118"))
+        first = self.cli("show", "--next", state=state)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        payload = json.loads(first.stdout)
+        self.assertEqual(payload["stage"], "INPUT")
+        self.assertIn("record-source", payload["next"]["command"])
+        self.assertIn(str(state), payload["next"]["command"])
+        # 只回一条命令，不附带整份摘要：主控每轮都要问这个问题
+        self.assertEqual(sorted(payload), ["next", "review_round", "stage"])
+
+        controller.record_source(
+            state, "SRC-1", "PRD", str(self.feature / "product-doc.md"),
+            "READ", "v1", "订单备注同步需求", "HIGH",
+        )
+        controller.finalize_inputs(state, "PASS", "全部关键资料已读取")
+        second = json.loads(self.cli("show", "--next", state=state).stdout)
+        self.assertIn("start-stage --to CONTEXT", second["next"]["command"])
+
+    # ---------------------------------------------------------- agent dispatch
 
     def test_dispatch_window_records_wall_time_by_phase(self) -> None:
         state = Path(controller.init_run(self.repo, self.feature, "run-40"))
@@ -1764,9 +2294,9 @@ class ConfirmationLoopTests(unittest.TestCase):
     def record(self, state: Path, role: str, session: str, scope: str = "") -> None:
         controller.record_agent(state, role, role, session, "sha256:input", "COMPLETED", scope)
 
-    def artifact(self, state: Path, kind: str) -> dict[str, Any]:
+    def artifact(self, state: Path, kind: str, text: str = EVIDENCE) -> dict[str, Any]:
         origin = self.repo / f"tmp-{kind}.md"
-        origin.write_text(EVIDENCE, encoding="utf-8")
+        origin.write_text(text, encoding="utf-8")
         return controller.write_artifact(state, kind, origin, None, None)
 
     def to_architect(self, run_id: str) -> Path:
@@ -2117,6 +2647,128 @@ class ConfirmationLoopTests(unittest.TestCase):
         self.assertTrue(self.entries(state)[0]["applied"])
         # the same settled decision now lets the review door open
         controller.start_stage(state, "REVIEW")
+
+    # ------------------------------------------------- delivery rewind (landing channel)
+
+    def to_delivery_with_unlanded(self, run_id: str) -> Path:
+        """A run that reached DELIVERY carrying one answered-but-unlanded decision."""
+        state = self.to_architect(run_id)
+        self.to_refiner(state)
+        controller.start_stage(state, "REVIEW")
+        self.approve_round(state)
+        self.write_conf(
+            "来源: ARCHITECT\n阻断: false\n位置: 13\n问题: 归档表是否随本期上线\n推荐: 随本期\n"
+            "决定: 按推荐\n应用: \n"
+        )
+        self.sync(state)
+        result = controller.start_stage(state, "DELIVERY")
+        self.assertEqual(result["pending_landing"], ["CONF-001"])
+        return state
+
+    def test_delivery_rewinds_to_the_refiner_to_land_a_settled_decision(self) -> None:
+        state = self.to_delivery_with_unlanded("conf-30")
+        result = controller.start_stage(state, "REFINER")
+        self.assertEqual(result["stage"], "REFINER")
+        # what reopened the run is the answer with no landing, not a Reviewer finding: this
+        # round raised none, and the rewind does not ask for one
+        self.assertEqual(result["landing_rewind"]["confirmations"], ["CONF-001"])
+        self.assertIn("review round 2", result["landing_rewind"]["cost"])
+        self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["findings"], [])
+        # the price is the point: the only way out of the reopened Refiner is a fresh review,
+        # so the previous round's APPROVE cannot carry a body this round changed
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(state, "DELIVERY")
+        self.assertIn("illegal transition REFINER -> DELIVERY", str(ctx.exception))
+
+    def test_the_rewind_refuses_a_delivery_with_nothing_to_land(self) -> None:
+        """Without this, ``DELIVERY -> REFINER`` is a back door around the review budget."""
+        state = self.to_architect("conf-31")
+        self.to_refiner(state)
+        controller.start_stage(state, "REVIEW")
+        self.approve_round(state)
+        delivered = controller.start_stage(state, "DELIVERY")
+        self.assertNotIn("pending_landing", delivered)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(state, "REFINER")
+        self.assertIn("no entry is waiting to be landed", str(ctx.exception))
+        self.assertIn("REQUEST_CHANGES", str(ctx.exception))
+        # --next must not offer a rewind this run cannot legitimately take
+        self.assertNotIn("landing_rewind", controller.show(state, True)["next"])
+
+        # a question nobody has answered is not a landing job either
+        other = self.to_architect("conf-31b")
+        self.to_refiner(other)
+        controller.start_stage(other, "REVIEW")
+        self.approve_round(other)
+        self.write_conf(
+            "来源: ARCHITECT\n阻断: false\n位置: 13\n问题: 归档表是否随本期上线\n推荐: 随本期\n"
+            "决定: \n应用: \n"
+        )
+        self.sync(other)
+        delivered = controller.start_stage(other, "DELIVERY")
+        self.assertNotIn("pending_landing", delivered)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(other, "REFINER")
+        self.assertIn("no entry is waiting to be landed", str(ctx.exception))
+
+    def test_the_rewind_refuses_once_the_round_budget_is_spent(self) -> None:
+        state = self.to_delivery_with_unlanded("conf-32")
+        # The gate reads the budget off the state, so a spent budget is the same door as the
+        # fifth round's; driving five real rounds here would only re-test the arithmetic.
+        data = json.loads(state.read_text(encoding="utf-8"))
+        data["max_review_rounds"] = data["review_round"]
+        state.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(state, "REFINER")
+        self.assertIn("last one the review budget allows", str(ctx.exception))
+        self.assertIn("CONF-001", str(ctx.exception))
+        # refusing must not cost the run its legal exit: 挂账 delivery stays reachable
+        self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["stage"], "DELIVERY")
+
+    def test_a_rewound_run_must_land_the_answer_before_it_can_be_reviewed(self) -> None:
+        state = self.to_delivery_with_unlanded("conf-33")
+        controller.start_stage(state, "REFINER")
+        self.record(state, "tech-refiner", "s-refine-landing")
+        self.artifact(
+            state, "refiner-map",
+            EVIDENCE + "落地回退：CONF-001 的决定尚未写回第 13 章，本轮只登记了派发。\n",
+        )
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(state, "REVIEW")
+        self.assertIn("CONF-001 never landed", str(ctx.exception))
+
+    def test_a_landed_rewind_delivers_on_its_own_fresh_verdict(self) -> None:
+        state = self.to_delivery_with_unlanded("conf-34")
+        controller.start_stage(state, "REFINER")
+        tdd = self.feature / "technical-doc.md"
+        tdd.write_text(
+            tdd.read_text(encoding="utf-8").replace(
+                "## 13. 告警设计\n",
+                "## 13. 告警设计\n归档表随本期上线，阈值在发布后第 3 天按实际积压量复检。\n",
+            ),
+            encoding="utf-8",
+        )
+        controller.mark_confirmation_applied(state, "CONF-001", "13", "归档表随本期上线")
+        self.record(state, "tech-refiner", "s-refine-landing")
+        self.artifact(
+            state, "refiner-map",
+            EVIDENCE + "落地回退：CONF-001 的决定已写进第 13 章，未改其余设计。\n",
+        )
+        result = controller.start_stage(state, "REVIEW")
+        self.assertEqual(result["review_round"], 2)
+        self.approve_round(state, "s-review-2")
+        delivered = controller.start_stage(state, "DELIVERY")
+        self.assertNotIn("pending_landing", delivered)
+        self.assertTrue(self.entries(state)[0]["applied"])
+
+    def test_show_next_discloses_the_rewind_without_choosing_it(self) -> None:
+        """Closing is legal with a 挂账 entry, so ``--next`` names the option, not a command."""
+        state = self.to_delivery_with_unlanded("conf-35")
+        nxt = controller.show(state, True)["next"]
+        self.assertIn("render-ledger", nxt["command"])
+        self.assertIn("CONF-001", nxt["landing_rewind"]["confirmations"])
+        self.assertIn("start-stage --to REFINER", nxt["landing_rewind"]["command"])
+        self.assertIn("review round", nxt["landing_rewind"]["cost"])
 
     # ----------------------------------------------------------------- gate: B2
 
