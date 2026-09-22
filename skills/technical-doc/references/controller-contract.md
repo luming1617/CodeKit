@@ -107,16 +107,16 @@ CTRL gate --state "<state>" --tdd-file "<TDD 绝对路径>"
 
 进入 `DELIVERY` 的顺序是固定的：`render-ledger`（先让第 16 章的生成块存在，否则 `gate` 必拒）→ `gate` → 通过后再 `render-ledger` 一次（把门禁结论刷进台账，`ledger-matches-state` 要求台账不早于门禁）→ `start-stage --to CLOSED`。`show --next` 就是按这个顺序回命令的。
 
-**落地回退**：`start-stage --to DELIVERY` 返回的 `pending_landing` 是“人类已经答完、正文里还没有”的条目。要落它们不必重放前面的阶段——`DELIVERY` 允许退回 `REFINER`：
+**落地回退**：`start-stage --to DELIVERY` 返回的 `pending_landing` 是“人类已经答完、正文里还没有”的条目。要落它们不必重放前面的阶段——`DELIVERY` 允许退回 `REFINER`；这条回退并不只服务于它们，任何“必须改正文才能收口”的门禁失败（例如 `scale-chapters` 太薄、`project-structure-branch` 走错分支）也只有这一条合法出路：
 
 ```text
-CTRL start-stage --state "<state>" --to REFINER                 # 落地回退，返回值列出回退理由
+CTRL start-stage --state "<state>" --to REFINER                 # 落地回退，返回值列出回退理由与代价
 CTRL record-fix --state "<state>" --finding-id REVIEW-1-002 --status FIXED --location "13" --change "<按决定改了什么>"
 CTRL mark-confirmation-applied --state "<state>" --conf-id CONF-007 --location "13" --summary "<落在哪、改了什么>"
 CTRL start-stage --state "<state>" --to REVIEW                  # 回退的那轮必须补一次全新终审
 ```
 
-它的门槛与拒绝都是死的：没有待落地条目就拒绝（那条路是给决定开的，不是给“再顺手改改文字”开的，改文字走 `REVIEW` 阶段的 `REQUEST_CHANGES`）；`mark-confirmation-applied` 仍在 `REFINER` 阶段，`--to REVIEW` 在任何一条已收口决定未落地前拒绝；落地仍受本轮 `--scope` 并集约束；`--to DELIVERY` 只认新轮次的结论，所以回退的标价是一整轮终审。轮次预算已耗尽时回退被拒，挂账交付是那几条唯一合法的出口。`show --next` 在 `DELIVERY` 的每一步都会把这些条目和这一条备选命令一起回给你（`landing_rewind`），但它不替你决定值不值。
+它的代价是死的、理由是活的：不再审查“为什么要回退”，只审查“付不付得起”——轮次预算已耗尽时回退被拒，挂账交付是那几条唯一合法的出口。代价本身由状态机强制：`mark-confirmation-applied` 仍在 `REFINER` 阶段，`--to REVIEW` 在任何一条已收口决定未落地前拒绝，落地仍受本轮 `--scope` 并集约束，`--to DELIVERY` 只认新轮次的结论，所以回退的标价是一整轮终审——放宽的是理由，不是审计强度。`show --next` 在 `DELIVERY` 的每一步都会把这些条目和这一条备选命令一起回给你（`rewind`），但它不替你决定值不值。
 
 ## 定位与回读
 

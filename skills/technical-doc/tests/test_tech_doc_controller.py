@@ -750,6 +750,33 @@ class TechDocControllerTests(unittest.TestCase):
         )
         self.assertIn("no-template-placeholders", result["failures"])
 
+    def test_english_prose_connectives_in_code_are_not_slots(self) -> None:
+        """``refer to``/``similar to`` are connectives, not fill-in instructions.
+
+        Filed as slot tokens they were unforgivable anywhere, including inside a fence, so a
+        DDL or YAML comment pointing at another section was refused as an unfilled template.
+        They stay placeholders where the document speaks prose.
+        """
+        body = TDD_BODY.replace(
+            "## 16. 审查闭环记录",
+            "## 8. 数据库设计\n"
+            "```sql\n"
+            "-- refer to section 3 for the retention rule\n"
+            "CREATE TABLE prep_task (\n"
+            "    prep_status TEXT NOT NULL DEFAULT 'todo',  -- similar to the card list\n"
+            ");\n"
+            "```\n\n## 16. 审查闭环记录",
+        )
+        _, result = self.gate_for("run-13e-1", body)
+        self.assertIn("no-template-placeholders", result["passed"], result["failures"])
+
+    def test_the_same_connectives_left_in_prose_are_still_placeholders(self) -> None:
+        # the exemption follows the code convention, not the token
+        _, result = self.gate_for(
+            "run-13e-2", TDD_BODY + "\n## 人工确认\n本表口径 refer to 第 3 章。\n"
+        )
+        self.assertIn("no-template-placeholders", result["failures"])
+
     def test_text_the_ledger_echoed_from_state_is_not_a_placeholder(self) -> None:
         """render-ledger copies state.json into chapter 16, so the gate cannot fail on that copy.
 
@@ -962,6 +989,30 @@ class TechDocControllerTests(unittest.TestCase):
         self.write_tdd(TDD_BODY)
         controller.record_fix(state, "CRITIC-001", "FIXED", "9.3", "补 30 秒退避窗口")
 
+    def test_a_traceability_row_that_cites_a_finding_is_not_a_mirror(self) -> None:
+        """Chapter 16 owns the ledger; another chapter may still cite a finding id.
+
+        The predicate used to refuse any row carrying ``CRITIC-\\d``, which blocked the
+        cross-reference the SKILL asks the author to write -- and with ``record-fix`` refused,
+        the only way out was editing the body, which ``review-report-matches-delivered-tdd``
+        then blocks.
+        """
+        state = Path(controller.init_run(self.repo, self.feature, "run-mirror-2b"))
+        self.write_tdd()
+        self.to_refiner(state)
+        controller.record_finding(
+            state, "CRITIC", "CRITIC-001", "High", "9.3", "缺退避与压测口径", None, 0
+        )
+        self.write_tdd(
+            TDD_BODY + "\n## 关键技术决策\n\n| 决策 | 依据 |\n|---|---|\n| 重试退避 | CRITIC-001 |\n"
+        )
+        controller.record_fix(state, "CRITIC-001", "FIXED", "9.3", "补 30 秒退避窗口")
+        # the same id under the ledger's own columns is still a second copy of the table
+        self.write_tdd(TDD_BODY + MIRROR_ROWS)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_fix(state, "CRITIC-001", "FIXED", "9.3", "补 30 秒退避窗口")
+        self.assertIn("hand-written Finding table", str(ctx.exception))
+
     def test_the_batch_refuses_a_copied_ledger_once_not_once_per_item(self) -> None:
         state = Path(controller.init_run(self.repo, self.feature, "run-mirror-3"))
         self.write_tdd()
@@ -1022,6 +1073,25 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertFalse(check["warn"])
         self.assertEqual([], report["warnings"])
         self.assertIn("pays for the growth", str(check["detail"]))
+
+    def test_growth_with_no_finding_to_attribute_it_to_still_warns(self) -> None:
+        """A round that raised nothing and still grew the body has no payer at all.
+
+        ``all([])`` is True, which is the answer wanted here; gating on ``bool(drivers)`` let
+        the clearest case of unattributed growth fall through as "nothing to attribute".
+        """
+        state = Path(controller.init_run(self.repo, self.feature, "run-grow-2b"))
+        self.write_tdd()
+        self.to_refiner(state)
+        self.write_tdd(grown_body(8))
+        controller.start_stage(state, "REVIEW")
+        self.approve_round(state)
+        self.render(state)
+        report = controller.gate(state, self.feature / "technical-doc.md")
+        check = self.growth_check(report)
+        self.assertTrue(check["warn"], check["detail"])
+        self.assertIn("raised no finding at all", str(check["detail"]))
+        self.assertIn("document-growth", [item["name"] for item in report["warnings"]])
 
     def test_growth_inside_the_threshold_is_recorded_without_a_warning(self) -> None:
         _state, report = self.delivered_with_growth("run-grow-3", 1, "Medium")
@@ -1264,6 +1334,31 @@ class TechDocControllerTests(unittest.TestCase):
         )
         self.assertEqual(len(json.loads(state.read_text(encoding="utf-8"))["findings"]), 2)
 
+    def test_a_marked_example_inside_a_fence_is_not_a_registration(self) -> None:
+        """A report that shows the format must not register the example.
+
+        The batch face replaced the orchestrator's glue scripts, so a format sample in a fenced
+        block used to become a real finding -- one that no role had raised and no evidence
+        backed, which then had to be disposed of before delivery.
+        """
+        state = Path(controller.init_run(self.repo, self.feature, "run-110b"))
+        report = self.repo / "critic-findings.md"
+        report.write_text(
+            "格式如下：\n\n"
+            "```text\n"
+            "@@FIND id=CRITIC-001 sev=High loc=9.3\n"
+            "这里写证据。\n"
+            "```\n\n"
+            "@@FIND id=CRITIC-002 sev=Medium must_fix=false loc=7.2\n"
+            "重试次数与幂等键的口径不一致。\n",
+            encoding="utf-8",
+        )
+        result = self.cli("record-findings", "--from-file", str(report), state=state)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(["CRITIC-002"], json.loads(result.stdout)["registered"])
+        stored = json.loads(state.read_text(encoding="utf-8"))["findings"]
+        self.assertEqual(["CRITIC-002"], [item["id"] for item in stored])
+
     def test_record_findings_cli_keeps_the_good_items_and_names_the_bad_one(self) -> None:
         state = Path(controller.init_run(self.repo, self.feature, "run-111"))
         report = self.repo / "critic-findings.md"
@@ -1479,6 +1574,67 @@ class TechDocControllerTests(unittest.TestCase):
                 state, "tech-critic", "tech-critic", "s-critic-1", "", "COMPLETED"
             )
         self.assertIn("already recorded", str(ctx.exception))
+
+    def open_review_round(self, run_id: str) -> Path:
+        state = Path(controller.init_run(self.repo, self.feature, run_id))
+        self.write_tdd()
+        self.to_review(state)
+        return state
+
+    def test_a_reviewer_dispatch_window_opens_and_closes(self) -> None:
+        """The path every Reviewer metric depends on, and it used to be impossible.
+
+        Wall time, the ``--scope`` read budget and the aborted-replay subset are all read off
+        a window that is opened with ``DISPATCHED``.  Closing it collided with its own opening
+        record, so none of those had a value for this role and the round could not be settled.
+        """
+        state = self.open_review_round("run-41a")
+        controller.record_agent(
+            state, "tech-reviewer", "tech-reviewer", "s-rev-1", "sha256:in", "DISPATCHED"
+        )
+        self.assertEqual(1, controller.show(state)["dispatches"]["open"])
+        entry = controller.record_agent(
+            state, "tech-reviewer", "tech-reviewer", "s-rev-1", "", "COMPLETED"
+        )
+        self.assertEqual("COMPLETED", entry["status"])
+        self.assertIsNotNone(entry["wall_seconds"])
+        summary = controller.show(state)
+        self.assertEqual(0, summary["dispatches"]["open"])
+        self.assertEqual(1, summary["dispatches"]["timed"])
+        # the wall clock lands in the phase the role belongs to, which is what the delivery
+        # report quotes when it says where the run's time went
+        self.assertIn("audit", summary["minutes_by_phase"])
+
+    def test_an_aborted_reviewer_window_frees_the_slot_for_a_replacement(self) -> None:
+        """What SKILL.md promises after a dropped connection has to be true in code.
+
+        Otherwise one interrupted dispatch takes the round's only reviewer slot forever, and
+        the run's only exit is ``init`` again -- the exact replay R7 exists to remove.
+        """
+        state = self.open_review_round("run-41b")
+        controller.record_agent(
+            state, "tech-reviewer", "tech-reviewer", "s-rev-1", "sha256:in", "DISPATCHED"
+        )
+        aborted = controller.record_agent(
+            state, "tech-reviewer", "tech-reviewer", "s-rev-1", "", "ABORTED"
+        )
+        self.assertEqual("ABORTED", aborted["status"])
+        controller.record_agent(
+            state, "tech-reviewer", "tech-reviewer", "s-rev-2", "sha256:in", "DISPATCHED"
+        )
+        entry = controller.record_agent(
+            state, "tech-reviewer", "tech-reviewer", "s-rev-2", "", "COMPLETED"
+        )
+        self.assertEqual("COMPLETED", entry["status"])
+        # what is still refused is a second instance in the same round
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_agent(
+                state, "tech-reviewer", "tech-reviewer", "s-rev-3", "sha256:in", "DISPATCHED"
+            )
+        self.assertIn("already ran in round 1", str(ctx.exception))
+        summary = controller.show(state)
+        self.assertEqual(1, summary["dispatches"]["aborted"])
+        self.assertEqual(0, summary["dispatches"]["open"])
 
     # ------------------------------------- document index and per-section budget
 
@@ -2671,8 +2827,12 @@ class ConfirmationLoopTests(unittest.TestCase):
         self.assertEqual(result["stage"], "REFINER")
         # what reopened the run is the answer with no landing, not a Reviewer finding: this
         # round raised none, and the rewind does not ask for one
-        self.assertEqual(result["landing_rewind"]["confirmations"], ["CONF-001"])
-        self.assertIn("review round 2", result["landing_rewind"]["cost"])
+        self.assertEqual(result["rewind"]["confirmations"], ["CONF-001"])
+        self.assertIn("review round 2", result["rewind"]["cost"])
+        # the rewind is on the record: a delivery report explaining round 2 reads it off state
+        rewinds = json.loads(state.read_text(encoding="utf-8"))["rewinds"]
+        self.assertEqual(["CONF-001"], rewinds[0]["unlanded"])
+        self.assertEqual(1, rewinds[0]["review_round"])
         self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["findings"], [])
         # the price is the point: the only way out of the reopened Refiner is a fresh review,
         # so the previous round's APPROVE cannot carry a body this round changed
@@ -2680,22 +2840,32 @@ class ConfirmationLoopTests(unittest.TestCase):
             controller.start_stage(state, "DELIVERY")
         self.assertIn("illegal transition REFINER -> DELIVERY", str(ctx.exception))
 
-    def test_the_rewind_refuses_a_delivery_with_nothing_to_land(self) -> None:
-        """Without this, ``DELIVERY -> REFINER`` is a back door around the review budget."""
+    def test_the_rewind_is_not_limited_to_landing_a_decision(self) -> None:
+        """The door prices the rewind; it no longer vets the reason.
+
+        Restricting it to unlanded decisions left every other delivery-time defect without a
+        legal way back: a gate failure that needs the body rewritten could neither be fixed
+        (``review-report-matches-delivered-tdd``) nor left alone, so the run was replayed.
+        """
         state = self.to_architect("conf-31")
         self.to_refiner(state)
         controller.start_stage(state, "REVIEW")
         self.approve_round(state)
         delivered = controller.start_stage(state, "DELIVERY")
         self.assertNotIn("pending_landing", delivered)
-        with self.assertRaises(controller.ControllerError) as ctx:
-            controller.start_stage(state, "REFINER")
-        self.assertIn("no entry is waiting to be landed", str(ctx.exception))
-        self.assertIn("REQUEST_CHANGES", str(ctx.exception))
-        # --next must not offer a rewind this run cannot legitimately take
-        self.assertNotIn("landing_rewind", controller.show(state, True)["next"])
+        # nothing to land, and still legal: the price is the one thing being guarded
+        result = controller.start_stage(state, "REFINER")
+        self.assertEqual("REFINER", result["stage"])
+        self.assertEqual([], result["rewind"]["confirmations"])
+        self.assertIn("review round 2", result["rewind"]["cost"])
+        # and the price is collected: the old verdict cannot carry a body this round changed
+        self.record(state, "tech-refiner", "s-refine-rewind")
+        self.artifact(state, "refiner-map", EVIDENCE + "按门禁失败项重写第 13 章。\n")
+        self.assertEqual(2, controller.start_stage(state, "REVIEW")["review_round"])
+        self.approve_round(state, "s-review-2")
+        controller.start_stage(state, "DELIVERY")
 
-        # a question nobody has answered is not a landing job either
+        # a question nobody has answered is not a landing job either, and does not block it
         other = self.to_architect("conf-31b")
         self.to_refiner(other)
         controller.start_stage(other, "REVIEW")
@@ -2707,9 +2877,7 @@ class ConfirmationLoopTests(unittest.TestCase):
         self.sync(other)
         delivered = controller.start_stage(other, "DELIVERY")
         self.assertNotIn("pending_landing", delivered)
-        with self.assertRaises(controller.ControllerError) as ctx:
-            controller.start_stage(other, "REFINER")
-        self.assertIn("no entry is waiting to be landed", str(ctx.exception))
+        controller.start_stage(other, "REFINER")
 
     def test_the_rewind_refuses_once_the_round_budget_is_spent(self) -> None:
         state = self.to_delivery_with_unlanded("conf-32")
@@ -2766,9 +2934,9 @@ class ConfirmationLoopTests(unittest.TestCase):
         state = self.to_delivery_with_unlanded("conf-35")
         nxt = controller.show(state, True)["next"]
         self.assertIn("render-ledger", nxt["command"])
-        self.assertIn("CONF-001", nxt["landing_rewind"]["confirmations"])
-        self.assertIn("start-stage --to REFINER", nxt["landing_rewind"]["command"])
-        self.assertIn("review round", nxt["landing_rewind"]["cost"])
+        self.assertIn("CONF-001", nxt["rewind"]["confirmations"])
+        self.assertIn("start-stage --to REFINER", nxt["rewind"]["command"])
+        self.assertIn("review round", nxt["rewind"]["cost"])
 
     # ----------------------------------------------------------------- gate: B2
 

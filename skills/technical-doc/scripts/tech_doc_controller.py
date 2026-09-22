@@ -95,9 +95,9 @@ STAGE_TRANSITIONS: dict[str, set[str]] = {
     "REFINER": {"REVIEW"},
     # A rejected review reopens the Refiner; an approved one moves to delivery.
     "REVIEW": {"REFINER", "DELIVERY"},
-    # Delivery closes the run; it may also reopen the Refiner, but only to land a settled
-    # human decision, and only at the price of one fresh review round -- see
-    # ``_require_landing_only_rewind``.
+    # Delivery closes the run; it may also reopen the Refiner -- the only step backwards --
+    # at the price of one fresh review round, which is what stops the rewind from being a
+    # cheap second opinion -- see ``_require_rewind_within_budget``.
     "DELIVERY": {"REFINER", "CLOSED"},
     "CLOSED": set(),
 }
@@ -132,10 +132,16 @@ TDD_FILE = "technical-doc.md"
 # token is an instruction to the author and never belongs in the delivered document, while
 # TODO/TBD/YYYY-MM-DD are also legitimate values ('todo' as a status enum, the date format
 # itself), so those read as slots only where the document speaks prose.
-PLACEHOLDER_SLOTS = re.compile(
-    r"(?:待定|待补充|后续补充|\bsimilar to\b|\brefer to\b|【填写】|【链接】)", re.IGNORECASE
+#
+# ``similar to``/``refer to`` sit in the value class on purpose: they are ordinary English
+# connective prose, not a fill-in instruction, and a DDL or YAML comment saying "refer to
+# section 3" is data the reader needs.  Classifying them as slots made the whole fence
+# exemption unreachable for them, which is how a comment about the schema got refused as an
+# unfilled template.
+PLACEHOLDER_SLOTS = re.compile(r"(?:待定|待补充|后续补充|【填写】|【链接】)", re.IGNORECASE)
+PLACEHOLDER_VALUES = re.compile(
+    r"(?:\bTBD\b|\bTODO\b|YYYY-MM-DD|\bsimilar to\b|\brefer to\b)", re.IGNORECASE
 )
-PLACEHOLDER_VALUES = re.compile(r"(?:\bTBD\b|\bTODO\b|YYYY-MM-DD)", re.IGNORECASE)
 PLACEHOLDER = re.compile(
     f"(?:{PLACEHOLDER_SLOTS.pattern}|{PLACEHOLDER_VALUES.pattern})", re.IGNORECASE
 )
@@ -177,6 +183,11 @@ LEDGER_ANCHOR = {
 # Render order inside one anchor section.
 LEDGER_ORDER = ("findings", "run-metadata", "confirmations", "history-index")
 LEDGER_CELL_LIMIT = 300
+# Columns a table has to announce before its rows count as a second copy of the ledger --
+# see ``_mirror_table_header``: the same row under a different header is a cross-reference.
+LEDGER_TABLE_COLUMNS = re.compile(
+    r"(?:Finding|来源|轮次|严重度|处置|状态|处理结论)", re.IGNORECASE
+)
 # ``--prd-changes`` is the change ledger the history index mirrors: modified/added/deleted
 # requirement lines, counted once by the orchestrator instead of prose-written per round.
 PRD_CHANGES = re.compile(r"\d+/\d+/\d+")
@@ -1238,7 +1249,16 @@ def start_stage(state_path: str | Path, target_stage: str, review_scope: str | N
         if current == "CRITIC":
             _require_evidence(state, "CRITIC", "critic-findings")
         elif current == "DELIVERY":
-            _require_landing_only_rewind(state)
+            _require_rewind_within_budget(state)
+            # The run pays a review round for this, so the ledger keeps the reason: a
+            # delivery report that has to explain round N+1 can read it off state.json
+            # instead of the orchestrator's memory.
+            state.setdefault("rewinds", []).append({
+                "from": current,
+                "review_round": state["review_round"],
+                "unlanded": _unlanded_decisions(state),
+                "at": _now(),
+            })
         else:
             _require_open_reviewer_findings(state)
     elif target == "REVIEW":
@@ -1303,7 +1323,7 @@ def start_stage(state_path: str | Path, target_stage: str, review_scope: str | N
     _save(path, state)
     result: dict[str, Any] = {"stage": target, "review_round": state["review_round"], "mode": state["mode"]}
     if target == "REFINER" and current == "DELIVERY":
-        result["landing_rewind"] = {
+        result["rewind"] = {
             "confirmations": _unlanded_decisions(state),
             "cost": f"review round {state['review_round'] + 1} of {state['max_review_rounds']}",
             "then": "land each decision in the body, record-fix --status FIXED for the finding it "
@@ -1385,9 +1405,10 @@ def _unlanded_decisions(state: dict[str, Any]) -> list[str]:
     """Settled human decisions whose answer has not been written into the TDD yet.
 
     One predicate, four readers: the audit doors refuse while it is non-empty, ``DELIVERY``
-    hands the list out as ``pending_landing``, the delivery rewind is legal only because of it,
-    and ``confirmations`` counts it.  They have to agree exactly -- a rewind check that reads a
-    looser definition would refuse to reopen the run for the very entries it advertises.
+    hands the list out as ``pending_landing``, the rewind report and ``--next`` quote it as the
+    reason a rewind may be worth its price, and ``confirmations`` counts it.  They have to agree
+    exactly -- a rewind that advertised entries it does not reopen for would strand the run with
+    an answer it claims to be able to land.
     """
     return [
         item["id"] for item in state.get("confirmations") or []
@@ -1395,35 +1416,33 @@ def _unlanded_decisions(state: dict[str, Any]) -> list[str]:
     ]
 
 
-def _require_landing_only_rewind(state: dict[str, Any]) -> None:
-    """DELIVERY may reopen the Refiner for one thing only: a settled decision with no landing.
+def _require_rewind_within_budget(state: dict[str, Any]) -> None:
+    """``DELIVERY -> REFINER`` is the only step backwards, and it costs one review round.
 
-    Before this edge existed, an answer that arrived after the last review door could not reach
-    the body in the same run at all: the run either shipped it as 挂账 for the next ``init`` to
-    consume, or wrote a blocking report.  The rewind is deliberately not a cheap second opinion
-    on the design.  ``start-stage --to REVIEW`` refuses while any settled decision is still
-    unlanded, so the answer has to actually be written, and ``start-stage --to DELIVERY``
-    refuses on a verdict from an older round, so the new text has to be reviewed again --
-    exactly one round of budget, which is why the budget and not the orchestrator's willingness
-    is what this check guards.  At the last round the price cannot be paid, so the rewind would
-    strand the run in a stage it cannot leave; refusing keeps 挂账 reachable instead.
+    The rewind used to be admitted for one reason only -- a settled human decision that had
+    not reached the body yet.  Every other delivery-time defect was then stuck: a gate failure
+    that needs the body rewritten (a scale check the draft was too thin to satisfy, a project
+    structure branch, an unknown fence language) had no legal way back, editing the body
+    anyway fails ``review-report-matches-delivered-tdd``, and the only exit left was replaying
+    the pipeline from CONTEXT.  So the reason is no longer what this guards.
+
+    The price is, and it is what makes the wider door safe: a reopened Refiner cannot reach
+    DELIVERY on the old verdict, because ``start-stage --to REVIEW`` wants this round's
+    ``refiner-map`` and ``start-stage --to DELIVERY`` refuses a verdict from an older round.
+    Every rewind therefore buys exactly one fresh full review of a body it changed, which is
+    the same audit strength an ordinary round has.  What is left to refuse is the run that
+    cannot pay: at the last round the rewind would strand the run in a stage it cannot leave,
+    so 挂账 delivery stays the reachable exit.
     """
-    unlanded = _unlanded_decisions(state)
-    if not unlanded:
-        raise ControllerError(
-            "start-stage --to REFINER refused from DELIVERY: the rewind exists to land a "
-            "settled human decision and no entry is waiting to be landed "
-            "('confirmations' lists them, and pending_landing is empty); prose you want changed "
-            "goes back through REQUEST_CHANGES at the REVIEW stage, and an unanswered question "
-            "is answered in the confirmation file and sync-confirmations first"
-        )
     if state["review_round"] >= state["max_review_rounds"]:
+        unlanded = _unlanded_decisions(state)
         raise ControllerError(
             f"start-stage --to REFINER refused from DELIVERY: round {state['review_round']} is "
             f"the last one the review budget allows and a rewind must be paid for with a fresh "
-            f"review round, so this run cannot land {', '.join(unlanded)}; keep them 待落地 in the "
-            "chapter-16 ledger, copy them into the delivery report, and the next run's init "
-            "consumes them as frozen human decisions"
+            f"review round, so this run cannot reopen the body"
+            + (f" to land {', '.join(unlanded)}" if unlanded else "")
+            + "; what is still open stays 挂账 in the chapter-16 ledger, is copied into the "
+            "delivery report, and the next run's init consumes it as frozen input"
         )
 
 
@@ -1487,12 +1506,23 @@ def _elapsed_seconds(started_at: str, finished_at: str) -> float | None:
     return max(0.0, (end - start).total_seconds())
 
 
-def _reviewer_slot_taken(state: dict[str, Any], role: str, round_: int) -> bool:
-    """One reviewer instance per round, counted from the dispatch, not only the verdict."""
+def _reviewer_slot_taken(
+    state: dict[str, Any], role: str, round_: int, session_id: str | None = None
+) -> bool:
+    """One reviewer instance per round, counted from the dispatch, not only the verdict.
+
+    Two windows have to be excluded or the count contradicts itself.  The dispatch being
+    closed is still ``DISPATCHED`` when this runs, so counting it makes closing any reviewer
+    window collide with its own opening record -- the round could then neither be settled nor
+    abandoned, and a dropped connection left the slot taken forever.  And an ``ABORTED``
+    window is absent from the set by construction: it consumed wall time without producing a
+    verdict, so closing it with ``--status ABORTED`` is what frees the slot for a replacement.
+    """
     return any(
         item["role"] == role
         and item["round"] == round_
         and item["status"] in {"COMPLETED", "DISPATCHED"}
+        and item["session_id"] != session_id
         for item in state["agents"]
     )
 
@@ -1510,7 +1540,8 @@ def record_agent(
 
     ``--status DISPATCHED`` opens a window the terminal status closes with the same session
     id, which is how per-role wall time is measured without parsing host transcripts.
-    ``ABORTED`` keeps a dispatch that consumed time but produced nothing visible in the run.
+    ``ABORTED`` keeps a dispatch that consumed time but produced nothing visible in the run,
+    and leaves the round's slot free, so the same role can be dispatched again.
     ``--scope`` declares the sections actually injected into the prompt; the read budget is
     then measured from the index instead of accepted as a claim.
     """
@@ -1549,7 +1580,10 @@ def record_agent(
                 raise ControllerError("no review round is open; enter the REVIEW stage first")
             if _reviewer_slot_taken(state, role, round_):
                 raise ControllerError(
-                    f"a {role} instance already ran in round {round_}; each round needs a fresh reviewer"
+                    f"a {role} instance already ran in round {round_}; each round needs a fresh "
+                    "reviewer -- if the previous dispatch produced nothing (lost connection, "
+                    "empty report), close it with '--status ABORTED' on the same session id and "
+                    "that frees this slot for a replacement"
                 )
         entry = {
             "role": role,
@@ -1572,9 +1606,11 @@ def record_agent(
     if role == ROLES["REVIEW"]:
         if round_ < 1:
             raise ControllerError("no review round is open; enter the REVIEW stage first")
-        if _reviewer_slot_taken(state, role, round_):
+        if _reviewer_slot_taken(state, role, round_, session_id):
             raise ControllerError(
-                f"a {role} instance already ran in round {round_}; each round needs a fresh reviewer"
+                f"a {role} instance already ran in round {round_}; each round needs a fresh "
+                "reviewer -- an ABORTED dispatch holds no slot, so the replacement is the one "
+                "that gets settled here"
             )
     if open_entry is None:
         entry = {
@@ -1834,10 +1870,20 @@ def _parse_marked_items(text: str, kind: str) -> list[dict[str, Any]]:
     A header with no body, an unknown key or a missing required key is an error rather than
     a skipped item: the batch face exists to remove glue, and silently dropping one finding
     would trade a visible parse failure for an invisible closure gap.
+
+    A fenced block in a report is an example or a quoted snippet, so it neither registers an
+    item nor feeds one: a report that shows the ``@@KIND`` format must not register the sample,
+    and leaving the fence readable would let an example become a finding no role raised.  An
+    item that only exists inside a fence therefore fails loudly as "no @@KIND lines" rather
+    than quietly registering nothing.
     """
+    lines = text.splitlines()
+    fenced = _fence_line_mask(lines)
     items: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
-    for number, line in enumerate(text.splitlines(), start=1):
+    for number, line in enumerate(lines, start=1):
+        if number - 1 in fenced:
+            continue
         match = MARKED_ITEM.match(line)
         if match:
             if match.group(1) != kind:
@@ -2659,7 +2705,7 @@ def _require_no_blocking_confirmations(state: dict[str, Any], target: str) -> No
     one still open.  Landing is only demanded where a landing channel is one dispatch away
     -- in front of the CRITIC and REVIEW doors the document is a resumed dispatch from a
     Refiner.  DELIVERY is the exception on purpose: its rewind
-    (``_require_landing_only_rewind``) exists, but it costs a whole fresh review round, so
+    (``_require_rewind_within_budget``) exists, but it costs a whole fresh review round, so
     whether an answer is worth that price is a delivery judgement rather than a precondition
     of shipping.  This door therefore refuses only on blocking entries and hands the rest out
     as ``pending_landing``; they stay in the chapter-16 ledger as 待落地, are listed by
@@ -3005,25 +3051,34 @@ def _document_growth_check(state: dict[str, Any], doc_text: str) -> dict[str, An
         item for item in state["findings"]
         if item["round"] == round_ or (round_ <= 1 and item["round"] == 0)
     ]
-    only_minor = bool(drivers) and all(
-        item["severity"] not in MUST_FIX_SEVERITIES for item in drivers
-    )
+    # ``all()`` over no findings is True, and that is the answer wanted: a round that raised
+    # nothing and still grew the document by a third is the case with no payer at all, so it
+    # must warn, not fall through as "nothing to attribute".
+    only_minor = all(item["severity"] not in MUST_FIX_SEVERITIES for item in drivers)
     warn = percent > GROWTH_WARN_PERCENT and only_minor
+    if percent <= GROWTH_WARN_PERCENT:
+        note = f"growth within the {GROWTH_WARN_PERCENT:g}% threshold"
+    elif not only_minor:
+        note = "a Blocker/High finding of this round pays for the growth"
+    elif not drivers:
+        note = (
+            "round {} raised no finding at all, yet the body grew {:+.1f}%: nothing paid for "
+            "it -- quote this in the delivery report (soft check, does not block)".format(
+                round_, percent
+            )
+        )
+    else:
+        note = (
+            "round {} raised {} finding(s), none of them Blocker/High: the growth was not paid "
+            "for -- quote this in the delivery report (soft check, does not block)".format(
+                round_, len(drivers)
+            )
+        )
     detail = [
         "body {} lines vs baseline {} ({:+.1f}%, baseline: {})".format(
             body, base, percent, baseline.get("baseline", "?")
         ),
-        (
-            "round {} raised {} finding(s), none of them Blocker/High: the growth was not paid "
-            "for -- quote this in the delivery report (soft check, does not block)".format(
-                round_, len(drivers)
-            ) if warn else (
-                f"growth within the {GROWTH_WARN_PERCENT:g}% threshold"
-                if percent <= GROWTH_WARN_PERCENT else
-                "a Blocker/High finding of this round pays for the growth"
-                if drivers else "no finding of this round to attribute the growth to"
-            )
-        ),
+        note,
     ]
     return {"name": "document-growth", "ok": True, "warn": warn, "detail": detail}
 
@@ -3247,6 +3302,22 @@ def _expected_ledger(state: dict[str, Any], doc_text: str, run_dir: str) -> dict
     }
 
 
+def _mirror_table_header(lines: list[str], index: int) -> str:
+    """The header row of the table ``lines[index]`` sits in, or ``''`` when it has none.
+
+    A row is judged with its table instead of on its own.  ``| 重试退避 | CRITIC-001 |`` in the
+    ADR chapter and ``| CRITIC-001 | FIXED |`` copied out of chapter 16 are the same two
+    columns the other way round: both start with ``|`` and both carry a finding id.  What
+    separates them is the header above the row, because a hand-copied ledger reproduces the
+    generated table's columns while a traceability table cites the same ids under a header of
+    its own -- and citing them is the cross-reference the SKILL asks the author to write.
+    """
+    start = index
+    while start > 0 and lines[start - 1].lstrip().startswith("|"):
+        start -= 1
+    return lines[start].strip()
+
+
 def _reject_handwritten_mirror(lines: list[str], blocks: dict[str, tuple[int, int]]) -> None:
     """A hand-copied ledger beside the generated one reintroduces the drift this removes."""
     covered = {index for start, end in blocks.values() for index in range(start, end + 1)}
@@ -3256,6 +3327,7 @@ def _reject_handwritten_mirror(lines: list[str], blocks: dict[str, tuple[int, in
         if index not in covered
         and line.lstrip().startswith("|")
         and re.search(r"(?:CRITIC-\d|REVIEW-\d{1,2}-\d)", line)
+        and LEDGER_TABLE_COLUMNS.search(_mirror_table_header(lines, index))
     ]
     if stray:
         raise ControllerError(
@@ -4449,12 +4521,14 @@ def _next_action(path: Path, state: dict[str, Any]) -> dict[str, Any]:
         else:
             waiting = advance("CLOSED", f"last gate: {gate['status']}, recorded in the ledger")
         unlanded = _unlanded_decisions(state)
-        if unlanded and state["review_round"] < state["max_review_rounds"]:
-            # Not the next command -- closing stays legal while these ride the ledger, and
-            # spending a review round on them is a human judgement.  It is disclosed on every
+        if state["review_round"] < state["max_review_rounds"]:
+            # Not the next command -- closing stays legal while anything rides the ledger, and
+            # spending a review round on it is a human judgement.  It is disclosed on every
             # step this stage takes, because the alternative is the orchestrator remembering,
-            # mid-delivery, that a channel it stopped believing in still exists.
-            waiting["landing_rewind"] = {
+            # mid-delivery, that a channel it stopped believing in still exists -- and the
+            # rewind is not only for unlanded decisions: a gate failure that needs the body
+            # rewritten has no other legal way back.
+            waiting["rewind"] = {
                 "command": run("start-stage --to REFINER"),
                 "confirmations": unlanded,
                 "cost": f"a fresh review round ({state['review_round']} → "

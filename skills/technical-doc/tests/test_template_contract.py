@@ -516,22 +516,23 @@ class ScaleContractTests(unittest.TestCase):
         self.assertNotIn("悄悄抹掉", TEMPLATE)
 
     def test_the_delivery_rewind_is_the_only_way_back_and_says_what_it_costs(self) -> None:
-        """`DELIVERY -> REFINER` is one edge with one purpose; both prose surfaces must say so.
+        """`DELIVERY -> REFINER` is one edge, and both prose surfaces must price it.
 
         The edge is the difference between "an answer that arrives after the final review is
         unshippable" and "it costs one more review round".  If the code, the orchestrator's
         manual and the auditor's standard stop agreeing on the price, the rewind either gets
-        used as a general re-edit channel or nobody dares to take it.
+        used as a free re-edit channel or nobody dares to take it.  What the door guards is
+        the price, not the reason: a gate failure that needs the body rewritten has no other
+        legal way back, and refusing it used to leave only a full pipeline replay.
         """
         self.assertEqual({"REFINER", "CLOSED"}, controller.STAGE_TRANSITIONS["DELIVERY"])
-        self.assertTrue(callable(getattr(controller, "_require_landing_only_rewind", None)))
+        self.assertTrue(callable(getattr(controller, "_require_rewind_within_budget", None)))
         self.assertIn("落地回退", SKILL_MD)
         self.assertIn("落地回退", MANUAL)
-        self.assertIn("landing_rewind", MANUAL)
-        # the two refusals: nothing to land, and no budget left to pay for the fresh review
-        self.assertIn("no entry is waiting to be landed", CONTROLLER_SRC)
+        self.assertIn("rewind", MANUAL)
+        # the one refusal left: no budget left to pay for the fresh review round
         self.assertIn("last one the review budget allows", CONTROLLER_SRC)
-        self.assertIn("没有待落地条目", MANUAL)
+        self.assertNotIn("no entry is waiting to be landed", CONTROLLER_SRC)
         self.assertIn("轮次预算已耗尽", MANUAL)
         self.assertIn("落地回退", STANDARD)
 
