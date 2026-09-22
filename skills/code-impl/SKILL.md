@@ -15,7 +15,7 @@ allowed-tools: 'Bash, Read, Write, Agent, Grep, LSP, Skill'
 
 > 本文档中的 `SKILL_DIR` / `SKILLS_ROOT` 解析方式、`<PYTHON>` 启动器按宿主的解析规则、派发时必须显式传入的路径清单，以及“Skill 之间不得用相对路径互相引用文件”的纪律，统一见 `$SKILLS_ROOT/_shared/prompts/path-convention.md`；下面是本 Skill 的特有补充。
 
-本 Skill 自带 `scripts/code_impl_controller.py`，用于输入冻结、运行状态、Agent 调用登记、预存 Diff 隔离、范围检查、审查快照和失败归属；编译、测试、Lint 等 Local Validator 仍使用目标仓库自己的工具。**`SKILL_DIR` = 本文档所在目录的绝对路径**（插件安装时为 `<plugin-cache>/skills/code-impl`）只用于定位 `references/`、`agents/` 和该控制器；在命令行、Agent 提示或任何外部进程中引用这些路径时统一使用 `$SKILL_DIR`，并在调用前解析为绝对路径，不要假设当前目录、当前插件目录或仓库根目录就是 Skill 目录。正文内联的资源描述（例如 `references/contracts.md`）按“相对 `SKILL_DIR`”理解，由主 Agent 读取时解析。
+本 Skill 自带 `scripts/code_impl_controller.py`，用于输入冻结、运行状态、Agent 调用登记、预存 Diff 隔离、范围检查、审查快照和失败归属；编译、测试、Lint 等 Local Validator 仍使用目标仓库自己的工具。**该控制器的全部子命令的参数、语义与预算上限统一见 [controller-contract.md](references/controller-contract.md)，需要"下一步敲什么"时读它，不要回读控制器源码**（源码 2600+ 行，读回上下文既慢又容易与文档漂移；命令条数以该手册为准，本文不写死数字）。**`SKILL_DIR` = 本文档所在目录的绝对路径**（插件安装时为 `<plugin-cache>/skills/code-impl`）只用于定位 `references/`、`agents/` 和该控制器；在命令行、Agent 提示或任何外部进程中引用这些路径时统一使用 `$SKILL_DIR`，并在调用前解析为绝对路径，不要假设当前目录、当前插件目录或仓库根目录就是 Skill 目录。正文内联的资源描述（例如 `references/contracts.md`）按“相对 `SKILL_DIR`”理解，由主 Agent 读取时解析。
 
 派发 Sub-agent 时，必须在输入中显式给出：`SKILL_DIR` 的绝对路径、`<feature-directory>` 的绝对路径与其中的固定文件名（`product-doc.md`、`technical-doc.md`、`release-doc.md`）、代码变更所在的 `repo_root` 绝对路径，以及要读取的角色文件名；不得让 Sub-agent 自行猜测资源文件、输入文档或工作目录。
 
@@ -307,6 +307,24 @@ Planner 的 DAG 必须先落盘为 JSON 产物，再用控制器校验；校验�
 Orchestrator 自觉。`--retry-policy prose` 是回退开关，只用于门禁本身成为故障源时临时放行，
 放行会在返回体里标注，最终报告必须如实说明用了多少次 prose 重试。
 
+### 派发中断：作废而不是记为失败
+
+Implementer 会话断连、宿主中断或 Subagent 无返回时，任务停在 `RUNNING`，而它既没有结论也没有错误指纹。这种情况**不得**记作 `FAILED`——`FAILED` 的语义是"任务被判失败"，会把一次传输故障写进台账、占用一次派发预算，并且随后的重派还会被 `gated` 重试门禁拦下（因为它要求一条 `record-failure`，而这里没有可诊断的东西）。
+
+控制器为此提供唯一的作废迁移 `RUNNING → PENDING`，它必须带 `--reason`：
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
+  --state "$state_path" --task-id '<task-id>' --status PENDING \
+  --reason 'implementer session lost: host dropped the connection'
+```
+
+作废把这次派发的预算记账撤销（任务回到 `PENDING`，`attempts` 不增长，重派不需要诊断、也不消耗 `--retry-policy prose`），但痕迹保留：`attempts_log` 该条标 `abandoned` 与原因，任务上累计 `abandoned_dispatches`，`show` 与 `render-ledger` 都会列出。最终报告必须说明作废了几次。**这条边只用于"派发没有返回"**；任务已经验证失败时只有一条路——`settle-task --status FAILED --error-fingerprint ...` 加 `record-failure`，`VALIDATING`/`FAILED` 状态下作废会被拒绝，不能用它绕开失败登记。
+
+作废必须同时收口死会话：被作废的 Implementer 在 Agent 登记表里仍是 `RUNNING`，要补一条 `record-agent --status ARCHIVED`，否则步骤 16 的 `gate` 会以 `dispatched-agents-closed` 拒绝交付（是哪一个，看 `show` 的 `open_agents`）。
+
+作废自身也有预算：同一任务最多作废 `MAX_TASK_ABANDONS=3` 次。作废是唯一不占派发预算的迁移，若没有上限，"宣称会话没返回"就成了绕开 `MAX_TASK_ATTEMPTS` 与指纹重试预算的无限后门，所以第 4 次作废会被控制器直接拒绝。被拒后只剩两条诚实出路：`settle-task --status FAILED` 带 `dispatch-lost-repeatedly::<task-id>` 这类指纹并 `record-failure`，或转 `BLOCKED` 升级步骤 17（人工介入）。
+
 非法迁移（如 PENDING 直接跳至 PASS、从终态再次转移）控制器会以 `ControllerError` 拒绝并退出码 2，不得绕过。
 
 ## 06 编码实现
@@ -459,7 +477,7 @@ Orchestrator 根据证据决策：
 ```
 
 `replan` 会：
-1. 将旧版本中状态为 `PENDING`、`READY` 或 `FAILED` 的任务标为 `SUPERSEDED`（`RUNNING` 和 `VALIDATING` 的任务必须处理完才能重规划）；
+1. 将旧版本中状态为 `PENDING`、`READY`、`FAILED` 或 `BLOCKED` 的任务标为 `SUPERSEDED`（`RUNNING` 和 `VALIDATING` 的任务必须处理完才能重规划）。`BLOCKED` 是终态，唯一出路就是被重规划取代；返回体的 `superseded_blocked` 单独列出这些任务，最终报告必须说明它们为什么被阻塞，不能让它们在台账里无声消失；
 2. 重算 `authorized_files`，仅保留 `PASS` 任务的文件范围；
 3. 将 `state["current_plan_version"]` 更新为新版本。
 
@@ -517,6 +535,17 @@ Code Review Handoff 的 `snapshot` 整块（`target_id`、`digest_scheme`、`com
   --command 'pytest -q' --cwd '<repo_root>' \
   --exit-code 0 --result PASS --evidence-file '<run>/logs/pytest.txt'
 ```
+
+整轮多项检查用批量面一次登记（字段与单条一致，写进 JSON 文件；逐条仍走同一套规则，任一
+条不合法整份拒绝并点名，不会留下"半轮"证据）：
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" record-validations \
+  --state "$state_path" --from-file '<run>/validations.json'
+```
+
+一次失败产生多条归属时同样有批量面 `record-failures --from-file`（批内同指纹按先后顺序
+正确累计出现次数，预算不会因批量而失效）。
 
 整体验证记录与 `freeze-review` 必须描述同一份工作树：记录会自动绑定当前 Diff 指纹，冻结后
 再写入任何文件，都会让步骤 16 的 `gate` 判定“证据早于交付 Diff”而 `BLOCKED`，此时必须
@@ -587,8 +616,11 @@ Orchestrator 严格使用 [contracts.md](references/contracts.md) 的 Code Revie
 验证记录；是否存在 `--scope overall` 且指纹与最后一次冻结一致的整体证据；是否已冻结审查
 快照、快照产物是否可读；最新审查结论是否存在、是否为可交付结论（`APPROVE` /
 `APPROVE_WITH_FOLLOW_UPS`）、其结构校验是否退出 0、结论绑定的 Diff 指纹是否就是最后一次
-冻结；报告文件是否仍在磁盘上；以及最终范围检查是否干净。任一不满足即退出码 2 并打印
-`BLOCKED: ...`，详情写入 `<run>/gate-report.json`。
+冻结；报告文件是否仍在磁盘上；**所有派发是否都已收口**（没有仍为 `RUNNING` 的 Agent
+条目——未收口的派发意味着这一轮有一份工作没被交代，也让角色耗时无从度量，补一次
+`record-agent --status ARCHIVED` 即可，`show` 的 `open_agents` 会列出是哪一个）；以及最终
+范围检查是否干净。任一不满足即退出码 2 并打印 `BLOCKED: ...`，详情写入
+`<run>/gate-report.json`。
 
 `gate` 的退出码就是“能否宣称编码完成”的判据：不得用 `--mode warn-only` 绕过它出报告
 （该模式仅供排障和盘点，仍会在返回体里标 `BLOCKED (warn-only)`）。若门禁挡住，回到对应

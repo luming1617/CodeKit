@@ -82,23 +82,21 @@ flowchart LR
 
 `init` 的可选开关决定本次运行走哪套阶段语义，只影响本次运行，不改代码：`--context-window`（读取预算的基准窗口）、`--review-stop-policy severity|fixed`（默认 `severity`，见“严重度门停与增量终审”；`fixed` 回退为“每轮都是全量终审，直到 5 轮上限”）、`--scale-enforcement enforce|record-only`（默认 `enforce`，见“规模判定与按规模裁剪”；`record-only` 只记录探针结论，`gate` 不按规模要求章节）。
 
-命令的必填参数、一条可复制的示例和拒绝语义，全部在 `references/controller-contract.md`（含 `@@FIND`/`@@FIX` 回报格式）；那一页就是主控的命令手册，**不要在 run 中途回读 `scripts/tech_doc_controller.py` 去凑参数**——上一次运行这类回读发生了 14 次，问的都是同一个问题，而 `show --next` 就是它的答复。
+命令的必填参数、一条可复制的示例和**拒绝语义**，全部在 `references/controller-contract.md`（含 `@@FIND`/`@@FIX` 回报格式）；下面这张表只承载两样东西——每条命令是干什么的、这一步需要主控自己拿的主意，被拒绝时为什么拒绝一律不在这里复述（上一版这张表把手册的拒绝理由抄了一遍，长到占整页 17%，而主控真正会撞上的那几条在手册里逐条都有）。那一页就是主控的命令手册，**不要在 run 中途回读 `scripts/tech_doc_controller.py` 去凑参数**——上一次运行这类回读发生了 14 次，问的都是同一个问题，而 `show --next` 就是它的答复。
 
 | 命令 | 用途 |
 |------|------|
-| `record-source` / `finalize-inputs` | 登记每项资料的 `source_id`、定位符、`READ/NOT_FOUND/NOT_ACCESSIBLE`、摘要与可信度，并给出 `input_status`；定位符会被磁盘核对，与声明不符即失败；`UPDATE` 运行必须同时用 `--prd-changes 修改数/新增数/删除数`（如 `3/1/0`）登记需求变更规模；`finalize-inputs` 顺带跑一次**规模探针**并把 `scale`/`signals`/`greenfield`（连同判定依据 `basis`）写进 `state.json`，返回值里就有，主控把它原样传给 Context Loader 与 Architect |
-| `start-stage --to <STAGE>` | 推进阶段状态机；前置证据不足即失败；进入 `REVIEW` 时可带 `--review-scope full|incremental`，增量轮只能由控制器在严重度门停后推导，不接受主控自报范围（想强制全量就省略该参数，由控制器决定最小可证范围）；进入 `DELIVERY` 前每条 Finding 都必须已登记处置；`DELIVERY` 唯一允许的回退是 `--to REFINER` 的**落地回退**——只要还没烧完轮次预算就放行（已收口未落地的人工决定是最常见的理由，但不是唯一理由：需要改动正文的门禁失败也走这条回退），回退后必须补一次全新终审（见“门禁挂钩”）；`CRITIC`/`REVIEW` 两道审计门前，已收口（ANSWERED/SKIPPED-DEFAULT）的人工决定必须已落地，`DELIVERY` 只拒绝阻断态未完成条目（见“人工确认循环”“门禁挂钩”） |
-| `record-agent` | 登记一次具名子代理调用：先用 `--status DISPATCHED`（带 `--session-id` 与 `--input-digest`）开时间窗，再用同一 `--session-id` 以 `COMPLETED`/`BLOCKED`/`ABORTED` 收口并写入墙钟耗时，收口调用可省略 `--input-digest`；派发后什么都没产出也必须用 `ABORTED` 收口；Reviewer 一旦 `DISPATCHED` 就占用本轮名额，但 `ABORTED` 收口会释放它（同一轮可以重派 Reviewer，被拒的是同一轮的第二个 Reviewer 实例）；`--scope "7.2,4.1"` 声明本次真正注入的章节，读取量由索引算出 |
-| `write-artifact` | 把 `context-pack`、`draft`、`critic-findings`、`refiner-map`、`review-report` 落入运行目录；`draft` 与 `refiner-map` 这两类会改动 TDD 的登记入口还多做两件事：正文里出现手抄的 Finding 表（生成台账标记之外的 `|` 行引用 `CRITIC-*`/`REVIEW-*` ID）即拒，不等交付前人工 strip；`draft` 同时把当时的正文行数为本次运行冻结成体积参照 |
-| `record-finding` / `record-fix` / `record-findings --from-file` / `record-fixes --from-file` | 登记 Finding 与逐项处置（处置是 Finding 唯一的闭环入口）。Finding 来自 Critic/Reviewer 回报，处置来自 Refiner 回报，两边都可用批量面一次交回：回报正文里每条结论加一行 `@@FIND id=… sev=… loc=…` / `@@FIX id=… status=… loc=…`，`--from-file` 直接吃那份回报，逐条仍走同一条登记路径与同一套校验（阶段、ID 形式、`--scope` 并集），不是绕过；同值重复登记进 `already_registered`（重跑整份报告安全），同 ID 改了严重度/位置则进 `failed` 并退出码 `2`（分歧必须被看见）。`record-fix` 的常规入口是 `REFINER` 阶段，评审结论在桌上时主 Agent 不得自己给改动打分；唯一例外：通过性结论（`APPROVE`/`APPROVE_WITH_FOLLOW_UPS`）挂账后，本轮新报的非阻断 Finding 允许在 `REVIEW`/`DELIVERY` 阶段直接登记 `PENDING_CONFIRMATION`/`REJECTED`（`FIXED` 声称改了正文，仍必须走 Refiner 轮 + 全新 Reviewer）。登记处置声称正文已改，所以这一步也做镜像检测：TDD 正文里有手抄的 Finding 表即整条拒绝（不是等 `render-ledger` 或交付前才发现）；`--from-file` 批量入口对整批只判一次，一份带镜像的回报回一个原因，不是每条 `failed` 各刷一遍同样的话 |
-| `record-review` | 把终审结论与被审 TDD 的内容快照绑定，并绑定**本轮的审查范围**（`--scope` 只能复述 `start-stage` 打开的范围，不能把增量轮改写成全量）；“审查闭环记录”章节标记之间的生成台账不计入该快照 |
-| `archive-history` | 把被覆盖的上一版 TDD 归档为独立文件 |
-| `index` / `locate` / `dump` | 重建 `doc-index.json`（章节 → 行区间、符号、Finding 归属），或把一条 Finding 的位置、一个章节号解析成行区间与读取预算；`locate`、`--scope` 派发与 `record-fix` 都会在 TDD 变化后自动重建索引，不必手动先跑 `index`；`locate` 找不到对应标题时返回 `NOT_LOCATED` 并给出兜底读法，不猜；`locate --batch "7.2,9.3,CRITIC-004"` 一次问完一簇（合并区间 + 一条预算结论，不做引用展开，选完簇仍用单条 `locate` 看某一节引用了谁）；`dump --finding CRITIC-001` 从 `state.json` 回一条 Finding 的当前状态与处置，默认不回 `evidence`（只给 `evidence_chars`），要原文用 `--fields all` |
+| `record-source` / `finalize-inputs` | 逐份登记资料的 `source_id`、定位符、`READ/NOT_FOUND/NOT_ACCESSIBLE`、摘要与可信度，并给出 `input_status`；`UPDATE` 运行必须同时登记 `--prd-changes 修改数/新增数/删除数`（如 `3/1/0`）。`finalize-inputs` 顺带跑规模探针，返回值里的 `scale`/`signals`/`greenfield`（连同 `basis`）原样传给 Context Loader 与 Architect |
+| `start-stage --to <STAGE>` | 推进阶段状态机，前置证据不足即失败。判据只有一处需要主控自己拿主意：`--to REFINER` 看**台账上还有没有未登记处置的 Finding**（往轮遗留的同样算，不要求是本轮 Reviewer 报的），`--to DELIVERY` 则要求每条都已闭环；`DELIVERY` 回 `REFINER` 是**落地回退**，只受轮次预算约束（两条门的细节见“门禁挂钩”）。`--review-scope` 只能复述控制器自己推导的范围 |
+| `record-agent` | 用 `--status DISPATCHED`（带 `--session-id` 与 `--input-digest`）开时间窗，再用同一 `--session-id` 收口。两处易错：子代理以 `CONFIRM_NEEDED` 提前收口时**登记 `COMPLETED`**（那半份草稿是下一阶段要查的证据，`ABORTED` 等于宣布它不存在）；`tech-refiner` 派发**必须**带 `--scope`（它是唯一改正文的角色，处置落点的量尺就是这份声明） |
+| `write-artifact` | 把 `context-pack`、`draft`、`critic-findings`、`refiner-map`、`review-report` 登记进运行目录：产物由**角色自己写盘**，主控只 `--file` 登记它回报的那个路径，不代抄正文。`draft` 同时把当时的正文行数冻结为本次运行的体积参照 |
+| `record-finding` / `record-fix` / `record-findings --from-file` / `record-fixes --from-file` | 登记 Finding 与逐项处置（处置是 Finding 唯一的闭环入口）。两边都可用 `--from-file` 吃角色回报里的 `@@FIND`/`@@FIX` 行，一次交回整批，逐条仍走同一条校验路径，不是绕过。`record-fix` 的常规入口是 `REFINER` 阶段，唯一例外见“阶段 5”的默认策略 |
+| `record-review` | 把终审结论与被审 TDD 的内容快照绑定，并绑定**本轮的审查范围**（只能复述 `start-stage` 打开的范围）；“审查闭环记录”章节标记之间的生成台账不计入该快照 |
+| `archive-history` | 把被覆盖的上一版 TDD 归档为独立文件（`UPDATE` 运行必须在覆写前调用） |
+| `index` / `locate` / `dump` | 把一条 Finding 的位置或一个章节号解析成行区间与读取预算，或从 `state.json` 回一条 Finding 的当前状态；是主控侧不整读原文的唯一回读面（见“读取预算与按节注入”） |
 | `render-ledger --state <state> --tdd-file <TDD>` | 从 `state.json` 重写 TDD “审查闭环记录”章节的生成台账（Finding 处置映射、运行元数据、人工确认台账、人工决定台账）与“历史版本索引”，并顺带重建索引；它只读确认文件、不写它 |
-| `sync-confirmations --file` | 解析确认文件：无 ID 条目分配 `CONF-<NNN>` 并只回写 ID 行，登记进 `state`，`决定:` 非空的置 ANSWERED（以 `按推荐` 开头的置 SKIPPED-DEFAULT），未答保持 OPEN；本 run 内引用未登记 Finding 的来源、重复问题文本、改写已登记字段或解析错误即失败（退出码非零），stdout 给出 `total/open/answered/skipped_to_default/applied` 计数与 `blocking_open/settled_unapplied/blocking_incomplete` 三份 ID 清单——“确认完毕”只以此为判定，不接受任何自述 |
-| `skip-to-default` / `mark-confirmation-applied` | 前者仅在用户显式指令下把 OPEN 条目按推荐选项登记为 SKIPPED-DEFAULT（`--by` 带指令引文，控制器回写该条目的 `决定:` 行；无 `推荐:` 字段的条目拒绝），不允许静默跳过；后者登记收口态（ANSWERED/SKIPPED-DEFAULT）条目的决定已落进正文，控制器回写该条目的 `应用:` 行（章节＋摘要＋时间），未收口拒绝，落点越过本轮 `--scope` 并集拒绝 |
-| `confirmations` | 只读对账：确认文件路径、阶段、条目逐条现状（ID / 来源 / 阻断 / 状态 / 决定 / 落点 / 是否跨 run 承接）与五计数，供主控与交付报告照抄；它不读 TDD 正文，marker 与条目的双向对账见 `gate` 的 `markers-match-confirmations` |
-| `gate` / `show` / `show --next` | 交付门禁与运行状态摘要；`show` 按 `prep`/`write`/`audit` 汇总各阶段墙钟耗时，给出派发计数（`timed`/`aborted`/`open`/`scoped`/`over_budget`）、索引摘要、`review_stop` 判定与 `scale` 结论、待答与待落地确认条目计数及确认文件路径；`findings` 另给三个清单——`undisposed`（重放派发只需携带的子集）、`open_non_blocking_followups`（登记处置即可、不配再烧一轮终审的）、`undisposed_blocking`（真正要求再开一轮的）；`show --next` 只回“这一步在等哪一条命令”，带齐参数，是卡住时的第一问——它是状态机的一次只读，不推进任何东西，给出的命令照样可能被门禁拒绝；`gate` 的 `checks` 里带 `warn` 的项另汇总成 `warnings`——软检查，`ok` 恒为 `true`，既不进 `failures` 也不改 `status`，但交付报告必须照抄。目前只有一项 `document-growth`：TDD 正文（不含生成台账）行数相对**冻结参照**（`NEW` 取 `draft` 落盘时、`UPDATE` 取被重写的那一版）增幅 >8%，且触发本轮增长的 Finding 全是 Medium/Low 时给 WARN——「每轮往里灌水」没有别的代价信号，不进报告就等于没人看见 |
+| `sync-confirmations` / `skip-to-default` / `mark-confirmation-applied` / `confirmations` | 确认文件的四个面：解析登记（分配 `CONF-<NNN>`，回计数与三份清单）、按用户显式指令收口为 SKIPPED-DEFAULT、登记已收口决定已落进正文、只读对账。“确认完毕”只以 `sync-confirmations` 的 `blocking_open` 与退出码判定，不接受任何自述 |
+| `gate` / `show` / `show --next` | 交付门禁与运行状态摘要（耗时、派发计数、门停与规模结论、待答与待落地清单）。**状态推导只有一条：`failures` 非空即 `BLOCKED`（退出码 2），降级不参与这一步**；带 `warn` 的是软检查，只进 `warnings`，交付报告强制照抄。卡住时的第一问是 `show --next`，它回的就是下一步该跑的完整命令，但**不推进任何东西**，给出的命令照样可能被门禁拒绝 |
 
 状态与产物落在 `<repo>/.codekit/technical-doc/<run-id>/`（运行时证据目录，不得作为业务变更提交）。**阶段间交接只传文件路径与 digest，不传正文**：子代理自己读文件，主 Agent 不搬运大段文本。
 
@@ -108,7 +106,7 @@ flowchart LR
 
 - 草稿落盘后 Refiner 的派发**先 `locate`**，按返回的行区间读取注入，不整篇回读；索引缺失或 TDD 已变时 `locate` 自己重建，不需要手动先跑一次 `index`。`locate --finding CRITIC-007` 会连带返回该章节按编号引用到的其他章节——只改一处、漏掉引用它的那一处，是下一轮 Finding 的来源。
 - 区间不足时**允许扩大读取**（`locate` 返回 `NOT_LOCATED`，或引用章节没随区间给到），不是硬门禁：Refiner 需在回报里声明多读了哪些章节。整篇可读始终是保留的退路，按节注入只是把翻页换成一次查表；Critic 与 Reviewer 做的是全量审查，不受本节约束。
-- 派发时把注入的章节写进 `record-agent --scope "7.2,4.1"`：读取量、行区间和是否超预算由索引算出，不接受子代理自述；`over_budget: true` 就把这一轮拆成更小的派发，而不是让角色自己翻页。`--scope` 只在开时间窗的那次调用上声明。
+- 派发时把注入的章节写进 `record-agent --scope "7.2,4.1"`：读取量、行区间和是否超预算由索引算出，不接受子代理自述；`over_budget: true` 就把这一轮拆成更小的派发，而不是让角色自己翻页。`--scope` 只在开时间窗的那次调用上声明。Refiner 的派发**必须**带这一项——它是唯一改正文的角色，而这个声明就是处置落点的量尺；确实整篇注入就写 `--scope all`，照旧按整篇度量并回报 `over_budget`，度量不因写法而放宽。
 - 处置只能落在**本轮**所有 `--scope` 的并集里，且 Finding 所在章节与处置落点都在并集内（缺一即拒，只核对处置落点会漏掉“没读原文就凭 Finding 描述改”的那条路）：一轮拆成多次按节派发是允许的，但上一轮声明过的章节不覆盖本轮，扩大范围靠再派发一次带 `--scope` 的 Refiner，而不是补一条旧范围外的 `record-fix`。
 - `init --context-window` 填宿主的真实窗口（默认 200000）；预算 = 窗口 × 0.5，剩下的要留给角色自己的指令与产出。
 - **主控侧不整读原文**：PRD、`context-pack`、TDD 正文只在角色自己的上下文里整篇读；主控要 TDD 的某一段用 `locate`（行区间）或 `locate --batch`（一簇），要一条 Finding 用 `dump`（默认连 `evidence` 都不回，只给 `evidence_chars`），要状态用 `show` 与 `confirmations`，要台账用 `render-ledger` 的返回值照抄。上一次运行里主控整读 `product-doc.md` 3 次（58K 字符）、`context-pack` 2 次（35K 字符），而这几份东西一旦进来就会留在主控上下文里直到 run 结束。要核对 PRD 里的一句话，就把它写成确认文件的待答条目，或让已经在读它的角色在回报里引用原文位置——不是自己翻页。
@@ -131,7 +129,7 @@ flowchart LR
 
 ```text
 CONF-007
-来源: ARCHITECT | REFINER:CRITIC-003 | REVIEWER:REVIEW-2-001 | LEGACY-MARKER
+来源: ARCHITECT | REFINER:CRITIC-003 | REFINER:REVIEW-2-001 | REVIEWER:REVIEW-2-001 | LEGACY-MARKER
 阻断: true|false
 位置: 7.2
 问题: 下游工单接口的限流阈值
@@ -146,7 +144,7 @@ CONF-007
 
 **阻断判据（唯一的暂停理由）**：`此项不拍板，本轮剩余工作（含其余非阻断 Finding 的处置）是否无法继续？` 是 ⇒ 阻断，触发暂停；否 ⇒ 照常挂账走人。由产出角色按该判断式裁决并写进 `阻断:` 栏；单 run 内 Architect/Refiner 的提前收口次数最多与轮次同数，且每次都必须是阻断项。
 
-**暂停协议**：子代理遇到阻断性未知时，先把部分产物落盘（至少 ADR 候选比较与受影响章节骨架；Refiner 先做完本轮其余 Finding，回报“已完成映射 + 未处理清单”两段），再按上述格式追加条目并以 `CONFIRM_NEEDED` 收口返回。主控随后：
+**暂停协议**：子代理遇到阻断性未知时，先把部分产物落盘（至少 ADR 候选比较与受影响章节骨架；Refiner 先做完本轮其余 Finding，回报“已完成映射 + 未处理清单”两段），再按上述格式追加条目并以 `CONFIRM_NEEDED` 收口返回。`CONFIRM_NEEDED` 是**回报里的约定，不是控制器状态**：这样的派发用 `--status COMPLETED` 登记——它已经把部分产物写进磁盘并交回了确认条目，那正是下一阶段要查的证据；用 `ABORTED` 收口会把已经落盘的草稿判成“什么都没发生”，主控接下来会被要求重做已经做完的那一半。主控随后：
 
 1. `sync-confirmations` 登记新条目，核对 stdout 计数；
 2. 向用户发出通知，必须含：确认文件的仓库相对路径、未答阻断条目表（CONF-ID | 问题 | 选项 | 推荐）、作答方式三条：
@@ -199,7 +197,7 @@ CONF-007
 
 ## 阶段 1：Context Loader
 
-只读理解现状，输出带证据路径的**系统上下文包**，落在运行目录并作为 `context-pack` 产物登记；不设计方案、不修改任何代码或仓库配置文件。
+只读理解现状，输出带证据路径的**系统上下文包**，落在运行目录并作为 `context-pack` 产物登记；不设计方案、不修改任何代码或仓库配置文件。上下文包由 `tech-context` 自己写进派发时给出的产物路径（它的 `Write` 只开给这一个文件），主控只 `write-artifact --file <该路径>` 登记，不代抄正文。
 
 输出至少覆盖：技术栈与版本、服务边界与上下游契约、核心领域模型与数据流、现有实现与可复用模式、技术债与瓶颈、规范与约定、约束与风险、待确认事项。每条关键结论标注证据路径或“未发现证据”，禁止臆造版本、容量和运行行为。
 
@@ -227,9 +225,9 @@ CONF-007
 
 ## 阶段 3：Critic
 
-一次性红队对抗审查（红队 + SRE + 成本审计视角），只读，不改写 TDD。Finding 用 `CRITIC-<NNN>` 登记，字段包含严重度（`Blocker/High/Medium/Low`）、影响范围、具体位置、问题与证据、修复建议。`Blocker`/`High` 默认 `must_fix`。
+一次性红队对抗审查（红队 + SRE + 成本审计视角），只读审查 TDD（`Write` 只用于落它自己的 Finding 报告），不改写 TDD。Finding 用 `CRITIC-<NNN>` 登记，字段包含严重度（`Blocker/High/Medium/Low`）、影响范围、具体位置、问题与证据、修复建议。`Blocker`/`High` 默认 `must_fix`。
 
-回报文件本身就是登记表：Critic 按 `@@FIND id=… sev=… loc=…` 一行一条写（格式见 `references/controller-contract.md`），同一份文件既登记为 `critic-findings` 产物，又直接喂给 `record-findings --from-file`——一次调用注册全部 Finding，主控不再逐条转抄，也不需要为每条 Finding 写一个注册脚本。注册结果里 `already_registered` 让重跑是安全的，`failed` 让分歧必须被看见。
+回报文件本身就是登记表：Critic 按 `@@FIND id=… sev=… loc=…` 一行一条写（格式见 `references/controller-contract.md`），并把它写进派发时给出的产物路径——同一份文件既登记为 `critic-findings` 产物，又直接喂给 `record-findings --from-file`，一次调用注册全部 Finding，主控不再逐条转抄，也不需要为每条 Finding 写一个注册脚本。注册结果里 `already_registered` 让重跑是安全的，`failed` 让分歧必须被看见。
 
 位置一栏写 TDD 里真实存在的章节号（如 `7.2`）：`locate` 靠它把行区间交给 Refiner。写成自由文本不会被拒，但那一轮就只能靠角色自己翻页找。
 
@@ -241,19 +239,19 @@ CONF-007
 
 只按当前轮 Finding 定向修复，不重新发起架构创作、不引入 Finding 之外的发挥、不删除问题伪造已修复。每个 Finding 必须有一条处置：`FIXED`（给位置与改法）、`REJECTED`（仅非 `must_fix`，需证据）或 `PENDING_CONFIRMATION`（仅非 `must_fix`，保留 `[需人工确认: xxx]`）。
 
-处置只经 `record-fix` 生效（一次 `record-fixes --from-file` 注册整份 Refiner 回报，逐条仍走同一套阶段与 `--scope` 校验，不是绕过）：主控按 Refiner 回报的映射登记，并把映射登记为 `refiner-map` 产物。派发前先按 Finding 所在章节聚类，逐条 `locate` 后把注入的区间随 `--scope` 登记（见“读取预算与按节注入”），Refiner 不再自己翻页找位置。**TDD “审查闭环记录”章节的两个台账由 `render-ledger` 生成，任何角色都不得手写**——这条已经不是交付前才发现的：`record-fix`/`record-fixes` 与登记 `refiner-map` 时就做镜像检测，正文里留有手抄行则处置入不了账，主控只能把这一处退回 Refiner 清掉冗余表，不要试图自己删了代登记（交付前人工 strip 两次正是这套机制要省掉的动作）；本轮处置登记完成后执行一次 `render-ledger`，再进入 Review——这样 Reviewer 读到的“审查闭环记录”章节与 `state.json` 一致，且“审查闭环记录”章节的刷新不会破坏终审与被审内容之间的绑定。
+处置只经 `record-fix` 生效（一次 `record-fixes --from-file` 注册整份 Refiner 回报，逐条仍走同一套阶段与 `--scope` 校验，不是绕过）：主控按 Refiner 回报的映射登记，并把映射登记为 `refiner-map` 产物。派发前先按 Finding 所在章节聚类，逐条 `locate` 后把注入的区间随 `--scope` 登记（见“读取预算与按节注入”），Refiner 不再自己翻页找位置；**Refiner 派发缺 `--scope` 会被 `record-agent` 直接拒绝**，整篇注入就写 `--scope all`，那是会被照整篇度量的合法声明而不是免检通道。**TDD “审查闭环记录”章节的两个台账由 `render-ledger` 生成，任何角色都不得手写**——这条已经不是交付前才发现的：`record-fix`/`record-fixes` 与登记 `refiner-map` 时就做镜像检测，生成台账标记之外出现**手抄的 Finding 表**（一行 `|` 开头的表格行，其最近的表头同时具备“Finding / CRITIC / REVIEW”一列与处置台账那组列名）即整条拒绝，不等交付前人工 strip。判据在表头不在字样：模板自带的 `评审人意见`、`检查清单` 这类人工表没有引用 Finding ID 的那一列，不是镜像，不要为了过门禁去删人家填好的表；`--from-file` 对整批只判一次，一份带镜像的回报回一个原因，不是每条 `failed` 各刷一遍同样的话。命中时主控只能把这一处退回 Refiner 清掉冗余表，不要自己删了代登记（交付前人工 strip 两次正是这套机制要省掉的动作）；本轮处置登记完成后执行一次 `render-ledger`，再进入 Review——这样 Reviewer 读到的“审查闭环记录”章节与 `state.json` 一致，且“审查闭环记录”章节的刷新不会破坏终审与被审内容之间的绑定。
 
 派发输入固定包含“已确认人工决策”槽（含上一 run 待落地条目）：Refiner 按已登记决策修订正文**不属于**“Finding 之外的发挥”；落点后回报章节与摘要，由主控 `mark-confirmation-applied` 登记——落点越出本轮 `--scope` 并集即被拒绝。新增 需人工确认 标记只允许用于“证据不足无法裁决”，必须先追加确认文件条目（`来源` 挂本轮 Finding）并在回报中给出处置不能进行的理由；不得以新增 marker 代替应做的 `FIXED`。命中阻断判据时按“人工确认循环”的收口协议执行：先完成本轮其余 Finding，再以 `CONFIRM_NEEDED` 收口。
 
 **一轮之内可以并行派发多个 Refiner 实例**：按 Finding 所在章节聚簇，每簇一个实例，实测同一份文档从 20+ 分钟降到 7 分钟（一轮串行改 15 条时，模型时间几乎全花在“读同一份文档的下一段”上）。聚簇与并行不放松任何校验：`--scope` 按**实例**分别声明，控制器取本轮并集，某簇的处置只能落在该簇被注入的章节里；一个实例的 `over_budget` 只说明那一簇太大，拆细即可，不必整轮回退成串行。
 
-**断连或 `ABORTED` 后不做整轮回放**：`show` 的 `findings.undisposed` 就是还欠处置的那批，重派只带这个子集及其章节区间；已 `FIXED` 并登记过的处置留在 `state.json` 与磁盘上，重跑一遍只会让 Reviewer 看到同一处改动被描述两次。收口为 `ABORTED` 的派发本身不留名额（见 `record-agent`），所以重派同一角色是允许的——被拒绝的是同一轮的第二个 Reviewer 实例。
+**断连或 `ABORTED` 后不做整轮回放**：`show` 的 `findings.undisposed` 就是还欠处置的那批，重派只带这个子集及其章节区间；已 `FIXED` 并登记过的处置留在 `state.json` 与磁盘上，重跑一遍只会让 Reviewer 看到同一处改动被描述两次。收口为 `ABORTED` 的派发本身不留名额（开窗与收口的语义见 `references/controller-contract.md` 的 `record-agent`），所以重派同一角色是允许的——被拒绝的是同一轮的第二个 Reviewer 实例。
 
 ## 阶段 5：Independent Reviewer
 
 `review_round` 表示**已执行的独立终审次数**，取值 1～5。一轮 = “独立 Reviewer 终审 →（`REQUEST_CHANGES` 时）Refiner 定向修订 → 重新派发全新 Reviewer”。5 是 `severity` 策略下的兜底而非目标，也是 `fixed` 策略下的固定上限。
 
-每轮必须由主控新建一个**全新实例**（同一轮内第二个 `tech-reviewer` 实例会被控制器拒绝），并收到：冻结 PRD、上下文包路径、当前 TDD 路径、既有 Finding 清单与处置、`references/check-standard.md`、本轮 `review_round`，以及本轮范围（`full`，或 `incremental` 与 `start-stage --to REVIEW` 返回的 `sections`/行区间）。Reviewer 只读，不改 TDD、不审代码实现、不调用 `code-review`、不把自身建议直接写入方案。
+每轮必须由主控新建一个**全新实例**（同一轮内第二个 `tech-reviewer` 实例会被控制器拒绝），并收到：冻结 PRD、上下文包路径、当前 TDD 路径、既有 Finding 清单与处置、`references/check-standard.md`、本轮 `review_round`、本轮报告的产物路径（运行目录内，报告由它自己写，`record-review --report` 吃的就是这一份），以及本轮范围（`full`，或 `incremental` 与 `start-stage --to REVIEW` 返回的 `sections`/行区间）。Reviewer 只读审查，不改 TDD、不写确认文件、不审代码实现、不调用 `code-review`、不把自身建议直接写入方案。
 
 审查范围：PRD 逐项追踪、模板与仓库事实一致性、图/接口/DDL/状态/正文/ADR 互相对齐、关键选型是否有备选与可执行迁移、Finding 是否逐项闭环。
 
@@ -283,7 +281,7 @@ PRD 当前版本中用户最新明确的方案和逻辑优先于旧 PRD、旧 TD
 
 1. 对每个无法派发的角色执行 `degrade --role <name> --reason <原因>`；
 2. 交付前执行 `render-ledger`——“运行元数据”台账会写明降级范围、未闭环的 `must_fix` 与交付门禁结论，不得手写该章节；
-3. 交付状态只能是 `PARTIAL_DEGRADED`，交付报告必须声明“独立审查门禁未满足，结论需人工复核”，不得写成“方案已完成并已通过独立评审”。
+3. 交付状态只能是 `PARTIAL_DEGRADED`——**且只在 `gate` 没有 `failures` 时成立**：降级把“独立审查”这一项从通过里拿掉，不拿掉其余任何一项检查，锚点缺失、台账与 `state.json` 不一致、marker 孤儿照旧是 `BLOCKED`（退出码 2）。把降级当成“反正是降级，门禁松一点”读，等于用一次不派发换来一条掩盖真实失败的通道。交付报告必须声明“独立审查门禁未满足，结论需人工复核”，不得写成“方案已完成并已通过独立评审”。
 
 ## 交付
 
@@ -299,9 +297,9 @@ PRD 当前版本中用户最新明确的方案和逻辑优先于旧 PRD、旧 TD
   --tdd-file "$feature_directory/technical-doc.md"
 ```
 
-`gate` 是确定性的，覆盖：输入可用性、五个阶段产物是否落盘、独立终审是否执行、**最后一轮终审是否覆盖当前内容**（终审之后改动手写章节的任何一个字都会被判 `BLOCKED`；“审查闭环记录”章节标记之间的生成台账不计入该比对）、**增量终审是否覆盖了自最后一次全量终审以来变过的每一节（`incremental-review-covers-changes`，变过却没进任何一轮范围即 `BLOCKED`）**、轮次是否越界、`must_fix` Finding 是否全部闭环、每个 Finding 是否有处置、**“审查闭环记录”章节生成台账是否存在（`ledger-blocks-present`）且与 `state.json` 逐字一致（`ledger-matches-state`，手改标记内内容、漏行、或在标记之外另抄一份台账都算失败）**、是否仍含模板占位符（分两类：**槽位字面量** `待定`/`待补充`/`后续补充`/`similar to`/`refer to`/`【填写】`/`【链接】` 是写给作者的指令，正文与代码围栏里都算未填写；**取值字面量** `TBD`/`TODO`/`YYYY-MM-DD` 与真实数据同形，只在手写正文的散文里算占位符，落在代码围栏或行内代码里按数据放行（DDL 里的 `'todo'` 状态枚举、`YYYY-MM-DD` 日期格式就是这一种）。“审查闭环记录”章节的生成台账块整体豁免：那是 `render-ledger` 从 `state.json` 回显的文字，为它报缺陷等于控制器判自己有罪，而块内的手写内容另由 `ledger-matches-state` 逐字核对，豁免不给出绕行通道；唯一允许的未知表达是 `[需人工确认: xxx]`，且该豁免只对**手写正文里**的 marker 生效）、必需章节锚点是否齐备、**按 `state.json` 的规模判定要求的章节是否齐备且有实质内容（`scale-chapters`，M/L 级用 `不涉及` 或短正文收缩即 `BLOCKED`）**、**`工程与模块` 是否走了探针选定的那条分支（`project-structure-branch`：绿地没有目录结构方案、照抄模板示例、仓库有 `.standard/` 却不点名规范文件，或既有实现缺模块表、有空格子、把本章推给“待初始化”，即 `BLOCKED`；失败详情会把探针实测的代码文件数与清单文件一起给出，质疑分支时先反驳这组数字**、代码围栏是否闭合且语言合法、变更运行是否已归档上一版、是否残留把上下文写回仓库 `AGENTS.md`/`CLAUDE.md` 的痕迹、正文 需人工确认 marker 与确认条目是否双向对得上（`markers-match-confirmations`，围栏内一律视为示例文本双向忽略；孤儿 marker、以及**已登记落地**的条目残留的 marker 即 `BLOCKED`，OPEN 与本 run 挂账条目的 marker 保留合法）、确认文件是否持久并与 `state.json` 逐条一致（`confirmations-file-persisted`）。另有**一项软检查**（`document-growth`，见上表 `gate` / `show` 行）只写进 `warnings`，永远不会让 `gate` 变成 `BLOCKED`。
+`gate` 是确定性的，覆盖：输入可用性、五个阶段产物是否落盘、独立终审是否执行、**最后一轮终审是否覆盖当前内容**（终审之后改动手写章节的任何一个字都会被判 `BLOCKED`；“审查闭环记录”章节标记之间的生成台账不计入该比对）、**增量终审是否覆盖了自最后一次全量终审以来变过的每一节（`incremental-review-covers-changes`，变过却没进任何一轮范围即 `BLOCKED`）**、轮次是否越界、`must_fix` Finding 是否全部闭环、每个 Finding 是否有处置、**“审查闭环记录”章节生成台账是否存在（`ledger-blocks-present`）且与 `state.json` 逐字一致（`ledger-matches-state`，手改标记内内容、漏行、或在标记之外另抄一份台账都算失败）**、是否仍含模板占位符（分两类：**槽位字面量**是写给作者的填写指令，正文与代码围栏里都算未填写——三个槽位词 `待定`/`待补充`/`后续补充`，加上任何残留的 `【…】` 方括号（模板把每个待填槽位写成 `【填写】`/`【链接】` 这样的方括号记号，所以判定按“还剩下方括号”而不是枚举括号里的字：逐字清单放过 `【填写/不涉及】`、`【通过/不通过/不涉及】`、`【服务名称】` 带着括号交付，而模板第 7 条早就说残留方括号正是要拦的东西；唯一算内容的是 PRD 变更标记 `【新增】`/`【修改】`/`【删除】`——「影响范围」要逐字引用它们，它们不是待填位）；**取值字面量** `TBD`/`TODO`/`YYYY-MM-DD`/`similar to`/`refer to` 与真实数据或普通英文散文同形，只在手写正文的散文里算占位符，落在代码围栏或行内代码里按数据放行（DDL 里的 `'todo'` 状态枚举、`YYYY-MM-DD` 日期格式、注释里的 refer to 都是这一种）。“审查闭环记录”章节的生成台账块整体豁免：那是 `render-ledger` 从 `state.json` 回显的文字，为它报缺陷等于控制器判自己有罪，而块内的手写内容另由 `ledger-matches-state` 逐字核对，豁免不给出绕行通道；唯一允许的未知表达是 `[需人工确认: xxx]`，且该豁免只对**手写正文里**的 marker 生效）、必需章节锚点是否齐备、**按 `state.json` 的规模判定要求的章节是否齐备且有实质内容（`scale-chapters`，M/L 级用 `不涉及` 或短正文收缩即 `BLOCKED`）**、**`工程与模块` 是否走了探针选定的那条分支（`project-structure-branch`：绿地没有目录结构方案、照抄模板示例、仓库有 `.standard/` 却不点名规范文件，或既有实现缺模块表、有空格子、把本章推给“待初始化”，即 `BLOCKED`；失败详情会把探针实测的代码文件数与清单文件一起给出，质疑分支时先反驳这组数字**、代码围栏是否闭合且语言合法、变更运行是否已归档上一版、是否残留把上下文写回仓库 `AGENTS.md`/`CLAUDE.md` 的痕迹、正文 需人工确认 marker 与确认条目是否双向对得上（`markers-match-confirmations`，围栏内一律视为示例文本双向忽略；孤儿 marker、以及**已登记落地**的条目残留的 marker 即 `BLOCKED`，OPEN 与本 run 挂账条目的 marker 保留合法）、确认文件是否持久并与 `state.json` 逐条一致（`confirmations-file-persisted`）。另有**一项软检查**（`document-growth`）只写进 `warnings`，永远不会让 `gate` 变成 `BLOCKED`：TDD 正文（不含生成台账）行数相对**冻结参照**（即 `write-artifact` 在 `draft` 落盘时留下的体积参照；`UPDATE` 取被重写的那一版）增长超过 8%，且触发本轮增长的 Finding 全是 Medium/Low 时给 WARN——「每轮往里灌水」没有别的代价信号，不进报告就等于没人看见。
 
-`gate` 退出码非 0 时不得写入“方案已完成”，应输出阻塞报告与缺口；退出码 0 且无降级才是“已通过独立终审”。`gate` 通过后再执行一次 `render-ledger`，让“审查闭环记录”章节的“交付门禁”行记录本次结论，然后才能进入 `CLOSED`；关闭后文档冻结，`render-ledger` 会被拒绝。图示一律使用模板规定的 Mermaid fenced code block，简单目录树和数据流用 ASCII art；不依赖任何外部渲染服务。
+`gate` 退出码非 0 时不得写入“方案已完成”，应输出阻塞报告与缺口；退出码 0 且无降级才是“已通过独立终审”，退出码 0 且已登记 `degrade` 才是 `PARTIAL_DEGRADED`——**状态推导只有这一条：`failures` 非空即 `BLOCKED`（退出码 2），无论是否降级**，`PARTIAL_DEGRADED` 只顶替“无降级 + 无失败”的 PASS 位置，从不顶替 `BLOCKED`。`gate` 通过后再执行一次 `render-ledger`，让“审查闭环记录”章节的“交付门禁”行记录本次结论，然后才能进入 `CLOSED`；关闭后文档冻结，`render-ledger` 会被拒绝。图示一律使用模板规定的 Mermaid fenced code block，简单目录树和数据流用 ASCII art；不依赖任何外部渲染服务。
 
 完成后输出交付报告：方案路径、运行目录、`input_status` 与缺口、需求变更三类数量及映射、旧/新 TDD 版本与归档文件、Critic 与 Reviewer 的 Finding 数量和最高严重度、`review_round` 与最终状态、各轮终审范围（全量/增量）与 `gate` 报告里的 `review_stop`、`finalize-inputs` 的规模判定（`scale`/`greenfield`/命中信号，连同 `basis` 给出的实测依据与由此选定的 `工程与模块` 分支）、`gate` 结果。仍需人工确认事项是**强制表格**（从 `confirmations` 与“人工确认台账”照抄，不得凭记忆重写）；`start-stage --to DELIVERY` 返回的 `pending_landing` 里的每一行都必须在表内——它们已经有答案而本 run 没有把它写进正文（付不起那一轮终审，或预算已耗尽），把“已答”当成“已闭环”而把它们从报告里抹掉，就是这套机制要防的那件事，落点栏写“本 run 未落地，落地回退需补一轮终审，下一次 run 承接”。非阻断待办同样是**强制表格**：`show` 的 `findings.open_non_blocking_followups` 与 `undisposed_blocking` 逐条照抄（ID、严重度、位置、处置与理由），前者是“按默认策略不改正文”的裁定记录、后者是“本 run 未闭环的阻断项”，空表也要写“无”——一份只报“已通过独立终审”、不报留下什么的报告，等于把下一场的调查成本重新卖一次。`gate` 的 `warnings` 同样**强制照抄**：`document-growth` 报出的正文行数、冻结参照行数、增幅百分比与参照种类（`draft` / `previous-version`）逐项写进报告，并说明增长由哪几条 Finding 换来；WARN 不改变门禁结论，把 WARN 省掉等于把“这一轮往文档里灌了多少没人要的字”这件事从记录里抹掉，没有任何 `BLOCKED` 会替你发现它漏了：
 

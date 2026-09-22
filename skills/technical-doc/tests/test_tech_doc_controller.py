@@ -126,6 +126,16 @@ def grown_body(lines: int) -> str:
 # refused while the Refiner can still fix it rather than at delivery.
 MIRROR_ROWS = "\n| Finding | 处置 |\n|---|---|\n| CRITIC-001 | 已补退避 |\n"
 
+# The template's own 评审人意见 skeleton: bookkeeping columns the generated ledger also uses
+# (处理结论/状态), under a header that names no Finding column.  This is where a human writes, so
+# the mirror predicate has to leave it standing -- it is the row shape the template hands out.
+REVIEWER_ROWS = (
+    "\n## 评审人意见\n\n"
+    "| 序号 | 意见 | 级别 | 提出人 | 负责人 | 处理结论 | 状态 |\n"
+    "|-----:|------|------|--------|--------|----------|------|\n"
+    "| 1 | 建议补 Runbook 链接 | 建议 | 张三 | 李四 | 已补 | 已关闭 |\n"
+)
+
 # TDD_BODY at M: 可观测设计 carries substance and the signalled chapter exists at all
 # (部署拓扑 stays in the body although M no longer demands it, matching a doc written for L).
 M_TDD_BODY = (
@@ -227,8 +237,27 @@ class TechDocControllerTests(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
         return path
 
-    def record(self, state: Path, role: str, session: str) -> None:
-        controller.record_agent(state, role, role, session, "sha256:input", "COMPLETED")
+    def draft_on_disk(self) -> Path:
+        """Leave the draft where the Architect leaves it, not only in the run directory.
+
+        A ``tech-refiner`` dispatch has to declare the sections it was handed, and the controller
+        measures that declaration against the output document, so standing in for the Architect
+        means writing the file the role would have written.
+        """
+        target = self.feature / "technical-doc.md"
+        if not target.is_file():
+            target.write_text(TDD_BODY, encoding="utf-8")
+        return target
+
+    def record(self, state: Path, role: str, session: str, scope: str = "") -> None:
+        """Log a COMPLETED dispatch, with the scope a ``tech-refiner`` dispatch must declare.
+
+        The default is ``all``: a helper stand-in really was handed the whole document, and
+        declaring that is what the controller now asks for.  A test that checks the section-window
+        guard passes the list it means to be limited to.
+        """
+        declared = scope or ("all" if role == "tech-refiner" else "")
+        controller.record_agent(state, role, role, session, "sha256:input", "COMPLETED", declared)
 
     def artifact(self, state: Path, kind: str, text: str = "") -> dict[str, Any]:
         origin = self.repo / f"tmp-{kind}.md"
@@ -250,15 +279,16 @@ class TechDocControllerTests(unittest.TestCase):
         controller.start_stage(state, "ARCHITECT")
         self.record(state, "tech-architect", "s-arch")
 
-    def to_refiner(self, state: Path, prd_changes: str | None = None) -> None:
+    def to_refiner(self, state: Path, prd_changes: str | None = None, scope: str = "all") -> None:
         """Drive INPUT -> REFINER with every delegated agent and artifact logged."""
         self.to_architect(state, prd_changes)
         self.artifact(state, "draft")
+        self.draft_on_disk()
         controller.start_stage(state, "CRITIC")
         self.record(state, "tech-critic", "s-critic")
         self.artifact(state, "critic-findings")
         controller.start_stage(state, "REFINER")
-        self.record(state, "tech-refiner", "s-refine")
+        self.record(state, "tech-refiner", "s-refine", scope)
         self.artifact(state, "refiner-map")
 
     def to_review(self, state: Path, prd_changes: str | None = None) -> None:
@@ -466,6 +496,43 @@ class TechDocControllerTests(unittest.TestCase):
         with self.assertRaises(controller.ControllerError) as ctx:
             controller.record_fix(state, "CRITIC-001", "FIXED", "4.2", "改法")
         self.assertIn("REFINER", str(ctx.exception))
+
+    def test_an_older_undisposed_finding_licenses_the_way_back(self) -> None:
+        """The round back from REVIEW is keyed on the ledger, not on who raised the finding.
+
+        One CRITIC finding left undisposed used to strand the run in REVIEW: ``--to DELIVERY``
+        refused the unfinished ledger, ``--to REFINER`` refused it because this round's reviewer
+        had raised nothing, and ``record-fix`` refused it because the stage was not REFINER.
+        """
+        state = Path(controller.init_run(self.repo, self.feature, "run-6c"))
+        self.to_refiner(state)
+        controller.record_finding(state, "CRITIC", "CRITIC-001", "High", "4.2", "缺退避", None, 0)
+        controller.record_finding(state, "CRITIC", "CRITIC-002", "Medium", "6.1", "缺索引", None, 0)
+        controller.record_fix(state, "CRITIC-001", "FIXED", "4.2", "补退避")
+        controller.start_stage(state, "REVIEW")
+        self.write_tdd()
+        self.approve_round(state)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(state, "DELIVERY")
+        self.assertIn("CRITIC-002", str(ctx.exception))
+        self.assertIn("start-stage --to REFINER", str(ctx.exception))
+        controller.start_stage(state, "REFINER")
+        controller.record_fix(state, "CRITIC-002", "FIXED", "6.1", "补索引")
+
+    def test_a_round_that_answered_nothing_has_no_refiner_round_to_open(self) -> None:
+        """The other half: a clean ledger may not spend a round, so the dead end is not reopened."""
+        state = Path(controller.init_run(self.repo, self.feature, "run-6d"))
+        self.write_tdd()
+        self.to_review(state)
+        self.record(state, "tech-reviewer", "s-review-1")
+        report = self.artifact(state, "review-report", "第 1 轮报告：无遗留项。\n")
+        controller.record_review(
+            state, "APPROVE", report["path"], self.feature / "technical-doc.md", "s-review-1"
+        )
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(state, "REFINER")
+        self.assertIn("nothing for a Refiner round to answer", str(ctx.exception))
+        self.assertIn("--to REFINER", str(ctx.exception))
 
     # ------------------------------------------------------- polish follow-ups
 
@@ -777,6 +844,26 @@ class TechDocControllerTests(unittest.TestCase):
         )
         self.assertIn("no-template-placeholders", result["failures"])
 
+    def test_a_template_bracket_left_in_the_body_is_an_unfilled_slot(self) -> None:
+        """The template marks what to fill as 【…】, so a leftover bracket is a leftover blank.
+
+        The scanner used to know three slot words only, which meant every 【通过/不通过】 cell a
+        drafter copied out of the skeleton sailed through the gate and reached a reviewer.
+        """
+        _, result = self.gate_for(
+            "run-13f",
+            TDD_BODY + "\n## 检查清单\n| 检查项 | 结论 |\n|---|---|\n| 范围明确 | 【通过/不通过】 |\n",
+        )
+        self.assertIn("no-template-placeholders", result["failures"])
+
+    def test_a_change_marker_is_content_not_a_slot(self) -> None:
+        """【新增】/【修改】/【删除】 are the answer a change run writes, not a blank to fill."""
+        _, result = self.gate_for(
+            "run-13g",
+            TDD_BODY + "\n## 变更历史\n| 版本 | 变更 |\n|---|---|\n| 1.1 | 【修改】4.2 补退避 |\n",
+        )
+        self.assertIn("no-template-placeholders", result["passed"], result["failures"])
+
     def test_text_the_ledger_echoed_from_state_is_not_a_placeholder(self) -> None:
         """render-ledger copies state.json into chapter 16, so the gate cannot fail on that copy.
 
@@ -853,6 +940,30 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertEqual(result["failures"], [])
         controller.start_stage(state, "DELIVERY")
         controller.start_stage(state, "CLOSED")
+
+    def test_degradation_never_overwrites_a_real_failure(self) -> None:
+        """``PARTIAL_DEGRADED`` renames a *clean* gate; a degraded run with a failed check is BLOCKED.
+
+        The status used to be derived from ``degraded`` alone, so a run that both lost its
+        independent reviewer and left a chapter unfilled closed at exit code 0 -- the one path
+        where the skill's 退出码非 0 即不得宣称完成 rule did not hold.
+        """
+        state = Path(controller.init_run(self.repo, self.feature, "run-17b"))
+        tdd = self.feature / "technical-doc.md"
+        self.to_review(state)
+        self.write_tdd(TDD_BODY.replace("审查闭环记录", "其它章节"))
+        self.approve_round(state)
+        controller.degrade(state, "tech-reviewer", "宿主不支持具名子代理，已降级为串行终审")
+        self.render(state)
+        result = controller.gate(state, tdd)
+        self.assertTrue(result["degradations"])
+        self.assertIn("template-anchors", result["failures"])
+        self.assertEqual(result["status"], "BLOCKED", result["failures"])
+        controller.start_stage(state, "DELIVERY")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(state, "CLOSED")
+        self.assertIn("gate has not passed", str(ctx.exception))
+        self.assertEqual(2, self.cli("gate", "--tdd-file", str(tdd), state=state).returncode)
 
     # ---------------------------------------------------------- generated ledger
 
@@ -1013,6 +1124,16 @@ class TechDocControllerTests(unittest.TestCase):
             controller.record_fix(state, "CRITIC-001", "FIXED", "9.3", "补 30 秒退避窗口")
         self.assertIn("hand-written Finding table", str(ctx.exception))
 
+    def test_the_templates_reviewer_opinion_table_is_not_a_mirror(self) -> None:
+        """处理结论/状态 belong to the ledger too; a Finding column is what tells them apart.
+
+        The scanner used to treat any bookkeeping column as the ledger's own signature, which
+        refused the very table the template hands the human reviewer to fill in.
+        """
+        _, result = self.gate_for("run-mirror-4", TDD_BODY + REVIEWER_ROWS)
+        self.assertIn("ledger-matches-state", result["passed"], result["failures"])
+        self.assertEqual(result["status"], "PASS", result["failures"])
+
     def test_the_batch_refuses_a_copied_ledger_once_not_once_per_item(self) -> None:
         state = Path(controller.init_run(self.repo, self.feature, "run-mirror-3"))
         self.write_tdd()
@@ -1133,7 +1254,27 @@ class TechDocControllerTests(unittest.TestCase):
         )
 
     def test_a_run_with_no_reference_version_says_so_instead_of_reporting_zero_growth(self) -> None:
-        _state, report = self.gate_for("run-grow-7")
+        """正文晚于 ``--to CRITIC`` 才落盘的一场 run 没有可比数字，只能明说，不能报 0%。
+
+        参照值只有两个冻结点：``write-artifact --kind draft`` 和 ``start-stage --to CRITIC``。
+        这一场两处都落空（初稿先回报、正文后落盘），而 ``tech-refiner`` 的 ``--scope`` 声明是
+        正文第一次存在的那一刻 —— 它测量读取窗口，不补记体积参照。
+        """
+        state = Path(controller.init_run(self.repo, self.feature, "run-grow-7"))
+        self.to_architect(state)
+        self.artifact(state, "draft")
+        controller.start_stage(state, "CRITIC")
+        self.assertIsNone(json.loads(state.read_text(encoding="utf-8"))["document_growth"])
+        self.draft_on_disk()
+        self.record(state, "tech-critic", "s-critic")
+        self.artifact(state, "critic-findings")
+        controller.start_stage(state, "REFINER")
+        self.record(state, "tech-refiner", "s-refine")
+        self.artifact(state, "refiner-map")
+        controller.start_stage(state, "REVIEW")
+        self.approve_round(state)
+        self.render(state)
+        report = controller.gate(state, self.feature / "technical-doc.md")
         check = self.growth_check(report)
         self.assertFalse(check["warn"])
         self.assertIn("no reference version", str(check["detail"]))
@@ -1253,6 +1394,10 @@ class TechDocControllerTests(unittest.TestCase):
             self.record(state, role, f"s-{stage.lower()}")
             expect(f"--kind {kind}")
             self.artifact(state, kind)
+            if kind == "draft":
+                # the Architect's real output is the document itself, and the next role's
+                # --scope declaration is measured against it
+                self.draft_on_disk()
         expect("record-findings")
         controller.record_finding(
             state, "CRITIC", "CRITIC-001", "Blocker", "4.2 主流程", "无退避", None, 0
@@ -1787,10 +1932,67 @@ class TechDocControllerTests(unittest.TestCase):
         )
         self.assertEqual(closed["budget"]["sections"], ["7.2"])
 
+    def test_a_refiner_dispatch_has_to_name_what_it_was_handed(self) -> None:
+        """The window guard measures against a declaration, so the editor has to make one.
+
+        Both calls are covered: opening a window with no ``--scope`` is refused, not just closing
+        it, so the requirement cannot be met by an empty DISPATCHED entry.
+        """
+        state = Path(controller.init_run(self.repo, self.feature, "run-55b"))
+        self.write_tdd(DOC_BODY)
+        for status in ("DISPATCHED", "COMPLETED"):
+            with self.subTest(status=status):
+                with self.assertRaises(controller.ControllerError) as ctx:
+                    controller.record_agent(
+                        state, "tech-refiner", "tech-refiner", f"s-{status}", "sha256:in", status
+                    )
+                self.assertIn("needs --scope for a tech-refiner", str(ctx.exception))
+                self.assertIn("--scope all", str(ctx.exception))
+        # The other roles keep their exemption: the architect runs before there is a document,
+        # and a read-only reviewer's window is not what a disposition is measured against.
+        controller.record_agent(
+            state, "tech-architect", "tech-architect", "s-arch", "sha256:in", "COMPLETED"
+        )
+
+    def test_scope_all_is_measured_and_not_excused(self) -> None:
+        """``all`` is a declaration of the whole read, priced like one instead of waved through."""
+        state = Path(controller.init_run(self.repo, self.feature, "run-55c", 1000))
+        self.write_tdd(DOC_BODY)
+        entry = controller.record_agent(
+            state, "tech-refiner", "tech-refiner", "s-refine-all", "sha256:in", "COMPLETED", "all"
+        )
+        index = self.cached_index(state)
+        self.assertEqual(entry["budget"]["sections"], [item["key"] for item in index["sections"]])
+        self.assertEqual(
+            entry["budget"]["read_chars"], sum(item["chars"] for item in index["sections"])
+        )
+        self.assertTrue(entry["budget"]["over_budget"], entry["budget"])
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_agent(
+                state, "tech-refiner", "tech-refiner", "s-refine-mix", "sha256:in",
+                "COMPLETED", "all, 7.2",
+            )
+        self.assertIn("cannot mix", str(ctx.exception))
+
+    def test_an_aborted_dispatch_does_not_license_someone_elses_edit(self) -> None:
+        """A window that came back with nothing in it contributes no sections to the union."""
+        state = Path(controller.init_run(self.repo, self.feature, "run-55d"))
+        self.write_tdd(DOC_BODY)
+        self.to_refiner(state, scope="7.2")
+        controller.record_agent(
+            state, "tech-refiner", "tech-refiner", "s-lost", "sha256:in", "DISPATCHED", "15"
+        )
+        controller.record_agent(state, "tech-refiner", "tech-refiner", "s-lost", "", "ABORTED")
+        controller.record_finding(state, "CRITIC", "CRITIC-001", "Medium", "15", "证据", None, 0)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_fix(state, "CRITIC-001", "FIXED", "15", "断线那轮没读到正文")
+        self.assertIn("outside every --scope", str(ctx.exception))
+
     def test_a_scoped_refiner_may_only_dispose_of_what_it_was_handed(self) -> None:
         state = Path(controller.init_run(self.repo, self.feature, "run-56"))
         self.write_tdd(DOC_BODY)
-        self.to_refiner(state)
+        # the round opens on a narrow window on purpose: what it may touch is what it was handed
+        self.to_refiner(state, scope="3.4")
         controller.record_agent(
             state, "tech-refiner", "tech-refiner", "s-refine-2", "sha256:in", "COMPLETED", "7.2"
         )
@@ -2448,7 +2650,8 @@ class ConfirmationLoopTests(unittest.TestCase):
         return path
 
     def record(self, state: Path, role: str, session: str, scope: str = "") -> None:
-        controller.record_agent(state, role, role, session, "sha256:input", "COMPLETED", scope)
+        declared = scope or ("all" if role == "tech-refiner" else "")
+        controller.record_agent(state, role, role, session, "sha256:input", "COMPLETED", declared)
 
     def artifact(self, state: Path, kind: str, text: str = EVIDENCE) -> dict[str, Any]:
         origin = self.repo / f"tmp-{kind}.md"
@@ -2471,12 +2674,12 @@ class ConfirmationLoopTests(unittest.TestCase):
         self.artifact(state, "draft")
         return state
 
-    def to_refiner(self, state: Path) -> None:
+    def to_refiner(self, state: Path, scope: str = "all") -> None:
         controller.start_stage(state, "CRITIC")
         self.record(state, "tech-critic", "s-critic")
         self.artifact(state, "critic-findings")
         controller.start_stage(state, "REFINER")
-        self.record(state, "tech-refiner", "s-refine")
+        self.record(state, "tech-refiner", "s-refine", scope)
         self.artifact(state, "refiner-map")
 
     def approve_round(self, state: Path, session: str = "s-review-1") -> None:
@@ -2785,7 +2988,8 @@ class ConfirmationLoopTests(unittest.TestCase):
             "来源: ARCHITECT\n阻断: false\n位置: 3.4\n问题: 值班群归属\n推荐: 订单群\n决定: \n"
         )
         self.sync(state)
-        self.to_refiner(state)
+        # the Refiner of this stage is handed 3.4 only: the scope it declares bounds where it may land
+        self.to_refiner(state, scope="3.4")
         # answered while the Refiner is on stage -- an OPEN entry does not stop an audit
         # hand-off, only a settled one that never landed does
         conf = self.feature / "confirmation-log.md"
@@ -2794,7 +2998,7 @@ class ConfirmationLoopTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.sync(state)
-        # this stage's Refiner dispatch was handed 3.4 only; 15 is outside the window
+        # a second scoped dispatch in the same stage: the window is their union, still only 3.4
         self.record(state, "tech-refiner", "s-refine-scoped", scope="3.4")
         with self.assertRaises(controller.ControllerError) as ctx:
             controller.mark_confirmation_applied(state, "CONF-001", "15", "改到了范围外")

@@ -94,16 +94,43 @@ TRACE_SOURCES = {"product_requirements", "technical_design", "release_plan", "us
 # P0-1: Task state machine — the controller enforces valid transitions.
 # Terminal states: PASS, BLOCKED, SUPERSEDED (no outgoing edges).
 # FAILED → RUNNING enables bounded retry (retry budget tracked in Task Ledger).
+#
+# RUNNING → PENDING is the *abandon* edge: the dispatch ended without a verdict
+# (the Implementer session died, the host dropped the connection) and the task
+# itself was never judged. Without it the only ways out of RUNNING were FAILED
+# and BLOCKED, so an interruption had to be recorded as a task failure it was
+# not, and a run that lost a few sessions to transport noise burned the whole
+# dispatch budget on attempts that never produced anything (see
+# ``update_task``'s abandon branch). Because the edge costs no dispatch budget,
+# it carries its own cap -- MAX_TASK_ABANDONS -- or "the session never returned"
+# would be an unlimited retry door (see the constant's comment).
 TASK_STATE_TRANSITIONS: dict[str, set[str]] = {
     "PENDING":    {"READY", "SUPERSEDED"},
     "READY":      {"RUNNING", "BLOCKED", "SUPERSEDED"},
-    "RUNNING":    {"VALIDATING", "FAILED", "BLOCKED"},
+    "RUNNING":    {"VALIDATING", "FAILED", "BLOCKED", "PENDING"},
     "VALIDATING": {"PASS", "FAILED", "BLOCKED"},
     "FAILED":     {"RUNNING", "SUPERSEDED"},
     "PASS":       set(),
     "BLOCKED":    set(),
     "SUPERSEDED": set(),
 }
+
+# An abandon has to say why. The edge exists for a dispatch that never returned;
+# requiring a reason is what keeps it from becoming the cheap way to skip a
+# failed verdict's record-failure entry -- the reason lands in the attempt log
+# and in the ledger, so a run that abandoned its way past a real failure is
+# readable as one in the delivery report.
+ABANDON_REASON_MIN = 8
+
+# A reason alone is self-reported, and abandon is the one transition that costs
+# no budget: without a cap, a loop of "dispatch → the Implementer really failed
+# → declare the session lost → abandon → re-dispatch" evades both
+# MAX_TASK_ATTEMPTS and the fingerprint budget forever (abandon returns the task
+# to PENDING, and dispatches from PENDING are unbudgeted by design). So an
+# abandon *is* charged — just not against the dispatch budget, against its own:
+# the 4th abandon of one task raises, and the honest exits from there are
+# settle FAILED (with a fingerprint) or BLOCKED.
+MAX_TASK_ABANDONS = 3
 
 # HIGH-1: SKILL.md budgets become mechanical enforcement instead of prose.
 # MAX_FINGERPRINT_ATTEMPTS counts record-failure occurrences of one error
@@ -372,6 +399,22 @@ def _read_document_text(
     return text, note
 
 
+# A frozen document must not still be a template, but "looks like a template" has to
+# be narrower than "is a lone angle-bracket line". ``<[^>]+>`` matched any single-line
+# HTML tag, so a PRD carrying ``<img src="diagram.png">`` or a ``<br>`` between
+# paragraphs was refused as an unfilled placeholder -- the run could not even start.
+# An angle-bracket line now counts only when it *says* it is waiting for an author:
+# the inner text carries a fill-in word, and no ``=`` (which is what turns it into an
+# HTML attribute list rather than a slot).
+_FILL_IN_HINT = (
+    r"(?:待填写|待补充|待定|填写|补充|placeholder|todo|tbd|your[-_ ]|xxx|\.\.\.)"
+)
+PLACEHOLDER_LINE = re.compile(
+    rf"^(?:TODO|TBD|待填写|待补充|<[^>=]*?{_FILL_IN_HINT}[^>]*>)$",
+    re.IGNORECASE,
+)
+
+
 def _document_snapshot(
     path: Path, label: str, *, allow_lossy: bool = False
 ) -> dict[str, Any]:
@@ -381,8 +424,7 @@ def _document_snapshot(
     meaningful = [line.strip() for line in text.splitlines() if line.strip() and line.strip() not in {"---", "```"}]
     if len("".join(meaningful)) < 20:
         raise ControllerError(f"{label} has no substantive content: {path}")
-    placeholder = re.compile(r"^(?:TODO|TBD|待填写|待补充|<[^>]+>)$", re.IGNORECASE)
-    if any(placeholder.fullmatch(line) for line in meaningful):
+    if any(PLACEHOLDER_LINE.fullmatch(line) for line in meaningful):
         raise ControllerError(f"{label} contains a template or placeholder line: {path}")
     stat = path.stat()
     snapshot: dict[str, Any] = {
@@ -584,16 +626,30 @@ def record_task(
     _atomic_json(path, state)
 
 
-def update_task(state_path: str | Path, task_id: str, status: str) -> dict[str, Any]:
+def update_task(
+    state_path: str | Path, task_id: str, status: str, reason: str | None = None
+) -> dict[str, Any]:
     """Transition a task to a new status, enforcing TASK_STATE_TRANSITIONS (P0-1).
 
     Valid transitions:
         PENDING    → READY | SUPERSEDED
         READY      → RUNNING | BLOCKED | SUPERSEDED
-        RUNNING    → VALIDATING | FAILED | BLOCKED
+        RUNNING    → VALIDATING | FAILED | BLOCKED | PENDING (abandon)
         VALIDATING → PASS | FAILED | BLOCKED
         FAILED     → RUNNING (retry) | SUPERSEDED
         PASS / BLOCKED / SUPERSEDED  are terminal.
+
+    ``RUNNING → PENDING`` is the abandon edge and is the only one that takes a
+    ``reason``: it hands the task back to the scheduler after a dispatch that
+    produced no verdict at all. It is deliberately *not* a way to retry a failed
+    task -- a failure has a fingerprint and goes through ``settle-task FAILED``
+    plus ``record-failure``, which is what the retry budget counts. Abandoning
+    undecided work costs nothing against ``MAX_TASK_ATTEMPTS`` (the attempt it
+    voids is decremented) but is charged against its own per-task budget
+    ``MAX_TASK_ABANDONS``, counted in ``abandoned_dispatches`` and stamped on
+    the attempt log, so an uninterrupted run leans on it freely while an
+    "abandon forever" loop hits a hard refusal and must settle FAILED or
+    BLOCKED instead.
     """
     path, state = load_state(state_path)
     task = _require_task(state, task_id)
@@ -604,8 +660,35 @@ def update_task(state_path: str | Path, task_id: str, status: str) -> dict[str, 
             f"invalid transition for {task_id}: {current} → {status}; "
             f"allowed: {sorted(allowed) if allowed else '(terminal state, no transitions)'}"
         )
+    now = _now()
+    if current == "RUNNING" and status == "PENDING":
+        why = (reason or "").strip()
+        if len(why) < ABANDON_REASON_MIN:
+            raise ControllerError(
+                f"abandoning {task_id} requires --reason (at least {ABANDON_REASON_MIN} "
+                "characters): the reason is what separates a dispatch that never returned "
+                "from a failure being hidden; a failed task goes through settle-task FAILED "
+                "with an error fingerprint instead"
+            )
+        if int(task.get("abandoned_dispatches", 0)) >= MAX_TASK_ABANDONS:
+            raise ControllerError(
+                f"cannot abandon {task_id}: {task['abandoned_dispatches']} dispatches "
+                f"already abandoned (MAX_TASK_ABANDONS={MAX_TASK_ABANDONS}). A fourth "
+                "'the session never returned' is not transport noise any more — settle "
+                "the task FAILED with an error fingerprint (e.g. "
+                "'dispatch-lost-repeatedly::<task-id>') and record-failure, or settle "
+                "it BLOCKED and escalate to step 17."
+            )
+        task["abandoned_dispatches"] = int(task.get("abandoned_dispatches", 0)) + 1
+        task["attempts"] = max(0, int(task.get("attempts", 0)) - 1)
+        if task.get("attempts_log"):
+            task["attempts_log"][-1].update({
+                "abandoned": True,
+                "abandoned_reason": why[:2000],
+                "abandoned_at": now,
+            })
     task["status"] = status
-    task["updated_at"] = _now()
+    task["updated_at"] = now
     _atomic_json(path, state)
     return task
 
@@ -1112,14 +1195,18 @@ def freeze_review(state_path: str | Path) -> dict[str, Any]:
     return snapshot
 
 
-def record_failure(
-    state_path: str | Path,
+def _failure_event(
+    state: dict[str, Any],
     failure_scope: str,
-    impacted_task_ids: list[str],
+    impacted_task_ids: Iterable[str],
     root_cause: str,
     error_fingerprint: str,
 ) -> dict[str, Any]:
-    path, state = load_state(state_path)
+    """Validate one failure and build its event without writing (shared by both faces).
+
+    Split out so ``record-failures --from-file`` runs the *same* rules per entry as
+    the one-at-a-time command instead of a second, softer copy of them.
+    """
     if failure_scope not in {"task", "overall"}:
         raise ControllerError("failure-scope must be task or overall")
     if root_cause not in ROOT_CAUSES:
@@ -1173,9 +1260,84 @@ def record_failure(
         "resolution": resolution,
         "recorded_at": _now(),
     }
+    return event
+
+
+def record_failure(
+    state_path: str | Path,
+    failure_scope: str,
+    impacted_task_ids: list[str],
+    root_cause: str,
+    error_fingerprint: str,
+) -> dict[str, Any]:
+    path, state = load_state(state_path)
+    event = _failure_event(state, failure_scope, impacted_task_ids, root_cause, error_fingerprint)
     state["failures"].append(event)
     _atomic_json(path, state)
     return event
+
+
+def _batch_entries(file_path: str | Path, kind: str) -> list[dict[str, Any]]:
+    """Read a batch file: ``{"<kind>": [...]}``, a bare list, or one object.
+
+    Anything else is an error rather than an empty batch -- a batch face that
+    silently registers nothing is worse than one that refuses, because the run
+    moves on believing the evidence is on disk.
+    """
+    source = Path(file_path).expanduser()
+    if not source.is_file():
+        raise ControllerError(f"--from-file is not a readable file: {source}")
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControllerError(f"--from-file is not valid JSON: {source}: {exc}") from exc
+    if isinstance(payload, dict):
+        entries = payload.get(kind, [payload])
+    elif isinstance(payload, list):
+        entries = payload
+    else:
+        raise ControllerError(f"--from-file must hold a list of {kind} or an object with a '{kind}' key")
+    if not isinstance(entries, list) or not all(isinstance(item, dict) for item in entries):
+        raise ControllerError(f"--from-file '{kind}' must be a list of objects")
+    if not entries:
+        raise ControllerError(f"--from-file holds no {kind}; nothing to register")
+    return entries
+
+
+def record_failures_from_file(state_path: str | Path, file_path: str | Path) -> dict[str, Any]:
+    """Register every failure in one file, in one state write.
+
+    Step 10 can produce several failures for one broken verification round, and
+    each used to be a round-trip that re-read and re-wrote the whole state. The
+    entries still go through ``_failure_event`` one at a time -- including the
+    fingerprint-occurrence counting, which has to see the entries already queued
+    in this batch, otherwise two registrations of the same fingerprint would each
+    read as the first occurrence and the retry budget would not move.
+    """
+    entries = _batch_entries(file_path, "failures")
+    path, state = load_state(state_path)
+    staged: list[dict[str, Any]] = []
+    for index, entry in enumerate(entries, start=1):
+        try:
+            event = _failure_event(
+                state,
+                str(entry.get("failure_scope", "")),
+                entry.get("impacted_task_ids") or [],
+                str(entry.get("root_cause", "")),
+                str(entry.get("error_fingerprint", "")),
+            )
+        except ControllerError as exc:
+            raise ControllerError(f"failures[{index}] rejected: {exc}") from exc
+        # staged first, persisted after the whole batch validates: a partial
+        # failure ledger would misreport the retry budget it just consumed
+        state["failures"].append(event)
+        staged.append(event)
+    _atomic_json(path, state)
+    return {
+        "registered": len(staged),
+        "failures_total": len(state["failures"]),
+        "dispositions": [item["disposition"] for item in staged],
+    }
 
 
 def _resolve_within_repo(root: Path, value: str, *, what: str) -> Path:
@@ -1203,8 +1365,49 @@ def record_validation(
     not_run_reason: str | None = None,
     started_at: str | None = None,
     finished_at: str | None = None,
+    evidence_file: str | None = None,
 ) -> dict[str, Any]:
-    """Persist one validation record so a PASS claim has a re-checkable provenance (KW1-b).
+    """Persist one validation record so a PASS claim has a re-checkable provenance (KW1-b)."""
+    path, state = load_state(state_path)
+    root = _require_repo_root(state["repository"]["root"])
+    record = _validation_record(
+        state, root, scope=scope, name=name, command=command, cwd=cwd,
+        exit_code=exit_code, result=result, task_id=task_id, evidence=evidence,
+        evidence_file=evidence_file,
+        not_run_reason=not_run_reason, started_at=started_at, finished_at=finished_at,
+    )
+    state["validations"].append(record)
+    _atomic_json(path, state)
+    return {
+        "name": record["name"],
+        "scope": scope,
+        "task_id": task_id,
+        "result": result,
+        "exit_code": exit_code,
+        "diff_digest": record["diff_digest"][:12],
+        "validations_total": len(state["validations"]),
+    }
+
+
+def _validation_record(
+    state: dict[str, Any],
+    root: Path,
+    *,
+    scope: str,
+    name: str,
+    command: str,
+    cwd: str,
+    exit_code: int | None,
+    result: str,
+    task_id: str | None = None,
+    evidence: str | None = None,
+    evidence_file: str | None = None,
+    not_run_reason: str | None = None,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate one validation entry and build its record without writing.
 
     Before this existed, ``SKILL.md`` step 12 asked for full-suite tests, compile,
     lint, contract and migration checks, and the controller stored none of it:
@@ -1217,13 +1420,15 @@ def record_validation(
       * ``NOT_RUN`` requires a reason and must not carry an exit code.
     Every record is stamped with the working-tree digest it was collected
     against, which is what lets ``gate`` refuse evidence that predates the diff.
+
+    ``snapshot`` lets a batch reuse one ``dirty_snapshot`` instead of asking git
+    the same question once per entry; the tree does not change mid-batch, so the
+    digest is the same one the single-record face would have produced.
     """
     if scope not in VALIDATION_SCOPES:
         raise ControllerError(f"validation scope must be one of {sorted(VALIDATION_SCOPES)}")
     if result not in VALIDATION_RESULTS:
         raise ControllerError(f"validation result must be one of {sorted(VALIDATION_RESULTS)}")
-    path, state = load_state(state_path)
-    root = _require_repo_root(state["repository"]["root"])
     if scope == "task":
         if not task_id:
             raise ControllerError("scope=task requires --task-id")
@@ -1234,6 +1439,15 @@ def record_validation(
         raise ControllerError("validation --name is required")
     if not command.strip():
         raise ControllerError("validation --command is required (the exact command line)")
+    if evidence_file:
+        log = Path(evidence_file).expanduser().resolve(strict=False)
+        if not log.is_file():
+            raise ControllerError(f"evidence file is not a readable file: {log}")
+        payload = log.read_bytes()
+        evidence = (evidence or "") + (
+            f"file://{log} ({len(payload)} bytes, "
+            "sha256:" + hashlib.sha256(payload).hexdigest()[:16] + ")"
+        )
 
     if result == "PASS":
         if exit_code != 0:
@@ -1258,7 +1472,7 @@ def record_validation(
         if not (not_run_reason or "").strip():
             raise ControllerError(f"NOT_RUN requires a non-empty --not-run-reason for {name}")
 
-    current = dirty_snapshot(root)
+    current = snapshot if snapshot is not None else dirty_snapshot(root)
     record: dict[str, Any] = {
         "scope": scope,
         "name": name.strip(),
@@ -1285,16 +1499,55 @@ def record_validation(
                 "point --evidence-file at the log instead"
             )
         record["evidence"] = evidence.strip()
-    state["validations"].append(record)
+    return record
+
+
+def record_validations_from_file(state_path: str | Path, file_path: str | Path) -> dict[str, Any]:
+    """Register every validation in one file, in one state write.
+
+    Step 12 asks for a full sweep -- tests, compile, lint, contract, migration,
+    build -- and each item used to be its own round-trip over the whole state
+    file plus its own ``git status``. The entries still go through
+    ``_validation_record`` one at a time, so the batch is not a looser door: one
+    bad entry names itself and rejects the whole file, because a half-recorded
+    sweep is exactly what lets "the tests passed" rest on nothing.
+    """
+    entries = _batch_entries(file_path, "validations")
+    path, state = load_state(state_path)
+    root = _require_repo_root(state["repository"]["root"])
+    # One snapshot for the batch: the working tree cannot change between entries
+    # of a sweep, and every record has to carry the same digest the single-record
+    # face would have stamped.
+    snapshot = dirty_snapshot(root)
+    staged: list[dict[str, Any]] = []
+    for index, entry in enumerate(entries, start=1):
+        try:
+            record = _validation_record(
+                state, root,
+                scope=str(entry.get("scope", "")),
+                name=str(entry.get("name", "")),
+                command=str(entry.get("command", "")),
+                cwd=str(entry.get("cwd", "")),
+                exit_code=entry.get("exit_code"),
+                result=str(entry.get("result", "")),
+                task_id=entry.get("task_id"),
+                evidence=entry.get("evidence"),
+                evidence_file=entry.get("evidence_file"),
+                not_run_reason=entry.get("not_run_reason"),
+                started_at=entry.get("started_at"),
+                finished_at=entry.get("finished_at"),
+                snapshot=snapshot,
+            )
+        except ControllerError as exc:
+            raise ControllerError(f"validations[{index}] rejected: {exc}") from exc
+        state["validations"].append(record)
+        staged.append(record)
     _atomic_json(path, state)
     return {
-        "name": record["name"],
-        "scope": scope,
-        "task_id": task_id,
-        "result": result,
-        "exit_code": exit_code,
-        "diff_digest": record["diff_digest"][:12],
+        "registered": len(staged),
         "validations_total": len(state["validations"]),
+        "results": [item["result"] for item in staged],
+        "diff_digest": snapshot["digest"][:12],
     }
 
 
@@ -1468,6 +1721,22 @@ def gate(state_path: str | Path, mode: str = "enforce") -> dict[str, Any]:
             },
         )
 
+    # A dispatch the orchestrator never closed is evidence that was never
+    # accounted for: the ledger says the task passed while an Implementer is
+    # still marked RUNNING, and per-role wall time has no end to measure. Step 06
+    # already asks for record-agent ARCHIVED on return; this is what makes it a
+    # delivery condition rather than a courtesy.
+    open_agents = sorted(
+        f"{item.get('role')}@{item.get('session_id')}"
+        for item in state["agents"]
+        if item.get("status") == "RUNNING"
+    )
+    add(
+        "dispatched-agents-closed",
+        not open_agents,
+        open_agents or f"{len(state['agents'])} dispatch(es), all closed",
+    )
+
     failures = [item["name"] for item in checks if not item["ok"]]
     status = "PASS" if not failures else "BLOCKED"
     report = {
@@ -1496,9 +1765,11 @@ def replan(state_path: str | Path, new_plan_version: int) -> dict[str, Any]:
       - tasks belonging to the new plan version (once recorded), and
       - tasks from any version that already reached PASS.
 
-    Supersede-eligible states: PENDING, READY, FAILED.
+    Supersede-eligible states: PENDING, READY, FAILED, BLOCKED.
     RUNNING / VALIDATING tasks are left in place (their Implementer may still
     be writing; the Orchestrator should handle them before calling replan).
+    BLOCKED tasks come along now that they otherwise have no exit at all -- they
+    are listed in ``superseded_blocked`` so the report cannot lose them.
     """
     path, state = load_state(state_path)
     old_pv = state.get("current_plan_version", 1)
@@ -1506,12 +1777,27 @@ def replan(state_path: str | Path, new_plan_version: int) -> dict[str, Any]:
         raise ControllerError(
             f"new plan version {new_plan_version} must exceed current {old_pv}"
         )
-    supersede_eligible = {"PENDING", "READY", "FAILED"}
+    # BLOCKED is here on purpose. It is a terminal state, so a task blocked at an
+    # old plan version could neither be re-dispatched nor superseded: it sat in
+    # the ledger forever and, while that version was still current, kept the
+    # delivery gate's "all current-plan tasks pass" check failing with no legal
+    # move left short of starting a new run. A replan is exactly the moment the
+    # plan is being rewritten around whatever blocked it, so the blocked task is
+    # superseded like any other unfinished work -- and, unlike SUPERSEDED by
+    # accident, it stays visible: ``superseded_blocked`` is reported separately
+    # so the delivery report has to say what was blocked instead of quietly
+    # dropping it.
+    supersede_eligible = {"PENDING", "READY", "FAILED", "BLOCKED"}
     superseded: list[str] = []
+    superseded_blocked: list[str] = []
     for task in state["tasks"]:
-        if task.get("plan_version") == old_pv and task["status"] in supersede_eligible:
+        previous = task.get("status")
+        if task.get("plan_version") == old_pv and previous in supersede_eligible:
+            if previous == "BLOCKED":
+                superseded_blocked.append(task["task_id"])
             task["status"] = "SUPERSEDED"
             task["superseded_at"] = _now()
+            task["superseded_from"] = previous
             superseded.append(task["task_id"])
     state["current_plan_version"] = new_plan_version
     # Recompute authorized_files: retain PASS task scopes; active tasks have none yet.
@@ -1526,6 +1812,9 @@ def replan(state_path: str | Path, new_plan_version: int) -> dict[str, Any]:
         "old_version": old_pv,
         "new_version": new_plan_version,
         "superseded_tasks": superseded,
+        # Reported apart: a superseded PENDING task is ordinary re-planning, a
+        # superseded BLOCKED task is a decision the run could not make.
+        "superseded_blocked": superseded_blocked,
     }
 
 
@@ -1583,6 +1872,11 @@ def render_ledger(state_path: str | Path, output: str | Path | None = None) -> d
         f"- 验证记录：{len(state.get('validations', []))} 条（任务级 + 整体）",
         f"- 失败登记：{len(state.get('failures', []))} 条；范围检查：{state.get('scope_checks_total', 0)} 次"
         f"（{len(state.get('scope_checks', []))} 条不同工作树记录）",
+        # An abandoned dispatch is not a failure and not a retry, so it needs a line of
+        # its own: the report must be able to say "three sessions died on this task"
+        # without that reading as three failed attempts.
+        f"- 作废派发：{sum(int(t.get('abandoned_dispatches', 0)) for t in tasks)} 次"
+        f"（派发未返回，不计入尝试预算，每任务上限 {MAX_TASK_ABANDONS}，原因见 state.json 的 attempts_log）",
         f"- 冻结快照：{len(state.get('review_snapshots', []))} 次；审查结论：{len(state.get('reviews', []))} 条",
         f"- 生成时间：{_now()}（由 render-ledger 从 state.json 渲染，勿手工编辑本块）",
     ]
@@ -1666,14 +1960,32 @@ def show(state_path: str | Path, tasks: bool = False) -> dict[str, Any]:
             "total": len(state["tasks"]),
             "by_status": by_status,
             "open": open_tasks,
+            # Two counters the dispatch budget does not carry: retries that
+            # skipped the diagnosis gate, and dispatches that never came back.
+            # Both are legal and both have to be named in the delivery report;
+            # abandons additionally carry their own per-task cap
+            # (MAX_TASK_ABANDONS), enforced where the transition happens.
             "prose_retries": sum(
                 1
                 for t in state["tasks"]
                 for entry in t.get("attempts_log", [])
                 if entry.get("retry_policy") == "prose"
             ),
+            "abandoned_dispatches": sum(
+                int(t.get("abandoned_dispatches", 0)) for t in state["tasks"]
+            ),
+            "abandon_budget": MAX_TASK_ABANDONS,
         },
         "agents": len(state["agents"]),
+        # A dispatch that was never closed is invisible in the counts above: the
+        # task may have settled, so nothing looks unfinished while an Implementer
+        # is still marked RUNNING. Listing them is what makes the step-06
+        # record-agent ARCHIVED discipline checkable at all.
+        "open_agents": sorted(
+            f"{item.get('role')}@{item.get('session_id')}"
+            for item in state["agents"]
+            if item.get("status") == "RUNNING"
+        ),
         "scope_checks": {
             "total": state.get("scope_checks_total", len(state.get("scope_checks", []))),
             "distinct": len(state.get("scope_checks", [])),
@@ -2075,7 +2387,14 @@ def _freeze_view(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The command surface, built where tests and the manual can both read it.
+
+    ``references/controller-contract.md`` documents one line per subcommand and a
+    reflection test checks the two against each other, so a new command that is
+    not written down fails the suite instead of becoming a face only the source
+    reader knows about.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -2115,6 +2434,10 @@ def main(argv: list[str] | None = None) -> int:
     ut.add_argument("--task-id", required=True)
     ut.add_argument("--status", required=True,
                     choices=sorted(TASK_STATE_TRANSITIONS))
+    ut.add_argument("--reason", default=None,
+                    help="Required for RUNNING -> PENDING: why this dispatch is being "
+                         "abandoned (it produced no verdict and must not be recorded "
+                         "as a task failure). Capped per task at MAX_TASK_ABANDONS.")
 
     scope = sub.add_parser("check-scope",
                            help="Task-bound scope check; the allowed set comes from the "
@@ -2162,6 +2485,13 @@ def main(argv: list[str] | None = None) -> int:
     failure.add_argument("--root-cause", required=True, choices=sorted(ROOT_CAUSES))
     failure.add_argument("--error-fingerprint", required=True)
 
+    # Batch face: one broken round can produce several failures; every entry still
+    # runs the single-entry rules, and a bad one rejects the whole file.
+    batch_failures = sub.add_parser("record-failures",
+                                    help="Register every failure in a JSON file in one state write")
+    batch_failures.add_argument("--state", required=True)
+    batch_failures.add_argument("--from-file", required=True)
+
     # KW1-b: validation evidence has to be on disk, not in the transcript
     val = sub.add_parser("record-validation",
                          help="Persist one validation record (command, cwd, exit code, evidence) "
@@ -2182,6 +2512,13 @@ def main(argv: list[str] | None = None) -> int:
     val.add_argument("--not-run-reason", default=None)
     val.add_argument("--started-at", default=None)
     val.add_argument("--finished-at", default=None)
+
+    # Batch face for the step-12 sweep: six checks are six round-trips otherwise,
+    # each re-reading the state file and re-running `git status`.
+    batch_val = sub.add_parser("record-validations",
+                               help="Register every validation in a JSON file in one state write")
+    batch_val.add_argument("--state", required=True)
+    batch_val.add_argument("--from-file", required=True)
 
     # KW1-c: the review verdict, bound to the frozen snapshot by the controller
     rr = sub.add_parser("record-review",
@@ -2222,6 +2559,11 @@ def main(argv: list[str] | None = None) -> int:
                           choices=("input", "task-contract", "task-dag", "failure", "handoff"))
     contract.add_argument("path")
 
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     try:
         if args.command == "init":
@@ -2235,7 +2577,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(record_tasks_from_dag(args.state, args.from_dag),
                              ensure_ascii=False))
         elif args.command == "update-task":
-            print(json.dumps(update_task(args.state, args.task_id, args.status),
+            print(json.dumps(update_task(args.state, args.task_id, args.status,
+                                         reason=args.reason),
                              ensure_ascii=False, indent=2))
         elif args.command == "check-scope":
             print(json.dumps(_scope_view(check_scope(args.state, args.task_id)),
@@ -2260,22 +2603,19 @@ def main(argv: list[str] | None = None) -> int:
                 ensure_ascii=False, indent=2,
             ))
         elif args.command == "record-validation":
-            evidence = args.evidence
-            if args.evidence_file:
-                log = Path(args.evidence_file).expanduser().resolve(strict=False)
-                if not log.is_file():
-                    raise ControllerError(f"--evidence-file is not a readable file: {log}")
-                payload = log.read_bytes()
-                evidence = (evidence or "") + (
-                    f"file://{log} ({len(payload)} bytes, "
-                    "sha256:" + hashlib.sha256(payload).hexdigest()[:16] + ")"
-                )
             print(json.dumps(record_validation(
                 args.state, args.scope, args.name, args.command_line, args.cwd, args.exit_code,
-                args.result, task_id=args.task_id, evidence=evidence,
+                args.result, task_id=args.task_id, evidence=args.evidence,
+                evidence_file=args.evidence_file,
                 not_run_reason=args.not_run_reason, started_at=args.started_at,
                 finished_at=args.finished_at,
             ), ensure_ascii=False))
+        elif args.command == "record-validations":
+            print(json.dumps(record_validations_from_file(args.state, args.from_file),
+                             ensure_ascii=False))
+        elif args.command == "record-failures":
+            print(json.dumps(record_failures_from_file(args.state, args.from_file),
+                             ensure_ascii=False))
         elif args.command == "record-review":
             print(json.dumps(record_review(
                 args.state, args.verdict, args.report_path, args.validator_exit_code,

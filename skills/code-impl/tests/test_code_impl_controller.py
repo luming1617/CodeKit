@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 import importlib.util
 import io
@@ -219,6 +220,154 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("T02", result["superseded_tasks"])
         after = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(after["current_plan_version"], 2)
+
+    def test_record_validations_from_file_registers_a_whole_sweep(self) -> None:
+        """Step 12 asks for six checks; six round-trips over the state file is glue."""
+        state_path = controller.init_run(self.repo, self.feature, "run-bv1")
+        controller.record_task(state_path, "T01", ["src/a.py"])
+        batch = self.repo / "sweep.json"
+        batch.write_text(json.dumps({"validations": [
+            {"scope": "task", "task_id": "T01", "name": "unit", "command": "pytest -q",
+             "cwd": str(self.repo), "exit_code": 0, "result": "PASS", "evidence": "3 passed"},
+            {"scope": "overall", "name": "lint", "command": "ruff check .",
+             "cwd": str(self.repo), "exit_code": 0, "result": "PASS", "evidence": "clean"},
+            {"scope": "overall", "name": "migration", "command": "prisma migrate diff",
+             "cwd": str(self.repo), "exit_code": None, "result": "NOT_RUN",
+             "not_run_reason": "no local database"},
+        ]}, ensure_ascii=False), encoding="utf-8")
+        outcome = controller.record_validations_from_file(state_path, batch)
+        self.assertEqual(outcome["registered"], 3)
+        self.assertEqual(outcome["results"], ["PASS", "PASS", "NOT_RUN"])
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(state["validations"]), 3)
+        # one snapshot for the batch: every record carries the same tree digest
+        self.assertEqual(len({v["diff_digest"] for v in state["validations"]}), 1)
+
+    def test_a_bad_batch_entry_rejects_the_whole_file(self) -> None:
+        """A half-recorded sweep is what lets 'the tests passed' rest on nothing."""
+        state_path = controller.init_run(self.repo, self.feature, "run-bv2")
+        controller.record_task(state_path, "T01", ["src/a.py"])
+        batch = self.repo / "bad.json"
+        batch.write_text(json.dumps({"validations": [
+            {"scope": "task", "task_id": "T01", "name": "unit", "command": "pytest -q",
+             "cwd": str(self.repo), "exit_code": 0, "result": "PASS", "evidence": "ok"},
+            # PASS with a non-zero exit code is the exact claim the gate exists to stop
+            {"scope": "overall", "name": "compile", "command": "tsc --noEmit",
+             "cwd": str(self.repo), "exit_code": 1, "result": "PASS", "evidence": "looks fine"},
+        ]}, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_validations_from_file(state_path, batch)
+        self.assertIn("validations[2] rejected", str(ctx.exception))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["validations"], [])
+
+    def test_record_failures_from_file_counts_fingerprints_across_the_batch(self) -> None:
+        """Batch registration must not reset the retry budget per entry."""
+        state_path = controller.init_run(self.repo, self.feature, "run-bf1")
+        controller.record_task(state_path, "T01", ["src/a.py"])
+        controller.record_task(state_path, "T02", ["src/b.py"])
+        batch = self.repo / "failures.json"
+        batch.write_text(json.dumps({"failures": [
+            {"failure_scope": "task", "impacted_task_ids": ["T01"],
+             "root_cause": "CODE_OR_TEST", "error_fingerprint": "pytest::a::AssertionError"},
+            {"failure_scope": "task", "impacted_task_ids": ["T02"],
+             "root_cause": "CODE_OR_TEST", "error_fingerprint": "pytest::b::AssertionError"},
+        ]}, ensure_ascii=False), encoding="utf-8")
+        outcome = controller.record_failures_from_file(state_path, batch)
+        self.assertEqual(outcome["registered"], 2)
+        self.assertEqual(outcome["dispositions"], ["retry_implementation", "retry_implementation"])
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual([f["fingerprint_occurrences"] for f in state["failures"]], [1, 1])
+        # the same fingerprint twice in one batch is two occurrences, not two firsts
+        again = self.repo / "failures2.json"
+        again.write_text(json.dumps({"failures": [
+            {"failure_scope": "task", "impacted_task_ids": ["T01"],
+             "root_cause": "CODE_OR_TEST", "error_fingerprint": "pytest::a::AssertionError"},
+            {"failure_scope": "task", "impacted_task_ids": ["T01"],
+             "root_cause": "CODE_OR_TEST", "error_fingerprint": "pytest::a::AssertionError"},
+        ]}, ensure_ascii=False), encoding="utf-8")
+        controller.record_failures_from_file(state_path, again)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual([f["fingerprint_occurrences"] for f in state["failures"][-2:]], [2, 3])
+        # and a bad entry names itself without leaving the file half-written
+        bad = self.repo / "bad-failures.json"
+        bad.write_text(json.dumps({"failures": [
+            {"failure_scope": "task", "impacted_task_ids": ["NOPE"],
+             "root_cause": "CODE_OR_TEST", "error_fingerprint": "x"},
+        ]}, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_failures_from_file(state_path, bad)
+        self.assertIn("failures[1] rejected", str(ctx.exception))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(state["failures"]), 4)
+
+    def test_an_html_tag_line_is_not_a_placeholder(self) -> None:
+        """A lone tag is content, not an unfilled slot.
+
+        The old ``<[^>]+>`` rule refused any single-line tag, so a PRD embedding
+        ``<img src="diagram.png">`` or a ``<br>`` between paragraphs was rejected
+        as an unfinished template before the run could start.
+        """
+        self.assertIsNone(controller.PLACEHOLDER_LINE.fullmatch("<br>"))
+        self.assertIsNone(controller.PLACEHOLDER_LINE.fullmatch('<img src="diagram.png">'))
+        self.assertIsNone(controller.PLACEHOLDER_LINE.fullmatch('<div class="note">'))
+        self.assertIsNone(controller.PLACEHOLDER_LINE.fullmatch("<groupId>com.example</groupId>"))
+        self.assertIsNone(controller.PLACEHOLDER_LINE.fullmatch('<img src="todo.png">'))
+        # ... and what still has to be refused: a line that asks for an author
+        for line in ("待填写", "待补充", "TODO", "TBD", "<填写>", "<待补充>",
+                     "<placeholder>", "<your-api-key>", "<xxx>"):
+            self.assertIsNotNone(
+                controller.PLACEHOLDER_LINE.fullmatch(line), f"{line} should be refused"
+            )
+
+    def test_a_document_with_an_html_tag_line_still_freezes(self) -> None:
+        (self.feature / "technical-doc.md").write_text(
+            "# TDD\nThe technical design defines the implementation boundary.\n"
+            '<img src="diagram.png">\n',
+            encoding="utf-8",
+        )
+        state_path = controller.init_run(self.repo, self.feature, "run-html")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertIn("content_digest", state["materials"]["technical_design"])
+        # but a genuinely unfilled slot is still refused at the same door
+        (self.feature / "release-doc.md").write_text(
+            "# RPD\nThe release plan defines validation and rollback steps.\n<待补充>\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.init_run(self.repo, self.feature, "run-slot")
+        self.assertIn("placeholder", str(ctx.exception))
+
+    def test_replan_gives_a_blocked_task_a_way_out(self) -> None:
+        """BLOCKED is terminal, so it has to be supersede-able or it is a dead end.
+
+        A task blocked at the current plan version kept ``all-current-plan-tasks-pass``
+        failing with no legal transition left -- not re-dispatchable (dispatch takes
+        PENDING/FAILED only), not supersede-able, so the only remaining move was a
+        fresh run.
+        """
+        state_path = controller.init_run(self.repo, self.feature, "run-rp1b")
+        controller.record_task(state_path, "T01", ["src/a.py"])
+        controller.dispatch_task(state_path, "T01", "s1", "d1")
+        controller.update_task(state_path, "T01", "BLOCKED")
+        # and it does block delivery while its plan version is the current one
+        self.assertIn("all-current-plan-tasks-pass", controller.gate(state_path)["failures"])
+
+        result = controller.replan(state_path, 2)
+        self.assertIn("T01", result["superseded_tasks"])
+        self.assertEqual(result["superseded_blocked"], ["T01"])
+        after = json.loads(state_path.read_text(encoding="utf-8"))
+        task = next(t for t in after["tasks"] if t["task_id"] == "T01")
+        self.assertEqual(task["status"], "SUPERSEDED")
+        # the reason it was superseded stays readable on the record
+        self.assertEqual(task["superseded_from"], "BLOCKED")
+        # a PASS task is still not touchable by the same rule
+        controller.record_task(state_path, "T02", ["src/b.py"], plan_version=2)
+        controller.dispatch_task(state_path, "T02", "s2", "d2")
+        controller.settle_task(state_path, "T02", "PASS")
+        second = controller.replan(state_path, 3)
+        self.assertNotIn("T02", second["superseded_tasks"])
+        self.assertEqual(second["superseded_blocked"], [])
 
     def test_replan_preserves_pass_task_files_in_authorized(self) -> None:
         """P1-3: PASS tasks survive replan and their files stay authorized."""
@@ -739,6 +888,121 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(state["tasks"][0]["status"], "RUNNING")
         self.assertEqual(state["agents"][0]["input_digest"], "digest-t01")
 
+    def test_an_interrupted_dispatch_is_abandoned_and_redistached(self) -> None:
+        """A dead Implementer session is not a failed task.
+
+        RUNNING used to have no way back: the only exits were FAILED and BLOCKED,
+        so a transport interruption had to be recorded as a task failure it was
+        not, and the retry gate -- which rightly demands a diagnosis for a real
+        failure -- then blocked the re-dispatch unless --retry-policy prose was
+        spent. Two interruptions consumed four of the six dispatches a task gets.
+        """
+        state_path = controller.init_run(self.repo, self.feature, "run-ab1")
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        controller.dispatch_task(state_path, "T01", "session-1", "digest-1")
+        # the session dies: no verdict, no fingerprint, nothing to diagnose
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.dispatch_task(state_path, "T01", "session-2", "digest-2")
+        self.assertIn("status must be PENDING or FAILED", str(ctx.exception))
+
+        self.assertEqual(
+            controller.update_task(
+                state_path, "T01", "PENDING",
+                reason="implementer session lost: host dropped the connection",
+            )["status"],
+            "PENDING",
+        )
+        outcome = controller.dispatch_task(state_path, "T01", "session-2", "digest-2")
+        self.assertEqual(outcome["status"], "RUNNING")
+        # the voided attempt is not charged: one real dispatch, not two
+        self.assertEqual(outcome["attempts"], 1)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        task = state["tasks"][0]
+        self.assertEqual(task["abandoned_dispatches"], 1)
+        self.assertTrue(task["attempts_log"][0]["abandoned"])
+        self.assertIn("dropped the connection", task["attempts_log"][0]["abandoned_reason"])
+        # the ledger and show both name it, so the report cannot hide it
+        self.assertEqual(controller.show(state_path)["tasks"]["abandoned_dispatches"], 1)
+        controller.render_ledger(state_path)
+        ledger = (state_path.parent / "task-ledger.md").read_text(encoding="utf-8")
+        self.assertIn("作废派发：1 次", ledger)
+
+    def test_repeated_interruptions_do_not_consume_the_dispatch_budget(self) -> None:
+        """Six dead sessions left the task undispatchable before the abandon edge.
+
+        Only legal up to MAX_TASK_ABANDONS — the abandons inside the cap leave
+        exactly one charged dispatch behind.
+        """
+        state_path = controller.init_run(self.repo, self.feature, "run-ab2")
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        controller.dispatch_task(state_path, "T01", "s0", "d0")
+        for index in range(1, controller.MAX_TASK_ABANDONS):
+            controller.update_task(state_path, "T01", "PENDING",
+                                   reason=f"session {index} never returned")
+            outcome = controller.dispatch_task(state_path, "T01", f"s{index}", f"d{index}")
+            self.assertEqual(outcome["attempts"], 1, f"after {index} interruptions")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["tasks"][0]["abandoned_dispatches"],
+                         controller.MAX_TASK_ABANDONS - 1)
+        self.assertEqual(state["tasks"][0]["attempts"], 1)
+
+    def test_abandon_budget_caps_the_endless_retry_loop(self) -> None:
+        """Abandon waives the dispatch budget, so it must carry its own cap.
+
+        Without it, "the session never returned" is an unlimited door:
+        dispatch → the Implementer really fails → declare transport death →
+        abandon → re-dispatch, evading both MAX_TASK_ATTEMPTS (abandon
+        decrements it) and the fingerprint budget (no FAILED, no
+        record-failure). The 4th abandon of one task must be a hard refusal,
+        and the honest exits must remain open.
+        """
+        state_path = controller.init_run(self.repo, self.feature, "run-ab4")
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        controller.dispatch_task(state_path, "T01", "s0", "d0")
+        for index in range(1, controller.MAX_TASK_ABANDONS + 1):
+            controller.update_task(state_path, "T01", "PENDING",
+                                   reason=f"session {index} never returned")
+            controller.dispatch_task(state_path, "T01", f"s{index}", f"d{index}")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.update_task(state_path, "T01", "PENDING",
+                                   reason="session 4 never returned either")
+        self.assertIn("MAX_TASK_ABANDONS", str(ctx.exception))
+        self.assertIn("BLOCKED", str(ctx.exception))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["tasks"][0]["abandoned_dispatches"],
+                         controller.MAX_TASK_ABANDONS)
+        self.assertEqual(state["tasks"][0]["status"], "RUNNING")
+        # the cap refuses the fourth abandon without trapping the task:
+        # BLOCKED remains the honest terminal, and show names the budget
+        self.assertEqual(
+            controller.update_task(state_path, "T01", "BLOCKED")["status"], "BLOCKED")
+        self.assertEqual(controller.show(state_path)["tasks"]["abandon_budget"],
+                         controller.MAX_TASK_ABANDONS)
+
+    def test_abandoning_requires_a_reason_and_cannot_hide_a_failure(self) -> None:
+        """The reason is what keeps the edge from being a way around record-failure."""
+        state_path = controller.init_run(self.repo, self.feature, "run-ab3")
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        controller.dispatch_task(state_path, "T01", "session-1", "digest-1")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.update_task(state_path, "T01", "PENDING")
+        self.assertIn("requires --reason", str(ctx.exception))
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.update_task(state_path, "T01", "PENDING", reason="short")
+        self.assertIn("requires --reason", str(ctx.exception))
+
+        # a task that actually failed still has to be settled with a fingerprint:
+        # abandoning is not an exit from VALIDATING, and PENDING from FAILED is
+        # not a transition at all.
+        controller.settle_task(state_path, "T01", "FAILED", "pytest::t::AssertionError")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.update_task(state_path, "T01", "PENDING", reason="session died again")
+        self.assertIn("invalid transition", str(ctx.exception))
+        # and the abandon did not mint a diagnosis, so the retry gate still bites
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.dispatch_task(state_path, "T01", "session-3", "digest-3")
+        self.assertIn("no record-failure entry", str(ctx.exception))
+
     def test_dispatch_task_retry_from_failed(self) -> None:
         state_path = controller.init_run(self.repo, self.feature, "run-dp2")
         controller.record_task(state_path, "T01", ["src/app.py"])
@@ -956,7 +1220,7 @@ class ControllerTests(unittest.TestCase):
 
     # ── KW1-a: the delivery gate decides from recorded evidence ──────────────
 
-    def _deliverable_run(self, run_id: str) -> Path:
+    def _deliverable_run(self, run_id: str, *, close_agent: bool = True) -> Path:
         """Drive one task all the way to a defensible delivery."""
         state_path = controller.init_run(self.repo, self.feature, run_id)
         (self.repo / "src").mkdir()
@@ -964,6 +1228,11 @@ class ControllerTests(unittest.TestCase):
         controller.record_task(state_path, "T01", ["src/app.py"])
         controller.dispatch_task(state_path, "T01", "s-1", "d-1")
         controller.settle_task(state_path, "T01", "PASS")
+        # step 06 closes the dispatch on return; a run that skips it is not a
+        # deliverable one (see test_gate_blocks_a_dispatch_that_was_never_closed)
+        if close_agent:
+            controller.record_agent(state_path, "impl-implementer", "impl-implementer",
+                                    "s-1", "d-1", "ARCHIVED")
         controller.record_validation(
             state_path, "task", "pytest-T01", "pytest -q tests/test_app.py", str(self.repo),
             0, "PASS", task_id="T01", evidence="1 passed in 0.31s",
@@ -982,6 +1251,27 @@ class ControllerTests(unittest.TestCase):
         report = controller.gate(self._deliverable_run("run-gate-ok"))
         self.assertEqual(report["status"], "PASS", report["failures"])
         self.assertEqual(report["failures"], [])
+
+    def test_gate_blocks_a_dispatch_that_was_never_closed(self) -> None:
+        """An Implementer left RUNNING is unaccounted-for work, however green the task is.
+
+        Every other gate check reads the task and the evidence; the dispatch itself
+        had no closing counterpart, so a run could deliver with a session still
+        marked RUNNING -- and no end timestamp, which is why per-role wall time
+        could not be measured at all.
+        """
+        state_path = self._deliverable_run("run-gate-open-agent", close_agent=False)
+        report = controller.gate(state_path)
+        self.assertEqual(report["status"], "BLOCKED")
+        self.assertIn("dispatched-agents-closed", report["failures"])
+        # show names it, so the orchestrator can see which session to close
+        self.assertEqual(controller.show(state_path)["open_agents"],
+                         ["impl-implementer@s-1"])
+        # closing it is all the run was missing
+        controller.record_agent(state_path, "impl-implementer", "impl-implementer",
+                                "s-1", "d-1", "ARCHIVED")
+        self.assertEqual(controller.gate(state_path)["status"], "PASS")
+        self.assertEqual(controller.show(state_path)["open_agents"], [])
 
     def test_gate_blocks_delivery_without_validation_evidence(self) -> None:
         """A3: zero test evidence used to be freezable and deliverable."""
@@ -1344,10 +1634,29 @@ class ControllerTests(unittest.TestCase):
     # ── 文档与控制器命令面不得漂移 ────────────────────────────────────────────
 
     SKILL_DIR = MODULE_PATH.parent.parent
-    DOCS = (SKILL_DIR / "SKILL.md", SKILL_DIR / "references" / "contracts.md")
+    MANUAL = SKILL_DIR / "references" / "controller-contract.md"
+    DOCS = (SKILL_DIR / "SKILL.md", SKILL_DIR / "references" / "contracts.md", MANUAL)
     SOURCE = MODULE_PATH.read_text(encoding="utf-8")
     COMMANDS = set(re.findall(r'add_parser\(\s*"([\w-]+)"', SOURCE))
     FLAGS = set(re.findall(r'add_argument\(\s*"(--[\w-]+)"', SOURCE))
+
+    def _registered_commands(self) -> set[str]:
+        """Read the command surface off argparse rather than off the source text."""
+        parser = controller.build_parser()
+        subparsers = next(
+            action for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        return set(subparsers.choices)
+
+    def _manual_lines(self) -> dict[str, str]:
+        documented: dict[str, str] = {}
+        for line in self.MANUAL.read_text(encoding="utf-8").splitlines():
+            # letter-first only: a ``--flag`` in prose is not a command line
+            match = re.match(r"^- `([a-z][a-z-]*)` ", line)
+            if match:
+                documented[match.group(1)] = line
+        return documented
 
     def _doc_command_blocks(self) -> list[str]:
         text = "\n".join(path.read_text(encoding="utf-8") for path in self.DOCS)
@@ -1371,10 +1680,29 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(called_commands - self.COMMANDS, set())
         self.assertEqual(called_flags - self.FLAGS, set())
 
-    def test_every_controller_command_is_documented(self) -> None:
-        text = "\n".join(path.read_text(encoding="utf-8") for path in self.DOCS)
-        undocumented = {name for name in self.COMMANDS if name not in text}
-        self.assertEqual(undocumented, set())
+    def test_every_subcommand_has_a_line_in_the_manual(self) -> None:
+        """One line per command, checked against argparse itself.
+
+        The old check was ``command_name in whole_document_text``: a single passing
+        mention in prose satisfied it, so a new command could ship with no usable
+        description of its flags and the suite stayed green. The manual is the
+        near-by discovery face the orchestrator reads instead of the 2 200-line
+        source, so every registered subcommand has to have its own line there.
+        """
+        registered = self._registered_commands()
+        self.assertTrue(registered)
+        self.assertEqual(registered, self.COMMANDS,
+                         "source-scraped commands disagree with argparse")
+        documented = self._manual_lines()
+        self.assertEqual(registered - set(documented), set(),
+                         "subcommand missing its line in controller-contract.md")
+        self.assertEqual(set(documented) - registered, set(),
+                         "controller-contract.md documents a command argparse does not know")
+
+    def test_the_manual_is_reachable_from_the_skill(self) -> None:
+        """A manual nobody is pointed at is not a discovery face."""
+        skill = (self.SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("references/controller-contract.md", skill)
 
 
 if __name__ == "__main__":

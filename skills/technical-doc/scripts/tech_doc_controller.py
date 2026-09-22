@@ -38,6 +38,10 @@ ROLES = {
 # ``DISPATCHED`` opens a timing window that the terminal status closes, so a run can be
 # analysed afterwards without parsing host transcripts.  ``ABORTED`` exists because a
 # dispatch that produced nothing still consumed time and must not stay invisible.
+# A role that stops early for a human decision (``CONFIRM_NEEDED`` in its report) is a
+# ``COMPLETED`` dispatch: it handed back the partial artifacts it wrote, which is exactly the
+# evidence the next stage asks for.  ``CONFIRM_NEEDED`` is deliberately not a status here --
+# closing one as ``ABORTED`` would erase the draft the run has to keep.
 AGENT_STATUSES = ("DISPATCHED", "COMPLETED", "BLOCKED", "ABORTED")
 PHASE_OF_ROLE = {
     ROLES["CONTEXT"]: "prep",
@@ -46,6 +50,12 @@ PHASE_OF_ROLE = {
     ROLES["CRITIC"]: "audit",
     ROLES["REVIEW"]: "audit",
 }
+# The role that revises the TDD section by section has to state which sections it was handed:
+# that union is what licenses a disposition (``_dispatch_scope_covers``) and what the read budget
+# is measured from, so a dispatch declaring nothing left both unchecked -- see ``SCOPE_ALL`` for
+# the honest way to declare a whole-document read.  ``tech-architect`` stays exempt because a NEW
+# run's draft is written while there is no document to index yet.
+SCOPE_REQUIRED_ROLES = (ROLES["REFINER"],)
 ARTIFACT_KINDS = (
     "context-pack",
     "draft",
@@ -138,13 +148,20 @@ TDD_FILE = "technical-doc.md"
 # section 3" is data the reader needs.  Classifying them as slots made the whole fence
 # exemption unreachable for them, which is how a comment about the schema got refused as an
 # unfilled template.
-PLACEHOLDER_SLOTS = re.compile(r"(?:待定|待补充|后续补充|【填写】|【链接】)", re.IGNORECASE)
+PLACEHOLDER_SLOTS = re.compile(r"(?:待定|待补充|后续补充)", re.IGNORECASE)
+# The template writes every fill-in slot inside 【…】, so a bracket that survives into the
+# delivered document is an unfilled slot whatever it happens to say inside.  Listing the slot
+# words instead (``【填写】``, ``【链接】``) is what let ``【填写/不涉及】``,
+# ``【通过/不通过/不涉及】`` and ``【服务名称】`` through the gate with the brackets still on
+# them, while the template tells the author that a leftover bracket is exactly what
+# ``no-template-placeholders`` looks for.  The PRD change tags are the one bracket that is
+# content: ``影响范围`` quotes 【新增】/【修改】/【删除】 verbatim.
+BRACKET_SLOT = re.compile(r"【[^】]{1,40}】")
+BRACKET_CONTENT_TAGS = re.compile(r"^【\s*(?:新增|修改|删除)\s*】$")
 PLACEHOLDER_VALUES = re.compile(
     r"(?:\bTBD\b|\bTODO\b|YYYY-MM-DD|\bsimilar to\b|\brefer to\b)", re.IGNORECASE
 )
-PLACEHOLDER = re.compile(
-    f"(?:{PLACEHOLDER_SLOTS.pattern}|{PLACEHOLDER_VALUES.pattern})", re.IGNORECASE
-)
+
 CONFIRMATION = re.compile(r"\[需人工确认[:：].*?\]")
 FENCE = re.compile(r"^```([A-Za-z0-9_+-]*)\s*$")
 ALLOWED_FENCE_LANGUAGES = {
@@ -185,9 +202,14 @@ LEDGER_ORDER = ("findings", "run-metadata", "confirmations", "history-index")
 LEDGER_CELL_LIMIT = 300
 # Columns a table has to announce before its rows count as a second copy of the ledger --
 # see ``_mirror_table_header``: the same row under a different header is a cross-reference.
+# Both halves have to match, because one word was too loose: the template's own 评审人意见 table
+# carries 处理结论/状态, so a human writing "CRITIC-003 已关闭" into it was refused as a
+# hand-copied ledger at the next ``record-fix``.  A mirror announces itself by naming a Finding
+# column *and* one of the bookkeeping columns the generated table has.
 LEDGER_TABLE_COLUMNS = re.compile(
-    r"(?:Finding|来源|轮次|严重度|处置|状态|处理结论)", re.IGNORECASE
+    r"(?:来源|轮次|严重度|位置|处置|状态|处理结论)", re.IGNORECASE
 )
+LEDGER_FINDING_COLUMN = re.compile(r"(?:Finding|CRITIC|REVIEW)", re.IGNORECASE)
 # ``--prd-changes`` is the change ledger the history index mirrors: modified/added/deleted
 # requirement lines, counted once by the orchestrator instead of prose-written per round.
 PRD_CHANGES = re.compile(r"\d+/\d+/\d+")
@@ -204,8 +226,13 @@ PRD_CHANGES = re.compile(r"\d+/\d+/\d+")
 CONFIRMATION_FILE = "confirmation-log.md"
 CONFIRMATION_ID = re.compile(r"^CONF-(\d{3})$")
 CONFIRMATION_FIELD = re.compile(r"^(来源|阻断|位置|问题|影响|选项|推荐|决定|应用)\s*[:：]\s*(.*?)\s*$")
+# A Refiner that cannot adjudicate the finding it was handed has to cite *that* finding, and from
+# round 2 onward it is the reviewer's own (``REVIEW-<r>-<nnn>``).  Accepting only
+# ``REFINER:CRITIC-*`` left the role with no legal 来源 for the entries its own contract tells it
+# to write, so ``sync`` refused a correctly-shaped file.
 CONFIRMATION_SOURCE = re.compile(
-    r"^(ARCHITECT|REFINER:CRITIC-\d{3}|REVIEWER:REVIEW-\d{1,2}-\d{3}|LEGACY-MARKER)$"
+    r"^(ARCHITECT|REFINER:(?:CRITIC-\d{3}|REVIEW-\d{1,2}-\d{3})"
+    r"|REVIEWER:REVIEW-\d{1,2}-\d{3}|LEGACY-MARKER)$"
 )
 CONFIRMATION_SETTLED = ("ANSWERED", "SKIPPED-DEFAULT")
 # ``决定:`` starting with this token means "take the recommended option as-is"; the
@@ -384,7 +411,7 @@ def _assert_substantive(text: str, label: str, path: Path) -> None:
     body = [line for line in lines if line not in {"---"} and not line.startswith("```")]
     if len("".join(body)) < 40:
         raise ControllerError(f"{label} has no substantive content: {path}")
-    placeholder = [line for line in body if PLACEHOLDER.search(line)]
+    placeholder = [line for line in body if _is_unfilled_slot(line, False)]
     if len(placeholder) / max(len(body), 1) > 0.3:
         raise ControllerError(
             f"{label} is still dominated by template placeholders "
@@ -1148,7 +1175,7 @@ def _structure_table_problems(body: str) -> list[str]:
     blank = next((row for row in data if any(not cell.strip() for cell in row.strip("|").split("|"))), None)
     if blank:
         problems.append(f"模块表有空格子：{blank[:60]}")
-    half = next((row for row in data if PLACEHOLDER.search(row)), None)
+    half = next((row for row in data if _is_unfilled_slot(row, False)), None)
     if half:
         problems.append(f"模块表仍留有占位内容：{half[:60]}")
     return problems
@@ -1260,7 +1287,7 @@ def start_stage(state_path: str | Path, target_stage: str, review_scope: str | N
                 "at": _now(),
             })
         else:
-            _require_open_reviewer_findings(state)
+            _require_undisposed_findings(state)
     elif target == "REVIEW":
         _require_no_blocking_confirmations(state, target)
         _require_evidence(state, "REFINER", "refiner-map", artifact_round=round_)
@@ -1391,13 +1418,28 @@ def _require_evidence(
         raise ControllerError(f"stage {stage} produced no persisted '{kind}' artifact")
 
 
-def _require_open_reviewer_findings(state: dict[str, Any]) -> None:
-    round_ = state["review_round"]
-    pending = [item["id"] for item in state["findings"] if item["round"] == round_ and not _closed(state, item["id"])]
+def _require_undisposed_findings(state: dict[str, Any]) -> None:
+    """A Refiner round back from REVIEW has to have something left to answer.
+
+    The predicate used to be "did *this round's* review raise findings", which made a run that
+    entered REVIEW with an older finding still undisposed unable to leave it: ``--to DELIVERY``
+    refused the undisposed finding, ``--to REFINER`` refused it because the finding was not the
+    reviewers', and ``record-fix`` refused it because the stage was not REFINER -- three errors
+    that only pointed at each other.  Any undisposed finding now licenses the round back, which
+    is the exit the old predicate removed; a settled human decision is a different debt and goes
+    through the DELIVERY rewind branch below.
+    """
+    pending = [
+        item["id"]
+        for item in state["findings"]
+        if not any(fix["finding_id"] == item["id"] for fix in state["fixes"])
+    ]
     if not pending:
         raise ControllerError(
-            f"round {round_} review did not raise findings; deliver the current TDD "
-            "instead of opening another Refiner round"
+            f"no finding is left undisposed, so round {state['review_round']} has nothing for a "
+            "Refiner round to answer; deliver the current TDD instead of opening another round"
+            " (a settled human decision that still has to reach the body is landed with "
+            "'start-stage --to REFINER' from DELIVERY)"
         )
 
 
@@ -1468,20 +1510,21 @@ def _require_all_findings_tracked(state: dict[str, Any]) -> None:
 
     The same condition is the gate's ``every-finding-has-a-disposition``; discovering it
     only at the gate left no legal transition out of DELIVERY, so one late non-blocking
-    finding could strand the whole run.
+    finding could strand the whole run.  The error names both exits, because which one is
+    legal depends on what the leftover finding is: a blocking one cannot be closed from here.
     """
     untracked = [
         item["id"]
         for item in state["findings"]
         if not any(fix["finding_id"] == item["id"] for fix in state["fixes"])
     ]
-    if untracked:
-        raise ControllerError(
-            f"findings without a disposition: {', '.join(untracked[:12])}; delivery may not "
-            "open on an unfinished ledger — from this stage, record-fix accepts "
-            "PENDING_CONFIRMATION/REJECTED for this round's non-blocking findings, and "
-            "must_fix or older findings need a Refiner round first"
-        )
+    if not untracked:
+        return
+    raise ControllerError(
+        f"findings without a disposition: {', '.join(untracked[:12])}; DELIVERY may not open on "
+        "an unfinished ledger — from here record-fix accepts PENDING_CONFIRMATION/REJECTED for "
+        "this round's non-blocking findings, while a must_fix or an older finding needs a Refiner "
+        "round first (start-stage --to REFINER)")
 
 
 def _require_gate_pass(state: dict[str, Any]) -> None:
@@ -1543,7 +1586,9 @@ def record_agent(
     ``ABORTED`` keeps a dispatch that consumed time but produced nothing visible in the run,
     and leaves the round's slot free, so the same role can be dispatched again.
     ``--scope`` declares the sections actually injected into the prompt; the read budget is
-    then measured from the index instead of accepted as a claim.
+    then measured from the index instead of accepted as a claim.  A ``tech-refiner`` dispatch
+    has to declare it -- ``--scope all`` is the honest answer when the whole document was handed
+    over -- because that declaration is what the disposition guard measures against.
     """
     path, state = load_state(state_path)
     if role not in ROLES.values():
@@ -1565,6 +1610,13 @@ def record_agent(
         raise ControllerError(
             f"--scope belongs on the call that opens session {session_id}; widening it after the "
             "role was handed its prompt would rewrite what the dispatch actually read"
+        )
+    if role in SCOPE_REQUIRED_ROLES and open_entry is None and settled is None and not scope.strip():
+        raise ControllerError(
+            f"record-agent needs --scope for a {role} dispatch: name the sections injected into "
+            "the prompt (`locate --finding <ID>` gives the keys), or pass `--scope all` to declare "
+            "that the whole document was handed -- measured the same way, reported over_budget, and "
+            "still cheaper than the role paging through it"
         )
     budget = _scope_budget(path, state, scope)
     if status == "DISPATCHED":
@@ -2264,7 +2316,8 @@ def _validate_confirmation_fields(item: dict[str, Any]) -> None:
     if not CONFIRMATION_SOURCE.fullmatch(fields["来源"]):
         raise ControllerError(
             f"confirmation entry {item['id'] or item['start']}: 来源 must be ARCHITECT, "
-            "REFINER:CRITIC-<NNN>, REVIEWER:REVIEW-<round>-<NNN> or LEGACY-MARKER, "
+            "REFINER:CRITIC-<NNN>, REFINER:REVIEW-<round>-<NNN>, "
+            "REVIEWER:REVIEW-<round>-<NNN> or LEGACY-MARKER, "
             f"got {fields['来源']!r}"
         )
     if fields["阻断"] not in {"true", "false"}:
@@ -3327,6 +3380,7 @@ def _reject_handwritten_mirror(lines: list[str], blocks: dict[str, tuple[int, in
         if index not in covered
         and line.lstrip().startswith("|")
         and re.search(r"(?:CRITIC-\d|REVIEW-\d{1,2}-\d)", line)
+        and LEDGER_FINDING_COLUMN.search(_mirror_table_header(lines, index))
         and LEDGER_TABLE_COLUMNS.search(_mirror_table_header(lines, index))
     ]
     if stray:
@@ -3486,6 +3540,12 @@ DEFAULT_CONTEXT_WINDOW = 200_000
 # One dispatch may not claim more than this share of the window: the role still has to hold
 # its own instructions, the finding list and the prose it is writing.
 BUDGET_SHARE = 0.5
+# The one non-section token ``--scope`` accepts.  A dispatch that really was handed the whole
+# document says so, and the index then measures that read the same way it measures a per-section
+# one -- ``over_budget`` comes out ``true``, which is the point: the declaration has to cost
+# something visible instead of being skipped, because a skipped declaration is what made the
+# whole read-budget guard inert for a run whose dispatches declared nothing.
+SCOPE_ALL = "all"
 # CJK and ASCII cost very different amounts: the delivered reference TDD is 428,429 characters,
 # only 27.6% of them CJK, and it costs ~220K tokens.  A single flat divisor is wrong in both
 # directions on that mix, so the estimate keeps the two terms apart.
@@ -3875,11 +3935,17 @@ def _scope_budget(state_path: Path, state: dict[str, Any], raw: str) -> dict[str
 
     The byte and token figures come from the document rather than from a self-report, so an
     over-budget claim cannot be talked down, and a section key that does not exist is an
-    error instead of a silently ignored typo.
+    error instead of a silently ignored typo.  ``all`` is the declared whole-document read: the
+    same measurement, over every section the index holds.
     """
     keys = [item.strip() for item in re.split(r"[,\s]+", raw) if item.strip()]
     if not keys:
         return {}
+    if SCOPE_ALL in keys and len(keys) > 1:
+        raise ControllerError(
+            f"--scope cannot mix '{SCOPE_ALL}' with section keys: '{SCOPE_ALL}' already means "
+            f"every section ({', '.join(keys)})"
+        )
     tdd = _resolve_tdd(state, None)
     if not tdd.is_file():
         raise ControllerError(
@@ -3891,12 +3957,19 @@ def _scope_budget(state_path: Path, state: dict[str, Any], raw: str) -> dict[str
     numbers = index["numbers"]
     chosen: dict[str, dict[str, Any]] = {}
     missing: list[str] = []
-    for token in keys:
-        item = by_key.get(token) or by_key.get(numbers.get(token, ""))
-        if item is None:
-            missing.append(token)
-            continue
-        chosen[item["key"]] = item
+    if keys == [SCOPE_ALL]:
+        chosen = {item["key"]: item for item in index["sections"]}
+        if not chosen:
+            raise ControllerError(
+                f"--scope all resolved to no section: the index has no headings in {tdd}"
+            )
+    else:
+        for token in keys:
+            item = by_key.get(token) or by_key.get(numbers.get(token, ""))
+            if item is None:
+                missing.append(token)
+                continue
+            chosen[item["key"]] = item
     if missing:
         raise ControllerError(
             f"unknown section key(s) in --scope: {', '.join(missing)}; run 'index' to see the keys"
@@ -3942,10 +4015,14 @@ def _dispatch_scope_covers(
 
     The window is the current stage entry, which is what makes a split round legal: several
     scoped dispatches contribute the union of their sections, while a scope declared in an
-    earlier round does not license this round's edit.  One dispatch that declares no ``--scope``
-    does not stand the guard down either -- it would be an escape hatch, and the ledger already
-    says which sections were injected.  A run where no dispatch declares a scope at all keeps the
-    reference behaviour of every earlier run.
+    earlier round does not license this round's edit.  Only a ``COMPLETED`` dispatch joins the
+    union: a window closed ``ABORTED``/``BLOCKED`` announced sections for a role that never got
+    to report on them, and letting it license a later edit would hand the guard back to the
+    orchestrator that lost the connection.  A ``tech-refiner`` dispatch must declare a scope at
+    all (``--scope all`` is the honest whole-document answer, and it is measured), so the union is
+    never silently empty for the role whose dispositions this checks; where it still is -- the
+    architect, a run recorded before this rule -- the guard has nothing to measure against and
+    stands down.
     """
     entered = [
         _parse_at(item.get("at"))
@@ -3956,7 +4033,7 @@ def _dispatch_scope_covers(
     role = ROLES[stage]
     scopes: list[str] = []
     for item in state["agents"]:
-        if item["role"] != role:
+        if item["role"] != role or item.get("status") != "COMPLETED":
             continue
         if since is not None and (_parse_at(item.get("recorded_at")) or since) < since:
             continue
@@ -4009,6 +4086,20 @@ def _inline_code_spans(line: str) -> list[tuple[int, int]]:
         position = closing + run
 
 
+def _slot_tokens(line: str) -> list[str]:
+    """Fill-in tokens on one hand-written line: the slot words plus any leftover 【…】 bracket.
+
+    The bracket half is what the two listed words could not express: a slot reads as an
+    instruction to the author whoever the template meant, and the change tags 【新增】/【修改】/
+    【删除】 are the only brackets that are content.
+    """
+    tokens = [match.group(0) for match in PLACEHOLDER_SLOTS.finditer(line)]
+    tokens += [
+        span for span in BRACKET_SLOT.findall(line) if not BRACKET_CONTENT_TAGS.fullmatch(span)
+    ]
+    return tokens
+
+
 def _is_unfilled_slot(line: str, quoted_as_code: bool) -> bool:
     """Whether one hand-written line still carries a template placeholder.
 
@@ -4017,7 +4108,7 @@ def _is_unfilled_slot(line: str, quoted_as_code: bool) -> bool:
     inline code span are data -- a status enum, a date format -- and are what the template tells
     the architect to write there.
     """
-    if PLACEHOLDER_SLOTS.search(line):
+    if _slot_tokens(line):
         return True
     if quoted_as_code:
         return False
@@ -4238,10 +4329,17 @@ def gate(state_path: str | Path, tdd_file: str | Path) -> dict[str, Any]:
 
     failures = [item for item in checks if not item["ok"]]
     warnings = [{"name": item["name"], "detail": item["detail"]} for item in checks if item.get("warn")]
-    if state["degraded"]:
+    # A degradation is a fact about how the run was staffed, not a verdict on the document: it
+    # renames a *clean* gate so the delivery report has to say "独立审查未完成", and nothing more.
+    # It used to overwrite ``BLOCKED`` too, which let a degraded run close on a TDD with a real
+    # failure behind it at exit code 0 -- the one path where the skill's "退出码非 0 即不得宣称
+    # 完成" rule silently did not hold.
+    if failures:
+        status = "BLOCKED"
+    elif state["degraded"]:
         status = "PARTIAL_DEGRADED"
     else:
-        status = "PASS" if not failures else "BLOCKED"
+        status = "PASS"
     report = {
         "status": status,
         "review_round": state["review_round"],
@@ -4374,10 +4472,15 @@ def _next_action(path: Path, state: dict[str, Any]) -> dict[str, Any]:
     def delegated(role: str, kind: str, agent_round: int, artifact_round: int | None,
                   after: dict[str, Any]) -> dict[str, Any]:
         if not _completed_agents(state, role, agent_round):
+            scope = (
+                " --scope <本轮注入的章节，整篇读取就写 all>"
+                if role in SCOPE_REQUIRED_ROLES
+                else ""
+            )
             return {
                 "command": run(
                     f"record-agent --role {role} --name <实例名> --session-id <会话 id> "
-                    "--input-digest <sha256:…> --status DISPATCHED"
+                    f"--input-digest <sha256:…> --status DISPATCHED{scope}"
                 ),
                 "why": f"{role}@{agent_round} has not been dispatched and completed",
                 "missing": [f"COMPLETED {role}@{agent_round}"],
@@ -4691,7 +4794,11 @@ def _fixer_commands(sub: argparse._SubParsersAction) -> None:
     agent.add_argument(
         "--scope",
         default="",
-        help="section keys injected into this dispatch (e.g. '7.2,4.2'); the read budget is derived from doc-index.json",
+        help=(
+            "section keys injected into this dispatch (e.g. '7.2,4.2'), or 'all' for a "
+            "whole-document read; the read budget is derived from doc-index.json and a "
+            "tech-refiner dispatch must declare one"
+        ),
     )
 
     artifact = sub.add_parser("write-artifact", help="persist a stage output under the run directory")

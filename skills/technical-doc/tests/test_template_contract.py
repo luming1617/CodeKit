@@ -86,6 +86,30 @@ class TemplateContractTests(unittest.TestCase):
         for anchor in ("ADR", "风险", "工作量", "里程碑规划", "审查闭环"):
             self.assertIn(anchor, tailoring)
 
+    def test_the_slot_rule_is_the_bracket_itself_not_a_list_of_words(self) -> None:
+        """Rule 7, the gate's sentence and the standard must describe one predicate.
+
+        The literal list (``【填写】``, ``【链接】``) is what let ``【服务名称】`` through with
+        its brackets on, so the shared wording is "a leftover bracket", and the change tags are
+        the one bracket that is content.
+        """
+        rule = next(line for line in TEMPLATE.splitlines() if line.startswith("> 7."))
+        self.assertIn("方括号", rule)
+        self.assertIn("【新增】", rule)
+        for token in ("【新增】", "【修改】", "【删除】"):
+            # the bracket regex sees a change tag as a bracket too -- the content exemption is a
+            # separate predicate, and it is the only thing keeping these three in the document
+            self.assertIsNotNone(controller.BRACKET_SLOT.fullmatch(token), token)
+            self.assertIsNotNone(controller.BRACKET_CONTENT_TAGS.fullmatch(token), token)
+        self.assertIsNone(controller.BRACKET_CONTENT_TAGS.fullmatch("【服务名称】"))
+        for asset, name in ((SKILL_MD, "SKILL.md"), (STANDARD, "check-standard.md")):
+            with self.subTest(asset=name):
+                self.assertIn("方括号", asset)
+                self.assertIn("【新增】", asset)
+                # the literal that used to slip through is named, so a future narrowing of the
+                # prose has to reckon with it
+                self.assertIn("【填写/不涉及】", asset)
+
 
 class LedgerContractTests(unittest.TestCase):
     """The 审查闭环记录/变更历史 ledgers are generated, so the template, anchors, and prose must agree."""
@@ -218,6 +242,34 @@ class ControllerManualTests(unittest.TestCase):
         self.assertIn("只有 Architect 读取完整模板", SKILL_MD)
         self.assertIn("template-anchors", SKILL_MD)
 
+    def test_the_command_table_states_purpose_and_leaves_refusals_to_the_manual(self) -> None:
+        """The table is injected every run; the manual is read on demand.
+
+        The table had grown to restate the manual's refusal rationale verbatim -- 5,184 of the
+        page's ~30,000 characters spent on sentences that drift the moment the code changes, and
+        one row carried a bare ``|`` inside a cell, which split the column and broke the render.
+        Purpose plus the single decision the orchestrator makes at that step stay here; why a
+        command refuses is stated once, on the manual page.
+        """
+        rows = [line for line in SKILL_MD.splitlines() if line.startswith("| `")]
+        self.assertEqual(11, len(rows), [line[:34] for line in rows])
+        for line in rows:
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            with self.subTest(command=cells[0]):
+                self.assertEqual(
+                    2, len(cells), "a cell holding a bare `|` splits the column in two"
+                )
+                self.assertLessEqual(len(cells[1]), 260, cells[0])
+        # the halves the table gave up live on the manual page, not nowhere
+        for phrase in ("三面碰壁", "不计入那个并集", "不是豁免通道"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, MANUAL)
+                self.assertNotIn(phrase, SKILL_MD)
+        # same for the reviewer-slot rule: the manual holds it, and the one SKILL.md sentence
+        # that depends on it names that page rather than a table row that no longer says so
+        self.assertIn("占的是**名额**", MANUAL)
+        self.assertIn("references/controller-contract.md` 的 `record-agent", SKILL_MD)
+
     def test_the_batch_faces_are_named_where_the_orchestrator_reads(self) -> None:
         for token in (
             "record-findings", "record-fixes", "--from-file", "--batch", "show --next",
@@ -320,12 +372,18 @@ class SkillDocumentTests(unittest.TestCase):
 
 
 class AgentContractTests(unittest.TestCase):
-    def test_read_only_roles_declare_no_write_tools(self) -> None:
+    def test_read_only_roles_may_write_their_artifact_but_not_edit(self) -> None:
+        """``Write`` is what keeps the report out of the main agent's context; ``Edit`` is the TDD.
+
+        The tool list and the body have to say the same thing: a role that gains ``Write``
+        without scoping it in prose is one dispatch away from rewriting the document it audits.
+        """
         for role in ("tech-context", "tech-critic", "tech-reviewer"):
             tools = re.search(r"^tools: (.+)$", AGENTS[role], re.MULTILINE).group(1)
             with self.subTest(role=role):
-                self.assertNotIn("Write", tools)
+                self.assertIn("Write", tools)
                 self.assertNotIn("Edit", tools)
+                self.assertIn("`Write` 只用于落", AGENTS[role])
 
     def test_writable_roles_do_not_claim_read_only(self) -> None:
         for role in ("tech-architect", "tech-refiner"):
@@ -562,6 +620,22 @@ class GrowthAndMirrorContractTests(unittest.TestCase):
         self.assertIn("对整批只判一次", MANUAL)
         # the role prompt must promise the early refusal, not only the delivery-time one
         self.assertIn("前移", AGENTS["tech-refiner"])
+
+    def test_the_mirror_predicate_needs_a_finding_column_not_just_a_disposition_one(self) -> None:
+        """The template's own hand-filled review table is the false positive this guards.
+
+        ``评审人意见`` carries a 处理结论 column, so a predicate keyed on the disposition columns
+        alone refused a table a human is meant to fill in -- worse than the copy it was catching.
+        The two halves are what keep the whitelist from being a list of exempted table names.
+        """
+        opinion = next(line for line in TEMPLATE.splitlines() if line.startswith("| 序号 | 意见"))
+        self.assertTrue(controller.LEDGER_TABLE_COLUMNS.search(opinion), opinion)
+        self.assertIsNone(controller.LEDGER_FINDING_COLUMN.search(opinion), opinion)
+        for name in ("LEDGER_FINDING_COLUMN.search", "LEDGER_TABLE_COLUMNS.search"):
+            self.assertIn(name, CONTROLLER_SRC, name)
+        for asset, name in ((SKILL_MD, "SKILL.md"), (MANUAL, "controller-contract.md")):
+            with self.subTest(asset=name):
+                self.assertIn("评审人意见", asset)
 
     def test_growth_is_a_soft_check_that_the_delivery_report_must_quote(self) -> None:
         self.assertTrue(callable(getattr(controller, "_document_growth_check", None)))
