@@ -27,7 +27,7 @@
 |---|---|---:|---|---|
 | `<L0-L6>` | `<command>` | `<code>` | `PASS/FAIL/NOT_RUN/NOT_AVAILABLE` | `<claim>` |
 
-表内每一行的退出码、结果和错误指纹必须来自 `RUN_DIR/validation-record.json`（由 `bugfix_state.py run-validation` 写入），不得手工填写或事后补写。
+表内每一行的命令、退出码、结果和错误指纹必须来自 `RUN_DIR/validation-record.json`（由 `bugfix_state.py run-plan` / `run-validation` 写入），不得手工填写或事后补写。抄表时只取记录的 `command`、`exit_code`、`result`、`proves` 与 `fingerprint` 字段；`output_tail` 已经截过尾部，不要把完整日志贴进报告。
 
 ## 5. 系统 Code Review
 

@@ -29,6 +29,16 @@ OWNED_ARTIFACTS = {"run-manifest.json": "initialize"}
 # it prints nothing and exits non-zero, so a skill that hardcodes it reads as "Python is
 # missing" and blocks the phase. Skills must use the <PYTHON> placeholder instead.
 PYTHON3_COMMAND = re.compile(r"(?:^|\s)(?:\$ )?python3(?=[ \t]+[\"'<$])")
+# A role's standing requirements must live in exactly one place: ``agents/<role>.md`` is the
+# source the host injects at dispatch, and ``references/*-prompt.md`` only adds that step's
+# inputs, constraints and output anchors. Two identical sentences in both files is a copy,
+# not a coincidence -- the pair then drifts apart in silence (review-specialist and its
+# prompt restated the same six rules with zero identical lines). One shared sentence is
+# tolerated as boilerplate, so the limit is per (agent, prompt) pair.
+ROLE_LINE_MIN = 20
+ROLE_DUP_LIMIT = 2
+ROLE_MARKUP = re.compile(r"^[\s#>*\-.0-9、]+")
+ROLE_SKIP_PREFIX = ("<", "|", "---", "```")
 
 
 def frontmatter(path: Path) -> dict[str, str]:
@@ -232,6 +242,46 @@ def check_agents(skills: list[Path], problems: list[str]) -> None:
                 seen[name] = agent.relative_to(skill.parent)
 
 
+def role_body_lines(path: Path) -> set[str]:
+    """Content sentences of a role file: frontmatter, slots, tables and fences excluded."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if lines and lines[0].strip() == "---":
+        for index in range(1, len(lines)):
+            if lines[index].strip() == "---":
+                lines = lines[index + 1 :]
+                break
+    result: set[str] = set()
+    for raw in lines:
+        stripped = raw.strip()
+        if stripped.startswith(ROLE_SKIP_PREFIX):
+            continue
+        sentence = ROLE_MARKUP.sub("", stripped).strip()
+        if len(sentence) >= ROLE_LINE_MIN:
+            result.add(sentence)
+    return result
+
+
+def check_role_body_dupes(skill: Path, problems: list[str]) -> None:
+    agents = sorted((skill / "agents").glob("*.md"))
+    prompts = sorted((skill / "references").glob("*-prompt.md"))
+    if not agents or not prompts:
+        return
+    for agent in agents:
+        body = role_body_lines(agent)
+        if not body:
+            continue
+        for prompt in prompts:
+            shared = sorted(body & role_body_lines(prompt))
+            if len(shared) >= ROLE_DUP_LIMIT:
+                preview = "; ".join(line[:32] for line in shared[:2])
+                problems.append(
+                    f"{skill.name}: {agent.name} and {prompt.name} restate the same role body in "
+                    f"two places ({len(shared)} identical sentences, e.g. {preview}); keep the "
+                    "requirements in agents/ and leave only inputs, step-specific constraints and "
+                    "the output anchors in the prompt template"
+                )
+
+
 def main() -> int:
     if not SKILLS_DIR.is_dir():
         print(f"skills directory not found: {SKILLS_DIR}", file=sys.stderr)
@@ -249,6 +299,7 @@ def main() -> int:
         check_dangling_references(skill, problems)
         check_assets(skill, problems)
         check_python_launcher(skill, problems)
+        check_role_body_dupes(skill, problems)
     check_agents(skills, problems)
     if problems:
         for problem in problems:

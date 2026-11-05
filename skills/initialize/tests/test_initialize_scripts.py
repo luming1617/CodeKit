@@ -482,6 +482,111 @@ class ManagedBlockTests(unittest.TestCase):
                 prepare.parse_languages("python,python", Path(directory))
 
 
+class LanguageDetectionTests(unittest.TestCase):
+    """语言识别必须是测量结果，并且测不出来时停在任何写入之前。
+
+    ``standard/02-stack`` 只有 java、python、go、cpp 四套模板，早期实现在什么都没测到时
+    静默回落成 java，于是文档型仓库会被写进一套和本项目无关的规范，还会一路带进
+    AGENTS.md 索引与后续 subagent。现在改成报错停下，由主 Agent 问人。
+    """
+
+    def parse(self, root: Path, raw: str | None = None):
+        return prepare.parse_languages(raw, root)
+
+    def test_an_explicit_language_is_recorded_as_the_user_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            languages, source, basis = self.parse(Path(directory), "python,go")
+        self.assertEqual(["python", "go"], languages)
+        self.assertEqual("explicit", source)
+        self.assertIn("用户指定", basis)
+
+    def test_detection_names_the_manifests_and_sources_it_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # 清单在子目录（多模块仓库）也算证据，早期只看根目录
+            (root / "services" / "order").mkdir(parents=True)
+            (root / "services" / "order" / "pom.xml").write_text("<project/>\n", encoding="utf-8")
+            (root / "src" / "main" / "java").mkdir(parents=True)
+            (root / "src" / "main" / "java" / "Order.java").write_text("class Order {}\n", encoding="utf-8")
+            languages, source, basis = self.parse(root)
+        self.assertEqual(["java"], languages)
+        self.assertEqual("detected", source)
+        self.assertIn("services/order/pom.xml", basis)
+        self.assertIn("源码 1 个", basis)
+
+    def test_example_code_under_the_docs_tree_does_not_pick_a_language(self) -> None:
+        """``docs/`` 里的示例片段是这套技能自己的产物，不是本项目已经选定的语言。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs" / "examples").mkdir(parents=True)
+            (root / "docs" / "examples" / "demo.py").write_text("print(1)\n", encoding="utf-8")
+            (root / "docs" / "examples" / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+            with self.assertRaises(prepare.PrepareError) as refused:
+                self.parse(root)
+            message = str(refused.exception)
+            self.assertIn("无法识别仓库的编程语言", message)
+            self.assertIn("按文档排除", message)
+            self.assertNotIn("--language java\n", message)
+
+    def test_a_repo_of_unsupported_sources_says_so_before_asking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "web").mkdir()
+            for name in ("app.ts", "server.ts", "legacy.js"):
+                (root / "web" / name).write_text("export const x = 1;\n", encoding="utf-8")
+            with self.assertRaises(prepare.PrepareError) as refused:
+                self.parse(root)
+            message = str(refused.exception)
+        self.assertIn("仓库里只找到非支持语言源码（ts 2 个、js 1 个）", message)
+        self.assertIn("当前只支持 4 种语言：java、python、go、cpp", message)
+        self.assertIn("必须由主 Agent 停下来向用户确认", message)
+        self.assertIn("--language", message)
+
+    def test_stray_cpp_sources_are_not_a_cpp_project_without_a_build_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "jni").mkdir()
+            (root / "jni" / "bridge.cpp").write_text("int main(){}\n", encoding="utf-8")
+            with self.assertRaises(prepare.PrepareError) as refused:
+                self.parse(root)
+            self.assertIn("未计为 cpp 工程", str(refused.exception))
+            (root / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8")
+            languages, _, basis = self.parse(root)
+        self.assertEqual(["cpp"], languages)
+        self.assertIn("CMakeLists.txt", basis)
+
+    def test_the_docs_exclusion_and_the_refusal_are_still_in_the_prose(self) -> None:
+        """SKILL.md must describe the tri-state the code implements, not the old two-state one.
+
+        「检测不到时使用 java」 was once true; left in the prose it is an instruction the main
+        agent follows by pre-filling --language and the refusal never runs.
+        """
+        skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        report = (SKILL_DIR / "references" / "final-report.md").read_text(encoding="utf-8")
+        self.assertNotIn("检测不到时使用", skill)
+        for text in (skill, report):
+            self.assertIn("language_source", text)
+            self.assertIn("language_basis", text)
+        self.assertIn("不存在默认语言", skill)
+        self.assertIn("非支持语言源码", skill)
+        self.assertIn("恰好这四个选项（`java`、`python`、`go`、`cpp`", skill.replace("**", ""))
+        # 文档目录口径与 technical-doc 的 greenfield 探针保持一致
+        self.assertEqual({"doc", "docs"}, prepare.DOC_DIR_NAMES)
+        self.assertIn("跳过根下的 `doc`/`docs`", skill)
+
+    def test_recognition_failure_happens_before_the_repository_is_touched(self) -> None:
+        """The whole point of refusing is that nothing was written yet."""
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            (root / "README.md").write_text("# 只有文档\n", encoding="utf-8")
+            with self.assertRaises(prepare.PrepareError):
+                prepare.main(["--root", str(root), "--no-git-hooks"], emit=False)
+            self.assertFalse((root / ".standard").exists())
+            self.assertFalse((root / ".codekit").exists())
+            self.assertEqual([], list(root.glob("AGENTS.md")))
+
+
 class GraphifyCapabilityTests(unittest.TestCase):
     def test_graphify_capabilities_detect_flags_and_ast_process_pool(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -915,7 +1020,7 @@ class GitNexusRunnerResolutionTests(unittest.TestCase):
             )
             completed = subprocess.run(
                 [sys.executable, str(SKILL_DIR / "scripts/run-gitnexus.py"),
-                 "--root", str(root), "--use-global-registry", "--",
+                 "--root", str(root), "--registry", "real", "--",
                  sys.executable, str(fake)],
                 text=True, capture_output=True, check=False,
                 env={**os.environ, "GITNEXUS_HOME": str(home)},
@@ -923,6 +1028,89 @@ class GitNexusRunnerResolutionTests(unittest.TestCase):
             self.assertEqual(0, completed.returncode, completed.stderr)
             self.assertTrue((home / "registry.json").is_file())
             self.assertNotIn("disposable GITNEXUS_HOME", completed.stderr)
+
+    def test_real_registry_mode_reports_a_denied_write(self):
+        """real 模式绝不静默回落：宿主拒绝就是 77 + 一行可读的提示。
+
+        静默回落到一次性目录正是旧行为的根因——调用方看不到拒绝，也就不会去申请
+        授权，只会拿到一个「索引有效但查询全废」的结果。
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "gitnexus-home"
+            home.mkdir()
+            fake = root / "fake-gitnexus.py"
+            fake.write_text(
+                "import sys\n"
+                "print('EPERM: operation not permitted, open registry.json', file=sys.stderr)\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts/run-gitnexus.py"),
+                 "--root", str(root), "--registry", "real", "--",
+                 sys.executable, str(fake)],
+                text=True, capture_output=True, check=False,
+                env={**os.environ, "GITNEXUS_HOME": str(home)},
+            )
+            self.assertEqual(77, completed.returncode, completed.stderr)
+            self.assertIn("global registry write denied", completed.stderr)
+            self.assertNotIn("disposable GITNEXUS_HOME", completed.stderr)
+
+    def test_read_only_home_does_not_relabel_a_read_failure_as_denied(self):
+        """读命令失败时「目录写不进去」解释不了它：不能改写成 77 去要一次多余授权。
+
+        旧判据是「marker 命中或目录写不进去」，于是只读 HOME 上任何与权限无关的失败
+        （子命令拼错、GitNexus 内部错误）都会变成 permission denied，把调用方推去申请
+        一次根本解决不了问题的授权。
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "blocker").write_text("", encoding="utf-8")
+            home = root / "blocker" / "gitnexus-home"
+            fake = root / "fake-gitnexus.py"
+            fake.write_text(
+                "import sys\n"
+                "print('error: unknown command statuss', file=sys.stderr)\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts/run-gitnexus.py"),
+                 "--root", str(root), "--registry", "real", "--",
+                 sys.executable, str(fake), "statuss"],
+                text=True, capture_output=True, check=False,
+                env={**os.environ, "GITNEXUS_HOME": str(home)},
+            )
+            self.assertEqual(1, completed.returncode, completed.stderr)
+            self.assertNotIn("global registry write denied", completed.stderr)
+
+    def test_registry_writing_command_still_falls_back_to_the_probe(self):
+        """没有原文证据时，写注册表的命令仍由一次真实探针写判成被拒。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "blocker").write_text("", encoding="utf-8")
+            home = root / "blocker" / "gitnexus-home"
+            fake = root / "fake-gitnexus.py"
+            fake.write_text(
+                "import sys\n"
+                "print('error: could not register repository', file=sys.stderr)\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts/run-gitnexus.py"),
+                 "--root", str(root), "--registry", "real", "--",
+                 sys.executable, str(fake), "index", str(root)],
+                text=True, capture_output=True, check=False,
+                env={**os.environ, "GITNEXUS_HOME": str(home)},
+            )
+            self.assertEqual(77, completed.returncode, completed.stderr)
+            self.assertIn("global registry write denied", completed.stderr)
+
+    def test_denied_exit_code_is_the_same_in_both_modules(self):
+        """两个模块各定义一次 77；错开就是「被拒被当成普通失败」的静默失效。"""
+        self.assertEqual(gitnexus_step.REGISTRY_DENIED_EXIT, gitnexus_runner.WRITE_DENIED_EXIT)
 
 
 class GitNexusRegistrationTests(unittest.TestCase):
@@ -952,16 +1140,26 @@ class GitNexusRegistrationTests(unittest.TestCase):
             )
         )
 
-    def test_unregistered_repository_requires_a_global_write_decision(self):
+    def test_unregistered_repository_plans_a_real_attempt_instead_of_blocking(self):
+        """未注册不再预先拦人：先声明「本次尝试一次真实注册」，权限由真实写入回答。
+
+        预检用的 ``os.access`` 在按路径拒绝访问的沙箱里会谎报可写，所以依据它停下来
+        问人，会把「其实写得进去」的运行也拦下来。
+        """
         with git_scratch_directory() as directory:
             root = Path(directory)
             fake = self.fixture(root)
             with isolated_gitnexus_home(root, registered=False):
-                with self.assertRaises(prepare.PrepareError) as caught:
-                    self.run_prepare(root, fake)
-            self.assertIn("registry.json", str(caught.exception))
-            # 判定与 embedding 前提一样发生在任何写入之前。
-            self.assertFalse((root / ".codekit").exists())
+                self.assertEqual(0, self.run_prepare(root, fake))
+                manifest = self.manifest(root)
+            self.assertFalse(manifest["gitnexus_registry"]["registered"])
+            self.assertEqual("attempt", manifest["gitnexus_registry"]["action"])
+            self.assertTrue(
+                any("gitnexus index" in warning for warning in manifest["warnings"])
+            )
+            self.assertTrue(
+                any("registry.json" in warning for warning in manifest["warnings"])
+            )
 
     def test_allow_partial_accepts_the_degraded_registration(self):
         with git_scratch_directory() as directory:
@@ -971,6 +1169,7 @@ class GitNexusRegistrationTests(unittest.TestCase):
                 self.assertEqual(0, self.run_prepare(root, fake, "--allow-partial"))
                 manifest = self.manifest(root)
             self.assertFalse(manifest["gitnexus_registry"]["registered"])
+            self.assertEqual("declined", manifest["gitnexus_registry"]["action"])
             self.assertTrue(
                 any("registry-missing" in warning for warning in manifest["warnings"])
             )
@@ -983,6 +1182,7 @@ class GitNexusRegistrationTests(unittest.TestCase):
                 self.assertEqual(0, self.run_prepare(root, fake, "--allow-global-writes"))
                 manifest = self.manifest(root)
             self.assertTrue(manifest["options"]["allow_global_writes"])
+            self.assertEqual("authorized", manifest["gitnexus_registry"]["action"])
             self.assertEqual([], manifest["warnings"])
 
     def test_registered_repository_needs_no_decision(self):
@@ -993,6 +1193,7 @@ class GitNexusRegistrationTests(unittest.TestCase):
                 self.assertEqual(0, self.run_prepare(root, fake))
                 manifest = self.manifest(root)
             self.assertTrue(manifest["gitnexus_registry"]["registered"])
+            self.assertEqual("none", manifest["gitnexus_registry"]["action"])
             self.assertEqual([], manifest["warnings"])
 
     def test_unrunnable_runner_needs_no_registration_decision(self):
@@ -1208,10 +1409,12 @@ class GitNexusStepTests(unittest.TestCase):
             self.assertEqual("index-current", result["error"]["code"])
             self.assertEqual("1", (root / "index-called").read_text(encoding="utf-8"))
             self.assertFalse((root / "analyze-called").exists())
-            self.assertTrue(any("补注册" in warning for warning in result["warnings"]))
+            self.assertTrue(
+                any("已注册到 GitNexus 全局 registry" in warning for warning in result["warnings"])
+            )
 
-    def test_unregistered_reuse_without_authorization_is_partial(self):
-        """未授权时不写全局注册表，但绝不能把「查不到的索引」记成 success。"""
+    def test_unregistered_reuse_without_authorization_attempts_registration(self):
+        """未授权不等于「不许写」：先真跑一次 index，写得进去就直接注册、不问人。"""
         with git_scratch_directory() as directory:
             root = Path(directory)
             git_repository(root)
@@ -1226,6 +1429,80 @@ class GitNexusStepTests(unittest.TestCase):
             with isolated_gitnexus_home(root, registered=False):
                 result = self.run_step(root, path)
                 self.assertEqual([], validator.validate_worker(result, manifest, root))
+                self.assertTrue(common.gitnexus_registry_state(root)["registered"])
+
+            self.assertEqual("skipped", result["status"])
+            self.assertEqual("index-current", result["error"]["code"])
+            self.assertEqual("1", (root / "index-called").read_text(encoding="utf-8"))
+            self.assertTrue(result["registry"]["registered"])
+            self.assertTrue(
+                any("已注册到 GitNexus 全局 registry" in warning for warning in result["warnings"])
+            )
+
+    def test_denied_registry_write_stops_recoverably_with_the_retry_command(self):
+        """宿主拒绝仓库外写入：不写 result、不推进阶段、不释放锁，交回同一条命令。"""
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            fake = root / "fake-gitnexus.py"
+            fake.write_text(
+                "import json, sys\n"
+                "if sys.argv[1:2] == ['status']:\n"
+                "    print(json.dumps({'status': 'current'}))\n"
+                "    raise SystemExit(0)\n"
+                "if sys.argv[1:2] == ['index']:\n"
+                "    print('EACCES: permission denied, open registry.json', file=sys.stderr)\n"
+                "    raise SystemExit(1)\n"
+                "raise SystemExit(0)\n",
+                encoding="utf-8",
+            )
+            (root / ".gitnexus").mkdir()
+            (root / ".gitnexus/meta.json").write_text("{}", encoding="utf-8")
+            tool = {
+                "available": True, "runner": "override", "command": [sys.executable, str(fake)],
+                "supports": {"skills": False}, "identity_stable": True, "local_embeddings": False,
+            }
+            manifest, path = self.step_manifest(root, tool)
+            with isolated_gitnexus_home(root, registered=False):
+                stdout, stderr = StringIO(), StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    code = controller.main(["analyze", "--manifest", str(path)])
+
+            self.assertEqual(77, code, stderr.getvalue())
+            payload = json.loads(stderr.getvalue()[stderr.getvalue().index("{"):])
+            self.assertEqual("registry-denied", payload["status"])
+            self.assertTrue(payload["recoverable"])
+            self.assertEqual("held", payload["lock"])
+            self.assertEqual("prepared", payload["phase"])
+            self.assertTrue(payload["registry_path"])
+            self.assertTrue(payload["justification"])
+            # 重试命令就是同一条命令：argv 里点名这次运行，弹窗与人看到的都是它。
+            self.assertIn("register", payload["retry_command"])
+            self.assertIn(str(path), payload["retry_command"])
+            # 没有 result 就等于没有可 gate 的证据，run 与锁都还在。
+            self.assertFalse((path.parent / "gitnexus-result.json").exists())
+            self.assertEqual("prepared", json.loads(path.read_text(encoding="utf-8"))["phase"])
+            self.assertTrue(Path(manifest["lock_path"]).exists())
+
+    def test_declined_registration_degrades_without_attempting(self):
+        """用户已用 --allow-partial 明确拒绝：不再尝试写入，记 partial/registry-missing。"""
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            fake = self.fake_runner(root, status="current")
+            (root / ".gitnexus").mkdir()
+            (root / ".gitnexus/meta.json").write_text("{}", encoding="utf-8")
+            tool = {
+                "available": True, "runner": "override", "command": [sys.executable, str(fake)],
+                "supports": {"skills": False}, "identity_stable": True, "local_embeddings": False,
+            }
+            manifest, path = self.step_manifest(root, tool, options={
+                "embeddings": False, "force": False, "allow_partial": True,
+                "commit": False, "allow_global_writes": False,
+            })
+            with isolated_gitnexus_home(root, registered=False):
+                result = self.run_step(root, path)
+                self.assertEqual([], validator.validate_worker(result, manifest, root))
 
             self.assertEqual("partial", result["status"])
             self.assertEqual("registry-missing", result["error"]["code"])
@@ -1234,6 +1511,34 @@ class GitNexusStepTests(unittest.TestCase):
             self.assertEqual("partial", validator.aggregate_status([result]))
             self.assertFalse((root / "index-called").exists())
             self.assertTrue(any("No indexed repositories" in warning for warning in result["warnings"]))
+
+    def test_register_command_performs_exactly_that_one_write(self):
+        """升级重试用的同一条命令：只写注册表，不产出 result、不推进阶段。"""
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            fake = self.fake_runner(root, status="current")
+            (root / ".gitnexus").mkdir()
+            (root / ".gitnexus/meta.json").write_text("{}", encoding="utf-8")
+            tool = {
+                "available": True, "runner": "override", "command": [sys.executable, str(fake)],
+                "supports": {"skills": False}, "identity_stable": True, "local_embeddings": False,
+            }
+            manifest, path = self.step_manifest(root, tool)
+            with isolated_gitnexus_home(root, registered=False):
+                stdout, stderr = StringIO(), StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    code = controller.main(["register", "--manifest", str(path)])
+                self.assertEqual(0, code, stderr.getvalue())
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual("registered", payload["status"])
+                self.assertTrue(payload["registry"]["registered"])
+                self.assertTrue(common.gitnexus_registry_state(root)["registered"])
+
+            self.assertEqual("1", (root / "index-called").read_text(encoding="utf-8"))
+            # 它不产出可 gate 的证据，也不动阶段：下一步由主 Agent 重跑 analyze。
+            self.assertFalse((path.parent / "gitnexus-result.json").exists())
+            self.assertEqual("prepared", json.loads(path.read_text(encoding="utf-8"))["phase"])
 
     def test_authorized_registration_that_does_not_land_fails(self):
         """已授权却仍没注册时必须失败：否则等于把「索引有效但查询全废」记成成功。"""
@@ -1267,6 +1572,115 @@ class GitNexusStepTests(unittest.TestCase):
             self.assertEqual("execution-failed", result["error"]["code"])
             self.assertFalse(result["registry"]["registered"])
             self.assertEqual("failed", validator.aggregate_status([result]))
+
+    def test_authorized_analyze_denied_by_the_host_names_the_registry(self):
+        """已授权仍被拒：算失败，但必须点名被拒的注册表路径与重试命令。
+
+        只报「退出码 77」等于把「宿主拒绝了这次仓库外写入」藏起来，调用方既看不出
+        原因，也拿不到下一步该跑什么。
+        """
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            fake = root / "fake-gitnexus.py"
+            fake.write_text(
+                "import json, sys\n"
+                "if sys.argv[1:2] == ['status']:\n"
+                "    print(json.dumps({'status': 'stale'}))\n"
+                "    raise SystemExit(0)\n"
+                "print('EPERM: operation not permitted, open registry.json', file=sys.stderr)\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            tool = {
+                "available": True, "runner": "override", "command": [sys.executable, str(fake)],
+                "supports": {"skills": False}, "identity_stable": True, "local_embeddings": False,
+            }
+            manifest, path = self.step_manifest(root, tool, options={
+                "embeddings": False, "force": False, "allow_partial": False,
+                "commit": False, "allow_global_writes": True,
+            })
+            with isolated_gitnexus_home(root, registered=False) as home:
+                result = self.run_step(root, path)
+                registry_path = str(home / "registry.json")
+
+            self.assertEqual("failed", result["status"])
+            self.assertEqual(77, result["exit_code"])
+            self.assertIn(registry_path, result["error"]["message"])
+            self.assertTrue(
+                any("register" in warning and registry_path in warning
+                    for warning in result["warnings"]),
+                result["warnings"],
+            )
+
+    def test_registered_repository_never_analyzes_against_the_real_home(self):
+        """已注册不等于授权：analyze 会在提交边界重写 registry.json，只读 HOME 下必被拒。
+
+        既有的注册不需要刷新（查询解析的入口是仓库内 .gitnexus/），所以已注册时
+        analyze 必须留在 disposable 目录——否则一个本来能成功的运行会被宿主拒成 failed。
+        """
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            fake = root / "fake-gitnexus.py"
+            fake.write_text(
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "if sys.argv[1:2] == ['status']:\n"
+                "    print(json.dumps({'status': 'stale'}))\n"
+                "    raise SystemExit(0)\n"
+                "if sys.argv[1:2] == ['analyze']:\n"
+                "    target = Path(os.getcwd()) / '.gitnexus'\n"
+                "    target.mkdir(exist_ok=True)\n"
+                "    (target / 'meta.json').write_text(json.dumps({'root': os.getcwd()}),"
+                " encoding='utf-8')\n"
+                "    (Path(os.getcwd()) / 'analyze-home').write_text(\n"
+                "        os.environ.get('GITNEXUS_HOME', ''), encoding='utf-8')\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(0)\n",
+                encoding="utf-8",
+            )
+            tool = {
+                "available": True, "runner": "override", "command": [sys.executable, str(fake)],
+                "supports": {"skills": False}, "identity_stable": True, "local_embeddings": False,
+            }
+            manifest, path = self.step_manifest(root, tool)
+            with isolated_gitnexus_home(root) as home:
+                result = self.run_step(root, path)
+                seen_home = (root / "analyze-home").read_text(encoding="utf-8")
+
+            self.assertEqual("success", result["status"], result["warnings"])
+            self.assertTrue(result["registry"]["registered"])
+            self.assertNotEqual(str(home), seen_home)
+            self.assertTrue(seen_home)
+
+    def test_register_with_an_unprepared_manifest_keeps_the_run(self):
+        """register 是补救命令：前提不满足时保持 run 与锁，绝不能 abort 掉它要救的 run。"""
+        with git_scratch_directory() as directory:
+            root = Path(directory)
+            git_repository(root)
+            fake = self.fake_runner(root, status="current")
+            tool = {
+                "available": True, "runner": "override", "command": [sys.executable, str(fake)],
+                "supports": {"skills": False}, "identity_stable": True, "local_embeddings": False,
+            }
+            manifest, path = self.step_manifest(root, tool)
+            manifest["phase"] = "gated"
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            stdout, stderr = StringIO(), StringIO()
+            with isolated_gitnexus_home(root, registered=False), redirect_stdout(
+                stdout
+            ), redirect_stderr(stderr):
+                code = controller.main(["register", "--manifest", str(path)])
+
+            self.assertEqual(2, code, stderr.getvalue())
+            payload = json.loads(stderr.getvalue()[stderr.getvalue().index("{"):])
+            self.assertEqual("input-error", payload["status"])
+            self.assertTrue(payload["recoverable"])
+            self.assertEqual("held", payload["lock"])
+            self.assertIn("register", payload["hint"])
+            self.assertEqual("gated", json.loads(path.read_text(encoding="utf-8"))["phase"])
+            self.assertTrue(Path(manifest["lock_path"]).exists())
 
     def test_analyze_declares_writes_and_passes_the_gate(self):
         with git_scratch_directory() as directory:

@@ -6,13 +6,14 @@
 
 ## 1. 实施前重新确认
 
-先运行两个门禁，再逐项人工确认：
+用**一条** `verify-gates` 连跑审批绑定与快照漂移两项门禁（它等价于依次执行 `verify-approval` 和 `check-snapshot`，分开跑只会多付一次模型往返）：
 
 ```bash
-<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" verify-approval --manifest "$RUN_DIR/state.json" \
+<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" verify-gates --manifest "$RUN_DIR/state.json" \
   --approval-file "$RUN_DIR/approval.txt" --proposal "$RUN_DIR/proposal.md"
-<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" check-snapshot --manifest "$RUN_DIR/state.json"
 ```
+
+在它的 `approval.checks` 与 `snapshot` 字段里核对：
 
 - 当前 `HEAD SHA`、工作树摘要和文档摘要是否仍与提案绑定快照一致；
 - 预先存在的用户修改是否变化；
@@ -20,15 +21,15 @@
 - 验证工具、依赖和环境是否可用；
 - 是否需要尚未授权的联网、安装、Migration、数据修复或外部变更。
 
-任何实质漂移先暂停。只读证明为无关变化后才能继续，否则更新提案并重新审批。
+任何实质漂移先暂停。只读证明为无关变化后才能继续，否则更新提案并重新审批。只有 `proposal_digest_match` 单项失败时，才按 SKILL.md 步骤 11 的 `--editorial` 规则判定是否属于编辑性修订。
 
 ## 2. 实施顺序
 
-1. 从 `verify-approval` 通过后的 `state.json` 冻结 Implementation Contract。
+1. `verify-gates` 通过后用 `freeze-contract --manifest "$RUN_DIR/state.json"` 冻结 Implementation Contract 与验证计划；允许范围、起始摘要、禁止项和验证命令都从提案取，不手抄。
 2. 在不修改生产逻辑的条件允许时，先添加或确认最小回归测试，并证明修复前能暴露问题。
 3. 在根因所属层实施最小修复。
-4. 用 `bugfix_state.py verify-scope --manifest "$RUN_DIR/state.json" --allowed <获批路径>` 检查实际 Diff 和修改文件范围。
-5. 用 `bugfix_state.py run-validation --manifest "$RUN_DIR/state.json" --proves <主张> -- <命令>` 运行回归测试，再运行受影响模块和跨边界验证。
+4. 用 `bugfix_state.py verify-scope --manifest "$RUN_DIR/state.json" --contract "$RUN_DIR/implementation-contract.json"` 检查实际 Diff 和修改文件范围。
+5. 用 `bugfix_state.py run-plan --manifest "$RUN_DIR/state.json"` 一次跑完整份验证计划（回归、模块、契约），只对计划外新增的检查补用 `run-validation`。
 6. 独立复核最终快照。
 
 如果无法安全地先运行失败测试，说明原因，并使用代码路径或其他 E2/E3 证据替代，不能伪造 red-green 过程。
@@ -45,7 +46,7 @@
 - **L5 非功能**：并发、事务、幂等、性能、容量、安全或故障注入；
 - **L6 发布**：构建产物、配置、灰度、监控、回滚和数据修复检查。
 
-每项由 `run-validation` 执行并追加到 `RUN_DIR/validation-record.json`，记录 `PASS`、`FAIL`、`TIMEOUT`、`NOT_AVAILABLE` 或 `NOT_RUN`；后三者不得当作通过，并必须说明原因和剩余风险。`proves` 写具体主张，不写“全部通过”。
+提案第 5 节列出的必需项由 `run-plan` 顺序执行；计划外的补充项用 `run-validation` 逐条执行。两者都把结果追加到 `RUN_DIR/validation-record.json`，记录 `PASS`、`FAIL`、`TIMEOUT`、`NOT_AVAILABLE` 或 `NOT_RUN`；后三者不得当作通过，并必须说明原因和剩余风险。`proves` 写具体主张，不写“全部通过”。`run-plan` 只在 stdout 回显摘要与退出码，命令输出按 `--tail-lines` 只留尾部进记录，不要为了看日志把记录整份读回。
 
 ## 4. 独立复核
 

@@ -83,7 +83,7 @@ GitNexus 强制重建。因此参数必须镜像 manifest 里记录的既有索�
 | `drop` | 追加 `--drop-embeddings`，并在 warnings 声明语义检索已失效 |
 | `install-authorized` | 先执行 `gitnexus embeddings install`（全局写入，已获用户授权），再执行 analyze |
 
-`install-authorized` 时通过 `<SKILL_DIR>/scripts/run-gitnexus.py --use-global-registry`
+`install-authorized` 时通过 `<SKILL_DIR>/scripts/run-gitnexus.py --registry real`
 执行：用户已授权全局写入，注册应落在真实 `GITNEXUS_HOME`，而不是一次性临时目录。
 
 | 状态 | 动作 |
@@ -110,22 +110,61 @@ GitNexus 把索引写在仓库内 `.gitnexus/`，却把仓库注册在
 
 因此「索引有效」和「查询可用」是两件事：只跑 analyze 而不注册时，`status --json`
 报 up-to-date，查询却一律报 `No indexed repositories found`。而 adapter 默认隔离
-registry（一次性 `GITNEXUS_HOME`，进程退出即删除），恰好会造成这个状态，所以：
+registry（一次性 `GITNEXUS_HOME`，进程退出即删除），恰好会造成这个状态。
 
-| 情形 | 行为 |
+**注册不预检、不提前拦人。** 判定「有没有权限写」的唯一诚实依据是一次真实写入：
+``os.access(os.W_OK)`` 在按路径拒绝文件系统访问的沙箱里会报可写，而预检失败就停下
+问人，会把「其实写得进去」的运行也拦下来（这正是 Codex 桌面端上发生的事）。所以
+`prepare.py` 只写计划（`gitnexus_registry.action`），处置放在 gitnexus 步骤里：
+
+| `action` / 情形 | 行为 |
 |---|---|
-| 已注册 | 无需任何全局写入，不询问用户 |
-| 未注册且用户授权（`--allow-global-writes`） | 经 `run-gitnexus.py --use-global-registry` 执行，注册落在真实 `GITNEXUS_HOME`；授权目录不可写时 adapter 降级为临时 registry 并 warning |
-| 未注册且未授权、未传 `--allow-partial` | `start` 在零业务写入前失败（`PrepareError`），主 Agent 必须询问用户后重跑 |
-| 未注册且未授权、已传 `--allow-partial` | 不写注册表，gitnexus 阶段记为 `partial/registry-missing`（整体 partial、禁止提交） |
-| 已授权但注册仍未落地 | `failed`，不得记 success |
+| `none`（已注册，或 runner 跑不起来） | 无需任何仓库外写入，不询问用户（已注册也不再走 `--registry real`：既有的注册不需要刷新） |
+| `authorized`（用户已传 `--allow-global-writes`） | 步骤用 `--registry real` 直接写真实 `GITNEXUS_HOME` |
+| `declined`（用户已传 `--allow-partial`） | 不尝试写入，gitnexus 阶段记 `partial/registry-missing`（整体 partial、禁止提交） |
+| `attempt`（未注册且未表态，默认） | **先真跑一次** `gitnexus index <root>`（`--registry real`，幂等、只登记既有 `.gitnexus/`）：成功即注册落地、继续运行、全场无需任何人点头；被拒 → 可恢复的 `registry-denied`；非权限原因失败 → `partial/registry-missing` + warning |
+| 已授权而注册仍未落地 | `failed`，不得记 success |
 
-控制器在**复用路径**（`status=current`）也会补注册：那时 analyze 不运行，否则仓库会
-长期停在「索引有效但查询全废」。补注册走 `gitnexus index <root>`——它只登记既有
-`.gitnexus/`，不重新分析，幂等且开销小。注册状态由 `gitnexus_registry_state(root)`
-在宿主环境下实测，写入 result 的 `registry` 字段；gate 会独立重测一次，缺失即拒绝
-complete 结论。`--use-global-registry` 不可写时会降级为临时 registry 并输出 warning，
-这仍是失败信号而不是可接受的降级。
+adapter 的两种模式因此是行为契约而不是偏好：`--registry disposable` 隔离全局目录，
+是**读路径与未授权时的唯一模式**——`analyze` 也在其中：已注册的仓库不需要刷新注册
+（查询解析的入口是仓库内 `.gitnexus/`，不随一次 analyze 变化），已注册就走 `real`
+只会在只读 `GITNEXUS_HOME` 下被无谓地拒成 `failed`。`--registry real` 只在用户已授权
+时使用，且绝不静默回落——它要么写成，要么返回专用退出码 `77` 并在 stderr 打
+`initialize error: global registry write denied: <dir>`。拒绝的判据是两级证据：子进程
+原文含 `EACCES`/`EPERM`/`EROFS`/`access is denied` 等即归为被拒；没有原文证据时，只有
+确实会写注册表的子命令（`index` / `analyze` / `embeddings`）才再用一次真实探针写复核
+——读命令失败时「目录写不进去」解释不了它，不能改写成权限被拒去要一次多余的授权。
+**静默回落到一次性目录正是旧行为的根因**：调用方看不到拒绝，也就不会去申请授权，只
+会拿到「索引有效但查询全废」。
+
+`analyze` 与 `embeddings install` 在 real 模式下被同样拒掉时也以 `77` 收尾：`analyze`
+记 `failed`（已授权却未落地），但 `error.message` 与 warnings 必须点名被拒的
+`registry.json` 路径、失败的命令与重试命令，不得只报一个「退出码 77」。
+
+控制器在**复用路径**（`status=current`）也走同一条决策（`resolve_missing_registration`）：
+那时 analyze 不运行，否则仓库会长期停在「索引有效但查询全废」。注册状态由
+`gitnexus_registry_state(root)` 在宿主环境下实测，写入 result 的 `registry` 字段；
+gate 会独立重测一次，缺失即拒绝 complete 结论。
+
+#### 宿主提权通道（`registry-denied` 之后怎么重试）
+
+被拒时控制器**不 abort**：它保持 run 与锁，并返回 `status: registry-denied`、
+`recoverable: true`、`registry_path`、`justification` 与 `retry_command`。那条命令就是
+`<PY> "<SKILL_DIR>/scripts/controller.py" register --manifest <run-manifest.json>`——
+**只做那一次写入**，不产出 result、不推进阶段、不释放锁。首次尝试与升级重试用的是
+同一条命令，所以宿主若弹窗，弹的永远是同一条 argv 与同一个目标文件。各宿主的通道
+不同，**不要用一个宿主的 observed 行为推断另一个**：
+
+| 宿主 | 重试方式 | 依据与边界 |
+|---|---|---|
+| Qoder / Qoder CN | 原样重跑 `retry_command` | 宿主在**工具调用**层拦截（命令/路径不在允许范围即弹窗）。argv 对人可见，点一次同时批准「执行这条命令」与「这次仓库外写入」，两个语义被塌缩成一次点击 |
+| Codex（桌面版 / CLI） | 同一命令，附带宿主提权参数：`sandbox_permissions: "require_escalated"`、`justification`（给用户看的一句问句，取控制器的 `justification`）、可选 `prefix_rule` | 宿主在**进程写入**层拦截，且提权必须由**模型主动发起**（`approval_policy=on-request` 的含义是「不开口就不弹」）。`approvals_reviewer=user` 时才弹给人；`auto_review` / `guardian_subagent` 会直接自动批准——写入成功但没有弹窗，这是档位决定的结果，不是漏弹。Codex 宿主的指令同时要求「请求提权前不要先给用户发消息」，与本技能「先问用户」的旧契约直接冲突，所以这里必须先发提权请求、让宿主去问人 |
+| Claude Code / OpenCode | **未实测**：退回文字提问，把 `registry_path` 与命令原文一并给出；用户同意后带 `--allow-global-writes` 重跑 `analyze` | 这两个宿主没有实测过的提权参数，不得为它们编造配置项 |
+
+重试**最多一次**：第二次仍返回 77 就不要再循环——改为询问用户；用户同意则带
+`--allow-global-writes` 重跑 `analyze`（此后注册失败才算 `failed`），用户拒绝则带
+`--allow-partial` 接受 `partial/registry-missing`。`prefix_rule` 会让弹窗多一个
+「以后都允许」，一旦点了，同类越界写后续静默放行——这是用户的取舍，报告里要说明。
 
 若不支持 `--skip-agents-md`：
 

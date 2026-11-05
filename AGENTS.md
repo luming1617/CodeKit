@@ -25,7 +25,7 @@ CodeKit 是以插件形式分发给 Claude、Codex、OpenCode、Qoder 与 Qoder 
 - `.codex-plugin/`: Codex 插件元数据：plugin.json 与 marketplace.json，与 .claude-plugin/ 同构，由 validate-plugin-manifests.py 校验名称与版本一致性。
 - `.qoder-plugin/`: Qoder 与 Qoder CN 共用的插件 manifest：实测目录内只有 plugin.json，没有 marketplace.json（两个发行版共享同一用户级配置根）。
 - `lefthook.yml`: git 钩子门禁：pre-commit 先运行 sync-plugin-version.py 并 git add 版本文件（权威清单在 sync-plugin-version.py 的 TARGET_FILES）、再校验 manifest；pre-push 校验技能布局、安装器 unittest 套件与 skills/*/tests 全部套件；marketplace/plugin 文件的存在性检查已由 validate-plugin-manifests.py 负责（钩子里的内联重复检查已删除）；钩子按平台解析解释器（Windows 用 `py -3`，其余用 `python3`）。
-- `.standard/`: 本 run Phase 1 刚写入的规范库：01-global/（00-instructions.md、api.md、git.md、security.md、unit-test.md）与 02-stack/python/（00-instructions.md、01-test.md）；两个 00-instructions.md 为规范索引，带托管 index-files 块，模板来源是 skills/initialize/standard/。
+- `.standard/`: 规范库：01-global/（00-instructions.md、api.md、git.md、security.md、unit-test.md）与 02-stack/python/（00-instructions.md 与 01-concurrency/02-observability/03-error-handling/04-unit-testing/05-project-structure/06-api-design/07-thread-pool/08-security/09-database 九份 FastAPI 后端规范）；00-instructions.md 为规范索引，带托管 index-files 块，模板来源是 skills/initialize/standard/。
 - `README.md`: 套件定位与一键安装入口说明；配套文档为 GUIDE.md（268 行使用指南）与 INSTALL-STRATEGY.md（302 行组件安装策略与安装行为说明），skills/README.md（61 行技能目录约定）。
 - `AGENTS.md`: CodeKit 托管的上下文文件（与 CLAUDE.md 成对，主 Agent 是唯一写者）；两者在本 run Phase 0 基线中均已存在且 dirty=false，其中既有托管块内容与当前工作树不符，本次扫描未采信（见 warnings）。
 
@@ -59,7 +59,7 @@ CodeKit 是以插件形式分发给 Claude、Codex、OpenCode、Qoder 与 Qoder 
 | 类别 | 先读取 | 详细文件 |
 |---|---|---|
 | 全局规范 | `.standard/01-global/00-instructions.md` | `.standard/01-global/api.md`, `.standard/01-global/git.md`, `.standard/01-global/security.md`, `.standard/01-global/unit-test.md` |
-| 技术栈规范 | `.standard/02-stack/python/00-instructions.md` | `.standard/02-stack/python/01-test.md` |
+| 技术栈规范 | `.standard/02-stack/python/00-instructions.md` | `.standard/02-stack/python/01-concurrency.md`, `.standard/02-stack/python/02-observability.md`, `.standard/02-stack/python/03-error-handling.md`, `.standard/02-stack/python/04-unit-testing.md`, `.standard/02-stack/python/05-project-structure.md`, `.standard/02-stack/python/06-api-design.md`, `.standard/02-stack/python/07-thread-pool.md`, `.standard/02-stack/python/08-security.md`, `.standard/02-stack/python/09-database.md` |
 
 进入某个场景时，先读取对应的 `00-instructions.md`，再只读取该场景所需的详细规范文件。
 <!-- codekit:initialize:standards:end -->

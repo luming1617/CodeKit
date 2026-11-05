@@ -25,6 +25,7 @@
 - 每一处变更都可追溯到任务目标或测试。
 - 没有调试残留、硬编码凭据、无关格式化或静默吞错。
 - 运行获准且适用的自检，并保留命令、退出码和关键证据。
+- 自检结果按真实退出码如实报告；判定与验证记录（`settle-task`、`record-validation`）由 Orchestrator 完成，把未运行或失败的自检写成通过会污染台账和重试预算。
 
 ## 输出
 严格按 contracts.md 的 Implementation Result 输出。DONE 只表示实现已提交给 Local Validator，不代表任务已通过。
