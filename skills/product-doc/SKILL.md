@@ -29,14 +29,14 @@ flowchart LR
     D -->|否| F["主 Agent + Writer<br/>按 Finding 定向修改"]
     F --> R
     D -->|是| O["主 Agent<br/>最终门禁与交付"]
-    O --> P["product-doc.md<br/>PRD + 原始评审报告 + 处理记录"]
+    O --> P["product-doc.md + prd-reviews.md<br/>PRD + 评审回执与完整意见 + 处理记录"]
 ```
 
 ### 协作与权限边界
 
 - 主 Agent：**唯一写入方**。可读输入资料和规范，可写最终 PRD、`history/` 快照、评审台账及允许的交付目录；不得把自己的推断伪装为 Extractor/Reviewer 结论。
 - Extractor：只读单份资料，只输出带 `source_id` 和定位信息的结构化事实；不得访问或修改其他 Extractor 的结果。
-- Writer：只接收事实台账、来源摘要、需求规模和模板；**只在会话内返回稿件文本，不写文件**——落盘统一由主 Agent 完成，避免 Writer 与主 Agent 双写同一文件互相覆盖；不自行消解冲突或补造事实。
+- Writer：只接收事实台账、来源摘要、需求规模和模板；初稿只写入同目录草稿文件 `product-doc.draft.md`，修订稿只在会话内返回定向补丁；**不得写入 `product-doc.md`**——正式文件的落盘与补丁应用统一由主 Agent 完成，避免双写同一文件互相覆盖；不自行消解冲突或补造事实。
 - Reviewer：新建且独立于 Writer 的只读 Sub-agent；只输出评审报告，不写 PRD、不删除问题、不调用其他 Skill。
 - 每轮修改必须基于冻结的 PRD 快照和 Reviewer Finding；同一 Reviewer 不得同时承担修改角色。
 
@@ -44,7 +44,7 @@ flowchart LR
 
 评审状态、严重度、Finding 字段、轮次边界与人工结论映射的唯一事实源是 `references/product-review-contract.md`，本文档与 `references/check-standard.md` 不再定义第二套枚举。
 
-`review_round` 从 1 开始计数，每一轮都是“独立 Reviewer 审查 → 主 Agent 协调 Writer 定向修改 → 主 Agent 核验稿件指纹”的完整循环，**最多 5 个完整循环**（轮次 1～5）。轮次与 Finding 闭环状态由 `scripts/review_state.py` 台账判定，不得由主 Agent 口头声明：第 5 轮收齐视角后仍有未闭环阻塞项，`advance` 会把台账置为阻塞态，此时必须停止并交付阻塞报告，不得继续审查或把未解决问题标记为通过。
+`review_round` 从 1 开始计数，每一轮都是“独立 Reviewer 审查 → 主 Agent 协调 Writer 定向修改 → 主 Agent 核验稿件指纹”的完整循环，**最多 5 个完整循环**（轮次 1～5）。中间轮可用增量复核（`advance --mode delta`，只派 1 个 RECHECK 视角复核未闭环 Finding 与被修改小节）；第 1 轮与最终交付轮必须是全量评审，增量复核不得连续进行，规则详见契约。轮次与 Finding 闭环状态由 `scripts/review_state.py` 台账判定，不得由主 Agent 口头声明：第 5 轮收齐视角后仍有未闭环阻塞项，`advance` 会把台账置为阻塞态，此时必须停止并交付阻塞报告，不得继续审查或把未解决问题标记为通过。
 
 ## 开始时声明
 
@@ -63,7 +63,7 @@ flowchart LR
 | 脚本 | 作用 | 调用时机 |
 |---|---|---|
 | `$SKILL_DIR/scripts/validate_prd.py` | 校验 PRD 的模板结构、编号追踪、9.3 来源台账、占位符残留、变更历史与评审回执；`--check-template-refs` 校验本文档与规范文件的章节号未漂移 | 每次写入 PRD 后、每轮修复后、交付前 |
-| `$SKILL_DIR/scripts/review_state.py` | 维护 `<feature-directory>/prd-review.json` 台账：轮次、视角路由、稿件指纹、Finding 闭环与交付门禁 | 初稿落盘后 `init`；每份报告 `record`；每条意见 `close`；收齐视角后 `advance`；交付前 `verify` |
+| `$SKILL_DIR/scripts/review_state.py` | 维护 `<feature-directory>/prd-review.json` 台账：轮次（full/delta）、视角路由、稿件指纹、Finding 闭环与交付门禁；`digest` 输出正文指纹，`render-appendix`/`render-report` 分别渲染 PRD 回执块与 prd-reviews.md 完整意见，`close --batch` 批量闭环 | 初稿落盘后 `init`；派发前 `digest`；每份报告双渲染后 `record`；意见 `close`（可批量）；收齐视角后 `advance`（可 `--mode delta`）；交付前 `verify` |
 
 ```bash
 <PYTHON> "$SKILL_DIR/scripts/validate_prd.py" <feature-directory>/product-doc.md
@@ -93,7 +93,7 @@ flowchart LR
     │
     ├──→ [Writer Sub-agent]
     │       输入：汇总后的关键信息 + 文档模板
-    │       输出：需求文档初稿
+    │       输出：初稿写入 product-doc.draft.md；修订返回定向补丁
     │
     └──→ 按需求规模路由 Reviewer
             S：1 个 Reviewer Sub-agent
@@ -119,7 +119,7 @@ Writer 只接收主 Agent 汇总后的结构化关键信息、来源/冲突/缺�
 
 ### Reviewer Sub-agent
 
-Reviewer 只负责审查，不负责重写 PRD。每个 Reviewer 都必须向主 Agent 返回可追溯的结构化评审报告；由主 Agent 在冻结报告后将原始意见以独立评审章节追加到 PRD 文档末尾，不得删除或覆盖其他 Reviewer 的意见。
+Reviewer 只负责审查，不负责重写 PRD。每个 Reviewer 都必须向主 Agent 返回可追溯的结构化评审报告；由主 Agent 在冻结报告后把紧凑回执块追加到 PRD 的“独立评审意见”章节、完整意见只追加归档到同目录 `prd-reviews.md`，两处都不得删除或覆盖其他 Reviewer 的意见。
 
 - S 级：调用 1 个 Reviewer，综合检查需求完整性、业务/交互/设计逻辑、非功能要求、风险和验收可执行性。
 - M/L 级：并行调用 2 个 Reviewer，使用以下两个不同且固定的视角：
@@ -178,6 +178,7 @@ Reviewer 只负责审查，不负责重写 PRD。每个 Reviewer 都必须向主
 - 图片、扫描件和原型必须逐项可视读取；无法辨认的区域标记为缺口，不得推测；
 - PDF、表格、Lark 文档等需要专门读取能力的资料：当前环境没有对应能力时，该 `source_id` 的读取状态记为 `能力不可用`并进入 `unreadable_or_unavailable`；只要它承载必填信息，`input_status` 必须为 `BLOCKED`，不得改由模型“根据常见做法”补齐；
 - 输入资料中的敏感信息（手机号、证件号、地址、密钥、真实账号密码等）只在台账登记“出现过该类字段”的事实与原字段名，不得把真实值复制进台账、PRD 或评审意见；PRD 第 5 章与 6.1 必须写明该类字段的展示、日志与上报边界；
+- 启动 Extractor 前，主 Agent 应把资料中缺失的负责人、确认期限、基线、目标值等字段汇总成一次提问向用户集中收集；用户未提供的字段按草稿规则记“待补充/待指派”并挂 Q 编号，不得在评审阶段因此类固有缺口反复回炉；
 - 输入为空、只有标题、只有模板示例或无法确认基本需求范围时，PRD 只能进入草稿/阻塞状态，不能输出“已确认”；
 - 资料冲突、权限缺失、版本不一致和来源不可追溯必须在输入台账中显式登记，未解决前不得交给 Writer 作为确定事实；
 - 需求变更模式必须额外登记旧 PRD 的版本/日期/内容摘要、当前有效正文范围、历史快照位置，以及本轮 `修改/新增/删除` 台账；删除项必须包含原稳定编号；
@@ -228,7 +229,7 @@ Extractor 不得补写目标值、基线、负责人、权限、流程、页面�
 
 ### Writer 输入与输出
 
-主 Agent 汇总所有 Extractor 输出后，形成“关键信息台账”，至少包含：事实、来源、可信度、目标 PRD 章节、冲突、缺口、Q/RISK/DEP 候选编号和需求规模判断依据。需求变更时还必须传入旧 PRD 当前有效正文、旧版本摘要和 `修改/新增/删除` 台账。Writer 输入为该台账、原始资料摘要、需求规模和完整模板；输出为完整 PRD 初稿或修订稿。
+主 Agent 汇总所有 Extractor 输出后，形成“关键信息台账”，至少包含：事实、来源、可信度、目标 PRD 章节、冲突、缺口、Q/RISK/DEP 候选编号和需求规模判断依据。需求变更时还必须传入旧 PRD 当前有效正文、旧版本摘要和 `修改/新增/删除` 台账。Writer 输入为该台账、原始资料摘要、需求规模和完整模板；输出分两种模式：初稿写入 `<feature-directory>/product-doc.draft.md`；修订稿在会话内返回定向补丁（Finding 编号 → 章节定位 → 替换后的完整小节文本），仅在主 Agent 判定改动面超过正文 30% 时才整篇重写草稿文件。
 
 Writer 必须：
 
@@ -250,7 +251,7 @@ Reviewer 输入必须包括：
 - `references/check-standard.md` 审查清单；
 - 该 Reviewer 的固定审查视角和需求规模。
 
-Reviewer 输出必须严格遵循 `references/product-review-contract.md` 的输入封套与输出契约（含 `review_id`、`contract_version`、`prd_digest` 与 Finding 字段），字段不得缺失、不得改名。评审意见只能指出文档问题，不得引入资料之外的新业务事实。主 Agent 必须把输出规范化为 JSON 后交给 `scripts/review_state.py record`，而不是直接读一段中文结论。
+Reviewer 输出必须严格遵循 `references/product-review-contract.md` 的输入封套与输出契约（含 `review_id`、`contract_version`、`prd_digest` 与 Finding 字段），字段不得缺失、不得改名。评审意见只能指出文档问题，不得引入资料之外的新业务事实。主 Agent 必须把输出规范化为 JSON，先用 `scripts/review_state.py render-appendix` 生成回执块并原样追加到 PRD，再交给 `scripts/review_state.py record`，而不是直接读一段中文结论或手拼回执格式。
 
 ## 信息可信度与缺口规则
 
@@ -324,7 +325,7 @@ flowchart TB
 
 ### 4. 调用 Writer Sub-agent 生成 PRD 初稿
 
-将汇总后的关键信息台账、原始资料摘要、需求规模和完整模板传给 Writer。Writer 按“问题 → 目标 → 用户与场景 → 功能 → 页面与交互 → 非功能要求 → 指标 → 验收 → 发布与风险”的顺序填写模板，**在会话内返回完整 PRD 初稿文本**（不写文件）；由主 Agent 落盘到 `<feature-directory>/product-doc.md` 并跑一次 `validate_prd.py`，确认结构后才能进入独立评审。
+将汇总后的关键信息台账、原始资料摘要、需求规模和完整模板传给 Writer。Writer 按“问题 → 目标 → 用户与场景 → 功能 → 页面与交互 → 非功能要求 → 指标 → 验收 → 发布与风险”的顺序填写模板，**把完整 PRD 初稿写入 `<feature-directory>/product-doc.draft.md`**（不写正式文件）；主 Agent 先对草稿跑一次 `validate_prd.py` 并修复结构类缺陷（此时评审回执类报错属预期，评审后必须归零），再把它落盘为 `<feature-directory>/product-doc.md`，确认结构后才能进入独立评审。
 
 所有功能需求必须回答：谁在什么条件下做什么；产品提供什么可观察行为；成功、失败、边界、重复和并发时如何表现；哪些属于本次范围；如何通过指标和验收判断完成。
 
@@ -333,19 +334,21 @@ flowchart TB
 初稿由主 Agent 落盘后，先建立评审台账再派发 Reviewer（`review_state.py init --state <feature-directory>/prd-review.json --prd <feature-directory>/product-doc.md --mode new|change --scale S|M|L --input SRC-001=<已落盘资料路径> ...`）。主 Agent 不得跳过独立审查：
 
 - 视角路由由 `references/product-review-contract.md` 按规模固定：S → 1 个 `COMPREHENSIVE`（综合）；M/L → 并行 2 个视角 `COMPLETENESS`（需求完整性与逻辑正确性）与 `NON_FUNCTIONAL`（非功能性需求）；不得用主 Agent 自检替代；
-- 派发时必须传入契约要求的完整输入封套，其中 `prd_digest` 取落盘后稿件**正文**的 sha256（不含文末回执区）；所有 Reviewer 都读取相同的 `check-standard.md`，但只能依据自己的输入和指定视角审查；
-- 每份报告返回后先原样追加到 PRD 的“独立评审意见”章节（保留 `review_id`、`perspective`、`review_round` 与 `prd_digest`），再规范化为 JSON 调 `record`；`record` 会拒绝轮次不符、视角重复、指纹过期或与 Finding 集合矛盾的结论；
+- 派发时必须传入契约要求的完整输入封套，其中 `prd_digest` 一律取自 `<PYTHON> "$SKILL_DIR/scripts/review_state.py" digest --prd <feature-directory>/product-doc.md` 的输出（即剔除文末回执区后的正文 sha256），不得手工计算；所有 Reviewer 都读取相同的 `check-standard.md`，但只能依据自己的输入和指定视角审查；
+- 每份报告返回后先规范化为 JSON，用 `render-appendix --report <normalized-report.json>` 生成紧凑回执块并原样追加到 PRD 的“独立评审意见”章节（保留 `review_id`、`perspective`、`review_round` 与 `prd_digest`），再用 `render-report --report <normalized-report.json>` 生成完整意见节并只追加到同目录 `prd-reviews.md`，然后调 `record`；`record` 会拒绝轮次不符、视角重复、指纹过期或与 Finding 集合矛盾的结论；
 - 收齐本轮要求的视角后才允许 `advance`；每次重新审查都必须重新冻结 PRD、输入台账和本轮变更摘要，不得复用旧 Reviewer 的口头结论。
 
 ### 6. 处理审查意见并完成最终自检
 
 主 Agent 对每条 Reviewer 意见逐项处理，并遵守台账记录的 `review_round`（轮次 1～5，不得由主 Agent 口头推定）：
 
-- 能由已有资料确认的问题，由主 Agent 依据 Finding 协调 Writer 重新出稿并落盘，同步修复关联编号、2.2 指标、9.3 台账、Q/RISK/DEP 和自检结论；
+- 占位符残留、9.3 台账补行、表头列名、回执格式等机械性缺陷由主 Agent 直接修复，不必派发 Writer；语义性修改由主 Agent 依据 Finding 协调 Writer 返回定向补丁并定点应用，同步修复关联编号、2.2 指标、9.3 台账、Q/RISK/DEP 和自检结论；改动面超过正文 30% 时才让 Writer 整篇重写草稿文件；
 - 资料无法确认或存在真实冲突的问题，不得擅自决策，写入 9.2 决策与待决问题和 8.2 依赖与风险，并以 `close --resolution deferred --q-ref Q-XXX` 关闭（`Q-XXX` 必须已出现在 PRD 中）；
-- 阻塞级 Finding 只能用 `fixed` 关闭，且必须发生在推进到下一轮之后（`close` 会拒绝“同一轮内自称已修复”）；非阻塞项可以 deferred 或有充分理由的 rejected 关闭；
+- 阻塞级 Finding 只能用 `fixed` 关闭，且必须发生在推进到下一轮之后（`close` 会拒绝“同一轮内自称已修复”）；非阻塞项可以 deferred 或有充分理由的 rejected 关闭；同一轮的多条 Finding 可用 `close --batch <closures.json>` 一次闭环（数组每项含 finding/resolution/evidence，deferred 另需 q_ref），逐条校验与单条一致，任一条失败整批不落盘；
+- 修复后的复核优先用增量轮：`advance --mode delta` 后只派 1 个 RECHECK Reviewer，输入封套只含未闭环 Finding、被修改小节与新旧指纹；RECHECK 确认修复的 Finding 写入 `verified_findings`（台账仍有未闭环项时不得空确认），据此批量 `close --resolution fixed`，脚本会拒绝未出现在任何后续 RECHECK 报告 `verified_findings` 中的 fixed 闭环；RECHECK 发现新阻塞问题或上一轮已是 delta 时，必须 `advance`（默认 full）回到全量评审；最终交付轮必须是全量且收齐规模要求的视角；
 - 每轮修复后重跑 `validate_prd.py`，再 `advance` 进入下一轮；正文与送审稿件一致时 `advance` 会拒绝，防止只归档回执不改稿；变更历史行数减少时同样拒绝（历史不得删除、覆盖或重排）；
-- Reviewer 的原始评审意见仍须保留在文档末尾，不得因修复正文而删除；
+- 每轮派发前必须依次完成：`validate_prd.py` 通过 → `digest` 取得正文指纹 → 派发 Reviewer；派发后到 `record` 前不得修改正文，否则指纹过期、整轮评审作废重来；
+- Reviewer 的回执块仍须保留在 PRD 末尾、完整意见仍须保留在 `prd-reviews.md`，不得因修复正文而删除；
 - 重新执行 `references/check-standard.md` 的完整自检，确保正文修复没有破坏模板结构和来源追溯；
 - 最终 PRD 的确认结论必须与信息完整性一致；只有 `review_state.py verify` 与 `validate_prd.py` 同时返回 0，才允许把自检结论写为“已确认”。
 
@@ -358,7 +361,7 @@ flowchart TB
 
 新需求的产品需求文档统一保存到 `docs/YYYY-MM-DD-<feature-name>/product-doc.md`；需求变更保存回 `<feature-directory>/product-doc.md`。
 
-`docs/YYYY-MM-DD-<feature-name>/` 即为本次需求的工作目录，其中固定存放：`product-doc.md`（PRD）、`prd-review.json`（评审台账）、`inputs/`（已落盘的粘贴类输入资料）与 `history/product-doc-v<版本>.md`（上一版正文快照）。
+`docs/YYYY-MM-DD-<feature-name>/` 即为本次需求的工作目录，其中固定存放：`product-doc.md`（PRD 与评审回执）、`prd-reviews.md`（完整评审意见，只追加）、`prd-review.json`（评审台账）、`inputs/`（已落盘的粘贴类输入资料）与 `history/product-doc-v<版本>.md`（上一版正文快照）。
 
 交付前必须依次跑完两个门禁（任一非 0 都只能交付阻塞报告，不得声称已确认）：
 
@@ -371,7 +374,8 @@ flowchart TB
 
 最终输出产物必须明确包括：
 
-- `<feature-directory>/product-doc.md`：完整 PRD、9.3 来源追踪、未决问题和原始 Reviewer 评审意见；
+- `<feature-directory>/product-doc.md`：完整 PRD、9.3 来源追踪、未决问题和评审回执块；
+- `<feature-directory>/prd-reviews.md`：逐轮完整评审意见（只追加，与 PRD 回执块的 `review_id` 一一对应）；
 - 需求变更时的 `修改/新增/删除` 醒目摘要、只追加变更历史台账，以及台账中登记的 `history/` 快照路径与内容摘要；
 - `prd-review.json`：输入资料清单、逐轮 Reviewer 回执与 Finding → 修改/待确认/不采纳映射；
 - 两个门禁脚本的退出状态与输出摘要；主 Agent 最终门禁结果：模板校验、需求覆盖、信息完整性、`review_round`、阻塞项和人工确认项。
@@ -397,7 +401,9 @@ flowchart TB
 9. 附录（含 9.3 来源与追踪台账，任何规模均为必填）；
 10. 变更历史（任何版本均为必填；新需求只写一行“无历史版本”）；
 11. PRD 自检与确认；
-12. 独立评审意见（追加在模板最后一节之后）。
+12. 独立评审意见（回执块追加在模板最后一节之后，完整意见归档在同目录 `prd-reviews.md`）。
+
+S 级且正文未引用 DEP/RISK/Q/DEC 编号时，第 8 章与 9.1/9.2 可整节省略（与模板《文档裁剪》表一致）；引用了就必须保留对应定义区，其余规模不得删除必填章节。
 
 填写要求：
 
@@ -445,13 +451,13 @@ Reviewer 的共同提示词约束如下：
 - 不得把主 Agent 的串行自检冒充独立 Reviewer 结果；不得为了推轮把未闭环的阻塞项降级为非阻塞。
 - 不得跳过 Extractor、Writer 或按需求规模要求的 Reviewer 阶段。
 - 不得把图片看不清的内容、资料中的示例或模型推断写成已确认产品事实。
-- 不得让 Writer 或 Reviewer 直接写入 `product-doc.md`；唯一写入方是主 Agent，否则两个角色会互相覆盖。
+- 不得让 Writer 或 Reviewer 直接写入 `product-doc.md`；Writer 只允许写草稿文件 `product-doc.draft.md`，Reviewer 不写任何文件；正式 PRD 的唯一写入方是主 Agent，否则两个角色会互相覆盖。
 - 不得把资料缺失填写为“不涉及”；只有明确不适用时才能写“不涉及”。
 - 不得编造用户、角色、权限、目标值、基线、指标口径、发布计划、负责人、验收结果或业务规则。
 - 不得使用“体验良好”“尽快”“高性能”等不可验证的模糊表述替代具体要求。
 - 不得遗漏正常、边界、异常、权限、状态、重复/并发和兼容性等适用场景。
-- 不得删除条件必填章节；不适用时必须保留章节并说明原因。
+- 不得删除条件必填章节；不适用时必须保留章节并说明原因（S 级未引用 DEP/RISK/Q/DEC 时第 8 章与 9.1/9.2 的整节省略除外）。
 - 不得将未解决的冲突、依赖或风险隐藏在正文中，必须通过 Q、DEP、RISK 或 DEC 编号追踪。
-- 不得删除、覆盖或静默改写 Reviewer 追加到文档结尾的原始评审意见。
+- 不得删除、覆盖或静默改写 Reviewer 追加到 PRD 文末的回执块与 `prd-reviews.md` 中的完整评审意见；不得以增量复核轮作为最终交付轮或连续使用增量复核逃避全量审查。
 - 需求变更不得直接覆盖旧 `product-doc.md`；不得删除历史快照、变更记录或三类变更台账，不得将旧逻辑重新写回当前有效正文覆盖最新输入。
 - 不得在信息不全时把 PRD 自检结论或确认结论写成“已确认”。

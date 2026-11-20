@@ -8,9 +8,13 @@
     review_state.py init   --state prd-review.json --prd product-doc.md --mode new --scale M --input SRC-001=note.md
     review_state.py record --state prd-review.json --report round1.json
     review_state.py close  --state prd-review.json --finding PR-001 --resolution fixed --evidence "已按 SRC-001 修正 4.1"
-    review_state.py advance --state prd-review.json
+    review_state.py advance --state prd-review.json [--mode full|delta]
     review_state.py verify  --state prd-review.json [--allow-blocked]
     review_state.py show    --state prd-review.json
+    review_state.py digest  --prd product-doc.md
+    review_state.py render-appendix --report round1.json
+    review_state.py render-report   --report round1.json
+    review_state.py close   --state prd-review.json --batch closures.json
 """
 
 from __future__ import annotations
@@ -34,12 +38,13 @@ CATEGORIES = (
     "TEMPLATE", "EVIDENCE", "TRACEABILITY", "CONTENT", "NON_FUNCTIONAL",
     "METRICS", "ACCEPTANCE", "CHANGE_HISTORY", "RISK",
 )
-PERSPECTIVES = ("COMPLETENESS", "NON_FUNCTIONAL", "COMPREHENSIVE")
+PERSPECTIVES = ("COMPLETENESS", "NON_FUNCTIONAL", "COMPREHENSIVE", "RECHECK")
 REQUIRED_PERSPECTIVES = {
     "S": {"COMPREHENSIVE"},
     "M": {"COMPLETENESS", "NON_FUNCTIONAL"},
     "L": {"COMPLETENESS", "NON_FUNCTIONAL"},
 }
+DELTA_PERSPECTIVES = {"RECHECK"}
 REPORT_FIELDS = (
     "review_id", "contract_version", "review_round", "perspective",
     "scale", "prd_digest", "status", "summary", "findings", "prd_appendix_markdown",
@@ -165,6 +170,20 @@ def round_reports(state: dict[str, Any], number: int) -> list[dict[str, Any]]:
     return []
 
 
+def round_entry_of(state: dict[str, Any], number: int) -> dict[str, Any]:
+    for round_entry in state["rounds"]:
+        if round_entry["round"] == number:
+            return round_entry
+    return {}
+
+
+def required_perspectives(state: dict[str, Any], entry: dict[str, Any]) -> set[str]:
+    """增量复核轮只要求 RECHECK；全量轮按规模路由（旧台账无 mode 字段时视为全量）。"""
+    if entry.get("mode", "full") == "delta":
+        return set(DELTA_PERSPECTIVES)
+    return set(REQUIRED_PERSPECTIVES[state["scale"]])
+
+
 def validate_finding(raw: Any, review_round: int, seen_ids: set[str]) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise GateError(f"第 {review_round} 轮 finding 必须是对象：{raw!r}")
@@ -232,7 +251,11 @@ def validate_report(payload: Any, state: dict[str, Any]) -> tuple[dict[str, Any]
     perspective = payload["perspective"]
     if perspective not in PERSPECTIVES:
         raise GateError(f"perspective `{perspective}` 非法（只允许 {', '.join(PERSPECTIVES)}）")
-    if perspective not in REQUIRED_PERSPECTIVES[state["scale"]]:
+    current_entry = round_entry_of(state, state["current_round"])
+    if current_entry.get("mode", "full") == "delta":
+        if perspective != "RECHECK":
+            raise GateError(f"增量复核轮只接受视角 RECHECK，不接受 {perspective}")
+    elif perspective not in REQUIRED_PERSPECTIVES[state["scale"]]:
         raise GateError(f"{state['scale']} 级需求不接受视角 {perspective}；应为 {sorted(REQUIRED_PERSPECTIVES[state['scale']])}")
     prd = Path(state["prd_path"])
     actual = content_digest(prd)
@@ -259,15 +282,29 @@ def validate_report(payload: Any, state: dict[str, Any]) -> tuple[dict[str, Any]
         raise GateError("status=REQUEST_CHANGES 要求至少一条 blocking finding")
     if status in {"APPROVE", "APPROVE_WITH_FOLLOW_UPS"} and blocking:
         raise GateError("存在 blocking finding 时不得给出 APPROVE/APPROVE_WITH_FOLLOW_UPS")
-    if status == "APPROVE" and (follow_ups or still_open):
+    if status == "APPROVE" and (follow_ups or (still_open and perspective != "RECHECK")):
         raise GateError(
             "status=APPROVE 要求本次无 Finding 且台账中无未闭环项；未闭环："
             + ", ".join(item["id"] for item in still_open + follow_ups)
         )
     if status == "APPROVE_WITH_FOLLOW_UPS" and not follow_ups:
         raise GateError("status=APPROVE_WITH_FOLLOW_UPS 要求存在非阻塞跟进项")
+    verified = payload.get("verified_findings", [])
+    if not isinstance(verified, list):
+        raise GateError("verified_findings 必须是数组")
+    if perspective != "RECHECK":
+        if verified:
+            raise GateError("verified_findings 只允许出现在 RECHECK 视角的报告中")
+    else:
+        # 增量复核的 APPROVE 只表示“被复核项已修复”，未闭环项随后由 close 归档。
+        for identifier in verified:
+            item = state["findings"].get(str(identifier))
+            if not item or item["status"] != "OPEN":
+                raise GateError(f"verified_findings 中的 {identifier} 必须是台账中未闭环的 Finding")
+        if status == "APPROVE" and still_open and not verified:
+            raise GateError("RECHECK 的 APPROVE 不得空确认：台账仍有未闭环项时 verified_findings 不得为空")
     if not str(payload.get("prd_appendix_markdown", "")).strip():
-        raise GateError("prd_appendix_markdown 为空；评审意见必须可原样追加到 PRD")
+        raise GateError("prd_appendix_markdown 为空；评审意见必须可原样追加到 prd-reviews.md")
     report = {
         "review_id": str(payload["review_id"]),
         "perspective": perspective,
@@ -276,6 +313,7 @@ def validate_report(payload: Any, state: dict[str, Any]) -> tuple[dict[str, Any]
         "summary": str(payload["summary"]),
         "blocked_reason": str(payload.get("blocked_reason", "")),
         "appendix_digest": hashlib.sha256(str(payload["prd_appendix_markdown"]).encode("utf-8")).hexdigest(),
+        "verified_findings": [str(item) for item in verified],
         "recorded_at": now(),
     }
     return report, findings
@@ -315,7 +353,7 @@ def command_init(args: argparse.Namespace) -> int:
         "prd_digest": content_digest(prd),
         "history_rows": history_row_count(prd),
         "inputs": inputs,
-        "rounds": [{"round": 1, "opened_at": now(), "prd_digest": content_digest(prd), "reports": []}],
+        "rounds": [{"round": 1, "mode": "full", "opened_at": now(), "prd_digest": content_digest(prd), "reports": []}],
         "findings": {},
         "transitions": [{"at": now(), "event": "init", "detail": f"mode={args.mode} scale={args.scale}"}],
     }
@@ -346,7 +384,7 @@ def command_record(args: argparse.Namespace) -> int:
             finding["first_seen_round"] = min(existing["first_seen_round"], finding["first_seen_round"])
         state["findings"][finding["id"]] = {**finding, "status": "OPEN", "resolution": None, "closed_in_round": None,
                                             "closure_evidence": "", "q_ref": ""}
-    required = REQUIRED_PERSPECTIVES[state["scale"]]
+    required = required_perspectives(state, round_entry_of(state, state["current_round"]))
     got = {item["perspective"] for item in entry}
     remaining = sorted(required - got)
     state["transitions"].append({"at": now(), "event": "record", "detail": f"{report['review_id']} -> {report['status']}"})
@@ -357,42 +395,92 @@ def command_record(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_close(args: argparse.Namespace) -> int:
-    state_path = Path(args.state)
-    state = load_state(state_path)
-    finding = state["findings"].get(args.finding)
+def close_finding(state: dict[str, Any], identifier: str, resolution: str, evidence: str, q_ref: str) -> None:
+    """校验并关闭一条 Finding；只改内存中的台账，落盘由调用方统一完成。"""
+    if resolution not in RESOLUTIONS:
+        raise GateError(f"resolution `{resolution}` 非法（只允许 {', '.join(RESOLUTIONS)}）")
+    finding = state["findings"].get(identifier)
     if not finding:
-        raise GateError(f"台账中没有 Finding {args.finding}；只能关闭 Reviewer 实际提出的问题")
+        raise GateError(f"台账中没有 Finding {identifier}；只能关闭 Reviewer 实际提出的问题")
     if finding["status"] == "CLOSED":
-        raise GateError(f"Finding {args.finding} 已在第 {finding['closed_in_round']} 轮闭环，不得重复关闭")
-    evidence = args.evidence.strip()
+        raise GateError(f"Finding {identifier} 已在第 {finding['closed_in_round']} 轮闭环，不得重复关闭")
+    evidence = evidence.strip()
     if len(evidence) < 10:
         raise GateError("closure 证据过短；必须说明依据哪份资料或哪条契约做了什么修改")
-    if args.resolution == "fixed":
+    if resolution == "fixed":
         if state["current_round"] <= finding["raised_in_round"]:
             raise GateError(
-                f"Finding {args.finding} 提出于第 {finding['raised_in_round']} 轮，"
+                f"Finding {identifier} 提出于第 {finding['raised_in_round']} 轮，"
                 "标记为 fixed 前必须先 advance 到下一轮并由独立 Reviewer 复核"
             )
-    if args.resolution == "deferred":
-        if not re.fullmatch(r"Q-\d+", args.q_ref or ""):
+        # 存在增量复核时，fixed 必须消费 RECHECK 的确认，不得由主 Agent 口头自称修复。
+        recheck_reports = [
+            report
+            for round_entry in state["rounds"]
+            if round_entry["round"] > finding["raised_in_round"]
+            for report in round_entry["reports"]
+            if report["perspective"] == "RECHECK"
+        ]
+        if recheck_reports and not any(
+            identifier in report.get("verified_findings", []) for report in recheck_reports
+        ):
+            raise GateError(
+                f"Finding {identifier} 未出现在任何后续 RECHECK 报告的 verified_findings 中，"
+                "不得以 fixed 关闭；请先由增量复核确认修复"
+            )
+    if resolution == "deferred":
+        if not re.fullmatch(r"Q-\d+", q_ref or ""):
             raise GateError("deferred 必须通过 --q-ref 指向 9.2 中已建立的 Q 编号")
         prd_text = Path(state["prd_path"]).read_text(encoding="utf-8")
-        if args.q_ref not in prd_text:
-            raise GateError(f"{args.q_ref} 未出现在 PRD 的 9.2 决策与待决问题中，不得以“待确认”关闭")
-    if args.resolution == "rejected":
+        if q_ref not in prd_text:
+            raise GateError(f"{q_ref} 未出现在 PRD 的 9.2 决策与待决问题中，不得以“待确认”关闭")
+    if resolution == "rejected":
         if finding["severity"] in BLOCKING_SEVERITIES:
             raise GateError(f"{finding['severity']} 级 Finding 不得判定为不采纳；只能修复或转 Q 待确认")
         if len(evidence) < 20:
             raise GateError("不采纳必须给出更长理由（≥20 字符），说明为何不构成文档缺陷")
     finding.update(
         status="CLOSED",
-        resolution=args.resolution,
+        resolution=resolution,
         closed_in_round=state["current_round"],
         closure_evidence=evidence,
-        q_ref=args.q_ref or "",
+        q_ref=q_ref or "",
     )
-    state["transitions"].append({"at": now(), "event": "close", "detail": f"{args.finding} -> {args.resolution}"})
+    state["transitions"].append({"at": now(), "event": "close", "detail": f"{identifier} -> {resolution}"})
+
+
+def command_close(args: argparse.Namespace) -> int:
+    if args.batch and (args.finding or args.resolution or args.evidence):
+        raise GateError("--batch 与 --finding/--resolution/--evidence 不得同时使用")
+    if args.batch:
+        try:
+            items = json.loads(sys.stdin.read() if args.batch == "-" else Path(args.batch).read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise GateError(f"无法读取批量闭环清单：{exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise GateError(f"批量闭环清单不是合法 JSON：{exc}") from exc
+        if not isinstance(items, list) or not items:
+            raise GateError("批量闭环清单必须是非空数组，每项含 finding/resolution/evidence（deferred 另需 q_ref）")
+    elif not (args.finding and args.resolution and args.evidence):
+        raise GateError("单条闭环需要 --finding/--resolution/--evidence；批量闭环请使用 --batch")
+    state_path = Path(args.state)
+    state = load_state(state_path)
+    if args.batch:
+        # 逐条校验与单条模式完全一致；任一条失败则整批不落盘，避免半批闭环。
+        for index, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                raise GateError(f"批量闭环第 {index} 项必须是对象")
+            close_finding(
+                state,
+                str(item.get("finding", "")).strip(),
+                str(item.get("resolution", "")).strip(),
+                str(item.get("evidence", "")),
+                str(item.get("q_ref", "")).strip(),
+            )
+        save_state(state_path, state)
+        print(f"CLOSED: 批量闭环 {len(items)} 条 Finding")
+        return 0
+    close_finding(state, args.finding, args.resolution, args.evidence, args.q_ref or "")
     save_state(state_path, state)
     print(f"CLOSED: {args.finding} ({args.resolution})")
     return 0
@@ -405,12 +493,20 @@ def command_advance(args: argparse.Namespace) -> int:
         raise GateError(f"台账状态为 {state['status']}，不得推进轮次")
     number = state["current_round"]
     entry = round_reports(state, number)
-    required = REQUIRED_PERSPECTIVES[state["scale"]]
+    current = round_entry_of(state, number)
+    required = required_perspectives(state, current)
     got = {item["perspective"] for item in entry}
     if required - got:
         raise GateError(f"第 {number} 轮尚未收齐独立评审：缺少 {', '.join(sorted(required - got))}")
     if not entry:
         raise GateError(f"第 {number} 轮没有评审记录")
+    if args.mode == "delta":
+        if current.get("mode", "full") != "full":
+            raise GateError("增量复核不得连续进行：上一轮已是 delta，本轮修复后必须回到全量评审")
+        if not open_findings(state):
+            raise GateError("没有未闭环 Finding，无需增量复核；请直接 verify 或推进全量轮")
+        if number + 1 >= state["max_rounds"]:
+            raise GateError("最终轮必须是全量评审，不得以增量复核轮作为最后一轮")
     prd = Path(state["prd_path"])
     digest = content_digest(prd)
     rows = history_row_count(prd)
@@ -435,10 +531,10 @@ def command_advance(args: argparse.Namespace) -> int:
             "稿件正文与送审时完全一致，但仍有未闭环的阻塞项；必须先按 Finding 修改正文再推进"
         )
     state["current_round"] = number + 1
-    state["rounds"].append({"round": number + 1, "opened_at": now(), "prd_digest": digest, "reports": []})
-    state["transitions"].append({"at": now(), "event": "advance", "detail": f"{number} -> {number + 1}"})
+    state["rounds"].append({"round": number + 1, "mode": args.mode, "opened_at": now(), "prd_digest": digest, "reports": []})
+    state["transitions"].append({"at": now(), "event": "advance", "detail": f"{number} -> {number + 1} ({args.mode})"})
     save_state(state_path, state)
-    print(f"ADVANCE: 进入第 {number + 1} 轮（送审稿件摘要 {digest[:12]}）")
+    print(f"ADVANCE: 进入第 {number + 1} 轮（{args.mode}，送审稿件摘要 {digest[:12]}）")
     return 0
 
 
@@ -463,21 +559,27 @@ def verify_delivery(state: dict[str, Any], allow_blocked: bool) -> list[str]:
             problems.append("台账已判定 BLOCKED；如需交付阻塞报告请使用 --allow-blocked")
         if not recorded_rounds:
             problems.append("独立评审未执行，不得交付")
-    required = REQUIRED_PERSPECTIVES[state["scale"]]
     last = recorded_rounds[-1] if recorded_rounds else None
     if last:
+        if not allow_blocked and last.get("mode", "full") != "full":
+            problems.append("最后一轮是增量复核（delta），交付前必须完成一轮全量评审")
         perspectives = {item["perspective"] for item in last["reports"]}
-        if required - perspectives:
-            problems.append(f"最后一轮（第 {last['round']} 轮）缺少视角：{', '.join(sorted(required - perspectives))}")
+        missing = required_perspectives(state, last) - perspectives
+        if missing:
+            problems.append(f"最后一轮（第 {last['round']} 轮）缺少视角：{', '.join(sorted(missing))}")
         statuses = {item["status"] for item in last["reports"]}
         if not allow_blocked and not statuses <= {"APPROVE", "APPROVE_WITH_FOLLOW_UPS"}:
             problems.append(f"最后一轮状态含 {', '.join(sorted(statuses - {'APPROVE', 'APPROVE_WITH_FOLLOW_UPS'}))}，不得按已确认交付")
         if digest != last["reports"][-1]["prd_digest"]:
             problems.append("PRD 在最后一次评审之后又被修改，但未进行下一轮复核")
+    reviews_path = prd.parent / "prd-reviews.md"
+    reviews_text = reviews_path.read_text(encoding="utf-8") if reviews_path.is_file() else ""
     for entry in recorded_rounds:
         for report in entry["reports"]:
             if report["review_id"] not in text:
-                problems.append(f"{report['review_id']} 的评审意见未追加进 PRD 的独立评审意见章节")
+                problems.append(f"{report['review_id']} 的回执块未追加进 PRD 的独立评审意见章节")
+            if report["review_id"] not in reviews_text:
+                problems.append(f"{report['review_id']} 的完整意见未归档进同目录 prd-reviews.md")
     for finding in state["findings"].values():
         if finding["status"] == "CLOSED" and finding["resolution"] == "fixed":
             later = [
@@ -507,6 +609,121 @@ def command_verify(args: argparse.Namespace) -> int:
     state["transitions"].append({"at": now(), "event": "verify", "detail": state["status"]})
     save_state(Path(args.state), state)
     print(f"VALID: 评审门禁通过（status={state['status']}，rounds={len([e for e in state['rounds'] if e['reports']])}）")
+    return 0
+
+
+def command_digest(args: argparse.Namespace) -> int:
+    prd = Path(args.prd)
+    if not prd.is_file():
+        raise GateError(f"PRD 不存在或不可读：{prd}")
+    print(content_digest(prd))
+    return 0
+
+
+def _escape_cell(value: Any) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _receipt_parts(payload: Any) -> tuple[str, str, int, str, list[str]]:
+    """校验回执必需字段，返回 (review_id, perspective, 轮次, 回执表格 Markdown, Finding 紧凑清单)。
+
+    只做字段与枚举检查；轮次、指纹与 Finding 闭环仍由 record 判定。
+    """
+    if not isinstance(payload, dict):
+        raise GateError("报告负载必须是 JSON 对象")
+    required = ("review_id", "review_round", "perspective", "status", "prd_digest", "prd_appendix_markdown")
+    missing = [field for field in required if not str(payload.get(field, "")).strip()]
+    if missing:
+        raise GateError(f"报告缺少回执必需字段：{', '.join(missing)}")
+    review_id = str(payload["review_id"]).strip()
+    perspective = str(payload["perspective"]).strip()
+    status = str(payload["status"]).strip()
+    if perspective not in PERSPECTIVES:
+        raise GateError(f"perspective `{perspective}` 非法（只允许 {', '.join(PERSPECTIVES)}）")
+    if status not in STATUSES:
+        raise GateError(f"status `{status}` 非法（只允许 {', '.join(STATUSES)}）")
+    digest = re.sub(r"[^0-9a-fA-F]", "", str(payload["prd_digest"]))
+    if len(digest) < 12:
+        raise GateError("prd_digest 不足 12 位十六进制，无法生成可校验的稿件摘要行")
+    try:
+        round_number = int(payload["review_round"])
+    except (TypeError, ValueError):
+        raise GateError("review_round 必须是整数") from None
+    if round_number < 1:
+        raise GateError("review_round 必须从 1 开始")
+    findings = payload.get("findings", [])
+    if not isinstance(findings, list):
+        raise GateError("findings 必须是数组（无问题时为空数组）")
+    table = [
+        "| 回执项 | 内容 |",
+        "|--------|------|",
+        f"| 稿件摘要 | {digest} |",
+        f"| 状态 | {status} |",
+        f"| 摘要 | {_escape_cell(payload.get('summary', ''))} |",
+    ]
+    compact: list[str] = []
+    for item in findings:
+        if not isinstance(item, dict):
+            raise GateError("Finding 必须是对象")
+        compact.append(
+            f"- {_escape_cell(item.get('id', '?'))}（{_escape_cell(item.get('severity', '?'))} / "
+            f"{_escape_cell(item.get('category', '?'))}，"
+            f"blocking={str(item.get('blocking', '')).lower()}）：{_escape_cell(item.get('location', ''))}"
+        )
+    return review_id, perspective, round_number, "\n".join(table), compact
+
+
+def render_appendix_markdown(payload: Any) -> str:
+    """渲染追加进 PRD「独立评审意见」章节的紧凑回执块；完整意见另由 render-report 归档到 prd-reviews.md。"""
+    review_id, perspective, round_number, table, compact = _receipt_parts(payload)
+    lines = [f"### {review_id} · {perspective} · 第 {round_number} 轮", "", table]
+    if compact:
+        lines += ["", "**Finding 清单**", "", *compact]
+    lines += ["", f"> 完整意见见同目录 `prd-reviews.md` 的 {review_id} 节。", ""]
+    return "\n".join(lines)
+
+
+def render_report_markdown(payload: Any) -> str:
+    """渲染追加进 prd-reviews.md 的完整评审报告节（含 Finding 明细与原始意见正文）。"""
+    review_id, perspective, round_number, table, _ = _receipt_parts(payload)
+    appendix = str(payload["prd_appendix_markdown"]).strip()
+    # prd-reviews.md 以二级标题分节；意见正文里的一/二级标题会破坏分节结构。
+    if any(line.startswith(("# ", "## ")) for line in appendix.splitlines()):
+        raise GateError("prd_appendix_markdown 不得包含一级或二级标题（# / ##）；小节请用三级标题、加粗文本或列表表达")
+    lines = [f"## {review_id} · {perspective} · 第 {round_number} 轮", "", table]
+    findings = payload.get("findings", [])
+    if findings:
+        lines += [
+            "", "**Finding 明细**", "",
+            "| ID | 严重度 | 分类 | 位置 | 证据 | 影响 | 修复动作 | 验证方式 | blocking |",
+            "|----|--------|------|------|------|------|----------|----------|----------|",
+        ]
+        for item in findings:
+            lines.append(
+                "| " + " | ".join(_escape_cell(item.get(field, "")) for field in (
+                    "id", "severity", "category", "location", "evidence", "impact",
+                    "remediation", "verification", "blocking")) + " |"
+            )
+    lines += ["", appendix, ""]
+    return "\n".join(lines)
+
+
+def _load_report_payload(raw: str) -> Any:
+    try:
+        return json.loads(sys.stdin.read() if raw == "-" else Path(raw).read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise GateError(f"无法读取报告：{exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise GateError(f"报告不是合法 JSON：{exc}") from exc
+
+
+def command_render_appendix(args: argparse.Namespace) -> int:
+    print(render_appendix_markdown(_load_report_payload(args.report)))
+    return 0
+
+
+def command_render_report(args: argparse.Namespace) -> int:
+    print(render_report_markdown(_load_report_payload(args.report)))
     return 0
 
 
@@ -550,16 +767,18 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--report", required=True, help="规范化 JSON 报告路径，或 - 读取 stdin")
     record.set_defaults(func=command_record)
 
-    close = sub.add_parser("close", help="关闭一条 Finding")
+    close = sub.add_parser("close", help="关闭一条或一批 Finding")
     close.add_argument("--state", required=True)
-    close.add_argument("--finding", required=True)
-    close.add_argument("--resolution", required=True, choices=RESOLUTIONS)
-    close.add_argument("--evidence", required=True)
+    close.add_argument("--finding", help="单条闭环的 Finding id")
+    close.add_argument("--resolution", choices=RESOLUTIONS, help="单条闭环的处理结果")
+    close.add_argument("--evidence", help="单条闭环的证据说明")
     close.add_argument("--q-ref", default="")
+    close.add_argument("--batch", help="批量闭环 JSON 数组路径，或 - 读取 stdin；任一条失败整批不落盘")
     close.set_defaults(func=command_close)
 
-    advance = sub.add_parser("advance", help="收齐本轮视角后推进到下一轮")
+    advance = sub.add_parser("advance", help="收齐本轮视角后推进到下一轮（full 全量 / delta 增量复核）")
     advance.add_argument("--state", required=True)
+    advance.add_argument("--mode", choices=("full", "delta"), default="full")
     advance.set_defaults(func=command_advance)
 
     verify = sub.add_parser("verify", help="交付门禁")
@@ -570,6 +789,18 @@ def build_parser() -> argparse.ArgumentParser:
     show = sub.add_parser("show", help="输出台账摘要")
     show.add_argument("--state", required=True)
     show.set_defaults(func=command_show)
+
+    digest = sub.add_parser("digest", help="输出稿件正文指纹（不含文末回执区），供派发封套使用")
+    digest.add_argument("--prd", required=True)
+    digest.set_defaults(func=command_digest)
+
+    render = sub.add_parser("render-appendix", help="把规范化评审报告渲染为追加进 PRD 的紧凑回执块")
+    render.add_argument("--report", required=True, help="规范化 JSON 报告路径，或 - 读取 stdin")
+    render.set_defaults(func=command_render_appendix)
+
+    render_full = sub.add_parser("render-report", help="把规范化评审报告渲染为追加进 prd-reviews.md 的完整意见节")
+    render_full.add_argument("--report", required=True, help="规范化 JSON 报告路径，或 - 读取 stdin")
+    render_full.set_defaults(func=command_render_report)
     return parser
 
 

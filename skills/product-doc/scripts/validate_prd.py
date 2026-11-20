@@ -37,7 +37,7 @@ VAGUE_TERMS = (
     "更好的体验", "大量用户", "响应较快", "基本满足",
 )
 REVIEW_STATUSES = ("APPROVE", "APPROVE_WITH_FOLLOW_UPS", "REQUEST_CHANGES", "BLOCKED")
-PERSPECTIVES = ("COMPLETENESS", "NON_FUNCTIONAL", "COMPREHENSIVE")
+PERSPECTIVES = ("COMPLETENESS", "NON_FUNCTIONAL", "COMPREHENSIVE", "RECHECK")
 REVIEW_ID_RE = re.compile(r"PR-R\d+-[A-Z]{2,3}\b")
 DIGEST_RE = re.compile(r"\b[0-9a-fA-F]{12,64}\b")
 
@@ -55,6 +55,11 @@ ALWAYS_REQUIRED_HEADINGS = (
     r"^变更历史", r"^PRD 自检与确认", r"^独立评审意见",
 )
 CHANGE_ONLY_HEADINGS = (r"^本轮变更摘要",)
+# S 级裁剪：未引用 DEP/RISK/Q/DEC 编号时，第 8 章与 9.1/9.2 允许整节省略（与模板《文档裁剪》表对齐）。
+S_OPTIONAL_HEADINGS = (
+    r"^8\. 发布、依赖与风险", r"^8\.1 发布与放量", r"^8\.2 依赖与风险",
+    r"^9\.1 术语与参考文档", r"^9\.2 决策与待决问题",
+)
 # 台账与回执区只做“引用”，不做编号定义与表内唯一性检查（9.2 是 Q/DEC 的定义区）。
 REFERENCE_HEADING = re.compile(
     r"^9\.3|^变更历史|^独立评审意见|^PRD 自检与确认|^1\.2 变更记录"
@@ -169,6 +174,7 @@ class PrdValidator:
         self.headings = parse_headings(self.lines, self.in_fence)
         self.sections = build_sections(self.headings, len(self.lines))
         self._owner_cache: dict[int, Section | None] = {}
+        self._scale_cache: dict[str, str | None] = {}
 
     # --- 基础设施 -----------------------------------------------------------
 
@@ -212,6 +218,8 @@ class PrdValidator:
         required = list(ALWAYS_REQUIRED_HEADINGS)
         if self.is_change_mode():
             required += list(CHANGE_ONLY_HEADINGS)
+        if self.declared_scale() == "S" and not self.references_risk_ids():
+            required = [pattern for pattern in required if pattern not in S_OPTIONAL_HEADINGS]
         found: list[int] = []
         for pattern in required:
             section = self.find_section(pattern)
@@ -364,7 +372,24 @@ class PrdValidator:
                     identifier = row[0] if row else f"第 {offset + 1} 行"
                     self.error("4.1", f"P0 功能 `{identifier}` 的“关联验收”未引用任何 AC 编号")
 
+    def references_risk_ids(self) -> bool:
+        """正文是否引用了 DEP/RISK/Q/DEC 编号；引用了就必须保留对应定义区。"""
+        for number, raw in enumerate(self.lines):
+            if self.in_fence[number]:
+                continue
+            if any(identifier.split("-")[0] in {"DEP", "RISK", "Q", "DEC"} for identifier in ids_in(raw)):
+                return True
+        return False
+
+    def is_incomplete_draft(self) -> bool:
+        """标题下、第 1 章之前存在“信息不完整”提示块时，视为输入不全的草稿。"""
+        chapter1 = self.find_section(r"^1\. 文档信息")
+        limit = chapter1.start if chapter1 is not None else len(self.lines)
+        return any("信息不完整" in self.lines[number] for number in range(limit))
+
     def check_open_questions(self) -> None:
+        draft = self.is_incomplete_draft()
+        relaxed = False
         for table in self.tables_of(r"^9\.2 决策与待决问题"):
             header_join = "".join(table.header)
             if "负责人" not in header_join or "当前状态" not in header_join:
@@ -382,9 +407,20 @@ class PrdValidator:
                     if value.strip() in {"", "-", "—"}:
                         self.error("9.2", f"`{row[columns['编号']]}` 的“{name}”为空，缺口必须可指派")
                 if len(row) > columns["截止日期"]:
-                    deadline = row[columns["截止日期"]]
-                    if not re.search(r"\d{4}-\d{2}-\d{2}", deadline):
+                    deadline = row[columns["截止日期"]].strip()
+                    if draft and deadline == "评审确认时指定":
+                        # 草稿豁免：资料固有缺口允许期限暂缺，但结论不得写“已确认”。
+                        relaxed = True
+                    elif not re.search(r"\d{4}-\d{2}-\d{2}", deadline):
                         self.error("9.2", f"`{row[columns['编号']]}` 的截止日期不是具体日期：`{deadline}`")
+        if relaxed:
+            cells = self.signoff_cells()
+            conclusion = cells.get("结论", "")
+            if not cells:
+                # 豁免守卫不得 fail-open：结论表不可解析时无法证明“未声称已确认”，直接拒收。
+                self.error("9.2", "Q 截止日期暂缺的草稿必须包含可解析的“项目/内容”自检结论表")
+            elif "已确认" in conclusion and "有条件确认" not in conclusion:
+                self.error("9.2", "Q 截止日期暂缺只允许草稿状态；自检结论不得写“已确认”")
 
     # --- 4. 变更历史 --------------------------------------------------------
 
@@ -472,15 +508,22 @@ class PrdValidator:
         return statuses
 
     def declared_scale(self) -> str | None:
+        # 结果缓存：check_structure 与 check_review_routing 都会调用，规模非法时错误只报一次。
+        if "value" in self._scale_cache:
+            return self._scale_cache["value"]
+        scale: str | None = None
         for table in self.tables_of(r"^1\.1 基本信息"):
             for row in table.rows:
                 if len(row) >= 2 and "需求规模" in row[0]:
                     letters = set(re.findall(r"\b([SML])\b", row[1].split("/")[0]))
                     if len(letters) == 1:
-                        return letters.pop()
-                    self.error("1.1", f"需求规模未选定，无法路由独立评审：`{row[1]}`")
-                    return None
+                        scale = letters.pop()
+                    else:
+                        self.error("1.1", f"需求规模未选定，无法路由独立评审：`{row[1]}`")
+                    self._scale_cache["value"] = scale
+                    return scale
         self.error("1.1", "基本信息表中找不到“需求规模 / 优先级”行")
+        self._scale_cache["value"] = None
         return None
 
     def check_review_routing(self, perspectives: set[str]) -> None:
@@ -492,9 +535,13 @@ class PrdValidator:
         if missing:
             self.error("评审", f"{scale} 级需求的独立评审缺少视角：{', '.join(missing)}")
 
+    def signoff_cells(self) -> dict[str, str]:
+        for table in self.tables_of(r"^PRD 自检与确认"):
+            if table.header == ["项目", "内容"]:
+                return {row[0]: row[1] for row in table.rows if len(row) >= 2}
+        return {}
+
     def check_signoff(self, statuses: list[str]) -> None:
-        conclusion = ""
-        blockers = ""
         failures = 0
         for table in self.tables_of(r"^PRD 自检与确认"):
             joined = "".join(table.header)
@@ -503,10 +550,9 @@ class PrdValidator:
                 for row in table.rows:
                     if len(row) > index and "不通过" in row[index]:
                         failures += 1
-            elif table.header == ["项目", "内容"]:
-                cells = {row[0]: row[1] for row in table.rows if len(row) >= 2}
-                conclusion = cells.get("结论", "")
-                blockers = cells.get("阻塞项与遗留项", "")
+        cells = self.signoff_cells()
+        conclusion = cells.get("结论", "")
+        blockers = cells.get("阻塞项与遗留项", "")
         if "已确认" not in conclusion or "有条件确认" in conclusion:
             return
         if failures:

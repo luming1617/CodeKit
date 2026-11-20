@@ -510,6 +510,11 @@ class ReviewAppendixTests(unittest.TestCase):
         broken = self.prd.replace("| 需求规模 / 优先级 | S / P0 |", "| 需求规模 / 优先级 | S · M · L / P0 |")
         self.assertTrue(any("需求规模未选定" in item for item in errors_of(broken)))
 
+    def test_scale_error_reported_once(self) -> None:
+        broken = self.prd.replace("| 需求规模 / 优先级 | S / P0 |", "| 需求规模 / 优先级 | S · M · L / P0 |")
+        errors = errors_of(broken)
+        self.assertEqual(sum("需求规模未选定" in item for item in errors), 1, joined(errors))
+
     def test_signoff_must_not_contradict_findings(self) -> None:
         broken = self.prd.replace("| 结论 | 待确认 |", "| 结论 | 已确认 |")
         broken = broken.replace("| 待决问题、依赖和风险都有负责人和期限 | 通过 | 见 8.2 与 9.2 |",
@@ -523,6 +528,92 @@ class ReviewAppendixTests(unittest.TestCase):
         broken = broken.replace("| 结论 | 待确认 |", "| 结论 | 已确认 |")
         errors = errors_of(broken)
         self.assertTrue(any("最后一轮独立评审状态为 `BLOCKED`" in item for item in errors), joined(errors))
+
+
+class ScaleTrimmingTests(unittest.TestCase):
+    """S 级裁剪与模板《文档裁剪》表对齐：未引用 DEP/RISK/Q/DEC 时第 8 章与 9.1/9.2 可整节省略。"""
+
+    @staticmethod
+    def trimmed_s_fixture() -> str:
+        text = PRD_FIXTURE
+        text = text.replace(
+            "| 外部团队/系统依赖 | 消息中心提供站内下发通道 | 进行中 | 无法在离开后触达用户 | DEP-001 | 李四 | 2026-09-20 |",
+            "| 外部团队/系统依赖 | 无 | 已确认 | 无 | 不涉及 | 张三 | 2026-09-15 |",
+        )
+        text = text.replace(
+            "| 未通过项处理 | 记入 Q-001，由李四在 2026-09-18 前确认后重跑验收 |",
+            "| 未通过项处理 | 由负责人确认后重跑验收 |",
+        )
+        start = text.index("# 8. 发布、依赖与风险（推荐）")
+        end = text.index("# 9. 附录（按需）")
+        text = text[:start] + text[end:]
+        start = text.index("## 9.1 术语与参考文档")
+        end = text.index("## 9.3 来源与追踪台账（必填）")
+        text = text[:start] + text[end:]
+        text = "\n".join(
+            line for line in text.splitlines()
+            if not re.match(r"^\| (DEP|RISK|Q|DEC)-\d+ \|", line)
+        )
+        text = text.replace(
+            "| 待决问题、依赖和风险都有负责人和期限 | 通过 | 见 8.2 与 9.2 |",
+            "| 待决问题、依赖和风险都有负责人和期限 | 不涉及 | 本次无依赖风险与待决问题 |",
+        )
+        return text
+
+    def test_s_without_risk_ids_may_omit_chapter8_and_9_1_9_2(self) -> None:
+        self.assertEqual(errors_of(self.trimmed_s_fixture()), [])
+
+    def test_m_scale_still_requires_all_chapters(self) -> None:
+        broken = self.trimmed_s_fixture().replace("| 需求规模 / 优先级 | S / P0 |", "| 需求规模 / 优先级 | M / P0 |")
+        errors = errors_of(broken)
+        self.assertTrue(any("缺少模板要求的章节" in item and "8\\.1" in item for item in errors), joined(errors))
+
+    def test_s_referencing_q_ids_must_keep_definition_sections(self) -> None:
+        broken = self.trimmed_s_fixture().replace(
+            "| 未通过项处理 | 由负责人确认后重跑验收 |",
+            "| 未通过项处理 | 记入 Q-001 后重跑验收 |",
+        )
+        errors = errors_of(broken)
+        self.assertTrue(any("缺少模板要求的章节" in item and "决策与待决问题" in item for item in errors), joined(errors))
+
+
+class DraftQuestionTests(unittest.TestCase):
+    """草稿（标题下有“信息不完整”提示块）允许 Q 的负责人/期限暂缺，但结论不得写“已确认”。"""
+
+    PENDING_ROW = (
+        "| 待决 | Q-001 | 离页后的站内触达频次上限 | 备选 1 次或 2 次 | 依赖消息中心配额 | DEP-001、FR-001 | 待指派 | 评审确认时指定 | 待确认 |"
+    )
+    ORIGINAL_ROW = (
+        "| 待决 | Q-001 | 离页后的站内触达频次上限 | 备选 1 次或 2 次 | 依赖消息中心配额 | DEP-001、FR-001 | 李四 | 2026-09-18 | 待确认 |"
+    )
+
+    def draft(self) -> str:
+        return PRD_FIXTURE.replace(
+            "# 下单页挽留产品需求说明书\n",
+            "# 下单页挽留产品需求说明书\n\n> **信息不完整，本文档不可视为已确认 PRD**；关键缺口：Q-001。\n",
+        ).replace(self.ORIGINAL_ROW, self.PENDING_ROW)
+
+    def test_draft_allows_pending_assignee_and_deadline(self) -> None:
+        self.assertEqual(errors_of(self.draft()), [])
+
+    def test_non_draft_still_requires_concrete_deadline(self) -> None:
+        broken = PRD_FIXTURE.replace(self.ORIGINAL_ROW, self.PENDING_ROW)
+        errors = errors_of(broken)
+        self.assertTrue(any("截止日期不是具体日期" in item for item in errors), joined(errors))
+
+    def test_draft_with_relaxed_q_cannot_claim_confirmed(self) -> None:
+        broken = self.draft().replace("| 结论 | 待确认 |", "| 结论 | 已确认 |")
+        errors = errors_of(broken)
+        self.assertTrue(any("Q 截止日期暂缺只允许草稿状态" in item for item in errors), joined(errors))
+
+    def test_draft_relaxation_requires_parseable_signoff_table(self) -> None:
+        # 豁免守卫不得 fail-open：结论表变形导致不可解析时，即使未写“已确认”也必须拒收。
+        broken = self.draft().replace(
+            "| 项目 | 内容 |\n|------|------|\n| 结论 | 待确认 |",
+            "| 项目 | 内容 | 备注 |\n|------|------|------|\n| 结论 | 已确认 | 无 |",
+        )
+        errors = errors_of(broken)
+        self.assertTrue(any("必须包含可解析的“项目/内容”自检结论表" in item for item in errors), joined(errors))
 
 
 class TemplateRefDriftTests(unittest.TestCase):
@@ -594,7 +685,7 @@ class ReviewStateCliTests(unittest.TestCase):
             "status": status,
             "summary": "覆盖结构与追踪维度",
             "findings": findings,
-            "prd_appendix_markdown": f"### {review_id}\n\n评审意见正文",
+            "prd_appendix_markdown": f"{review_id} 的评审意见正文",
         }
         payload.update(extra)
         path = self.root / f"{review_id}.json"
@@ -617,12 +708,18 @@ class ReviewStateCliTests(unittest.TestCase):
         return item
 
     def append_appendix(self, review_id: str) -> None:
-        """把回执归档到文末评审区——它不得改变被评审正文的指纹。"""
+        """回执归档到文末评审区、完整意见归档到 prd-reviews.md——都不得改变被评审正文的指纹。"""
         lines = self.prd.read_text(encoding="utf-8").rstrip().splitlines()
         if self.APPENDIX not in lines:
             lines += ["", self.APPENDIX]
-        lines += ["", f"### {review_id}", "", f"{review_id} 的评审意见已原样归档。"]
+        lines += ["", f"### {review_id}", "", f"{review_id} 的评审回执已原样归档。"]
         self.prd.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        reviews = self.root / "prd-reviews.md"
+        existing = reviews.read_text(encoding="utf-8") if reviews.is_file() else "# 完整评审意见（只追加）\n"
+        reviews.write_text(
+            existing.rstrip() + f"\n\n## {review_id}\n\n{review_id} 的完整意见已原样归档。\n",
+            encoding="utf-8",
+        )
 
     def edit_body(self, note: str) -> None:
         """一次实质修订：修改正文而非追加回执。"""
@@ -828,6 +925,290 @@ class ReviewStateCliTests(unittest.TestCase):
         self.assertEqual(summary["rounds"]["1"], ["PR-R1-CO:REQUEST_CHANGES"])
         self.assertIn("PR-001", summary["findings"])
 
+    def test_digest_command_matches_content_digest(self) -> None:
+        code, out = self.cli("digest", "--prd", str(self.prd))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.strip(), review_state.content_digest(self.prd))
+        self.append_appendix("PR-R1-CO")
+        code, out2 = self.cli("digest", "--prd", str(self.prd))
+        self.assertEqual(code, 0, out2)
+        self.assertEqual(out2.strip(), out.strip())
+
+    def test_digest_rejects_missing_prd(self) -> None:
+        code, out = self.cli("digest", "--prd", str(self.root / "nope.md"))
+        self.assertEqual(code, 1)
+        self.assertIn("PRD 不存在", out)
+
+    def test_render_appendix_block_passes_structure_gate(self) -> None:
+        body = PRD_FIXTURE.split("## 独立评审意见")[0].rstrip()
+        with tempfile.TemporaryDirectory() as tmp:
+            prd = Path(tmp) / "product-doc.md"
+            prd.write_text(body + "\n", encoding="utf-8")
+            payload = {
+                "review_id": "PR-R1-CO",
+                "contract_version": review_state.CONTRACT_VERSION,
+                "review_round": 1,
+                "perspective": "COMPREHENSIVE",
+                "scale": "S",
+                "prd_digest": review_state.content_digest(prd),
+                "status": "APPROVE",
+                "summary": "覆盖结构、追踪与验收维度，未发现问题",
+                "findings": [],
+                "prd_appendix_markdown": "**结论**：未发现阻塞问题，依据为 2.2 与 7.1 的口径核对。",
+            }
+            report = Path(tmp) / "report.json"
+            report.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            code, out = self.cli("render-appendix", "--report", str(report))
+            self.assertEqual(code, 0, out)
+            prd.write_text(body + "\n\n## 独立评审意见（按轮次追加，不覆盖；必填）\n\n" + out, encoding="utf-8")
+            self.assertEqual(PrdValidator(prd).validate(), [])
+
+    def test_render_appendix_is_compact_and_points_to_reviews_file(self) -> None:
+        self.init()
+        path = self.report("PR-R1-CO", "COMPREHENSIVE", "APPROVE", [])
+        code, out = self.cli("render-appendix", "--report", str(path))
+        self.assertEqual(code, 0, out)
+        self.assertIn("prd-reviews.md", out)
+        self.assertNotIn("评审意见正文", out)
+
+    def test_render_report_contains_full_opinion_and_finding_details(self) -> None:
+        self.init()
+        path = self.report("PR-R1-CO", "COMPREHENSIVE", "REQUEST_CHANGES", [self.finding()])
+        code, out = self.cli("render-report", "--report", str(path))
+        self.assertEqual(code, 0, out)
+        self.assertIn("## PR-R1-CO", out)
+        self.assertIn("Finding 明细", out)
+        self.assertIn("PR-001", out)
+        self.assertIn("评审意见正文", out)
+
+    def test_render_report_rejects_top_level_headings(self) -> None:
+        self.init()
+        path = self.report("PR-R1-CO", "COMPREHENSIVE", "APPROVE", [])
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["prd_appendix_markdown"] = "## 小节标题\n\n评审意见正文"
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        code, out = self.cli("render-report", "--report", str(path))
+        self.assertEqual(code, 1)
+        self.assertIn("不得包含一级或二级标题", out)
+
+    def test_archiving_rendered_appendix_keeps_fingerprint(self) -> None:
+        self.init()
+        path = self.report("PR-R1-CO", "COMPREHENSIVE", "APPROVE", [])
+        code, out = self.cli("render-appendix", "--report", str(path))
+        self.assertEqual(code, 0, out)
+        before = review_state.content_digest(self.prd)
+        lines = self.prd.read_text(encoding="utf-8").rstrip().splitlines()
+        lines += ["", self.APPENDIX, "", out.rstrip()]
+        self.prd.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.assertEqual(review_state.content_digest(self.prd), before)
+
+    def test_batch_close_matches_single_close_semantics(self) -> None:
+        self.init()
+        self.edit_body("Q-001 触达频次上限待业务确认")
+        path = self.report("PR-R1-CO", "COMPREHENSIVE", "APPROVE_WITH_FOLLOW_UPS",
+                           [self.finding(identifier="PR-001", severity="Low", blocking=False),
+                            self.finding(identifier="PR-002", severity="Medium", blocking=False)])
+        self.assertEqual(self.cli("record", "--state", str(self.state), "--report", str(path))[0], 0)
+        batch = self.root / "closures.json"
+        batch.write_text(json.dumps([
+            {"finding": "PR-001", "resolution": "rejected",
+             "evidence": "该措辞已被 2.2 的计算口径替代，不构成文档缺陷"},
+            {"finding": "PR-002", "resolution": "deferred",
+             "evidence": "口径待业务确认，先记入待决问题", "q_ref": "Q-001"},
+        ], ensure_ascii=False), encoding="utf-8")
+        code, out = self.cli("close", "--state", str(self.state), "--batch", str(batch))
+        self.assertEqual(code, 0, out)
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(state["findings"]["PR-001"]["resolution"], "rejected")
+        self.assertEqual(state["findings"]["PR-002"]["q_ref"], "Q-001")
+        self.assertTrue(all(item["status"] == "CLOSED" for item in state["findings"].values()))
+
+    def test_batch_close_is_atomic_on_failure(self) -> None:
+        self.init()
+        path = self.report("PR-R1-CO", "COMPREHENSIVE", "REQUEST_CHANGES",
+                           [self.finding(identifier="PR-001", severity="Low", blocking=False),
+                            self.finding(identifier="PR-002", severity="Blocker")])
+        self.assertEqual(self.cli("record", "--state", str(self.state), "--report", str(path))[0], 0)
+        batch = self.root / "closures.json"
+        batch.write_text(json.dumps([
+            {"finding": "PR-001", "resolution": "rejected",
+             "evidence": "该措辞已被 2.2 的计算口径替代，不构成文档缺陷"},
+            {"finding": "PR-002", "resolution": "rejected",
+             "evidence": "认为该问题不影响交付，理由充分且已复核两次"},
+        ], ensure_ascii=False), encoding="utf-8")
+        code, out = self.cli("close", "--state", str(self.state), "--batch", str(batch))
+        self.assertEqual(code, 1)
+        self.assertIn("不得判定为不采纳", out)
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertTrue(all(item["status"] == "OPEN" for item in state["findings"].values()))
+
+    def test_close_without_single_or_batch_args_is_rejected(self) -> None:
+        self.init()
+        code, out = self.cli("close", "--state", str(self.state))
+        self.assertEqual(code, 1)
+        self.assertIn("--batch", out)
+
+    def test_verify_requires_external_review_archive(self) -> None:
+        self.init()
+        path = self.report("PR-R1-CO", "COMPREHENSIVE", "APPROVE", [])
+        self.assertEqual(self.cli("record", "--state", str(self.state), "--report", str(path))[0], 0)
+        self.append_appendix("PR-R1-CO")
+        (self.root / "prd-reviews.md").unlink()
+        code, out = self.cli("verify", "--state", str(self.state))
+        self.assertEqual(code, 1)
+        self.assertIn("完整意见未归档进同目录 prd-reviews.md", out)
+
+    def test_delta_recheck_round_flow(self) -> None:
+        self.init()
+        first = self.report("PR-R1-CO", "COMPREHENSIVE", "REQUEST_CHANGES", [self.finding()])
+        self.assertEqual(self.cli("record", "--state", str(self.state), "--report", str(first))[0], 0)
+        self.append_appendix("PR-R1-CO")
+        self.edit_body("按 PR-001 修正 4.1 的关联验收列")
+        code, out = self.cli("advance", "--state", str(self.state), "--mode", "delta")
+        self.assertEqual(code, 0, out)
+        recheck = self.report("PR-R2-RC", "RECHECK", "APPROVE", [], verified_findings=["PR-001"])
+        code, out = self.cli("record", "--state", str(self.state), "--report", str(recheck))
+        self.assertEqual(code, 0, out)
+        self.append_appendix("PR-R2-RC")
+        code, out = self.cli("close", "--state", str(self.state), "--finding", "PR-001",
+                             "--resolution", "fixed", "--evidence", "已按 SRC-001 修正 4.1 的关联验收列")
+        self.assertEqual(code, 0, out)
+        # 增量复核轮不得直接交付，也不得连续增量。
+        code, out = self.cli("verify", "--state", str(self.state))
+        self.assertEqual(code, 1)
+        self.assertIn("最后一轮是增量复核", out)
+        code, out = self.cli("advance", "--state", str(self.state), "--mode", "delta")
+        self.assertEqual(code, 1)
+        self.assertIn("增量复核不得连续", out)
+        self.assertEqual(self.cli("advance", "--state", str(self.state))[0], 0)
+        third = self.report("PR-R3-CO", "COMPREHENSIVE", "APPROVE", [])
+        self.assertEqual(self.cli("record", "--state", str(self.state), "--report", str(third))[0], 0)
+        self.append_appendix("PR-R3-CO")
+        code, out = self.cli("verify", "--state", str(self.state))
+        self.assertEqual(code, 0, out)
+
+    def test_recheck_perspective_rejected_in_full_round(self) -> None:
+        self.init()
+        path = self.report("PR-R1-RC", "RECHECK", "APPROVE", [])
+        code, out = self.cli("record", "--state", str(self.state), "--report", str(path))
+        self.assertEqual(code, 1)
+        self.assertIn("不接受视角 RECHECK", out)
+
+    def test_delta_round_rejects_full_perspectives(self) -> None:
+        self.init()
+        first = self.report("PR-R1-CO", "COMPREHENSIVE", "REQUEST_CHANGES", [self.finding()])
+        self.assertEqual(self.cli("record", "--state", str(self.state), "--report", str(first))[0], 0)
+        self.append_appendix("PR-R1-CO")
+        self.edit_body("按 PR-001 修正 4.1")
+        self.assertEqual(self.cli("advance", "--state", str(self.state), "--mode", "delta")[0], 0)
+        path = self.report("PR-R2-CO", "COMPREHENSIVE", "APPROVE", [])
+        code, out = self.cli("record", "--state", str(self.state), "--report", str(path))
+        self.assertEqual(code, 1)
+        self.assertIn("增量复核轮只接受视角 RECHECK", out)
+
+    def test_delta_requires_open_findings(self) -> None:
+        self.init()
+        path = self.report("PR-R1-CO", "COMPREHENSIVE", "APPROVE", [])
+        self.assertEqual(self.cli("record", "--state", str(self.state), "--report", str(path))[0], 0)
+        self.append_appendix("PR-R1-CO")
+        code, out = self.cli("advance", "--state", str(self.state), "--mode", "delta")
+        self.assertEqual(code, 1)
+        self.assertIn("没有未闭环 Finding", out)
+
+    def test_delta_cannot_open_the_final_round(self) -> None:
+        self.init()
+        for round_number in range(1, 5):
+            path = self.report(f"PR-R{round_number}-CO", "COMPREHENSIVE", "REQUEST_CHANGES",
+                               [self.finding(identifier=f"PR-{round_number:03d}")])
+            self.assertEqual(self.cli("record", "--state", str(self.state), "--report", str(path))[0], 0)
+            self.append_appendix(f"PR-R{round_number}-CO")
+            if round_number < 4:
+                self.edit_body(f"第 {round_number} 轮的修订说明")
+                self.assertEqual(self.cli("advance", "--state", str(self.state))[0], 0)
+        # 第 4 轮已收齐视角；若允许 delta，第 5 轮（最终轮）将是增量复核，必须拒绝。
+        self.edit_body("第 4 轮的修订说明")
+        code, out = self.cli("advance", "--state", str(self.state), "--mode", "delta")
+        self.assertEqual(code, 1)
+        self.assertIn("最终轮必须是全量评审", out)
+
+    def test_verified_findings_must_reference_open_findings(self) -> None:
+        self.init()
+        first = self.report("PR-R1-CO", "COMPREHENSIVE", "REQUEST_CHANGES", [self.finding()])
+        self.assertEqual(self.cli("record", "--state", str(self.state), "--report", str(first))[0], 0)
+        self.append_appendix("PR-R1-CO")
+        self.edit_body("按 PR-001 修正 4.1")
+        self.assertEqual(self.cli("advance", "--state", str(self.state), "--mode", "delta")[0], 0)
+        recheck = self.report("PR-R2-RC", "RECHECK", "APPROVE", [], verified_findings=["PR-999"])
+        code, out = self.cli("record", "--state", str(self.state), "--report", str(recheck))
+        self.assertEqual(code, 1)
+        self.assertIn("必须是台账中未闭环的 Finding", out)
+
+    def test_verified_findings_only_allowed_for_recheck(self) -> None:
+        self.init("M")
+        first = self.report("PR-R1-CO", "COMPLETENESS", "REQUEST_CHANGES", [self.finding()])
+        self.assertEqual(self.cli("record", "--state", str(self.state), "--report", str(first))[0], 0)
+        second = self.report("PR-R1-NF", "NON_FUNCTIONAL", "APPROVE_WITH_FOLLOW_UPS",
+                             [self.finding(identifier="PR-002", severity="Low", blocking=False)],
+                             verified_findings=["PR-001"])
+        code, out = self.cli("record", "--state", str(self.state), "--report", str(second))
+        self.assertEqual(code, 1)
+        self.assertIn("verified_findings 只允许出现在 RECHECK", out)
+
+    def test_recheck_approve_rejects_empty_verification(self) -> None:
+        self.init()
+        first = self.report("PR-R1-CO", "COMPREHENSIVE", "REQUEST_CHANGES", [self.finding()])
+        self.assertEqual(self.cli("record", "--state", str(self.state), "--report", str(first))[0], 0)
+        self.append_appendix("PR-R1-CO")
+        self.edit_body("按 PR-001 修正 4.1")
+        self.assertEqual(self.cli("advance", "--state", str(self.state), "--mode", "delta")[0], 0)
+        recheck = self.report("PR-R2-RC", "RECHECK", "APPROVE", [], verified_findings=[])
+        code, out = self.cli("record", "--state", str(self.state), "--report", str(recheck))
+        self.assertEqual(code, 1)
+        self.assertIn("不得空确认", out)
+
+    def test_fixed_close_requires_recheck_verification(self) -> None:
+        self.init()
+        first = self.report("PR-R1-CO", "COMPREHENSIVE", "REQUEST_CHANGES", [self.finding()])
+        self.assertEqual(self.cli("record", "--state", str(self.state), "--report", str(first))[0], 0)
+        self.append_appendix("PR-R1-CO")
+        self.edit_body("按 PR-001 修正 4.1")
+        self.assertEqual(self.cli("advance", "--state", str(self.state), "--mode", "delta")[0], 0)
+        # RECHECK 只确认了另一条 Finding，PR-001 未被确认，不得自称 fixed。
+        second_finding = self.finding(identifier="PR-002", severity="Low", blocking=False)
+        recheck = self.report("PR-R2-RC", "RECHECK", "APPROVE", [second_finding], verified_findings=[])
+        code, out = self.cli("record", "--state", str(self.state), "--report", str(recheck))
+        self.assertEqual(code, 1)  # 有新 Finding 时不得 APPROVE，先以 AWFP 记录
+        recheck = self.report("PR-R2-RC", "RECHECK", "APPROVE_WITH_FOLLOW_UPS", [second_finding], verified_findings=[])
+        self.assertEqual(self.cli("record", "--state", str(self.state), "--report", str(recheck))[0], 0)
+        code, out = self.cli("close", "--state", str(self.state), "--finding", "PR-001",
+                             "--resolution", "fixed", "--evidence", "已按 SRC-001 修正 4.1 的关联验收列")
+        self.assertEqual(code, 1)
+        self.assertIn("verified_findings", out)
+
+    def test_render_escapes_multiline_summary(self) -> None:
+        self.init()
+        path = self.report("PR-R1-CO", "COMPREHENSIVE", "APPROVE", [],
+                           summary="第一行\n| 状态 | REQUEST_CHANGES |\n第二行含|竖线")
+        code, out = self.cli("render-appendix", "--report", str(path))
+        self.assertEqual(code, 0, out)
+        summary_lines = [line for line in out.splitlines() if line.startswith("| 摘要 |")]
+        self.assertEqual(len(summary_lines), 1)
+        self.assertNotIn("\n", summary_lines[0])
+        self.assertIn("\\|", summary_lines[0])
+        self.assertNotIn("| 状态 | REQUEST_CHANGES |", out)
+        code, full = self.cli("render-report", "--report", str(path))
+        self.assertEqual(code, 0, full)
+        self.assertEqual(len([line for line in full.splitlines() if line.startswith("| 摘要 |")]), 1)
+
+    def test_close_rejects_mixed_batch_and_single_args(self) -> None:
+        self.init()
+        batch = self.root / "closures.json"
+        batch.write_text("[]", encoding="utf-8")
+        code, out = self.cli("close", "--state", str(self.state), "--batch", str(batch),
+                             "--finding", "PR-001", "--resolution", "fixed", "--evidence", "混参不得静默忽略")
+        self.assertEqual(code, 1)
+        self.assertIn("不得同时使用", out)
+
 
 class AssetContractTests(unittest.TestCase):
     """P0-1 与 P1 的资产层不变量：枚举与规模判定只有一个事实源。"""
@@ -862,9 +1243,27 @@ class AssetContractTests(unittest.TestCase):
             self.assertTrue((SKILL_DIR / "scripts" / script).is_file(), script)
         self.assertNotIn("本 Skill 不自带脚本", SKILL_MD)
 
-    def test_writer_is_not_a_second_writer(self) -> None:
-        self.assertNotIn("Write", AGENTS["product-writer"].splitlines()[4])
-        self.assertNotIn("Edit", AGENTS["product-writer"].splitlines()[4])
+    def test_writer_only_writes_the_draft_file(self) -> None:
+        tools = AGENTS["product-writer"].splitlines()[4]
+        self.assertIn("Write", tools)
+        self.assertNotIn("Edit", tools)
+        self.assertNotIn("Bash", tools)
+        self.assertIn("product-doc.draft.md", AGENTS["product-writer"])
+        self.assertIn("不写入 `product-doc.md`", AGENTS["product-writer"])
+        self.assertIn("product-doc.draft.md", SKILL_MD)
+
+    def test_skill_declares_efficiency_commands(self) -> None:
+        for token in ("digest", "render-appendix", "--batch"):
+            self.assertIn(token, SKILL_MD)
+            self.assertIn(token, CONTRACT)
+
+    def test_skill_declares_p1_semantics(self) -> None:
+        for token in ("prd-reviews.md", "RECHECK", "--mode delta", "render-report"):
+            self.assertIn(token, SKILL_MD)
+            self.assertIn(token, CONTRACT)
+        self.assertIn("RECHECK", review_state.PERSPECTIVES)
+        self.assertIn("资料固有缺口分流", CONTRACT)
+        self.assertIn("资料固有缺口", STANDARD)
 
     def test_read_only_roles_have_no_shell(self) -> None:
         for role in ("product-extractor", "product-reviewer"):
