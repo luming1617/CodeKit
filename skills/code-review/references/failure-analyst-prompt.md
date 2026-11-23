@@ -15,7 +15,7 @@
 <基线结果与已有用户修改>
 
 ## 本步约束
-1. 读取 Diff 读物前先核对其 `sha256` 与输入的 `diff_artifact.digest` 一致；归因结论必须绑定该 `diff_digest`，读物摘要不一致时返回 `BLOCKED` 说明。
+1. 读取 Diff 读物前先用一条 `sha256sum` 命令核对全部输入文件的摘要与输入登记值一致（Diff 对照 `diff_artifact.digest`）；归因结论必须绑定该 `diff_digest`，读物摘要不一致时返回 `BLOCKED` 说明。
 2. 基线里已存在的失败与本轮目标引入的失败必须分开表述，并给出各自的证据位置。
 
 ## 输出

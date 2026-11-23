@@ -101,6 +101,15 @@ RELEASE_CHECK_CRITICALITY = {"critical", "non_critical"}
 # （code-impl 侧 gate 的 review-delivery-round-full 兜底）。
 DELTA_RESULT_STATUSES = {"FIXED", "NOT_FIXED", "REGRESSION"}
 DELTA_LIMITATION_MARKERS = ("DELTA_RECHECK", "DELTA_CARRY_FORWARD")
+# P1-1：S 档派发降档的披露标记。准入由冻结脚本签进 manifest 的
+# reduced_dispatch_eligible 决定；非空 limitations 已由 validate_verdict 封顶结论。
+REDUCED_DISPATCH_MARKER = "S_TIER_REDUCED"
+EMPTY_REGISTER_MARKER = "S_TIER_EMPTY_REGISTER"
+# P1-2：上游验证证据复用的披露标记；复用谓词见 validate_reused_validation。
+REUSED_VALIDATION_MARKER = "REUSED_VALIDATION"
+# P1-3：步骤 18 复核分级的披露标记；机械边界是“标记 + 无阻塞 Finding + S/M 档”
+# 三元谓词，复核深度本身不可机械观测，由角色契约约束（诚实披露）。
+SCOPED_RECHECK_MARKER = "SCOPED_FINAL_RECHECK"
 FINDING_FIELDS = {
     "id",
     "candidate_id",
@@ -188,10 +197,13 @@ class ReportValidator:
         self,
         snapshot_manifest: dict[str, Any] | None = None,
         dispatch_ledger: list[dict[str, Any]] | None = None,
+        run_dir: Path | None = None,
     ) -> None:
         self.errors: list[str] = []
         self.snapshot_manifest = snapshot_manifest
         self.dispatch_ledger = dispatch_ledger
+        # P1-1：空候选清单跳过步骤 10 时，校验器要读回磁盘上的 register 核对确为空。
+        self.run_dir = run_dir
 
     def error(self, path: str, message: str) -> None:
         self.errors.append(f"{path}: {message}")
@@ -251,8 +263,11 @@ class ReportValidator:
         self.validate_rejected(report.get("rejected_candidates"))
         limitations = self.require_string_list(report.get("limitations"), "$.limitations")
         residual_risks = self.require_string_list(report.get("residual_risks"), "$.residual_risks")
+        self.validate_reused_validation(report, validation, review_context, limitations)
         self.validate_signed_disclosures(limitations)
         self.validate_delta_recheck(report, review_context, limitations, coverage)
+        self.validate_reduced_dispatch(review_context, limitations)
+        self.validate_scoped_recheck(report, review_context, limitations)
         self.validate_dispatches(snapshot_digest, coverage)
         self.validate_verdict(
             verdict,
@@ -494,6 +509,126 @@ class ReportValidator:
                     f"{path}.limitations",
                     f"unknown handoff limitation {entry!r}; the script only emits {list(_HANDOFF_LIMITATIONS)}",
                 )
+        # P1-2：可选的验证证据段（仅上游声明且冻结脚本核过后存在）。
+        evidence = block.get("validation_evidence")
+        if evidence is not None:
+            epath = f"{path}.validation_evidence"
+            if not isinstance(evidence, dict):
+                self.error(epath, "must be an object")
+            else:
+                self.require_fields(evidence, {"path", "digest", "target_id", "worktree_diff_digest"}, epath)
+                self.require_string(evidence.get("path"), f"{epath}.path")
+                self.require_string(evidence.get("target_id"), f"{epath}.target_id")
+                for field in ("digest", "worktree_diff_digest"):
+                    value = self.require_string(evidence.get(field), f"{epath}.{field}")
+                    if value and not DIGEST_RE.fullmatch(value):
+                        self.error(f"{epath}.{field}", "must be a lowercase SHA-256 digest")
+
+    def validate_reused_validation(
+        self,
+        report: dict[str, Any],
+        validation: list[dict[str, Any]],
+        review_context: dict[str, Any],
+        limitations: list[str],
+    ) -> None:
+        """P1-2：上游验证证据复用的机械边界（镜像 code-impl reuse-validation 的已验证边界）。
+
+        复用只省重复执行，不省判据：源必须 PASS、同目标同工作树、命令逐字一致、
+        禁复用链、DELTA 轮禁用，且必须逐字披露。"""
+        reused = [
+            (index, item) for index, item in enumerate(validation)
+            if isinstance(item, dict) and "reused_from" in item
+        ]
+        if not reused:
+            return
+        if review_context.get("review_mode") == "DELTA":
+            self.error(
+                "$.validation",
+                "DELTA rechecks must run validation freshly against the new snapshot; "
+                "reused_from is not allowed",
+            )
+        if not any(REUSED_VALIDATION_MARKER in item for item in limitations):
+            self.error(
+                "$.limitations",
+                "reused validation records must disclose REUSED_VALIDATION",
+            )
+        manifest = self.snapshot_manifest if isinstance(self.snapshot_manifest, dict) else {}
+        handoff = manifest.get("handoff")
+        evidence_ref = handoff.get("validation_evidence") if isinstance(handoff, dict) else None
+        repo_root = manifest.get("repository_root")
+        snapshot = report.get("snapshot") if isinstance(report.get("snapshot"), dict) else {}
+        for index, item in reused:
+            path = f"$.validation[{index}].reused_from"
+            ref = item.get("reused_from")
+            if not isinstance(ref, dict):
+                self.error(path, "must be an object with path, digest and validation_id")
+                continue
+            self.require_fields(ref, {"path", "digest", "validation_id"}, path)
+            ref_path = self.require_string(ref.get("path"), f"{path}.path")
+            ref_digest = self.require_string(ref.get("digest"), f"{path}.digest")
+            source_id = self.require_string(ref.get("validation_id"), f"{path}.validation_id")
+            if ref_digest and not DIGEST_RE.fullmatch(ref_digest):
+                self.error(f"{path}.digest", "must be a lowercase SHA-256 digest")
+            if not isinstance(evidence_ref, dict):
+                self.error(
+                    path,
+                    "reuse requires a --handoff manifest whose handoff.validation_evidence "
+                    "was verified at freeze time",
+                )
+                continue
+            if ref_path != evidence_ref.get("path") or ref_digest != evidence_ref.get("digest"):
+                self.error(
+                    path,
+                    "must reference the exact validation_evidence artifact verified in the "
+                    "signed manifest handoff",
+                )
+                continue
+            try:
+                raw = Path(ref_path).read_bytes()
+            except OSError:
+                self.error(path, "source evidence file is unreadable")
+                continue
+            if hashlib.sha256(raw).hexdigest() != ref_digest:
+                self.error(path, "source evidence digest does not match the file on disk")
+                continue
+            try:
+                evidence = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                self.error(path, "source evidence is not readable JSON")
+                continue
+            if not isinstance(evidence, dict) or evidence.get("target_id") != snapshot.get("target_id"):
+                self.error(path, "source evidence target_id must equal $.snapshot.target_id")
+                continue
+            records = evidence.get("records")
+            source = next(
+                (record for record in records if isinstance(record, dict) and record.get("name") == source_id),
+                None,
+            ) if isinstance(records, list) else None
+            if source is None:
+                self.error(path, f"validation_id {source_id!r} is not a record of the source evidence")
+                continue
+            if source.get("reused_from") is not None:
+                self.error(path, "reuse chains are forbidden: the source record is itself reused")
+            if source.get("result") != "PASS" or source.get("exit_code") != 0:
+                self.error(path, "only PASS evidence with exit_code 0 can be reused")
+            if source.get("diff_digest") != evidence.get("worktree_diff_digest"):
+                self.error(path, "source record was not collected against the frozen worktree")
+            if item.get("command") != source.get("command"):
+                self.error(path, "command must match the source record verbatim (whitespace variants rejected)")
+            source_cwd = source.get("cwd")
+            if isinstance(repo_root, str) and isinstance(source_cwd, str) and isinstance(item.get("cwd"), str):
+                ours = (Path(repo_root) / item["cwd"]).resolve()
+                if ours != Path(source_cwd).resolve():
+                    self.error(path, "cwd must resolve to the source record's cwd")
+            else:
+                self.error(path, "cwd comparison requires manifest repository_root and string cwds")
+            if item.get("status") != "PASS" or item.get("exit_code") != 0:
+                self.error(f"$.validation[{index}]", "a reused record must itself be PASS with exit_code 0")
+            evidence_text = item.get("evidence")
+            if not isinstance(evidence_text, str) or not (
+                source_id in evidence_text or ref_path in evidence_text
+            ):
+                self.error(f"$.validation[{index}].evidence", "must reference the source record or artifact")
 
     def validate_signed_disclosures(self, limitations: list[str]) -> None:
         """脚本签进 manifest 的每一项放行/限制，报告都必须逐字带一条 —— 凭据在签名里，措辞在模型侧。
@@ -1082,6 +1217,127 @@ class ReportValidator:
                 f"step 18 must use a fresh Evidence Verifier; {shared} already rebutted at step 10",
             )
 
+    def _candidate_register(self) -> list[Any] | None:
+        """读回磁盘上的候选清单；缺失/损坏/形状不对都返回 None（由调用方报错）。"""
+        if self.run_dir is None:
+            return None
+        path = self.run_dir / "steps" / "09-candidate-register.json"
+        if not path.is_file():
+            return None
+        try:
+            register = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        candidates = register.get("candidates") if isinstance(register, dict) else None
+        return candidates if isinstance(candidates, list) else None
+
+    def validate_reduced_dispatch(self, review_context: dict[str, Any], limitations: list[str]) -> None:
+        """P1-1：S 档降档的机械边界。放宽的是派发覆盖面，不是判据：
+        准入必须来自签名 manifest，披露必须逐字，空清单跳过仍须步骤 18 兜底。"""
+        reduced = any(REDUCED_DISPATCH_MARKER in item for item in limitations)
+        empty_register = any(EMPTY_REGISTER_MARKER in item for item in limitations)
+        manifest = self.snapshot_manifest if isinstance(self.snapshot_manifest, dict) else {}
+        tier = (manifest.get("review_scale") or {}).get("tier") if isinstance(manifest.get("review_scale"), dict) else None
+        specialists = [
+            record for record in (self.dispatch_ledger or [])
+            if record.get("step") == 8 and record.get("role") == "review-specialist"
+        ]
+        rebuttals = [
+            record for record in (self.dispatch_ledger or [])
+            if record.get("step") == 10 and record.get("role") == "review-evidence"
+        ]
+        # 反向谓词独立于标记声明，无条件执行（审查修复 Critical-1/Medium-3）：
+        # 任何降档标记都不得关闭这两道门禁，否则最常见的合法标记会顺手
+        # 把“候选必须反证”与“单 Specialist 必须披露”变成静默漏检通道。
+        if (
+            isinstance(manifest.get("reduced_dispatch_eligible"), bool)
+            and tier == "S" and self.dispatch_ledger is not None
+            and len(specialists) < 2 and not reduced
+        ):
+            self.error(
+                "$.limitations",
+                "S-tier reviews with fewer than two specialists must disclose S_TIER_REDUCED",
+            )
+        # 非空候选清单必须有步骤 10 反证，不得静默丢弃（无论是否声明降档）。
+        if self.dispatch_ledger is not None and not rebuttals:
+            candidates = self._candidate_register()
+            if candidates:
+                self.error(
+                    "$.limitations",
+                    "a non-empty candidate register requires step-10 rebuttals; "
+                    "candidates cannot be silently dropped",
+                )
+        if not (reduced or empty_register):
+            return
+        if review_context.get("review_mode") == "DELTA":
+            self.error(
+                "$.limitations",
+                "S-tier reduced dispatch markers cannot appear in a DELTA recheck",
+            )
+        if manifest.get("reduced_dispatch_eligible") is not True or tier != "S":
+            self.error(
+                "$.limitations",
+                "S_TIER_REDUCED/S_TIER_EMPTY_REGISTER require a signed manifest with "
+                "reduced_dispatch_eligible=true and review_scale tier S",
+            )
+        if empty_register:
+            candidates = self._candidate_register()
+            if candidates is None:
+                self.error(
+                    "$.limitations",
+                    "S_TIER_EMPTY_REGISTER requires a readable steps/09-candidate-register.json "
+                    "with a candidates list",
+                )
+            elif candidates:
+                self.error(
+                    "$.limitations",
+                    "S_TIER_EMPTY_REGISTER requires an empty candidates list; "
+                    "non-empty candidates must be rebutted in step 10",
+                )
+            if self.dispatch_ledger is not None:
+                rechecks = [
+                    record for record in self.dispatch_ledger
+                    if record.get("step") == 18 and record.get("role") == "review-evidence"
+                ]
+                if not rechecks:
+                    self.error(
+                        "$.limitations",
+                        "S_TIER_EMPTY_REGISTER still requires the step-18 independent recheck dispatch",
+                    )
+
+    def validate_scoped_recheck(
+        self, report: dict[str, Any], review_context: dict[str, Any], limitations: list[str]
+    ) -> None:
+        """P1-3：步骤 18 复核分级的机械边界。阻塞 Finding 永远全量重建；
+        分级只适用于无阻塞且 S/M 档的报告，DELTA 轮禁用。"""
+        if not any(SCOPED_RECHECK_MARKER in item for item in limitations):
+            return
+        if review_context.get("review_mode") == "DELTA":
+            self.error(
+                "$.limitations",
+                "SCOPED_FINAL_RECHECK cannot appear in a DELTA recheck",
+            )
+        findings = report.get("findings")
+        if isinstance(findings, list) and any(
+            isinstance(item, dict) and item.get("blocking") is True for item in findings
+        ):
+            self.error(
+                "$.limitations",
+                "SCOPED_FINAL_RECHECK requires no blocking findings; blocking findings "
+                "always get a full causal reconstruction at step 18",
+            )
+        manifest = self.snapshot_manifest if isinstance(self.snapshot_manifest, dict) else {}
+        scale = manifest.get("review_scale")
+        if not isinstance(scale, dict):
+            snapshot = report.get("snapshot")
+            scale = snapshot.get("review_scale") if isinstance(snapshot, dict) else None
+        tier = scale.get("tier") if isinstance(scale, dict) else None
+        if tier not in {"S", "M"}:
+            self.error(
+                "$.limitations",
+                "SCOPED_FINAL_RECHECK is only available for S/M tier reviews",
+            )
+
     def validate_delta_recheck(
         self,
         report: dict[str, Any],
@@ -1501,6 +1757,190 @@ def input_artifact_staleness_errors(ledger: Any) -> list[str]:
     return errors
 
 
+# P0-2：Markdown 交付由确定性渲染器从同一 JSON 负载产出，主 Agent 不再手写第二份。
+# 章节清单与 contracts.md 的 markdown-delivery 节一致，由契约测试看守。
+MARKDOWN_SECTION_HEADINGS = (
+    "结论与依据",
+    "审查快照与范围",
+    "Findings",
+    "Open Questions",
+    "PRD-TDD-代码-测试-RPD 追踪矩阵",
+    "审查覆盖矩阵",
+    "本地验证证据",
+    "Release Gate",
+    "已排除候选与未验证限制",
+    "剩余风险",
+)
+
+
+def _escape_cell(value: Any) -> str:
+    """表格单元格转义：每一个自由文本插入点都必须过这里（product-doc 实证教训：
+    只守部分字段时，含竖线/换行的 summary 能撕裂表格并注入伪行）。"""
+    text = str(value)
+    return text.replace("|", "\\|").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+
+
+def _cell_list(values: Any) -> str:
+    if not isinstance(values, list) or not values:
+        return "—"
+    return _escape_cell("; ".join(str(item) for item in values))
+
+
+def _table(headers: tuple[str, ...], rows: list[list[str]]) -> str:
+    lines = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
+    lines.extend("| " + " | ".join(row) + " |" for row in rows)
+    return "\n".join(lines)
+
+
+def _bullets(values: Any) -> str:
+    if not isinstance(values, list) or not values:
+        return "（无）"
+    return "\n".join(f"- {_escape_cell(item)}" for item in values)
+
+
+def _changed_files_view(changed: Any) -> str:
+    if isinstance(changed, dict):
+        return (
+            f"变更文件 {changed.get('count')} 项（摘要 {changed.get('digest')}），"
+            f"全量清单见 `{changed.get('full_list_path')}`"
+        )
+    if isinstance(changed, list):
+        return f"变更文件 {len(changed)} 项：" + _cell_list(changed)
+    return _escape_cell(changed)
+
+
+def render_markdown(payload: dict[str, Any]) -> str:
+    """从已通过校验的规范化 JSON 渲染中文 Markdown；不引入负载之外的新事实。"""
+    scope = payload["scope"]
+    snapshot = payload["snapshot"]
+    scale = snapshot["review_scale"]
+    gate = payload["release_gate"]
+    sections: list[str] = ["# 代码审查报告"]
+
+    verdict_lines = [
+        f"**结论：{payload['verdict']}**",
+        "",
+        _escape_cell(payload["summary"]),
+        "",
+        "结论依据：",
+        _bullets(payload["verdict_basis"]),
+    ]
+    if payload["blockers"]:
+        verdict_lines.extend(["", "阻塞项：", _bullets(payload["blockers"])])
+    sections.append("## 结论与依据\n\n" + "\n".join(verdict_lines))
+
+    documents = snapshot["documents"]
+    document_view = _cell_list([
+        f"{item.get('locator')}（revision: {item.get('revision')}）" for item in documents
+    ]) if documents else "（无冻结文档）"
+    snapshot_lines = [
+        f"- 目标：{_escape_cell(scope['target_type'])} / {_escape_cell(scope['target_locator'])}",
+        f"- Base SHA：`{snapshot['base_sha']}`；Head SHA：`{snapshot['head_sha']}`",
+        f"- target_id：`{snapshot['target_id']}`",
+        f"- diff_digest：`{snapshot['diff_digest']}`",
+        f"- 规模档位：{scale['tier']}（{scale['changed_files']} 文件 / {scale['changed_lines']} 行）",
+        f"- {_changed_files_view(snapshot['changed_files'])}",
+        f"- 冻结文档：{document_view}",
+        f"- 审查范围：纳入 {_cell_list(scope['included'])}；排除 {_cell_list(scope['excluded'])}",
+    ]
+    sections.append("## 审查快照与范围\n\n" + "\n".join(snapshot_lines))
+
+    findings = payload["findings"]
+    if findings:
+        rows = [[
+            _escape_cell(item["id"]), _escape_cell(item["title"]), _escape_cell(item["dimension"]),
+            _escape_cell(item["severity"]), "是" if item["blocking"] else "否",
+            _escape_cell(item["evidence_level"]), _cell_list(item["locations"]),
+            _escape_cell(item["remediation"]),
+        ] for item in findings]
+        detail_lines: list[str] = []
+        for item in findings:
+            detail_lines.extend([
+                f"- {_escape_cell(item['id'])} 触发场景：{_escape_cell(item['trigger_scenario'])}",
+                f"- {_escape_cell(item['id'])} 影响：{_escape_cell(item['impact'])}；受影响范围：{_cell_list(item['affected_scope'])}",
+                f"- {_escape_cell(item['id'])} 因果链：{_cell_list(item['causal_chain'])}",
+                f"- {_escape_cell(item['id'])} 证据：{_cell_list(item['evidence'])}；置信度：{item['confidence']}",
+                f"- {_escape_cell(item['id'])} 阻塞理由：{_escape_cell(item['blocking_reason'])}；回归测试：{_escape_cell(item['regression_test'])}",
+            ])
+        findings_body = _table(
+            ("ID", "标题", "维度", "严重度", "阻塞", "证据等级", "位置", "修复方向"), rows
+        ) + "\n\n" + "\n".join(detail_lines)
+    else:
+        findings_body = "（无）"
+    sections.append("## Findings\n\n" + findings_body)
+
+    questions = payload["open_questions"]
+    questions_body = _table(
+        ("ID", "问题", "负责人类型", "阻塞", "所需证据", "不确认的影响"),
+        [[
+            _escape_cell(item["id"]), _escape_cell(item["question"]), _escape_cell(item["owner_type"]),
+            "是" if item["blocking"] else "否", _escape_cell(item["required_evidence"]),
+            _escape_cell(item["impact_if_unanswered"]),
+        ] for item in questions],
+    ) if questions else "（无）"
+    sections.append("## Open Questions\n\n" + questions_body)
+
+    traceability = payload["traceability"]
+    trace_body = _table(
+        ("ID", "类型", "来源", "陈述", "状态", "代码/测试证据", "缺口"),
+        [[
+            _escape_cell(item["id"]), _escape_cell(item["kind"]), _escape_cell(item["source"]),
+            _escape_cell(item["statement"]), _escape_cell(item["status"]),
+            _cell_list(item["links"].get("code", []) + item["links"].get("tests", [])),
+            _escape_cell(item["gap"]) if item["gap"] else "—",
+        ] for item in traceability],
+    ) if traceability else "（无）"
+    sections.append("## PRD-TDD-代码-测试-RPD 追踪矩阵\n\n" + trace_body)
+
+    coverage_body = _table(
+        ("维度", "必需", "状态", "责任人", "证据", "理由"),
+        [[
+            _escape_cell(item["dimension"]), "是" if item["required"] else "否",
+            _escape_cell(item["status"]), _escape_cell(item["owner"]),
+            _cell_list(item["evidence"]), _escape_cell(item["reason"]),
+        ] for item in payload["coverage"]],
+    )
+    sections.append("## 审查覆盖矩阵\n\n" + coverage_body)
+
+    validation_body = _table(
+        ("ID", "证明目标", "命令", "cwd", "状态", "退出码", "证据", "未运行原因"),
+        [[
+            _escape_cell(item["id"]), _escape_cell(item["target_claim"]), _escape_cell(item["command"]),
+            _escape_cell(item["cwd"]), _escape_cell(item["status"]),
+            _escape_cell(item["exit_code"]) if item["exit_code"] is not None else "—",
+            _escape_cell(item["evidence"]),
+            _escape_cell(item["not_run_reason"]) if item["not_run_reason"] else "—",
+        ] for item in payload["validation"]],
+    ) if payload["validation"] else "（无）"
+    sections.append("## 本地验证证据\n\n" + validation_body)
+
+    gate_lines = [f"**Gate 状态：{gate['status']}**", ""]
+    gate_lines.append(_table(
+        ("检查项", "状态", "关键性", "证据", "条件/缺口"),
+        [[
+            _escape_cell(item["item"]), _escape_cell(item["status"]), _escape_cell(item["criticality"]),
+            _cell_list(item["evidence"]),
+            _escape_cell(item["condition_or_gap"]) if item["condition_or_gap"] else "—",
+        ] for item in gate["checks"]],
+    ))
+    if gate["blocking_reasons"]:
+        gate_lines.extend(["", "阻塞理由：", _bullets(gate["blocking_reasons"])])
+    if gate["conditions"]:
+        gate_lines.extend(["", "条件：", _bullets(gate["conditions"])])
+    sections.append("## Release Gate\n\n" + "\n".join(gate_lines))
+
+    rejected = payload["rejected_candidates"]
+    rejected_body = _table(
+        ("候选 ID", "排除理由"),
+        [[_escape_cell(item["candidate_id"]), _escape_cell(item["reason"])] for item in rejected],
+    ) if rejected else "（无）"
+    exclusions_body = rejected_body + "\n\n限制项：\n" + _bullets(payload["limitations"])
+    sections.append("## 已排除候选与未验证限制\n\n" + exclusions_body)
+
+    sections.append("## 剩余风险\n\n" + _bullets(payload["residual_risks"]))
+    return "\n\n".join(sections) + "\n"
+
+
 def split_error(error: str) -> tuple[str, str]:
     """把 `path: message` 形态的错误拆成机器可读两段。
 
@@ -1565,9 +2005,20 @@ def main() -> int:
         help="print only errors whose path starts with this JSON path (e.g. '$.findings[2]'); repeatable. "
         "Filters the output, never the checks: a filtered run is not a gate result",
     )
+    parser.add_argument(
+        "--render-markdown",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="after a full validation passes, deterministically render the Chinese Markdown delivery "
+        "from the same JSON payload to PATH (step 20 no longer hand-writes a second copy); "
+        "mutually exclusive with --only",
+    )
     args = parser.parse_args()
     if not all(prefix.startswith("$") for prefix in args.only):
         parser.error("--only takes a JSON path starting with '$' (e.g. '$.coverage[3]' or '$.findings')")
+    if args.render_markdown is not None and args.only:
+        parser.error("--render-markdown cannot be combined with --only: a filtered run is not a gate result")
     _reconfigure_streams()
     try:
         payload = load_payload(args.report)
@@ -1593,7 +2044,8 @@ def main() -> int:
             return 2
 
     errors = ReportValidator(
-        snapshot_manifest=snapshot_manifest, dispatch_ledger=dispatch_ledger
+        snapshot_manifest=snapshot_manifest, dispatch_ledger=dispatch_ledger,
+        run_dir=Path(args.snapshot_manifest).resolve().parent,
     ).validate(payload)
     if args.check_worktree:
         errors = (
@@ -1631,6 +2083,13 @@ def main() -> int:
     checked = ["manifest", "worktree freshness"] if args.check_worktree else ["manifest"]
     if dispatch_ledger is not None:
         checked.append(f"dispatch ledger ({len(dispatch_ledger)} record(s))")
+    if args.render_markdown is not None:
+        try:
+            _write_text_atomic(args.render_markdown, render_markdown(payload))
+        except OSError as exc:
+            print(f"INVALID: unable to write --render-markdown {args.render_markdown}: {exc}", file=sys.stderr)
+            return 2
+        checked.append(f"markdown rendered to {args.render_markdown}")
     print(f"VALID: code-review report structure and verdict invariants passed [{', '.join(checked)}]")
     return 0
 

@@ -41,6 +41,7 @@ from freeze_review_snapshot import (  # noqa: E402
     build_snapshot,
     canonical_json,
     parse_name_status,
+    reduced_dispatch_eligible,
     resolve_auto_branch_target,
     resolve_handoff_check,
     review_scale,
@@ -1584,6 +1585,19 @@ class SnapshotScriptTests(unittest.TestCase):
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(record.returncode, 0, record.stderr)
+            # P1-1 后新冻结的 S 档 manifest 要求至少两个 Specialist（或显式降档披露）；
+            # 本用例关注输入重哈希，补第二个派发保持完整审查形状。
+            second = subprocess.run(
+                [
+                    sys.executable, str(SKILL_DIR / "scripts" / "record_review_dispatch.py"),
+                    "--ledger", str(ledger_path),
+                    "--step", "08", "--role", "review-specialist", "--instance-id", "SP-02",
+                    "--input-diff-digest", manifest["worktree_state"]["diff_digest"],
+                    "--returned-status", "COMPLETED",
+                ],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
             report_path = run_dir / "review-report.json"
             report_path.write_text(
                 json.dumps(self._report_for_manifest(manifest)), encoding="utf-8"
@@ -1932,6 +1946,229 @@ class SkillCommandDriftTests(unittest.TestCase):
                 self.assertNotIn("<完整 Diff", text)
                 self.assertNotIn("<目标 Diff>\n", text)
 
+    def test_parallel_scheduling_and_two_track_validation_are_documented(self) -> None:
+        # P0-4/P0-3/P0-2 的调度与批量/渲染规则是操作指令，防止叙事瘦身时被误删。
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        step08 = text.split("## 08", 1)[1].split("## 09", 1)[0]
+        self.assertIn("并行派发", step08)
+        self.assertIn("--batch", step08)
+        step14 = text.split("## 14", 1)[1].split("## 15", 1)[0]
+        self.assertIn("基线机械检查", step14)
+        self.assertIn("针对性检查", step14)
+        self.assertIn("--render-markdown", text)
+
+    def test_rationale_file_exists_and_is_not_a_role_prompt(self) -> None:
+        # P0-1：外置叙事必须有落点，且不得伪装成角色模板被派发注入。
+        rationale = SKILL_DIR / "references" / "rationale.md"
+        self.assertTrue(rationale.is_file())
+        self.assertFalse(rationale.name.endswith("-prompt.md"))
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("references/rationale.md", text)
+
+
+class BatchDispatchTests(unittest.TestCase):
+    """P0-3 提效：批量台账登记与单条共用谓词，原子落盘，混用显式报错。"""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = Path(self.temp.name)
+        self.ledger = self.root / "dispatch-ledger.jsonl"
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _cli(self, *extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(SKILL_DIR / "scripts" / "record_review_dispatch.py"),
+             "--ledger", str(self.ledger), *extra],
+            capture_output=True, text=True, check=False,
+        )
+
+    def _entry(self, instance: str, step: int = 8, role: str = "review-specialist", **fields: object) -> dict:
+        entry = {
+            "step": step, "role": role, "instance_id": instance,
+            "input_diff_digest": DIGEST, "returned_status": "COMPLETED",
+            "started_at": f"2026-09-09T00:00:{step:02d}Z",
+            "ended_at": f"2026-09-09T00:00:{step:02d}Z",
+        }
+        entry.update(fields)
+        return entry
+
+    def _write_batch(self, entries: list[dict]) -> Path:
+        path = self.root / "batch.json"
+        path.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def _records(self) -> list[dict]:
+        return [json.loads(line) for line in self.ledger.read_text(encoding="utf-8").splitlines()]
+
+    def test_batch_final_state_equals_sequential_execution(self) -> None:
+        # 复合命令等价性验收：除脚本写入的 recorded_at 外，终态逐字节等价。
+        entries = [
+            self._entry("SP-01"), self._entry("SP-02"),
+            self._entry("EV-01", step=10, role="review-evidence"),
+        ]
+        batched = self._cli("--batch", str(self._write_batch(entries)))
+        self.assertEqual(batched.returncode, 0, batched.stderr)
+        batch_lines = self.ledger.read_text(encoding="utf-8").splitlines()
+        self.ledger.unlink()
+        for entry in entries:
+            single = self._cli(
+                "--step", str(entry["step"]), "--role", entry["role"],
+                "--instance-id", entry["instance_id"], "--input-diff-digest", DIGEST,
+                "--returned-status", "COMPLETED",
+                "--started-at", entry["started_at"], "--ended-at", entry["ended_at"],
+            )
+            self.assertEqual(single.returncode, 0, single.stderr)
+        sequential_lines = self.ledger.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(batch_lines), len(sequential_lines))
+        for batched_line, sequential_line in zip(batch_lines, sequential_lines):
+            batched_record, sequential_record = json.loads(batched_line), json.loads(sequential_line)
+            batched_record.pop("recorded_at"), sequential_record.pop("recorded_at")
+            self.assertEqual(batched_record, sequential_record)
+
+    def test_batch_is_atomic_when_a_middle_entry_is_invalid(self) -> None:
+        self._cli("--batch", str(self._write_batch([self._entry("SP-00")])))
+        before = self.ledger.read_text(encoding="utf-8")
+        entries = [self._entry("SP-01"), self._entry("SP-02", input_diff_digest="not-a-digest"), self._entry("SP-03")]
+        result = self._cli("--batch", str(self._write_batch(entries)))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("batch[1]", result.stderr)
+        self.assertEqual(self.ledger.read_text(encoding="utf-8"), before)
+
+    def test_batch_over_budget_is_rejected_as_a_whole(self) -> None:
+        self.ledger.write_text(
+            "".join(json.dumps(ledger_record(8, "review-specialist", f"SP-{i:02d}")) + "\n"
+                    for i in range(MAX_DISPATCHES - 1)),
+            encoding="utf-8",
+        )
+        result = self._cli("--batch", str(self._write_batch([self._entry("SP-90"), self._entry("SP-91")])))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(f"MAX_DISPATCHES={MAX_DISPATCHES}", result.stderr)
+        self.assertIn("BLOCKED", result.stderr)
+        self.assertEqual(len(self._records()), MAX_DISPATCHES - 1)
+
+    def test_batch_rejects_duplicates_within_batch_and_against_ledger(self) -> None:
+        result = self._cli("--batch", str(self._write_batch([self._entry("SP-01"), self._entry("SP-01")])))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("already in", result.stderr)
+        self.assertFalse(self.ledger.exists())
+        self._cli("--batch", str(self._write_batch([self._entry("SP-01")])))
+        again = self._cli("--batch", str(self._write_batch([self._entry("SP-02"), self._entry("SP-01")])))
+        self.assertEqual(again.returncode, 2)
+        self.assertEqual(len(self._records()), 1)
+
+    def test_batch_mixed_with_single_flags_is_an_explicit_error(self) -> None:
+        result = self._cli("--batch", str(self._write_batch([self._entry("SP-01")])), "--step", "08")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cannot be combined", result.stderr)
+        self.assertFalse(self.ledger.exists())
+
+    def test_batch_with_missing_input_file_rejects_the_whole_batch(self) -> None:
+        entries = [self._entry("SP-01"), self._entry("SP-02", inputs=[str(self.root / "absent.json")])]
+        result = self._cli("--batch", str(self._write_batch(entries)))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("existing file", result.stderr)
+        self.assertFalse(self.ledger.exists())
+
+    def test_batch_entries_require_explicit_timestamps(self) -> None:
+        entry = self._entry("SP-01")
+        del entry["started_at"]
+        result = self._cli("--batch", str(self._write_batch([entry])))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("timestamps", result.stderr)
+
+    def test_single_mode_missing_flags_reports_explicitly(self) -> None:
+        result = self._cli("--step", "08")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("missing required flag", result.stderr)
+        self.assertIn("--role", result.stderr)
+
+
+class RenderMarkdownTests(unittest.TestCase):
+    """P0-2 提效：Markdown 由确定性渲染器从同一负载产出，不再手写第二份。"""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = Path(self.temp.name)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _run(self, report: dict, *extra: str) -> subprocess.CompletedProcess:
+        manifest = signed_manifest()
+        copy_snapshot_fields(report, manifest)
+        report_path = self.root / "report.json"
+        manifest_path = self.root / "snapshot.json"
+        report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        return subprocess.run(
+            [sys.executable, str(SKILL_DIR / "scripts" / "validate_review_report.py"),
+             "--snapshot-manifest", str(manifest_path), *extra, str(report_path)],
+            capture_output=True, text=True, check=False,
+        )
+
+    def test_valid_report_renders_all_ten_sections_in_order(self) -> None:
+        out = self.root / "report.md"
+        result = self._run(valid_report(), "--render-markdown", str(out))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = out.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("# 代码审查报告"))
+        positions = [text.index(f"## {heading}") for heading in (
+            "结论与依据", "审查快照与范围", "Findings", "Open Questions",
+            "PRD-TDD-代码-测试-RPD 追踪矩阵", "审查覆盖矩阵", "本地验证证据",
+            "Release Gate", "已排除候选与未验证限制", "剩余风险",
+        )]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_invalid_report_does_not_render(self) -> None:
+        report = valid_report()
+        report["summary"] = ""
+        out = self.root / "report.md"
+        result = self._run(report, "--render-markdown", str(out))
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(out.exists())
+
+    def test_render_markdown_cannot_combine_with_only(self) -> None:
+        out = self.root / "report.md"
+        result = self._run(valid_report(), "--render-markdown", str(out), "--only", "$.findings")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cannot be combined", result.stderr)
+        self.assertFalse(out.exists())
+
+    def test_finding_cells_with_pipes_and_newlines_are_escaped(self) -> None:
+        report = valid_report()
+        report["verdict"] = "REQUEST_CHANGES"
+        report["findings"] = [valid_finding(title="a|b\nc", remediation="x|y")]
+        out = self.root / "report.md"
+        result = self._run(report, "--render-markdown", str(out))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = out.read_text(encoding="utf-8")
+        self.assertIn("a\\|b<br>c", text)
+        self.assertIn("x\\|y", text)
+        row = next(line for line in text.splitlines() if line.startswith("| F-001 |"))
+        self.assertEqual(row.count("|") - row.count("\\|"), 9, "表格行被撕裂或注入了伪列")
+
+    def test_render_is_deterministic(self) -> None:
+        first, second = self.root / "first.md", self.root / "second.md"
+        self.assertEqual(self._run(valid_report(), "--render-markdown", str(first)).returncode, 0)
+        self.assertEqual(self._run(valid_report(), "--render-markdown", str(second)).returncode, 0)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_rendered_values_trace_back_to_the_payload(self) -> None:
+        report = valid_report()
+        report["verdict"] = "REQUEST_CHANGES"
+        report["findings"] = [valid_finding()]
+        out = self.root / "report.md"
+        result = self._run(report, "--render-markdown", str(out))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = out.read_text(encoding="utf-8")
+        for value in (
+            report["snapshot"]["diff_digest"], report["snapshot"]["target_id"],
+            "F-001", "VAL-001", "python -m unittest", "REQ-001", "REQUEST_CHANGES",
+        ):
+            self.assertIn(value, text)
+
 
 class DeltaRecheckTests(unittest.TestCase):
     """P1-1 提效：DELTA 增量复核轮的机械契约与对抗面。
@@ -2131,6 +2368,346 @@ class DeltaRecheckTests(unittest.TestCase):
         self.assertTrue(any("must be a FULL review" in item for item in errors), errors)
 
 
+class ReducedDispatchTests(unittest.TestCase):
+    """P1-1 提效：S 档派发降档的机械准入与对抗面。
+
+    放宽的是派发覆盖面，不是判据：每条用例都试图把“受限派发”伪装成
+    “完整审查”或借机静默丢弃候选，校验器必须逐一拦下。
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.run_dir = Path(self.temp.name)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _manifest(self, **fields: object) -> dict:
+        fields.setdefault("reduced_dispatch_eligible", True)
+        return signed_manifest(**fields)
+
+    def _report(self, manifest: dict, markers: list[str], verdict: str = "APPROVE_WITH_FOLLOW_UPS") -> dict:
+        report = report_for_manifest(manifest)
+        report["limitations"] = markers
+        report["verdict"] = verdict
+        return report
+
+    def _write_register(self, candidates: list) -> None:
+        steps = self.run_dir / "steps"
+        steps.mkdir(parents=True, exist_ok=True)
+        (steps / "09-candidate-register.json").write_text(
+            json.dumps({"candidates": candidates}, ensure_ascii=False), encoding="utf-8"
+        )
+
+    def test_reduced_single_specialist_with_disclosure_passes(self) -> None:
+        manifest = self._manifest()
+        report = self._report(manifest, ["S_TIER_REDUCED: single specialist covers all applicable dimensions"])
+        errors = ReportValidator(manifest, valid_ledger(), self.run_dir).validate(report)
+        self.assertEqual(errors, [])
+
+    def test_high_risk_manifest_cannot_claim_reduced(self) -> None:
+        manifest = self._manifest(reduced_dispatch_eligible=False)
+        report = self._report(manifest, ["S_TIER_REDUCED: claimed anyway"])
+        errors = ReportValidator(manifest, valid_ledger(), self.run_dir).validate(report)
+        self.assertTrue(any("reduced_dispatch_eligible=true" in item for item in errors), errors)
+
+    def test_legacy_manifest_without_eligibility_cannot_claim_reduced(self) -> None:
+        manifest = signed_manifest()
+        report = self._report(manifest, ["S_TIER_REDUCED: claimed on a legacy manifest"])
+        errors = ReportValidator(manifest, valid_ledger(), self.run_dir).validate(report)
+        self.assertTrue(any("reduced_dispatch_eligible=true" in item for item in errors), errors)
+
+    def test_reduced_round_cannot_approve(self) -> None:
+        manifest = self._manifest()
+        report = self._report(manifest, ["S_TIER_REDUCED: single specialist"], verdict="APPROVE")
+        errors = ReportValidator(manifest, valid_ledger(), self.run_dir).validate(report)
+        self.assertTrue(any("APPROVE_WITH_FOLLOW_UPS" in item for item in errors), errors)
+
+    def test_single_specialist_without_marker_is_rejected(self) -> None:
+        manifest = self._manifest()
+        report = report_for_manifest(manifest)
+        errors = ReportValidator(manifest, valid_ledger(), self.run_dir).validate(report)
+        self.assertTrue(any("must disclose S_TIER_REDUCED" in item for item in errors), errors)
+
+    def test_empty_register_skip_passes_with_step18(self) -> None:
+        self._write_register([])
+        manifest = self._manifest()
+        report = self._report(manifest, [
+            "S_TIER_REDUCED: single specialist",
+            "S_TIER_EMPTY_REGISTER: no candidates, step 18 rechecks the empty-register claim",
+        ])
+        ledger = [ledger_record(8, "review-specialist", DEFAULT_OWNER),
+                  ledger_record(18, "review-evidence", "EV-02", started_at="2026-09-09T00:01:00Z", ended_at="2026-09-09T00:02:00Z")]
+        errors = ReportValidator(manifest, ledger, self.run_dir).validate(report)
+        self.assertEqual(errors, [])
+
+    def test_empty_register_marker_with_nonempty_register_is_rejected(self) -> None:
+        self._write_register([{"id": "CF-001", "claim": "unrebutted candidate"}])
+        manifest = self._manifest()
+        report = self._report(manifest, ["S_TIER_REDUCED: x", "S_TIER_EMPTY_REGISTER: claimed empty"])
+        ledger = [ledger_record(8, "review-specialist", DEFAULT_OWNER),
+                  ledger_record(18, "review-evidence", "EV-02", started_at="2026-09-09T00:01:00Z", ended_at="2026-09-09T00:02:00Z")]
+        errors = ReportValidator(manifest, ledger, self.run_dir).validate(report)
+        self.assertTrue(any("empty candidates list" in item for item in errors), errors)
+
+    def test_empty_register_marker_without_register_file_is_rejected(self) -> None:
+        manifest = self._manifest()
+        report = self._report(manifest, ["S_TIER_REDUCED: x", "S_TIER_EMPTY_REGISTER: no file"])
+        errors = ReportValidator(manifest, valid_ledger(), self.run_dir).validate(report)
+        self.assertTrue(any("09-candidate-register.json" in item for item in errors), errors)
+
+    def test_empty_register_skip_without_step18_is_rejected(self) -> None:
+        self._write_register([])
+        manifest = self._manifest()
+        report = self._report(manifest, ["S_TIER_REDUCED: x", "S_TIER_EMPTY_REGISTER: skipped both"])
+        ledger = [ledger_record(8, "review-specialist", DEFAULT_OWNER)]
+        errors = ReportValidator(manifest, ledger, self.run_dir).validate(report)
+        self.assertTrue(any("step-18 independent recheck" in item for item in errors), errors)
+
+    def test_l_tier_cannot_claim_reduced(self) -> None:
+        manifest = self._manifest(review_scale=review_scale(50, 2000), reduced_dispatch_eligible=False)
+        report = self._report(manifest, ["S_TIER_REDUCED: claimed on L tier"])
+        errors = ReportValidator(manifest, valid_ledger(), self.run_dir).validate(report)
+        self.assertTrue(any("tier S" in item for item in errors), errors)
+
+    def test_delta_round_cannot_carry_reduced_markers(self) -> None:
+        manifest = self._manifest()
+        report = self._report(manifest, ["S_TIER_REDUCED: smuggled into delta"])
+        report["review_context"] = {"review_mode": "DELTA", "documents_status": "available"}
+        errors = ReportValidator(manifest, valid_ledger(), self.run_dir).validate(report)
+        self.assertTrue(any("cannot appear in a DELTA" in item for item in errors), errors)
+
+    def test_nonempty_register_without_rebuttals_is_rejected_even_without_markers(self) -> None:
+        self._write_register([{"id": "CF-001", "claim": "silently dropped"}])
+        manifest = self._manifest()
+        report = report_for_manifest(manifest)
+        ledger = [ledger_record(8, "review-specialist", DEFAULT_OWNER),
+                  ledger_record(8, "review-specialist", "SP-02"),
+                  ledger_record(18, "review-evidence", "EV-02", started_at="2026-09-09T00:01:00Z", ended_at="2026-09-09T00:02:00Z")]
+        errors = ReportValidator(manifest, ledger, self.run_dir).validate(report)
+        self.assertTrue(any("non-empty candidate register requires step-10" in item for item in errors), errors)
+
+    def test_reduced_marker_cannot_silently_drop_nonempty_candidates(self) -> None:
+        """对抗面（审查 Critical-1）：最常见的合法标记不得关闭候选反证门禁。"""
+        self._write_register([{"id": "CF-001", "claim": "dropped under the reduced marker"}])
+        manifest = self._manifest()
+        report = self._report(manifest, ["S_TIER_REDUCED: single specialist covers all dimensions"])
+        ledger = [ledger_record(8, "review-specialist", DEFAULT_OWNER),
+                  ledger_record(18, "review-evidence", "EV-02", started_at="2026-09-09T00:01:00Z", ended_at="2026-09-09T00:02:00Z")]
+        errors = ReportValidator(manifest, ledger, self.run_dir).validate(report)
+        self.assertTrue(any("non-empty candidate register requires step-10" in item for item in errors), errors)
+
+    def test_empty_register_marker_alone_cannot_hide_single_specialist(self) -> None:
+        """对抗面（审查 Medium-3）：只带空清单标记仍须披露单 Specialist 降档。"""
+        self._write_register([])
+        manifest = self._manifest()
+        report = self._report(manifest, ["S_TIER_EMPTY_REGISTER: no candidates"])
+        ledger = [ledger_record(8, "review-specialist", DEFAULT_OWNER),
+                  ledger_record(18, "review-evidence", "EV-02", started_at="2026-09-09T00:01:00Z", ended_at="2026-09-09T00:02:00Z")]
+        errors = ReportValidator(manifest, ledger, self.run_dir).validate(report)
+        self.assertTrue(any("must disclose S_TIER_REDUCED" in item for item in errors), errors)
+
+    def test_eligibility_probe_matches_high_risk_paths_only(self) -> None:
+        self.assertTrue(reduced_dispatch_eligible("S", ["M:src/app.py"]))
+        self.assertFalse(reduced_dispatch_eligible("S", ["A:migrations/001_init.py"]))
+        self.assertFalse(reduced_dispatch_eligible("S", ["M:db/schema.sql"]))
+        self.assertFalse(reduced_dispatch_eligible("S", ["R:old.py->auth/login.py"]))
+        self.assertFalse(reduced_dispatch_eligible("S", ["M:AUTH/login.py"]))
+        self.assertFalse(reduced_dispatch_eligible("M", ["M:src/app.py"]))
+        self.assertTrue(reduced_dispatch_eligible("S", []))
+
+    def test_freeze_signs_eligibility_from_real_changes(self) -> None:
+        for relative, expected in (("src/app.py", True), ("migrations/001.sql", False)):
+            with self.subTest(path=relative), tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+                repo = Path(directory)
+                base = init_repo(repo)
+                target = repo / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("print('new')\n", encoding="utf-8")
+                manifest_path = repo / ".." / "snapshot.json"
+                result = freeze_cli(
+                    repo, "--repo", str(repo), "--base-sha", base, "--head-sha", base,
+                    "--target-type", "local_diff", "--target-locator", "test",
+                    "--emit-manifest", str(manifest_path),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertIs(manifest["reduced_dispatch_eligible"], expected)
+
+
+class ReuseValidationTests(unittest.TestCase):
+    """P1-2 提效：上游验证证据复用的机械边界与对抗面。
+
+    复用只省重复执行，不省判据：每条用例都试图拿不合格的证据冒充
+    “同目标同工作树的 PASS”，校验器必须逐一拦下。"""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = Path(self.temp.name)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _fixture(self, record_overrides: dict | None = None) -> tuple[dict, dict, Path]:
+        record = {
+            "name": "full-tests", "command": "python -m unittest", "cwd": "/repo",
+            "exit_code": 0, "result": "PASS", "diff_digest": DIGEST, "evidence": "exit code 0",
+        }
+        record.update(record_overrides or {})
+        evidence_path = self.root / "review-validation-evidence.json"
+        evidence_path.write_text(json.dumps({
+            "produced_by": "codekit:code-impl/scripts/code_impl_controller.py",
+            "target_id": TARGET_ID, "worktree_diff_digest": DIGEST,
+            "worktree_files": [], "records": [record],
+        }, ensure_ascii=False), encoding="utf-8")
+        digest = sha256(evidence_path.read_bytes())
+        manifest = signed_manifest(handoff={
+            "path": str(self.root / "upstream.json"),
+            "sources": ["codekit:code-impl/scripts/code_impl_controller.py"],
+            "digest_scheme": DIGEST_SCHEME,
+            "target_id": TARGET_ID,
+            "target_id_matched": True,
+            "compared_fields": ["head_sha"],
+            "uncomparable_digests": [],
+            "limitations": [],
+            "validation_evidence": {
+                "path": str(evidence_path), "digest": digest,
+                "target_id": TARGET_ID, "worktree_diff_digest": DIGEST,
+            },
+        })
+        report = report_for_manifest(manifest)
+        report["validation"][0]["reused_from"] = {
+            "path": str(evidence_path), "digest": digest, "validation_id": "full-tests",
+        }
+        report["validation"][0]["evidence"] = "reused from full-tests (exit code 0)"
+        report["limitations"] = ["REUSED_VALIDATION: 1 record inherited from code-impl"]
+        report["verdict"] = "APPROVE_WITH_FOLLOW_UPS"
+        return manifest, report, evidence_path
+
+    def test_reused_pass_evidence_with_disclosure_passes(self) -> None:
+        manifest, report, _ = self._fixture()
+        self.assertEqual(ReportValidator(manifest).validate(report), [])
+
+    def test_fail_source_cannot_be_reused(self) -> None:
+        manifest, report, _ = self._fixture({"result": "FAIL", "exit_code": 1})
+        errors = ReportValidator(manifest).validate(report)
+        self.assertTrue(any("only PASS evidence" in item for item in errors), errors)
+
+    def test_not_run_source_cannot_be_reused(self) -> None:
+        manifest, report, _ = self._fixture({"result": "NOT_RUN", "exit_code": None})
+        errors = ReportValidator(manifest).validate(report)
+        self.assertTrue(any("only PASS evidence" in item for item in errors), errors)
+
+    def test_digest_mismatch_is_rejected(self) -> None:
+        manifest, report, _ = self._fixture()
+        report["validation"][0]["reused_from"]["digest"] = "f" * 64
+        errors = ReportValidator(manifest).validate(report)
+        self.assertTrue(any("exact validation_evidence artifact" in item for item in errors), errors)
+
+    def test_command_whitespace_variant_is_rejected(self) -> None:
+        manifest, report, _ = self._fixture()
+        report["validation"][0]["command"] = "python -m unittest "
+        errors = ReportValidator(manifest).validate(report)
+        self.assertTrue(any("verbatim" in item for item in errors), errors)
+
+    def test_cwd_mismatch_is_rejected(self) -> None:
+        manifest, report, _ = self._fixture({"cwd": "/repo/sub"})
+        errors = ReportValidator(manifest).validate(report)
+        self.assertTrue(any("cwd must resolve" in item for item in errors), errors)
+
+    def test_reuse_chain_is_rejected(self) -> None:
+        manifest, report, _ = self._fixture({"reused_from": 3})
+        errors = ReportValidator(manifest).validate(report)
+        self.assertTrue(any("reuse chains" in item for item in errors), errors)
+
+    def test_source_from_another_worktree_is_rejected(self) -> None:
+        manifest, report, _ = self._fixture({"diff_digest": "9" * 64})
+        errors = ReportValidator(manifest).validate(report)
+        self.assertTrue(any("not collected against the frozen worktree" in item for item in errors), errors)
+
+    def test_delta_round_cannot_reuse(self) -> None:
+        manifest, report, _ = self._fixture()
+        report["review_context"] = {"review_mode": "DELTA", "documents_status": "available"}
+        errors = ReportValidator(manifest).validate(report)
+        self.assertTrue(any("DELTA rechecks must run validation freshly" in item for item in errors), errors)
+
+    def test_missing_disclosure_is_rejected(self) -> None:
+        manifest, report, _ = self._fixture()
+        report["limitations"] = []
+        errors = ReportValidator(manifest).validate(report)
+        self.assertTrue(any("must disclose REUSED_VALIDATION" in item for item in errors), errors)
+
+    def test_missing_source_file_is_rejected(self) -> None:
+        manifest, report, evidence_path = self._fixture()
+        evidence_path.unlink()
+        errors = ReportValidator(manifest).validate(report)
+        self.assertTrue(any("unreadable" in item for item in errors), errors)
+
+    def test_reuse_without_handoff_evidence_is_rejected(self) -> None:
+        manifest, report, _ = self._fixture()
+        plain = signed_manifest()
+        report = report_for_manifest(plain)
+        report["validation"][0]["reused_from"] = manifest["handoff"]["validation_evidence"] | {"validation_id": "full-tests"}
+        report["limitations"] = ["REUSED_VALIDATION: claimed without handoff"]
+        report["verdict"] = "APPROVE_WITH_FOLLOW_UPS"
+        errors = ReportValidator(plain).validate(report)
+        self.assertTrue(any("reuse requires a --handoff manifest" in item for item in errors), errors)
+
+
+class ScopedRecheckTests(unittest.TestCase):
+    """P1-3 提效：步骤 18 复核分级的机械边界与对抗面。
+
+    分级只适用于无阻塞且 S/M 档的报告；每条用例都试图把分级范围
+    扩大到阻塞 Finding 或大档位，校验器必须拦下。"""
+
+    def _report(self, manifest: dict | None = None, **overrides: object) -> dict:
+        report = report_for_manifest(manifest) if manifest is not None else valid_report()
+        report["limitations"] = ["SCOPED_FINAL_RECHECK: consistency + gate + omission scan only"]
+        report["verdict"] = "APPROVE_WITH_FOLLOW_UPS"
+        report.update(overrides)
+        return report
+
+    def test_scoped_recheck_passes_for_clean_s_tier(self) -> None:
+        manifest = signed_manifest()
+        self.assertEqual(ReportValidator(manifest).validate(self._report(manifest)), [])
+
+    def test_scoped_recheck_passes_for_clean_m_tier(self) -> None:
+        manifest = signed_manifest(review_scale=review_scale(20, 800))
+        self.assertEqual(ReportValidator(manifest).validate(self._report(manifest)), [])
+
+    def test_scoped_recheck_allows_non_blocking_findings(self) -> None:
+        manifest = signed_manifest()
+        report = self._report(manifest, findings=[valid_finding(blocking=False, blocking_reason="non-blocking: follow-up only")])
+        self.assertEqual(ReportValidator(manifest).validate(report), [])
+
+    def test_blocking_finding_cannot_use_scoped_recheck(self) -> None:
+        manifest = signed_manifest()
+        report = self._report(manifest, findings=[valid_finding()], verdict="REQUEST_CHANGES")
+        errors = ReportValidator(manifest).validate(report)
+        self.assertTrue(any("requires no blocking findings" in item for item in errors), errors)
+
+    def test_l_tier_cannot_use_scoped_recheck(self) -> None:
+        manifest = signed_manifest(review_scale=review_scale(50, 2000))
+        errors = ReportValidator(manifest).validate(self._report(manifest))
+        self.assertTrue(any("only available for S/M tier" in item for item in errors), errors)
+
+    def test_delta_round_cannot_use_scoped_recheck(self) -> None:
+        manifest = signed_manifest()
+        report = self._report(manifest)
+        report["review_context"] = {"review_mode": "DELTA", "documents_status": "available"}
+        errors = ReportValidator(manifest).validate(report)
+        self.assertTrue(any("SCOPED_FINAL_RECHECK cannot appear in a DELTA" in item for item in errors), errors)
+
+    def test_scoped_recheck_cannot_approve(self) -> None:
+        manifest = signed_manifest()
+        report = self._report(manifest, verdict="APPROVE")
+        errors = ReportValidator(manifest).validate(report)
+        self.assertTrue(any("APPROVE_WITH_FOLLOW_UPS" in item for item in errors), errors)
+
+    def test_without_manifest_the_report_tier_is_used(self) -> None:
+        self.assertEqual(ReportValidator().validate(self._report()), [])
+
+
 class ContractAnchorDriftTests(unittest.TestCase):
     """CW3-b：契约节锚点、角色表与 prompt 三方必须互相对得上（D1 的看守）。"""
 
@@ -2161,7 +2738,7 @@ class ContractAnchorDriftTests(unittest.TestCase):
     def test_every_anchor_is_routed_and_no_route_is_invented(self) -> None:
         text = self._contracts()
         defined = self._defined(text)
-        self.assertEqual(len(defined), 17)
+        self.assertEqual(len(defined), 19)
         table = text.split("## 节锚点与按角色读取", 1)[1].split("\n## ", 1)[0]
         routed: set[str] = set()
         for row in re.findall(r"^\| ([^|]+) \| ([^|]+) \|$", table, re.M):
@@ -2431,6 +3008,59 @@ class CrossSkillHandoffTests(unittest.TestCase):
             head = "b" * 40
             self.assertEqual(target_id_for(root, head), self.impl._handoff_target_id(root, head))
             self.assertEqual(target_id_for(root, head), self.bugfix.target_id_for(root, head))
+
+    def test_validation_evidence_is_handed_over_and_bound_to_the_worktree(self) -> None:
+        # P1-2 跨技能端到端：用真实上游生成器导出证据，冻结时核逐文件绑定；
+        # 树在上游冻结后动过，复用必须被拒绝而不是静默继承旧证据。
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            repo, run = self._repo_and_run(directory)
+            base = init_repo(repo)
+            subprocess.run(["git", "checkout", "-qb", "feature"], cwd=repo, check=True)
+            (repo / "committed.py").write_text("print('committed')\n", encoding="utf-8")
+            subprocess.run(["git", "add", "committed.py"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "feat"], cwd=repo, check=True)
+            head = git_in(repo, "rev-parse", "HEAD")
+            feature = repo / "docs" / "feature"
+            feature.mkdir(parents=True)
+            for name, body in (
+                ("product-doc.md", "# PRD\nThe product requirement is explicit and testable.\n"),
+                ("technical-doc.md", "# TDD\nThe technical design defines the implementation boundary.\n"),
+                ("release-doc.md", "# RPD\nThe release plan defines validation and rollback steps.\n"),
+            ):
+                (feature / name).write_text(body, encoding="utf-8")
+            state_path = self.impl.init_run(repo, feature, "p12")
+            (repo / "app.py").write_text("print('implemented')\n", encoding="utf-8")
+            self.impl.record_task(state_path, "T01", ["app.py"])
+            self.impl.record_validation(
+                state_path, "overall", "full-tests", "python -m unittest", ".", 0, "PASS",
+                evidence="exit code 0",
+            )
+            upstream = self.impl.freeze_review(state_path)
+            self.assertIn("validation_evidence", upstream)
+            args = (
+                "--repo", str(repo), "--base-sha", base, "--head-sha", head,
+                "--target-type", "branch", "--target-locator", "master...feature",
+                "--handoff", upstream["path"],
+            )
+            manifest_path = repo / ".codekit" / "code-review" / "p12" / "review-snapshot.json"
+            frozen = freeze_cli(repo, *args, "--emit-manifest", str(manifest_path))
+            self.assertEqual(frozen.returncode, 0, frozen.stderr)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            evidence = manifest["handoff"]["validation_evidence"]
+            self.assertEqual(evidence["digest"], upstream["validation_evidence"]["digest"])
+            self.assertEqual(evidence["target_id"], upstream["target_id"])
+            (repo / "app.py").write_text("print('drifted')\n", encoding="utf-8")
+            drifted = freeze_cli(repo, *args, "--emit-manifest", str(run / "second.json"))
+            self.assertEqual(drifted.returncode, 3)
+            self.assertIn("drifted after", drifted.stderr)
+            # 对抗面（审查 High-2）：修改已有文件会被逐文件重算拦下，但**新增**
+            # 文件同样意味着旧证据不再覆盖当前树，反向集合核对必须同样拒绝。
+            (repo / "app.py").write_text("print('implemented')\n", encoding="utf-8")
+            (repo / "sneaky_new_file.py").write_text("print('new')\n", encoding="utf-8")
+            gained = freeze_cli(repo, *args, "--emit-manifest", str(run / "third.json"))
+            self.assertEqual(gained.returncode, 3)
+            self.assertIn("gained file(s)", gained.stderr)
+            self.assertIn("sneaky_new_file.py", gained.stderr)
 
     def test_a_flat_duplicate_of_a_grouped_field_is_not_a_valid_manifest(self) -> None:
         # CW2-a② 的扁平/分组二义性：顶层再抄一份 base_sha，跨 SKILL 比对就会各取一侧。

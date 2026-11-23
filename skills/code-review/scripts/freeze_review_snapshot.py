@@ -48,8 +48,8 @@ PRODUCED_BY = "codekit:code-review/scripts/freeze_review_snapshot.py"
 # review_scale（CW4-b 规模分档）。1.4：新增 retry_policy（CW4-e 回滚开关的落盘凭据）。
 # 1.5：目标标识拆分（CW2-a）——base/head 移入 committed_range、四个分层摘要移入
 # worktree_state，并新增 target_id、digest_scheme、committed_range.range_digest。
-MANIFEST_SCHEMA_VERSION = "1.5"
-GENERATOR_VERSION = "1.5"
+MANIFEST_SCHEMA_VERSION = "1.6"
+GENERATOR_VERSION = "1.6"
 GIT_COMMAND_LOG: list[list[str]] = []
 # CW2-a①：三家 SKILL 的摘要编码统一为"裸小写 sha256 hexdigest，不带 `sha256:` 前缀"，
 # 并在各自产物里用 digest_scheme 自述这套编码。前缀曾经是跨 SKILL 比对恒为 False 的
@@ -583,6 +583,27 @@ COMPACTED_CHANGED_FIELDS = ("count", "digest", "first", "full_list_path")
 # 路径；档位由脚本按机械口径算出、签进 manifest，模型不自选档位（自选的档位总是偏小）。
 # 前三档各有 (文件数上限, 变更行上限)，任一超限即升档，末档 XL 无上限。
 SCALE_TIERS = ("S", "M", "L", "XL")
+# P1-1：S 档派发降档的机械准入。命中高风险路径即拒绝降档；清单只增不减，
+# 新增模式必须配"命中即拒绝降档"的对抗用例。目录段匹配大小写不敏感，
+# 重命名条目（R:old->new）两侧都查。
+HIGH_RISK_DIRS = {"migrations", "migration", "auth", "security", "payment", "billing", "schema"}
+HIGH_RISK_SUFFIXES = (".sql",)
+
+
+def reduced_dispatch_eligible(tier: str, changed_files: list[str]) -> bool:
+    """S 档且无高风险路径才允许降档；判据签进 manifest，模型不得自选。"""
+    if tier != "S":
+        return False
+    for entry in changed_files:
+        path = entry.split(":", 1)[1] if ":" in entry else entry
+        for side in path.split("->"):
+            lowered = side.strip().lower()
+            segments = lowered.split("/")
+            if any(segment in HIGH_RISK_DIRS for segment in segments[:-1]):
+                return False
+            if lowered.endswith(HIGH_RISK_SUFFIXES):
+                return False
+    return True
 SCALE_TIER_LIMITS = ((10, 300), (40, 1500), (150, 6000))
 REVIEW_SCALE_FIELDS = ("tier", "changed_files", "changed_lines", "tier_limits")
 
@@ -807,6 +828,18 @@ def handoff_producer(entry: dict[str, object]) -> str:
     return value if isinstance(value, str) and value else "unknown"
 
 
+def _worktree_file_digest(path: Path) -> str:
+    """P1-2：与 code-impl `_path_digest` 同一口径的逐文件摘要，用于把上游
+    验证证据绑定到当前工作树；口径漂移会让比对恒不等，两侧由跨技能测试看守。"""
+    if path.is_symlink():
+        return "symlink:" + os.readlink(path)
+    if not path.exists():
+        return "missing"
+    if not path.is_file():
+        return "non-file"
+    return "sha256:" + sha256(path.read_bytes())
+
+
 def resolve_handoff_check(path: Path, manifest: dict[str, object], *, committed_present: bool) -> dict[str, object]:
     """CW2-a③：把上游 Handoff 与本次冻结做机械比对，产出签进 manifest 的 `handoff` 段。
 
@@ -907,7 +940,76 @@ def resolve_handoff_check(path: Path, manifest: dict[str, object], *, committed_
         entry.get("target_id") for entry in entries if isinstance(entry, dict) and entry.get("target_id") is not None
     ]
     matched: object = TARGET_ID_UNDECLARED if not declared_ids else all(value == ours_id for value in declared_ids)
-    return {
+    # P1-2：上游声明的验证证据产物。核对文件摘要、目标/工作树绑定，并重算
+    # 逐文件摘要确认当前工作树与上游冻结时一致；任一处漂移即拒绝复用。
+    evidence_block: dict[str, object] | None = None
+    for entry in entries:
+        ref = entry.get("validation_evidence") if isinstance(entry, dict) else None
+        if ref is None:
+            continue
+        if not isinstance(ref, dict) or not isinstance(ref.get("path"), str) or not isinstance(ref.get("digest"), str):
+            raise HandoffError("--handoff validation_evidence must carry path and digest strings")
+        ref_path = Path(ref["path"]).expanduser()
+        if not ref_path.is_file():
+            raise HandoffError(f"--handoff validation_evidence.path is unreadable: {ref_path}")
+        raw_bytes = ref_path.read_bytes()
+        if ref["digest"] != sha256(raw_bytes):
+            raise HandoffError("--handoff validation_evidence.digest does not match the evidence file on disk")
+        try:
+            evidence = json.loads(raw_bytes.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise HandoffError(f"--handoff validation_evidence is not readable JSON: {exc}") from exc
+        if not isinstance(evidence, dict):
+            raise HandoffError("--handoff validation_evidence must hold a JSON object")
+        if evidence.get("target_id") != entry.get("target_id"):
+            raise HandoffError("--handoff validation_evidence target_id does not match the Handoff snapshot")
+        their_worktree = handoff_field(entry, "diff_digest")
+        if evidence.get("worktree_diff_digest") != their_worktree:
+            raise HandoffError(
+                "--handoff validation_evidence worktree_diff_digest does not match the Handoff "
+                "worktree; the evidence describes a different tree"
+            )
+        files = evidence.get("worktree_files")
+        if not isinstance(files, list):
+            raise HandoffError("--handoff validation_evidence must carry a worktree_files list")
+        repo_root = Path(str(manifest["repository_root"]))
+        for item in files:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not isinstance(item.get("digest"), str):
+                raise HandoffError("--handoff validation_evidence worktree_files entries must carry path and digest")
+            current = _worktree_file_digest(repo_root / item["path"])
+            if current != item["digest"]:
+                raise HandoffError(
+                    f"--handoff validation_evidence worktree file {item['path']!r} drifted after the "
+                    "upstream freeze; re-run the upstream validation instead of reusing it"
+                )
+        # 审查修复 High-2：逐文件重算是单向的，上游冻结后**新增**的工作树文件
+        # 同样意味着旧证据不再覆盖当前树，必须反向集合核对。重命名两侧都展开；
+        # .codekit/ 排除与上游 dirty_snapshot 的口径镜像（上游从不把它计入证据）。
+        current_paths: set[str] = set()
+        for entry_path in changed_from_diff(repo_root, "--cached") + changed_from_diff(repo_root):
+            for side in entry_path.split(":", 1)[1].split("->"):
+                current_paths.add(side)
+        untracked_paths, _, _ = untracked_manifest(repo_root)
+        current_paths.update(untracked_paths)
+        current_paths = {
+            path for path in current_paths
+            if path.rstrip("/") != ".codekit" and not path.startswith(".codekit/")
+        }
+        evidence_paths = {item["path"] for item in files}
+        gained = sorted(current_paths - evidence_paths)
+        if gained:
+            raise HandoffError(
+                "--handoff validation_evidence worktree gained file(s) after the upstream freeze: "
+                f"{', '.join(gained[:5])}; re-run the upstream validation instead of reusing it"
+            )
+        evidence_block = {
+            "path": str(ref_path.resolve()),
+            "digest": ref["digest"],
+            "target_id": evidence["target_id"],
+            "worktree_diff_digest": evidence["worktree_diff_digest"],
+        }
+        break
+    result: dict[str, object] = {
         "path": str(path.resolve()),
         "sources": sorted(set(producers)),
         "digest_scheme": DIGEST_SCHEME,
@@ -917,6 +1019,9 @@ def resolve_handoff_check(path: Path, manifest: dict[str, object], *, committed_
         "uncomparable_digests": sorted(comparable),
         "limitations": sorted(set(limitations)),
     }
+    if evidence_block is not None:
+        result["validation_evidence"] = evidence_block
+    return result
 
 
 def build_snapshot(args: argparse.Namespace, probe_prefix: list[list[str]] | None = None) -> dict[str, object]:
@@ -993,6 +1098,11 @@ def build_snapshot(args: argparse.Namespace, probe_prefix: list[list[str]] | Non
         "changed_files_digest": sha256(canonical_json(changed_files)),
         # 1.3：新增 review_scale（CW4-b 规模分档），报告侧照抄，档位不由模型自选。
         "review_scale": review_scale(len(changed_files), changed_lines),
+        # 1.6 / P1-1：S 档派发降档的机械准入，与档位一起签名；报告侧不复制该键，
+        # 校验器直接读 manifest，披露标记与结论封顶由 validate_reduced_dispatch 核对。
+        "reduced_dispatch_eligible": reduced_dispatch_eligible(
+            review_scale(len(changed_files), changed_lines)["tier"], changed_files
+        ),
         "preexisting_changes": preexisting,
         # 1.2：文档版本进入签名 manifest（CW2-b），报告侧照抄后即为可核对的冻结输入。
         "documents": collect_documents(repo, document_specs_from_args(args)),

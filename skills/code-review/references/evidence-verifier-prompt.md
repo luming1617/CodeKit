@@ -16,7 +16,7 @@
 <必要的代码、测试、配置、契约与规格>
 
 ## 本步约束
-1. 读取 Diff 读物与候选清单前先核对其 `sha256` 与输入登记的摘要一致；不一致时返回 `BLOCKED` 说明，不得凭部分读物反证。
+1. 读取 Diff 读物与候选清单前先用一条 `sha256sum` 命令核对全部输入文件的摘要与输入登记值一致；不一致时返回 `BLOCKED` 说明，不得凭部分读物反证。
 2. 只处理该清单里随本任务给出的候选，不参考其他 Reviewer 的发现，也不参与本实例的候选提出。
 
 ## 输出
@@ -43,10 +43,28 @@
 3. 核对验证状态与原始退出码/日志，Release Gate 与 RPD 是否一致。
 4. 搜索是否遗漏会改变最终 verdict 的高风险路径。
 5. 输出：维持、推翻、需要降级的 Finding；矩阵错误；新 Candidate Finding；以及对四态结论的证据约束。新候选不能直接成为正式 Finding。
-6. 读取 Diff 读物与每份中间契约前先核对其 `sha256` 与输入登记的摘要一致；不一致或文件缺失时返回 `BLOCKED` 说明。契约结论一律以磁盘上的那一份为准，任务正文里的转述不能作为复核对象。
+6. 读取 Diff 读物与每份中间契约前先用一条 `sha256sum` 命令核对全部输入文件的摘要与输入登记值一致；不一致或文件缺失时返回 `BLOCKED` 说明。契约结论一律以磁盘上的那一份为准，任务正文里的转述不能作为复核对象。
 
 ## 输出
 只读 `$SKILL_DIR/references/contracts.md` 中锚点为 `traceability-matrix`、`coverage-matrix`、`validation-record`、`failure-attribution`、`release-gate` 的五节（`grep -n "SECTION: <锚点>"` 定位，不整读本文件），按其中同名结构逐项复核并输出。
+```
+
+## 步骤 18：SCOPED 分级复核（P1-3，仅无阻塞 Finding 且 S/M 档时可选用）
+
+```text
+你是第二位全新、只读 Evidence Verifier，执行 SCOPED_FINAL_RECHECK 分级复核：本轮报告无阻塞 Finding 且规模档为 S/M，Orchestrator 已在 limitations 逐字披露。
+
+## 输入
+与步骤 18 整包复核相同（快照、Diff 读物、中间契约与验证记录，均按路径 + 摘要）。
+
+## 本步特有约束
+1. 执行“矩阵一致性 + Gate 核对 + 高风险遗漏扫描”；非阻塞 Finding 抽查而非逐条重建因果链。
+2. 发现任何阻塞级新问题时必须如实报告，由 Orchestrator 升级回整包复核，不得自行按分级范围略过。
+3. 新候选仍不得直接成为正式 Finding，须走 09–12 反证流程。
+4. 摘要核对与“以磁盘那一份为准”的纪律与步骤 18 整包复核相同。
+
+## 输出
+只读 `$SKILL_DIR/references/contracts.md` 中锚点为 `traceability-matrix`、`coverage-matrix`、`validation-record`、`failure-attribution`、`release-gate`、`scoped-recheck` 的六节（`grep -n "SECTION: <锚点>"` 定位，不整读本文件），按同名结构逐项输出复核结果。
 ```
 
 ## DELTA 复核轮（上游修复后的增量复核）
@@ -61,7 +79,7 @@
 <Handoff 的 delta_recheck.repaired_findings 清单：finding_id、locations、remediation>
 
 ## 本步约束
-1. 读取 Diff 读物与上一轮报告前先核对其 `sha256` 与输入登记的摘要一致；不一致时返回 `BLOCKED` 说明。
+1. 读取 Diff 读物与上一轮报告前先用一条 `sha256sum` 命令核对全部输入文件的摘要与输入登记值一致；不一致时返回 `BLOCKED` 说明。
 2. 逐个被修 Finding 在新快照下重建触发路径：确认修复真实生效（FIXED）、未生效（NOT_FIXED）或引入新问题（REGRESSION），每项给出 file:line 或命令证据；不得沿用上一轮的结论代替本次验证。
 3. 只复核清单内的 Finding 与其受影响维度；发现清单外的高风险新问题时如实报告，由 Orchestrator 决定是否升级回 FULL 轮，不得自行扩大复核范围。
 

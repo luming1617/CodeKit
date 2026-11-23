@@ -1180,6 +1180,33 @@ def freeze_review(state_path: str | Path) -> dict[str, Any]:
         "preexisting_diff_snapshot": state["preexisting_snapshot"],
         "frozen_at": _now(),
     }
+    # P1-2（code-review 侧 reuse-validation）：把 overall 验证记录导出为独立证据产物，
+    # 下游审查可继承同目标的 PASS 证据而不重跑同一条命令。worktree_files 携带逐文件
+    # 内容摘要（_path_digest 同一口径），下游冻结时重算比对，把复用证据机械绑定到
+    # 当前工作树；树在上游冻结后动过即拒绝，而不是静默继承旧证据。
+    evidence = {
+        "produced_by": PRODUCED_BY,
+        "target_id": snapshot["target_id"],
+        "worktree_diff_digest": current["digest"],
+        "worktree_files": [
+            {"path": item["path"], "digest": item["digest"]} for item in current["files"]
+        ],
+        "records": [
+            {key: record[key] for key in (
+                "scope", "name", "command", "cwd", "exit_code", "result",
+                "diff_digest", "head_sha", "evidence", "not_run_reason",
+                "started_at", "finished_at", "reused_from",
+            ) if key in record}
+            for record in state.get("validations", [])
+            if record.get("scope") == "overall"
+        ],
+    }
+    evidence_path = path.parent / "review-validation-evidence.json"
+    _atomic_json(evidence_path, evidence)
+    snapshot["validation_evidence"] = {
+        "path": str(evidence_path),
+        "digest": hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
+    }
     artifact = path.parent / "review-snapshot.json"
     _atomic_json(artifact, snapshot)
     snapshot["path"] = str(artifact)
@@ -2582,6 +2609,49 @@ def validate_contract(payload: dict[str, Any], kind: str) -> None:
                 f"{expected_id!r} derived from repo_root + snapshot head_sha; re-run "
                 "freeze-review instead of composing the Handoff snapshot by hand"
             )
+        # P1-2：可选的验证证据产物引用。一旦声明就必须可核：文件存在、摘要相符、
+        # 且绑定的正是本 Handoff 的目标与工作树，不得拿另一轮的证据冒充。
+        evidence_ref = snapshot.get("validation_evidence")
+        if evidence_ref is not None:
+            _required(evidence_ref, "snapshot.validation_evidence", dict)
+            ev_path = evidence_ref.get("path")
+            _required(ev_path, "snapshot.validation_evidence.path", str)
+            ev_file = Path(ev_path).expanduser().resolve(strict=False)
+            if not ev_file.is_file():
+                raise ControllerError(
+                    f"snapshot.validation_evidence.path does not resolve to a file: {ev_file}"
+                )
+            ev_digest = evidence_ref.get("digest")
+            _required(ev_digest, "snapshot.validation_evidence.digest", str)
+            if not HEX64_RE.fullmatch(ev_digest):
+                raise ControllerError(
+                    "snapshot.validation_evidence.digest must be 64 lowercase hex characters"
+                )
+            if ev_digest != hashlib.sha256(ev_file.read_bytes()).hexdigest():
+                raise ControllerError(
+                    "snapshot.validation_evidence.digest does not match the evidence file on disk"
+                )
+            try:
+                ev_payload = json.loads(ev_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ControllerError(
+                    f"snapshot.validation_evidence.path is not readable JSON: {exc}"
+                ) from exc
+            if not isinstance(ev_payload, dict):
+                raise ControllerError("validation evidence must be a JSON object")
+            if ev_payload.get("target_id") != snapshot["target_id"]:
+                raise ControllerError(
+                    "validation evidence target_id does not match the Handoff snapshot"
+                )
+            if ev_payload.get("worktree_diff_digest") != worktree["diff_digest"]:
+                raise ControllerError(
+                    "validation evidence worktree_diff_digest does not match the Handoff "
+                    "worktree_state.diff_digest; the evidence describes a different tree"
+                )
+            if not isinstance(ev_payload.get("records"), list):
+                raise ControllerError("validation evidence must carry a records list")
+            if not isinstance(ev_payload.get("worktree_files"), list):
+                raise ControllerError("validation evidence must carry a worktree_files list")
         return
 
     raise ControllerError(f"unsupported contract kind: {kind}")

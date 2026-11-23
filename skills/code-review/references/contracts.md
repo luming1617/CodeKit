@@ -4,7 +4,7 @@
 
 ## 节锚点与按角色读取
 
-每个契约节标题下都有机器可读锚点 `<!-- SECTION: <id> -->`。角色**只按锚点定位并读取自己需要的节**（例如 `grep -n "SECTION: evidence-verdict" contracts.md` 取行号后按区间读取），不要整读本文件——全文约 4.8k token，而单个角色只需要 2–4 节。下表与 SKILL.md「按阶段读取资源」一致，两侧由测试互相核对：
+每个契约节标题下都有机器可读锚点 `<!-- SECTION: <id> -->`。角色**只按锚点定位并读取自己需要的节**（例如 `grep -n "SECTION: evidence-verdict" contracts.md` 取行号后按区间读取），不要整读本文件——全文实测约 9k token（以中文为主），而单个角色只需要 2–4 节。下表与 SKILL.md「按阶段读取资源」一致，两侧由测试互相核对：
 
 | 角色 / 步骤 | 必读锚点 |
 |---|---|
@@ -13,9 +13,9 @@
 | Specialist Reviewer（08） | `review-input-contract`、`review-snapshot`、`context-contract`、`impact-surface`、`candidate-finding`、`coverage-matrix` |
 | Evidence Verifier（10） | `review-snapshot`、`candidate-finding`、`evidence-verdict`、`formal-finding`、`open-question` |
 | Failure Analyst（16） | `validation-record`、`failure-attribution`、`candidate-finding` |
-| Evidence Verifier（18） | `traceability-matrix`、`coverage-matrix`、`validation-record`、`failure-attribution`、`release-gate` |
+| Evidence Verifier（18） | `traceability-matrix`、`coverage-matrix`、`validation-record`、`failure-attribution`、`release-gate`、`scoped-recheck` |
 | Evidence Verifier（DELTA 复核） | `review-snapshot`、`delta-recheck`、`formal-finding` |
-| Orchestrator（01/20/21） | `review-input-contract`、`review-snapshot`、`dispatch-ledger`、`normalized-report-json`、`markdown-delivery`、`delta-recheck` |
+| Orchestrator（01/20/21） | `review-input-contract`、`review-snapshot`、`dispatch-ledger`、`normalized-report-json`、`markdown-delivery`、`delta-recheck`、`reduced-dispatch`、`scoped-recheck` |
 
 ## Review Input Contract
 <!-- SECTION: review-input-contract -->
@@ -59,7 +59,7 @@ PRD/TDD/RPD 三类文档的版本判据以步骤 02 冻结的 `review_snapshot.d
 
 ```yaml
 review_snapshot:
-  schema_version: "1.5"
+  schema_version: "1.6"
   repository_root: absolute-path
   target_type: string                # branch | local_diff | commit_range | ...
   target_locator: string             # 如 master...feature/x，记录实际选择的基线
@@ -78,6 +78,7 @@ review_snapshot:
     changed_files: integer           # 四层变更文件数
     changed_lines: integer           # tracked 三层 numstat 增删行 + 未跟踪文件行数
     tier_limits: [[integer, integer]]  # [文件数上限, 行数上限]，与脚本 SCALE_TIER_LIMITS 同源
+  reduced_dispatch_eligible: true | false  # P1-1：S 档派发降档的机械准入（tier S 且无高风险路径），与档位一起签名
   worktree_state:                    # CW2-a②：1.5 起 diff_digest 只覆盖工作树三层，不含已提交范围
     staged_digest: sha256
     unstaged_digest: sha256
@@ -91,7 +92,7 @@ review_snapshot:
   freeze_index: integer              # 同一 target 的第几次冻结（含首次）；上限 MAX_REFREEZE=3
   retry_policy: gated | prose        # gated 机械执行该上限；prose 是 CW4-e 回滚开关（步骤 02 的 --retry-policy）
   produced_by: "codekit:code-review/scripts/freeze_review_snapshot.py"   # 固定字面量
-  generator_version: "1.5"
+  generator_version: "1.6"
   git_probe_digest: sha256           # 脚本实际执行的 git 命令序列的规范摘要
   handoff:                           # 可选：仅 --handoff 时存在，是 CW2-a③ 机械比对的结果
     path: absolute-path              # 读入的上游 Handoff 文件
@@ -102,6 +103,11 @@ review_snapshot:
     compared_fields: [string]        # 两侧都带且 material 相同的共有字段
     uncomparable_digests: [string]   # "<producer>:<value>"；material 不同，比了没有意义
     limitations: [string]            # SCOPE_SUPERSET / HANDOFF_SCHEME_MISMATCH，逐字进报告 $.limitations
+    validation_evidence:             # 可选（P1-2）：仅上游声明且冻结脚本核过后存在
+      path: absolute-path            # 上游验证证据产物，冻结时已核摘要与逐文件工作树绑定
+      digest: sha256
+      target_id: string
+      worktree_diff_digest: sha256   # 上游口径的工作树摘要，复用源记录必须绑定它
   diff_artifact:                     # 可选：仅 --emit-diff 时存在，存在则整段必填
     path: absolute-path              # 四段合一的 review.diff
     bytes: integer                   # 落盘字节数
@@ -311,7 +317,13 @@ validation:
     status: PASS | FAIL_INTRODUCED | FAIL_BASELINE | ENVIRONMENT_ERROR | PERMISSION_DENIED | FLAKY | NOT_RUN
     evidence: string
     not_run_reason: string | null
+    reused_from:                     # 可选（P1-2）：继承上游 PASS 证据，不重跑同一条命令
+      path: absolute-path            # 必须与 manifest handoff.validation_evidence.path 逐字一致
+      digest: sha256                 # 与证据产物文件逐字节对应
+      validation_id: string          # 源记录的 name
 ```
+
+`reused_from` 的机械边界（`validate_review_report.py` 的 `validate_reused_validation` 执行，镜像 code-impl 已验证的 reuse-validation 边界）：源文件可读且 digest 相符；源记录 `result: PASS` 且 `exit_code: 0`；源证据 `target_id` 等于报告 `snapshot.target_id`，源记录 `diff_digest` 等于证据的 `worktree_diff_digest`；`command` 逐字相等（空白变体拒绝），`cwd` 按 manifest `repository_root` 解析后与源记录相等；源记录自身不得是复用（禁链）；复用记录本身必须 PASS 且 evidence 引用源记录或产物；**DELTA 轮禁用**（新鲜执行规则不变）；`limitations` 必须逐字携带 `REUSED_VALIDATION: <说明>`（非空 limitations 封顶结论）。上游证据的导出与冻结时的逐文件工作树绑定见 code-impl `freeze_review` 的 `validation_evidence` 产物；树在上游冻结后动过时冻结脚本直接拒绝（退出码 `3`）。
 
 ## Failure Attribution
 <!-- SECTION: failure-attribution -->
@@ -421,6 +433,29 @@ delta_recheck:
   未复核维度不强制 BLOCKED，但结论封顶 `APPROVE_WITH_FOLLOW_UPS`，不得 `APPROVE`；
 - 非 DELTA 报告不得携带 `delta_recheck` 块；验证记录仍须针对新快照新鲜执行。
 
+## Reduced Dispatch（S 档派发降档）
+<!-- SECTION: reduced-dispatch -->
+
+P1-1 提效：S 档小变更的受限派发降档。放宽的是派发覆盖面，不是判据；九维登记、十项 Gate、报告校验与独立复核义务不减。
+
+机械准入（`freeze_review_snapshot.py` 计算并签进 manifest 的 `reduced_dispatch_eligible`）：`review_scale.tier == S` 且变更文件不命中高风险路径（`HIGH_RISK_DIRS`/`HIGH_RISK_SUFFIXES` 常量，清单只增不减；重命名条目两侧都查）。模型不得自选或改标；该键在 `manifest_digest` 签名范围内，去掉或改值都会签名失败。历史 manifest 无该键时不追溯新义务。
+
+两项可选放宽（仅准入为 true 时，由 Orchestrator 显式选用）：
+
+1. 最少 Specialist 2→1：一人覆盖全部适用维度。披露：`limitations` 逐字携带 `S_TIER_REDUCED: <说明>`；新 manifest 下 S 档台账 specialist 不足 2 个而无该标记即报错。
+2. 空候选清单跳过步骤 10：`$RUN_DIR/steps/09-candidate-register.json` 的 `candidates` 为空数组时可不派发反证。披露：`limitations` 逐字携带 `S_TIER_EMPTY_REGISTER: <说明>`；校验器读回磁盘 register 核对确为空（缺失/损坏/非空都报错），且台账必须有步骤 18 的全新 `review-evidence` 实例，其任务正文显式包含“复核空候选清单主张”。非空 register 而无步骤 10 反证，无论是否声明降档都报错（候选不得静默丢弃）。
+
+机械边界（`validate_review_report.py` 的 `validate_reduced_dispatch` 执行）：标记出现但 manifest 准入不为 true 或 tier 非 S 即报错；DELTA 轮不得携带任一标记；两条标记都进 `limitations`，非空 limitations 使结论最多 `APPROVE_WITH_FOLLOW_UPS`，不得 `APPROVE`。
+
+## Scoped Final Recheck（步骤 18 复核分级）
+<!-- SECTION: scoped-recheck -->
+
+P1-3 提效：干净报告的终审降档。报告无阻塞 Finding 且 `review_scale.tier ∈ {S, M}` 时，步骤 18 允许执行“矩阵一致性 + Gate 核对 + 高风险遗漏扫描”，非阻塞 Finding 抽查而非逐条重建因果链；**阻塞 Finding 永远全量重建**，复核中发现新阻塞问题时必须如实报告并升级回整包复核。
+
+披露：`limitations` 逐字携带 `SCOPED_FINAL_RECHECK: <说明>`；非空 limitations 使结论最多 `APPROVE_WITH_FOLLOW_UPS`。DELTA 轮禁用本标记。
+
+机械边界（`validate_review_report.py` 的 `validate_scoped_recheck` 执行）：标记 + 无阻塞 Finding + S/M 档三元谓词，任一不满足即报错。诚实披露：复核深度本身不可机械观测，由角色契约（evidence-verifier-prompt.md 的 SCOPED 模板）约束，与既有 prose 规则同级；新候选仍不得直接成为正式 Finding，必须走 09–12 反证流程。步骤 18 的全新实例与台账核对义务不变。
+
 ## 规范化报告 JSON
 <!-- SECTION: normalized-report-json -->
 
@@ -521,7 +556,7 @@ delta_recheck:
 ## Markdown 交付结构
 <!-- SECTION: markdown-delivery -->
 
-从通过校验的 JSON 渲染以下章节，不添加负载之外的新事实：
+中文 Markdown 由 `validate_review_report.py --render-markdown` 在完整校验通过后从同一 JSON 负载确定性渲染（P0-2），主 Agent 不再手写第二份；渲染器不添加负载之外的新事实，所有自由文本插入点过表格单元格转义。从通过校验的 JSON 渲染以下章节：
 
 ```markdown
 # 代码审查报告
