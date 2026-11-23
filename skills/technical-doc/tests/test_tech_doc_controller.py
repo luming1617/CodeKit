@@ -1279,6 +1279,358 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertFalse(check["warn"])
         self.assertIn("no reference version", str(check["detail"]))
 
+    # ---------------------------------------- P1-3: 体积硬门 + Reviewer 裁定豁免 + 大章节信号
+
+    def hard_growth_check(self, report: dict[str, Any]) -> dict[str, Any]:
+        return next(item for item in report["checks"] if item["name"] == "document-growth-hard")
+
+    def test_unattributed_growth_past_the_hard_threshold_blocks_delivery(self) -> None:
+        _state, report = self.delivered_with_growth("run-grow-hard-1", 40, "Medium")
+        self.assertEqual(report["status"], "BLOCKED", report["failures"])
+        self.assertIn("document-growth-hard", report["failures"])
+        check = self.hard_growth_check(report)
+        self.assertFalse(check["ok"])
+        self.assertIn("25% hard threshold", str(check["detail"]))
+        # 软检查照旧记账：硬门拦交付，软门仍把灌水数字写进 warnings
+        self.assertTrue(self.growth_check(report)["warn"])
+
+    def test_a_blocking_finding_pays_for_growth_past_the_hard_threshold(self) -> None:
+        _state, report = self.delivered_with_growth("run-grow-hard-2", 40, "High")
+        self.assertEqual(report["status"], "PASS", report["failures"])
+        check = self.hard_growth_check(report)
+        self.assertTrue(check["ok"])
+        self.assertIn("pays for the growth", str(check["detail"]))
+
+    def test_growth_between_the_soft_and_hard_thresholds_only_warns(self) -> None:
+        _state, report = self.delivered_with_growth("run-grow-hard-3", 8, "Medium")
+        self.assertEqual(report["status"], "PASS", report["failures"])
+        check = self.hard_growth_check(report)
+        self.assertTrue(check["ok"])
+        self.assertIn("within the 25% hard threshold", str(check["detail"]))
+        self.assertTrue(self.growth_check(report)["warn"])
+
+    def test_growth_inside_a_code_fence_still_counts_toward_the_hard_gate(self) -> None:
+        """对抗：把灌水藏进代码围栏不能绕过体积测量——_body_lines 数的是所有非台账行。"""
+        state = Path(controller.init_run(self.repo, self.feature, "run-grow-hard-fence"))
+        self.write_tdd()
+        self.to_refiner(state)
+        controller.record_finding(
+            state, "CRITIC", "CRITIC-001", "Medium", "9.3", "缺退避口径", None, 0
+        )
+        filler = "    note over order: 重试窗口取 30 秒，退避上限 5 次。\n" * 40
+        fenced = TDD_BODY.replace("```\n\n## 9. 工程与模块", filler + "```\n\n## 9. 工程与模块")
+        self.write_tdd(fenced)
+        controller.record_fix(state, "CRITIC-001", "FIXED", "9.3", "补退避口径")
+        controller.start_stage(state, "REVIEW")
+        self.approve_round(state)
+        self.render(state)
+        report = controller.gate(state, self.feature / "technical-doc.md")
+        self.assertIn("document-growth-hard", report["failures"], report["failures"])
+
+    def _grown_delivery_with_waiver(self, run_id: str) -> Path:
+        """Drive a hard-blocked grown run to DELIVERY whose Reviewer report raises the waiver anchor.
+
+        The waiver must cite a finding the reviewer actually wrote: the round-1 report carries
+        ``@@FIND REVIEW-1-001``, so the anchor survives the report-digest binding rather than
+        being a finding the orchestrator registered after the verdict.
+        """
+        state = Path(controller.init_run(self.repo, self.feature, run_id))
+        self.write_tdd()
+        self.to_refiner(state)
+        controller.record_finding(
+            state, "CRITIC", "CRITIC-001", "Medium", "9.3", "缺退避与压测口径", None, 0
+        )
+        self.write_tdd(grown_body(40))
+        controller.record_fix(state, "CRITIC-001", "FIXED", "9.3", "补 30 秒退避窗口与压测口径")
+        controller.start_stage(state, "REVIEW")
+        self.record(state, "tech-reviewer", "s-review-1")
+        report = self.repo / f"{run_id}-review.md"
+        report.write_text(
+            "@@FIND id=REVIEW-1-001 sev=Medium loc=13\n"
+            "本轮要求展开完整重试契约，这部分增长确属必要。\n" + EVIDENCE,
+            encoding="utf-8",
+        )
+        controller.write_artifact(state, "review-report", report, None, None)
+        controller.record_review(
+            state, "APPROVE_WITH_FOLLOW_UPS", report,
+            self.feature / "technical-doc.md", "s-review-1",
+        )
+        controller.record_finding(
+            state, "REVIEWER", "REVIEW-1-001", "Medium", "13", "本轮要求展开完整重试契约", None, None
+        )
+        controller.record_fix(
+            state, "REVIEW-1-001", "PENDING_CONFIRMATION", "13", "挂账：契约展开已落地"
+        )
+        controller.start_stage(state, "DELIVERY")
+        return state
+
+    def test_a_reviewer_waiver_lets_the_hard_gate_pass_and_is_quoted(self) -> None:
+        state = self._grown_delivery_with_waiver("run-grow-hard-4")
+        entry = controller.waive_growth(state, "REVIEW-1-001", "重试契约必须完整展开")
+        self.assertEqual(entry["finding_id"], "REVIEW-1-001")
+        self.assertEqual(entry["round"], 1)
+        self.render(state)
+        report = controller.gate(state, self.feature / "technical-doc.md")
+        self.assertEqual(report["status"], "PASS", report["failures"])
+        check = self.hard_growth_check(report)
+        self.assertTrue(check["ok"])
+        self.assertTrue(check["warn"])  # 被豁免的增长仍进 warnings 强制照抄
+        self.assertIn("growth waived by REVIEW-1-001", str(check["detail"]))
+        self.assertIn("document-growth-hard", [item["name"] for item in report["warnings"]])
+        data = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual(data["growth_waivers"][-1]["finding_id"], "REVIEW-1-001")
+        # 豁免进第 16 章“体积豁免”台账行
+        self.assertIn("体积豁免", (self.feature / "technical-doc.md").read_text(encoding="utf-8"))
+
+    def test_a_waiver_must_cite_a_reviewer_finding_not_a_critic_one(self) -> None:
+        state = self._grown_delivery_with_waiver("run-grow-hard-5")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.waive_growth(state, "CRITIC-001", "Critic 说的不算")
+        self.assertIn("must cite a Reviewer finding", str(ctx.exception))
+
+    def test_a_waiver_needs_a_reason_and_a_known_finding(self) -> None:
+        state = self._grown_delivery_with_waiver("run-grow-hard-6")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.waive_growth(state, "REVIEW-1-001", "   ")
+        self.assertIn("needs a reason", str(ctx.exception))
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.waive_growth(state, "REVIEW-1-999", "不存在的 Finding")
+        self.assertIn("unknown finding id", str(ctx.exception))
+
+    def test_a_waiver_only_runs_at_delivery(self) -> None:
+        state, report = self.delivered_with_growth("run-grow-hard-7", 40, "Medium")
+        self.assertIn("document-growth-hard", report["failures"])
+        # 还在 REVIEW 阶段，豁免被拒
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.waive_growth(state, "REVIEW-1-001", "提前豁免")
+        self.assertIn("runs at DELIVERY", str(ctx.exception))
+
+    def test_a_waiver_is_retired_when_a_new_review_round_opens(self) -> None:
+        """对抗：豁免锚定最新终审轮；回退补一轮后旧豁免自动作废，硬门重新拦下。"""
+        state = self._grown_delivery_with_waiver("run-grow-hard-8")
+        controller.waive_growth(state, "REVIEW-1-001", "重试契约必须完整展开")
+        self.render(state)
+        self.assertEqual(
+            controller.gate(state, self.feature / "technical-doc.md")["status"], "PASS"
+        )
+        # 落地回退开第 2 轮（上一轮全量且通过，补审默认增量）
+        controller.start_stage(state, "REFINER")
+        self.record(state, "tech-refiner", "s-refine-2")
+        self.artifact(state, "refiner-map", "第 2 轮落地映射。\n")
+        controller.start_stage(state, "REVIEW")
+        self.approve_round(state, "s-review-2")
+        controller.start_stage(state, "DELIVERY")
+        self.render(state)
+        report = controller.gate(state, self.feature / "technical-doc.md")
+        self.assertIn("document-growth-hard", report["failures"], report["failures"])
+        self.assertIsNone(controller._growth_waiver(json.loads(state.read_text(encoding="utf-8"))))
+
+    def test_show_names_sections_past_the_large_section_signal(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "run-grow-large"))
+        self.write_tdd(grown_body(350))  # 350 行落在第 13 章跨度内
+        self.to_refiner(state)
+        controller.doc_index(state)
+        payload = controller.show(state)
+        self.assertTrue(
+            any(item.startswith("13:") for item in payload["large_sections"]),
+            payload["large_sections"],
+        )
+        self.assertEqual(payload["growth_waivers"], [])
+
+    def test_show_survives_an_unreadable_index_on_both_faces(self) -> None:
+        """Fix1: 损坏索引下紧凑面不得 KeyError 崩溃，与 --verbose 面一致退出 0。"""
+        state = Path(controller.init_run(self.repo, self.feature, "run-show-corrupt"))
+        self.write_tdd()
+        self.to_refiner(state)
+        controller.doc_index(state)
+        (state.parent / controller.DOC_INDEX_FILE).write_text("{corrupt", encoding="utf-8")
+        compact = self.cli("show", state=state)
+        self.assertEqual(compact.returncode, 0, compact.stderr)
+        payload = json.loads(compact.stdout)
+        self.assertEqual(payload["doc_index"]["status"], "unreadable")
+        self.assertEqual(payload["large_sections"], [])
+        verbose = self.cli("show", "--verbose", state=state)
+        self.assertEqual(verbose.returncode, 0, verbose.stderr)
+        self.assertEqual(json.loads(verbose.stdout)["doc_index"]["status"], "unreadable")
+
+    def test_a_waiver_cannot_cite_a_finding_the_reviewer_never_raised(self) -> None:
+        """Fix2 对抗：主控在 DELIVERY 自造一条“本轮 REVIEWER Finding”不能换取豁免。"""
+        state = self._grown_delivery_with_waiver("run-grow-hard-9")
+        controller.record_finding(
+            state, "REVIEWER", "REVIEW-1-002", "Medium", "13", "自造的豁免锚点", None, None
+        )
+        controller.record_fix(
+            state, "REVIEW-1-002", "PENDING_CONFIRMATION", "13", "自造处置"
+        )
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.waive_growth(state, "REVIEW-1-002", "试图自裁豁免")
+        self.assertIn("does not appear", str(ctx.exception))
+
+    def test_a_waiver_refuses_a_tampered_review_report(self) -> None:
+        """Fix2 对抗：终审后往报告里补一条 @@FIND 会破坏 digest 绑定，豁免被拒。"""
+        state = self._grown_delivery_with_waiver("run-grow-hard-10")
+        data = json.loads(state.read_text(encoding="utf-8"))
+        report = Path(data["repository"]["root"]) / data["reviews"][-1]["report"]
+        report.write_text(
+            report.read_text(encoding="utf-8")
+            + "\n@@FIND id=REVIEW-1-002 sev=Medium loc=13\n事后补的。\n",
+            encoding="utf-8",
+        )
+        controller.record_finding(
+            state, "REVIEWER", "REVIEW-1-002", "Medium", "13", "事后补的锚点", None, None
+        )
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.waive_growth(state, "REVIEW-1-002", "篡改报告后豁免")
+        self.assertIn("changed after the verdict", str(ctx.exception))
+
+    def test_a_second_landing_rewind_may_not_open_another_incremental_round(self) -> None:
+        """Fix3 对抗：双重落地回退不得开出连续增量轮（上一轮增量则补审例外失效）。"""
+        state = Path(controller.init_run(self.repo, self.feature, "rewind-2x"))
+        self.write_tdd()
+        self.to_review(state)
+        self.approve_round(state)  # r1 全量通过
+        controller.start_stage(state, "DELIVERY")
+        controller.start_stage(state, "REFINER")  # 落地回退 #1
+        tdd = self.feature / "technical-doc.md"
+        tdd.write_text(
+            tdd.read_text(encoding="utf-8").replace(
+                "## 13. 告警设计\n", "## 13. 告警设计\n告警路由按已裁定的值班群改写。\n"
+            ),
+            encoding="utf-8",
+        )
+        self.record(state, "tech-refiner", "s-refine-2")
+        self.artifact(state, "refiner-map", "第 2 轮落地映射。\n")
+        opened = controller.start_stage(state, "REVIEW")
+        self.assertEqual(opened["review_scope"], "incremental")  # 例外：r1 全量
+        self.approve_round(state, "s-review-2")  # r2 增量通过
+        controller.start_stage(state, "DELIVERY")  # 例外放行增量交付
+        controller.start_stage(state, "REFINER")  # 落地回退 #2
+        self.record(state, "tech-refiner", "s-refine-3")
+        self.artifact(state, "refiner-map", "第 3 轮落地映射。\n")
+        opened = controller.start_stage(state, "REVIEW")
+        self.assertEqual(opened["review_scope"], "full")  # r2 增量 → 例外失效
+
+    def test_mechanical_patch_needs_a_gate_refusal_first(self) -> None:
+        """Fix4 对抗：没跑过 gate（或声明检查未失败）时，即使镜像行可删也拒绝。"""
+        state = Path(controller.init_run(self.repo, self.feature, "mech-nogate"))
+        self.to_refiner(state)
+        controller.start_stage(state, "REVIEW")
+        tdd = self.write_tdd(TDD_BODY + MIRROR_ROWS)
+        self.approve_round(state)
+        controller.start_stage(state, "DELIVERY")
+        lines = tdd.read_text(encoding="utf-8").splitlines()
+        mirror = controller._handwritten_mirror_lines(lines, controller._ledger_blocks(lines))
+        self.assertTrue(mirror)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.apply_mechanical_patch(
+                state, tdd, "ledger-matches-state", self._deletion_patch(lines, mirror)
+            )
+        self.assertIn("did not refuse", str(ctx.exception))
+
+    def test_mechanical_patch_may_not_delete_fenced_example_markers(self) -> None:
+        """Fix4 对抗：围栏内的示例 marker 行是 gate 从不标记的内容，补丁删不得。"""
+        state = Path(controller.init_run(self.repo, self.feature, "mech-fence"))
+        self.to_architect(state)
+        conf = self.feature / "confirmation-log.md"
+        conf.write_text(
+            "来源: ARCHITECT\n阻断: false\n位置: 13\n问题: 告警值班群归属\n决定: 订单值班群\n",
+            encoding="utf-8",
+        )
+        controller.sync_confirmations(state, conf)
+        controller.mark_confirmation_applied(state, "CONF-001", "13", "已按决定改写")
+        self.artifact(state, "draft")
+        tdd = self.draft_on_disk()
+        tdd.write_text(
+            TDD_BODY.replace(
+                "## 13. 告警设计\n",
+                "## 13. 告警设计\n[需人工确认: 告警值班群归属]\n"
+                "```text\n[需人工确认: 告警值班群归属]\n```\n",
+            ),
+            encoding="utf-8",
+        )
+        controller.start_stage(state, "CRITIC")
+        self.record(state, "tech-critic", "s-critic")
+        self.artifact(state, "critic-findings")
+        controller.start_stage(state, "REFINER")
+        self.record(state, "tech-refiner", "s-refine", "all")
+        self.artifact(state, "refiner-map")
+        controller.start_stage(state, "REVIEW")
+        self.approve_round(state)
+        controller.start_stage(state, "DELIVERY")
+        self.render(state)
+        result = controller.gate(state, tdd)
+        self.assertIn("markers-match-confirmations", result["failures"])
+        lines = tdd.read_text(encoding="utf-8").splitlines()
+        fenced = controller._fence_line_mask(lines)
+        fenced_marker = next(
+            i for i, line in enumerate(lines)
+            if line.strip() == "[需人工确认: 告警值班群归属]" and i in fenced
+        )
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.apply_mechanical_patch(
+                state, tdd, "markers-match-confirmations",
+                self._deletion_patch(lines, [fenced_marker]),
+            )
+        self.assertIn("example content", str(ctx.exception))
+
+    def test_mechanical_patch_credits_the_full_baseline_on_an_incremental_delivery_round(self) -> None:
+        """Fix5 对抗：增量交付轮下，范围外章节的补丁必须 credit 全量基线，否则 coverage 搞浅。"""
+        state = Path(controller.init_run(self.repo, self.feature, "mech-credit", None, "fixed"))
+        self.to_architect(state)
+        conf = self.feature / "confirmation-log.md"
+        conf.write_text(
+            "来源: ARCHITECT\n阻断: false\n位置: 12\n问题: 大盘分维度口径\n决定: 按服务分维度\n",
+            encoding="utf-8",
+        )
+        controller.sync_confirmations(state, conf)
+        controller.mark_confirmation_applied(state, "CONF-001", "12", "已改写")
+        self.artifact(state, "draft")
+        tdd = self.draft_on_disk()
+        tdd.write_text(
+            TDD_BODY.replace(
+                "## 12. 可观测设计\n", "## 12. 可观测设计\n[需人工确认: 大盘分维度口径]\n"
+            ),
+            encoding="utf-8",
+        )
+        controller.start_stage(state, "CRITIC")
+        self.record(state, "tech-critic", "s-critic")
+        self.artifact(state, "critic-findings")
+        controller.start_stage(state, "REFINER")
+        self.record(state, "tech-refiner", "s-refine", "all")
+        self.artifact(state, "refiner-map")
+        controller.start_stage(state, "REVIEW")
+        self.approve_round(state)  # r1 全量
+        controller.start_stage(state, "DELIVERY")
+        controller.start_stage(state, "REFINER")  # 落地回退
+        tdd.write_text(
+            tdd.read_text(encoding="utf-8").replace(
+                "## 13. 告警设计\n", "## 13. 告警设计\n告警路由按已裁定的值班群改写。\n"
+            ),
+            encoding="utf-8",
+        )
+        self.record(state, "tech-refiner", "s-refine-land")
+        self.artifact(state, "refiner-map", "落地映射：第 13 章改写。\n")
+        opened = controller.start_stage(state, "REVIEW")
+        self.assertEqual(opened["review_scope"], "incremental")
+        self.assertNotIn("12", opened["sections"])  # 第 12 章不在补审范围
+        self.approve_round(state, "s-review-2")  # r2 增量
+        controller.start_stage(state, "DELIVERY")
+        self.render(state)
+        result = controller.gate(state, tdd)
+        self.assertIn("markers-match-confirmations", result["failures"])
+        self.assertIn("incremental-review-covers-changes", result["passed"])
+        lines = tdd.read_text(encoding="utf-8").splitlines()
+        residue = next(
+            i for i, line in enumerate(lines) if line.strip() == "[需人工确认: 大盘分维度口径]"
+        )
+        controller.apply_mechanical_patch(
+            state, tdd, "markers-match-confirmations", self._deletion_patch(lines, [residue])
+        )
+        self.render(state)
+        result = controller.gate(state, tdd)
+        self.assertEqual(result["status"], "PASS", result["failures"])
+        self.assertIn("incremental-review-covers-changes", result["passed"])
+
     def test_ledger_markers_must_stay_outside_code_fences(self) -> None:
         state, tdd = self.closed_loop("run-25")
         text = tdd.read_text(encoding="utf-8")
@@ -2102,32 +2454,86 @@ class TechDocControllerTests(unittest.TestCase):
             opened = self.quiet_round(state, round_)
         return state, opened
 
-    def test_two_quiet_rounds_scope_the_next_review(self) -> None:
-        state, opened = self.after_quiet_rounds("run-70")
-        self.assertEqual(opened["review_round"], 3)
+    def test_one_quiet_round_scopes_the_next_review(self) -> None:
+        state, opened = self.after_quiet_rounds("run-70", 1)
+        self.assertEqual(opened["review_round"], 2)
         self.assertEqual(opened["review_scope"], "incremental")
-        # The Low from round 2 sits in chapter 12, so that is the section the reviewer is handed.
+        # The Low from round 1 sits in chapter 12, so that is the section the reviewer is handed.
         self.assertIn("12", opened["sections"])
         self.assertFalse(opened["over_budget"])
         pending = json.loads(state.read_text(encoding="utf-8"))["pending_review"]
-        self.assertEqual(pending["baseline_round"], 2)
+        self.assertEqual(pending["baseline_round"], 1)
         self.assertTrue(pending["severity_stop"]["forced"])
+
+    def test_incremental_rounds_may_not_run_back_to_back(self) -> None:
+        """P1-1 brake: after an incremental verdict the next round is full, even when quiet."""
+        state, opened = self.after_quiet_rounds("run-70b", 1)
+        self.assertEqual(opened["review_scope"], "incremental")
+        # round 2 comes back quiet and incremental; round 3 must be full again
+        opened = self.quiet_round(state, 2)
+        self.assertEqual(opened["review_round"], 3)
+        self.assertEqual(opened["review_scope"], "full")
+        stop = json.loads(state.read_text(encoding="utf-8"))["pending_review"]["severity_stop"]
+        self.assertTrue(stop["quiet"])
+        self.assertFalse(stop["forced"])
+        # and asking for another incremental round right after an incremental one is refused
+        # (a fresh feature directory keeps the second run NEW: the first already left a TDD)
+        feature2 = self.repo / "docs" / "feature2"
+        feature2.mkdir(parents=True)
+        (feature2 / "product-doc.md").write_text(PRD, encoding="utf-8")
+        original_feature, self.feature = self.feature, feature2
+        state3, _ = self.after_quiet_rounds("run-70d", 1)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            self.quiet_round(state3, 2, "incremental")
+        self.feature = original_feature
+        self.assertIn("may not be scoped yet", str(ctx.exception))
+
+    def test_delivery_demands_a_full_verdict_and_the_rewind_pays_for_it(self) -> None:
+        """P1-1 brake: an incremental verdict cannot deliver; the rewind works with nothing undisposed."""
+        state, opened = self.after_quiet_rounds("run-70e", 1)
+        self.assertEqual(opened["review_scope"], "incremental")
+        self.approve_round(state, "s-review-2")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.start_stage(state, "DELIVERY")
+        self.assertIn("delivery round must be a full review", str(ctx.exception))
+        # nothing is undisposed, yet the rewind is legal -- it pays for the full delivery round
+        controller.start_stage(state, "REFINER")
+        self.record(state, "tech-refiner", "s-refine-2")
+        self.artifact(state, "refiner-map", "第 2 轮落地映射。\n")
+        opened = controller.start_stage(state, "REVIEW")
+        self.assertEqual(opened["review_scope"], "full")
+        self.approve_round(state, "s-review-3")
+        controller.start_stage(state, "DELIVERY")
+        data = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual(data["reviews"][-1]["scope"], "full")
 
     def test_a_scoped_round_may_not_be_asked_before_the_stop(self) -> None:
         state = Path(controller.init_run(self.repo, self.feature, "run-71"))
         self.write_tdd()
-        self.to_review(state)
+        self.to_refiner(state)
         with self.assertRaises(controller.ControllerError) as ctx:
-            self.quiet_round(state, 1, "incremental")
+            controller.start_stage(state, "REVIEW", "incremental")
         self.assertIn("may not be scoped yet", str(ctx.exception))
 
     def test_a_quiet_run_may_not_insist_on_a_full_round(self) -> None:
         state = Path(controller.init_run(self.repo, self.feature, "run-71b"))
         self.write_tdd()
         self.to_review(state)
-        self.quiet_round(state, 1)
+        self.record(state, "tech-reviewer", "s-review-1")
+        report = self.artifact(state, "review-report", "第 1 轮报告：无阻塞项。\n")
+        controller.record_review(
+            state, "APPROVE_WITH_FOLLOW_UPS", report["path"],
+            self.feature / "technical-doc.md", "s-review-1",
+        )
+        controller.record_finding(
+            state, "REVIEWER", "REVIEW-1-001", "Low", "12", "大盘少一个分维度面板", None, None
+        )
+        controller.start_stage(state, "REFINER")
+        self.record(state, "tech-refiner", "s-refine-1")
+        self.artifact(state, "refiner-map", "第 1 轮处置映射。\n")
+        controller.record_fix(state, "REVIEW-1-001", "FIXED", "12", "补分维度面板")
         with self.assertRaises(controller.ControllerError) as ctx:
-            self.quiet_round(state, 2, "full")
+            controller.start_stage(state, "REVIEW", "full")
         self.assertIn("omit --review-scope", str(ctx.exception))
         self.assertIn("--review-stop-policy fixed", str(ctx.exception))
 
@@ -2164,13 +2570,13 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertFalse(stop["forced"])
 
     def test_a_verdict_may_not_relabel_its_round(self) -> None:
-        state, _ = self.after_quiet_rounds("run-74")
-        self.record(state, "tech-reviewer", "s-review-3")
-        report = self.artifact(state, "review-report", "第 3 轮增量终审报告。\n")
+        state, _ = self.after_quiet_rounds("run-74", 1)
+        self.record(state, "tech-reviewer", "s-review-2")
+        report = self.artifact(state, "review-report", "第 2 轮增量终审报告。\n")
         with self.assertRaises(controller.ControllerError) as ctx:
             controller.record_review(
                 state, "APPROVE", report["path"], self.feature / "technical-doc.md",
-                "s-review-3", "full",
+                "s-review-2", "full",
             )
         self.assertIn("re-label", str(ctx.exception))
 
@@ -2184,7 +2590,7 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertIn("incremental-review-covers-changes", result["passed"])
 
     def test_gate_proves_a_scoped_round_saw_every_change(self) -> None:
-        state, opened = self.after_quiet_rounds("run-76")
+        state, opened = self.after_quiet_rounds("run-76", 1)
         # An edit outside the handed sections, landed before the verdict is bound: the
         # whole-document digest matches, so only the per-section diff can show the gap.
         self.write_tdd(
@@ -2194,7 +2600,7 @@ class TechDocControllerTests(unittest.TestCase):
             )
         )
         self.assertIn("12", opened["sections"])
-        self.approve_round(state, "s-review-3")
+        self.approve_round(state, "s-review-2")
         self.render(state)
         result = controller.gate(state, self.feature / "technical-doc.md")
         self.assertIn("incremental-review-covers-changes", result["failures"])
@@ -2203,14 +2609,14 @@ class TechDocControllerTests(unittest.TestCase):
 
     def test_a_deleted_top_level_chapter_is_not_silently_covered(self) -> None:
         """A section nobody can re-read any more still has to appear in some later scope."""
-        state, opened = self.after_quiet_rounds("run-79")
+        state, opened = self.after_quiet_rounds("run-79", 1)
         tdd = self.feature / "technical-doc.md"
         text = tdd.read_text(encoding="utf-8")
         start = text.index("## 15. 里程碑规划")
         end = text.index("## 16. 审查闭环记录")
         tdd.write_text(text[:start] + text[end:], encoding="utf-8")
         self.assertIn("12", opened["sections"])
-        self.approve_round(state, "s-review-3")
+        self.approve_round(state, "s-review-2")
         self.render(state)
         result = controller.gate(state, tdd)
         self.assertIn("incremental-review-covers-changes", result["failures"])
@@ -2542,7 +2948,9 @@ class TechDocControllerTests(unittest.TestCase):
     def test_cli_carries_the_rollback_switches(self) -> None:
         """Both W4 rollback flags have to be reachable from the command the orchestrator runs."""
         self.write_prd(PRD_STRUCTURAL)
-        state = self.repo / ".codekit" / "technical-doc" / "run-89" / "state.json"
+        # resolve() keeps the expectation aligned with the controller on hosts where the
+        # temp root is a symlink (macOS /var -> /private/var)
+        state = (self.repo / ".codekit" / "technical-doc" / "run-89" / "state.json").resolve()
         out = subprocess.run(
             [sys.executable, str(MODULE_PATH), "init", "--repo-root", str(self.repo),
              "--feature-directory", str(self.feature), "--run-id", "run-89",
@@ -2564,6 +2972,453 @@ class TechDocControllerTests(unittest.TestCase):
         self.assertEqual(summary["review_stop"], {"policy": "fixed", "forced": False, "quiet": False,
                                                  "quiet_rounds": [], "open_must_fix": []})
         self.assertIsNone(summary["scale"])
+
+    # ------------------------------------------------------- composite faces (P0-2)
+
+    def _deletion_patch(self, lines: list[str], indices: list[int]) -> Path:
+        """One deletion-only hunk per contiguous run of indices, as a unified diff file."""
+        hunks: list[str] = []
+        for index in indices:
+            hunks.append(f"@@ -{index + 1},1 +{index + 1},0 @@\n-{lines[index]}\n")
+        patch = self.repo / "mech.patch"
+        patch.write_text("".join(hunks), encoding="utf-8")
+        return patch
+
+    def test_mechanical_patch_deletes_a_mirror_without_paying_a_round(self) -> None:
+        """P1-2 channel ①: the mirror present at verdict time is deleted by verified diff."""
+        state = Path(controller.init_run(self.repo, self.feature, "mech-1"))
+        self.to_refiner(state)
+        controller.record_finding(state, "CRITIC", "CRITIC-001", "Blocker", "4.2", "无退避", None, 0)
+        controller.record_fix(state, "CRITIC-001", "FIXED", "4.2", "补退避")
+        controller.start_stage(state, "REVIEW")
+        tdd = self.write_tdd(TDD_BODY + MIRROR_ROWS)
+        self.approve_round(state)
+        controller.start_stage(state, "DELIVERY")
+        self.render(state)
+        result = controller.gate(state, tdd)
+        self.assertIn("ledger-matches-state", result["failures"])
+
+        lines = tdd.read_text(encoding="utf-8").splitlines()
+        mirror = controller._handwritten_mirror_lines(lines, controller._ledger_blocks(lines))
+        self.assertTrue(mirror)
+        patch = self._deletion_patch(lines, mirror)
+        entry = controller.apply_mechanical_patch(state, tdd, "ledger-matches-state", patch)
+        self.assertEqual(entry["deleted_lines"], len(mirror))
+        self.render(state)
+        result = controller.gate(state, tdd)
+        self.assertEqual(result["status"], "PASS", result["failures"])
+        data = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual(data["review_round"], 1)  # no round consumed
+        self.assertEqual(len(data["mechanical_patches"]), 1)
+        self.assertIn("机械补丁", tdd.read_text(encoding="utf-8"))
+
+        # adversarial: an added line is refused even when the deletion half is legal
+        # (a fresh feature directory keeps the second run NEW: mech-1 already left a TDD)
+        feature2 = self.repo / "docs" / "feature2"
+        feature2.mkdir(parents=True)
+        (feature2 / "product-doc.md").write_text(PRD, encoding="utf-8")
+        original_feature, self.feature = self.feature, feature2
+        state2 = Path(controller.init_run(self.repo, self.feature, "mech-1b"))
+        self.to_refiner(state2)
+        controller.start_stage(state2, "REVIEW")
+        tdd2 = self.write_tdd(TDD_BODY + MIRROR_ROWS)
+        self.approve_round(state2)
+        controller.start_stage(state2, "DELIVERY")
+        lines2 = tdd2.read_text(encoding="utf-8").splitlines()
+        mirror2 = controller._handwritten_mirror_lines(lines2, controller._ledger_blocks(lines2))
+        bad = self.repo / "bad.patch"
+        bad.write_text(
+            f"@@ -{mirror2[0] + 1},1 +{mirror2[0] + 1},2 @@\n-{lines2[mirror2[0]]}\n+夹带的设计句\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.apply_mechanical_patch(state2, tdd2, "ledger-matches-state", bad)
+        self.assertIn("only delete lines", str(ctx.exception))
+        # adversarial: deleting a non-mirror line under the mirror check is refused
+        prose = next(i for i, line in enumerate(lines2) if line.startswith("备注同步成功率"))
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.apply_mechanical_patch(
+                state2, tdd2, "ledger-matches-state", self._deletion_patch(lines2, [prose])
+            )
+        self.assertIn("non-mirror", str(ctx.exception))
+        # adversarial: body edited after the verdict -> the patch channel is closed
+        tdd2.write_text(tdd2.read_text(encoding="utf-8") + "\n终审后另改的一句。\n", encoding="utf-8")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.apply_mechanical_patch(
+                state2, tdd2, "ledger-matches-state", self._deletion_patch(lines2, mirror2)
+            )
+        self.assertIn("body changed after the verdict", str(ctx.exception))
+        # adversarial: wrong stage and non-whitelisted check are refused
+        state3, tdd3 = self.closed_loop("mech-1c", update=True)
+        with self.assertRaises(controller.ControllerError):
+            controller.apply_mechanical_patch(state3, tdd3, "ledger-matches-state", patch)
+        with self.assertRaises(controller.ControllerError):
+            controller.apply_mechanical_patch(state, tdd, "scale-chapters", patch)
+        self.feature = original_feature
+
+    def test_mechanical_patch_deletes_only_applied_markers(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "mech-2"))
+        self.to_architect(state)
+        conf = self.feature / "confirmation-log.md"
+        conf.write_text(
+            "来源: ARCHITECT\n阻断: false\n位置: 13\n问题: 告警值班群归属\n决定: 订单值班群\n\n"
+            "来源: ARCHITECT\n阻断: false\n位置: 13\n问题: 阈值复检周期\n决定: \n",
+            encoding="utf-8",
+        )
+        controller.sync_confirmations(state, conf)
+        controller.mark_confirmation_applied(state, "CONF-001", "13", "已按决定改写")
+        self.artifact(state, "draft")
+        tdd = self.draft_on_disk()
+        tdd.write_text(
+            TDD_BODY.replace(
+                "## 13. 告警设计\n",
+                "## 13. 告警设计\n[需人工确认: 告警值班群归属]\n[需人工确认: 阈值复检周期]\n",
+            ),
+            encoding="utf-8",
+        )
+        controller.start_stage(state, "CRITIC")
+        self.record(state, "tech-critic", "s-critic")
+        self.artifact(state, "critic-findings")
+        controller.start_stage(state, "REFINER")
+        self.record(state, "tech-refiner", "s-refine", "all")
+        self.artifact(state, "refiner-map")
+        controller.start_stage(state, "REVIEW")
+        self.approve_round(state)
+        controller.start_stage(state, "DELIVERY")
+        self.render(state)
+        result = controller.gate(state, tdd)
+        self.assertIn("markers-match-confirmations", result["failures"])
+
+        lines = tdd.read_text(encoding="utf-8").splitlines()
+        applied = next(i for i, line in enumerate(lines) if line.strip() == "[需人工确认: 告警值班群归属]")
+        open_marker = next(i for i, line in enumerate(lines) if line.strip() == "[需人工确认: 阈值复检周期]")
+        # adversarial: an OPEN entry's marker may not be deleted, even in a mixed batch
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.apply_mechanical_patch(
+                state, tdd, "markers-match-confirmations",
+                self._deletion_patch(lines, [applied, open_marker]),
+            )
+        self.assertIn("not APPLIED", str(ctx.exception))
+        # the applied entry's residue marker is deletable; the OPEN one stays legal
+        entry = controller.apply_mechanical_patch(
+            state, tdd, "markers-match-confirmations", self._deletion_patch(lines, [applied])
+        )
+        self.assertEqual(entry["deleted_lines"], 1)
+        self.render(state)
+        result = controller.gate(state, tdd)
+        self.assertEqual(result["status"], "PASS", result["failures"])
+        self.assertIn("[需人工确认: 阈值复检周期]", tdd.read_text(encoding="utf-8"))
+
+    def test_rewind_recheck_is_incremental_even_under_fixed_policy(self) -> None:
+        """P1-2 channel ②: the landing rewind's re-review reads the repair diff, not the doc."""
+        state = Path(controller.init_run(self.repo, self.feature, "mech-3", None, "fixed"))
+        self.to_review(state)
+        self.approve_round(state)
+        controller.start_stage(state, "DELIVERY")
+        controller.start_stage(state, "REFINER")  # landing rewind, budget 1 < 5
+        tdd = self.feature / "technical-doc.md"
+        tdd.write_text(
+            tdd.read_text(encoding="utf-8").replace(
+                "## 13. 告警设计\n",
+                "## 13. 告警设计\n告警路由按已裁定的值班群改写。\n",
+            ),
+            encoding="utf-8",
+        )
+        self.record(state, "tech-refiner", "s-refine-land")
+        self.artifact(state, "refiner-map", "落地映射：第 13 章按决定改写。\n")
+        opened = controller.start_stage(state, "REVIEW")
+        self.assertEqual(opened["review_scope"], "incremental")  # fixed policy would say full
+        self.assertIn("13", opened["sections"])
+        self.approve_round(state, "s-review-2")
+        controller.start_stage(state, "DELIVERY")  # the one exception to the full delivery door
+        self.render(state)
+        result = controller.gate(state, tdd)
+        self.assertEqual(result["status"], "PASS", result["failures"])
+        self.assertIn("incremental-review-covers-changes", result["passed"])
+
+    def test_gap_ref_citation_is_validated_and_cannot_ride_on_must_fix(self) -> None:
+        """P0-1: the triage citation is mechanically checked; the judgement stays with the roles."""
+        state = Path(controller.init_run(self.repo, self.feature, "gap-1"))
+        self.to_architect(state)
+        entry = controller.record_finding(
+            state, "CRITIC", "CRITIC-001", "Medium", "3.4", "阈值未定，PRD 已登记", None, 0,
+            "PRD:验收标准",
+        )
+        self.assertEqual(entry["gap_ref"], "PRD:验收标准")
+        self.assertFalse(entry["must_fix"])
+        # adversarial: free text is not a citation
+        with self.assertRaises(controller.ControllerError):
+            controller.record_finding(
+                state, "CRITIC", "CRITIC-002", "Medium", "3.4", "x", None, 0, "somewhere"
+            )
+        # adversarial: a CONF citation must name an entry the ledger holds
+        with self.assertRaises(controller.ControllerError):
+            controller.record_finding(
+                state, "CRITIC", "CRITIC-003", "Medium", "3.4", "x", None, 0, "CONF-999"
+            )
+        # adversarial: a must_fix finding cannot carry a triage citation
+        with self.assertRaises(controller.ControllerError):
+            controller.record_finding(
+                state, "CRITIC", "CRITIC-004", "High", "3.4", "x", None, 0, "PRD:3.2"
+            )
+        # a synced CONF entry is a valid citation
+        conf = self.feature / "confirmation-log.md"
+        conf.write_text(
+            "来源: ARCHITECT\n阻断: false\n位置: 3.4\n问题: 限流阈值\n决定: \n",
+            encoding="utf-8",
+        )
+        controller.sync_confirmations(state, conf)
+        entry = controller.record_finding(
+            state, "CRITIC", "CRITIC-005", "Medium", "3.4", "x", None, 0, "CONF-001"
+        )
+        self.assertEqual(entry["gap_ref"], "CONF-001")
+        # batch face: gap_ref rides through @@FIND; a High carrying one fails per item
+        report = self.repo / "gap-report.md"
+        report.write_text(
+            "@@FIND id=CRITIC-006 sev=Medium loc=3.4 gap_ref=PRD:3.2\n已登记缺口。\n"
+            "@@FIND id=CRITIC-007 sev=High loc=3.4 gap_ref=PRD:3.2\n试图给 High 挂引用。\n",
+            encoding="utf-8",
+        )
+        batch = controller.record_findings(state, report)
+        self.assertIn("CRITIC-006", batch["registered"])
+        self.assertEqual([item["id"] for item in batch["failed"]], ["CRITIC-007"])
+        stored = {
+            item["id"]: item
+            for item in json.loads(state.read_text(encoding="utf-8"))["findings"]
+        }
+        self.assertEqual(stored["CRITIC-006"]["gap_ref"], "PRD:3.2")
+        self.assertNotIn("CRITIC-007", stored)
+
+    def test_record_sources_batch_equals_single_calls_and_refuses_atomically(self) -> None:
+        """The batch is a transport: same validation, same entries, and no half-registered freeze."""
+        readme = self.repo / "README.md"
+        prd = self.feature / "product-doc.md"
+        items = [
+            {"source_id": "SRC-1", "kind": "PRD", "locator": str(prd), "status": "READ",
+             "revision": "v1", "summary": "需求", "confidence": "HIGH"},
+            {"source_id": "SRC-2", "kind": "REPOSITORY_RULES", "locator": str(readme),
+             "status": "READ", "summary": "仓库说明", "confidence": "MEDIUM"},
+        ]
+        manifest = self.repo / "sources.json"
+        manifest.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+
+        batch_state = Path(controller.init_run(self.repo, self.feature, "batch-1"))
+        report = controller.record_sources(batch_state, manifest)
+        self.assertEqual(report["status"], "OK", report)
+        self.assertEqual(report["registered"], ["SRC-1", "SRC-2"])
+
+        single_state = Path(controller.init_run(self.repo, self.feature, "batch-2"))
+        for item in items:
+            controller.record_source(
+                single_state, item["source_id"], item["kind"], item["locator"],
+                item["status"], item.get("revision", ""), item["summary"], item["confidence"],
+            )
+        strip = lambda data: [  # noqa: E731 - timestamps differ between the two runs
+            {k: v for k, v in entry.items() if k != "recorded_at"}
+            for entry in json.loads(data.read_text(encoding="utf-8"))["sources"]
+        ]
+        self.assertEqual(strip(batch_state), strip(single_state))
+
+        # adversarial: one lying item (READ on a missing file) refuses the WHOLE batch
+        bad = [items[0], {**items[1], "locator": str(self.repo / "absent.md")}]
+        manifest.write_text(json.dumps(bad, ensure_ascii=False), encoding="utf-8")
+        refused = Path(controller.init_run(self.repo, self.feature, "batch-3"))
+        report = controller.record_sources(refused, manifest)
+        self.assertEqual(report["status"], "PARTIAL")
+        self.assertEqual(report["registered"], [])
+        self.assertEqual(report["failed"][0]["source_id"], "SRC-2")
+        self.assertEqual(json.loads(refused.read_text(encoding="utf-8"))["sources"], [])
+        out = self.cli("record-sources", "--from-file", str(manifest), state=refused)
+        self.assertEqual(out.returncode, 2)
+
+        # adversarial: a duplicate id inside the manifest is the same refusal as across calls
+        manifest.write_text(json.dumps([items[0], items[0]], ensure_ascii=False), encoding="utf-8")
+        report = controller.record_sources(refused, manifest)
+        self.assertEqual(report["status"], "PARTIAL")
+        self.assertIn("duplicate", report["failed"][0]["error"])
+        self.assertEqual(json.loads(refused.read_text(encoding="utf-8"))["sources"], [])
+
+    def test_settle_agent_equals_three_calls_and_keeps_steps_done_before_a_refusal(self) -> None:
+        state = Path(controller.init_run(self.repo, self.feature, "settle-1"))
+        self.to_architect(state)
+        self.artifact(state, "draft")
+        self.draft_on_disk()
+        controller.start_stage(state, "CRITIC")
+        controller.record_agent(
+            state, "tech-critic", "critic-a", "s-crit", "sha256:input", "DISPATCHED"
+        )
+        report_file = self.repo / "critic-report.md"
+        report_file.write_text(
+            "@@FIND id=CRITIC-001 sev=High loc=3.4\n无退避设计。\n" + EVIDENCE,
+            encoding="utf-8",
+        )
+        out = controller.settle_agent(
+            state, "s-crit", artifact=f"critic-findings:{report_file}", register=report_file
+        )
+        self.assertEqual(out["status"], "OK", out)
+        self.assertEqual(out["settled"]["status"], "COMPLETED")
+        self.assertEqual(out["registered"]["registered"], ["CRITIC-001"])
+        data = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual(data["findings"][0]["id"], "CRITIC-001")
+        self.assertEqual([a["kind"] for a in data["artifacts"]], ["context-pack", "draft", "critic-findings"])
+
+        # the control run: the same three steps called one by one land in the same place.
+        # A fresh feature directory keeps it a NEW run (the first run already left a TDD behind).
+        feature2 = self.repo / "docs" / "feature2"
+        feature2.mkdir(parents=True)
+        (feature2 / "product-doc.md").write_text(PRD, encoding="utf-8")
+        original_feature, self.feature = self.feature, feature2
+        control = Path(controller.init_run(self.repo, self.feature, "settle-2"))
+        self.to_architect(control)
+        self.artifact(control, "draft")
+        self.feature = original_feature
+        controller.start_stage(control, "CRITIC")
+        controller.record_agent(
+            control, "tech-critic", "critic-a", "s-crit", "sha256:input", "DISPATCHED"
+        )
+        controller.record_agent(control, "tech-critic", "critic-a", "s-crit", "", "COMPLETED")
+        controller.write_artifact(control, "critic-findings", report_file, None, None)
+        controller.record_findings(control, report_file)
+        keys = ("findings", "agents", "artifacts")
+        strip = lambda data: {  # noqa: E731 - paths/timestamps differ between runs
+            key: [
+                {k: v for k, v in entry.items()
+                 if k not in ("recorded_at", "dispatched_at", "finished_at", "wall_seconds",
+                              "path", "origin", "content_digest", "size")}
+                for entry in data[key]
+            ]
+            for key in keys
+        }
+        self.assertEqual(
+            strip(json.loads(state.read_text(encoding="utf-8"))),
+            strip(json.loads(control.read_text(encoding="utf-8"))),
+        )
+
+        # adversarial: a malformed marker is a parse error (the whole file refuses), but the
+        # close and the artifact that already succeeded stay done -- exactly like separate calls
+        broken = self.repo / "broken-report.md"
+        broken.write_text("@@FIND id=CRITIC-002 loc=3.4\n缺严重度。\n", encoding="utf-8")
+        controller.record_agent(
+            state, "tech-critic", "critic-b", "s-crit-2", "sha256:input", "DISPATCHED"
+        )
+        with self.assertRaises(controller.ControllerError):
+            controller.settle_agent(
+                state, "s-crit-2", artifact=f"critic-findings:{broken}", register=broken
+            )
+        data = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [a["status"] for a in data["agents"] if a["session_id"] == "s-crit-2"],
+            ["COMPLETED"],
+        )
+        self.assertNotIn("CRITIC-002", [f["id"] for f in data["findings"]])
+
+        # adversarial: a severity clash with the stored entry is a per-item PARTIAL, and the
+        # close still lands while the disputed finding keeps its stored severity
+        clash = self.repo / "clash-report.md"
+        clash.write_text(
+            "@@FIND id=CRITIC-001 sev=Low loc=3.4\n试图降级。\n" + EVIDENCE,
+            encoding="utf-8",
+        )
+        controller.record_agent(
+            state, "tech-critic", "critic-c", "s-crit-3", "sha256:input", "DISPATCHED"
+        )
+        out = controller.settle_agent(state, "s-crit-3", register=clash)
+        self.assertEqual(out["status"], "PARTIAL")
+        self.assertTrue(out["registered"]["failed"])
+        data = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [f["severity"] for f in data["findings"] if f["id"] == "CRITIC-001"], ["High"]
+        )
+        self.assertEqual(
+            [a["status"] for a in data["agents"] if a["session_id"] == "s-crit-3"],
+            ["COMPLETED"],
+        )
+
+        # adversarial: an ABORTED close cannot carry an artifact, and an unknown session is refused
+        with self.assertRaises(controller.ControllerError):
+            controller.settle_agent(state, "s-crit-2", status="ABORTED", artifact=f"draft:{report_file}")
+        with self.assertRaises(controller.ControllerError):
+            controller.settle_agent(state, "no-such-session")
+
+    def test_deliver_walks_the_fixed_sequence_and_stops_at_a_blocked_gate(self) -> None:
+        state, tdd = self.closed_loop("deliver-1")
+        out = controller.deliver(state, tdd)
+        self.assertEqual(out["status"], "PASS", out)
+        data = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual(data["stage"], "CLOSED")
+        self.assertEqual(len(data["gates"]), 1)
+        self.assertIn("交付门禁", tdd.read_text(encoding="utf-8"))
+        # a closed document is frozen: a second deliver is refused, not replayed
+        with self.assertRaises(controller.ControllerError):
+            controller.deliver(state, tdd)
+
+        # adversarial: body edited after the verdict -- deliver stops at the gate, stays DELIVERY
+        blocked_state, blocked_tdd = self.closed_loop("deliver-2", update=True)
+        blocked_tdd.write_text(
+            blocked_tdd.read_text(encoding="utf-8") + "\n终审后主控亲手补的一段。\n",
+            encoding="utf-8",
+        )
+        out = controller.deliver(blocked_state, blocked_tdd)
+        self.assertEqual(out["status"], "BLOCKED")
+        self.assertIn("review-report-matches-delivered-tdd", out["gate"]["failures"])
+        data = json.loads(blocked_state.read_text(encoding="utf-8"))
+        self.assertEqual(data["stage"], "DELIVERY")
+        out = self.cli("deliver", "--tdd-file", str(blocked_tdd), state=blocked_state)
+        self.assertEqual(out.returncode, 2)
+
+    def test_gate_and_show_compact_faces_keep_the_actionable_fields(self) -> None:
+        state, report = self.gate_for("compact-1")
+        tdd = self.feature / "technical-doc.md"
+        # every gate call appends to state, so the ledger must be refreshed before the next
+        # gate -- the same render->gate ordering the delivery sequence enforces
+        controller.render_ledger(state, tdd)
+        compact = json.loads(self.cli("gate", "--tdd-file", str(tdd), state=state).stdout)
+        self.assertEqual(compact["status"], "PASS", compact.get("failures"))
+        self.assertNotIn("checks", compact)
+        self.assertEqual(compact["failed_checks"], [])
+        self.assertEqual(compact["passed"], report["passed"])
+        self.assertEqual(compact["warnings"], report["warnings"])
+        self.assertEqual(compact["review_stop"], report["review_stop"])
+        controller.render_ledger(state, tdd)
+        verbose = json.loads(
+            self.cli("gate", "--tdd-file", str(tdd), "--verbose", state=state).stdout
+        )
+        self.assertEqual(
+            [(item["name"], item["ok"]) for item in verbose["checks"]],
+            [(item["name"], item["ok"]) for item in report["checks"]],
+        )
+        # the stored report stays complete regardless of the print face
+        stored = json.loads(state.read_text(encoding="utf-8"))["gates"][-1]
+        self.assertIn("checks", stored)
+
+        # a blocked gate keeps every failure detail in the compact face: the failed entries
+        # must be exactly the verbose report's failing checks, detail included
+        bad_state = Path(controller.init_run(self.repo, self.feature, "compact-2"))
+        self.write_tdd()
+        bad_tdd = str(self.feature / "technical-doc.md")
+        out = self.cli("gate", "--tdd-file", bad_tdd, state=bad_state)
+        self.assertEqual(out.returncode, 2)
+        payload = json.loads(out.stdout)
+        self.assertTrue(payload["failed_checks"])
+        full_bad = json.loads(self.cli("gate", "--tdd-file", bad_tdd, "--verbose", state=bad_state).stdout)
+        self.assertEqual(
+            payload["failed_checks"],
+            [item for item in full_bad["checks"] if not item["ok"]],
+        )
+
+        # show: the compact face counts the index sections, --verbose keeps the full index
+        full = controller.show(state)
+        compact_show = json.loads(self.cli("show", state=state).stdout)
+        if full["doc_index"] is None:
+            self.assertIsNone(compact_show["doc_index"])
+        else:
+            self.assertEqual(
+                compact_show["doc_index"],
+                {"sections": full["doc_index"]["sections"], "present": True},
+            )
+        verbose_show = json.loads(self.cli("show", "--verbose", state=state).stdout)
+        self.assertEqual(verbose_show["doc_index"], full["doc_index"])
+        self.assertEqual(compact_show["review_stop"], full["review_stop"])
 
 
 CONF_FIXTURE = """来源: ARCHITECT
@@ -3129,6 +3984,10 @@ class ConfirmationLoopTests(unittest.TestCase):
         result = controller.start_stage(state, "REVIEW")
         self.assertEqual(result["review_round"], 2)
         self.approve_round(state, "s-review-2")
+        # P1-2 channel ②: the landing rewind's re-review is scoped to what the repair touched
+        # (round 1 was full and passing), and that incremental verdict may deliver directly --
+        # the gate's coverage proof still binds every changed section.
+        self.assertEqual(result["review_scope"], "incremental")
         delivered = controller.start_stage(state, "DELIVERY")
         self.assertNotIn("pending_landing", delivered)
         self.assertTrue(self.entries(state)[0]["applied"])

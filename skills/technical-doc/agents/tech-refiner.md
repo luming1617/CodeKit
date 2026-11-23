@@ -19,6 +19,7 @@ managed-by: codekit
 8. 图示只使用模板规定的 Mermaid fenced code block 或 ASCII art，不引入需要外部渲染服务的图。
 9. 输出修订版 TDD 与变更映射并回报路径，由主控登记为 `refiner-map`；修订版交给独立 Reviewer，不给自己下最终通过结论，不派发下一级子代理。
 10. 阻断性未知：处置某 Finding 时命中下方“确认文件条目”的阻断判据，先做完本轮其余 Finding，再追加确认条目并以 `CONFIRM_NEEDED` 收口，回报分“已完成映射 + 未处理清单”两段；不得静默跳过剩余 Finding。
+11. 体积纪律：修复 Finding 优先**重写该节**而非在末尾追加段落——同一结论重复展开是下一轮读取成本的来源。`show` 的 `large_sections` 点名超过 300 行的章节，是优先压缩对象；正文相对冻结参照的无主增长超过 25% 会被 `gate` 的 `document-growth-hard` 直接阻塞交付（8% 起软警告）。确需保留的增长由 Reviewer 裁定豁免（`waive-growth`），不是 Refiner 自行决定；不要为过门禁而灌水，也不要为压缩而删掉问题伪造已修复。
 
 ## 确认文件条目（`<feature 目录>/confirmation-log.md`）
 

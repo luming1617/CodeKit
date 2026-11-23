@@ -252,7 +252,7 @@ class ControllerManualTests(unittest.TestCase):
         command refuses is stated once, on the manual page.
         """
         rows = [line for line in SKILL_MD.splitlines() if line.startswith("| `")]
-        self.assertEqual(11, len(rows), [line[:34] for line in rows])
+        self.assertEqual(16, len(rows), [line[:34] for line in rows])
         for line in rows:
             cells = [cell.strip() for cell in line.strip("|").split("|")]
             with self.subTest(command=cells[0]):
@@ -278,6 +278,33 @@ class ControllerManualTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, SKILL_MD)
         self.assertIn("不推进任何东西", SKILL_MD)
+
+    def test_the_composite_faces_keep_their_refusal_semantics_in_the_manual(self) -> None:
+        """P0-2: the composites are transport, so the manual must state what they do NOT relax."""
+        for token in ("record-sources", "settle-agent", "deliver", "--verbose"):
+            with self.subTest(token=token):
+                self.assertIn(token, SKILL_MD)
+                self.assertIn(token, MANUAL)
+        for phrase in ("整批不落盘", "已完成的步骤保持生效", "gate 失败即停在 gate"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, MANUAL)
+        # the compact faces keep the fields the delivery report must quote
+        for token in ("failed_checks", "warnings"):
+            self.assertIn(token, MANUAL)
+
+    def test_the_mechanical_patch_channel_is_bounded_in_prose(self) -> None:
+        """P1-2: the exception to 'the orchestrator never edits the body' is stated with its bounds."""
+        for token in ("apply-mechanical-patch", "机械补丁"):
+            with self.subTest(token=token):
+                self.assertIn(token, SKILL_MD)
+                self.assertIn(token, MANUAL)
+        self.assertIn("只认删除行", MANUAL)
+        self.assertIn("先有拒绝，才有补丁", MANUAL)
+        self.assertIn("围栏外、生成台账外", MANUAL)
+        self.assertIn("补审默认增量", SKILL_MD)
+        self.assertIn("补审默认增量", MANUAL)
+        self.assertIn("唯一例外", STANDARD)
+        self.assertIn("mechanical_patches", MANUAL)
 
     def test_the_report_markers_are_taught_to_every_writer(self) -> None:
         for role, marker, face in (
@@ -312,6 +339,18 @@ class StandardContractTests(unittest.TestCase):
 
     def test_standard_defers_mechanical_checks_to_the_gate(self) -> None:
         self.assertIn("tech_doc_controller.py gate", STANDARD)
+
+    def test_the_inherent_gap_triage_is_one_rule_shared_by_four_assets(self) -> None:
+        """P0-1: the triage is a citation rule, not a downgrade switch, and every reader agrees."""
+        for asset in (STANDARD, SKILL_MD, AGENTS["tech-critic"], AGENTS["tech-reviewer"]):
+            self.assertIn("固有缺口分流", asset)
+        self.assertIn("gap_ref", AGENTS["tech-critic"])
+        self.assertIn("gap_ref=", MANUAL)
+        for asset in (STANDARD, AGENTS["tech-reviewer"]):
+            self.assertIn("降级逃逸", asset)
+        self.assertIn("不是降级开关", STANDARD)
+        self.assertIn("同时满足", STANDARD)
+        self.assertIn("同时满足", AGENTS["tech-critic"])
 
 
 class SkillDocumentTests(unittest.TestCase):
@@ -414,10 +453,14 @@ class ReviewScopeContractTests(unittest.TestCase):
             self.assertIn(name, STANDARD)
 
     def test_streak_length_matches_between_code_and_prose(self) -> None:
-        """'连续两轮' is the constant; a changed constant with old prose lies about the gate."""
-        self.assertEqual(controller.SEVERITY_STOP_STREAK, 2)
-        self.assertIn("连续两轮", SKILL_MD)
-        self.assertIn("连续两轮", STANDARD)
+        """P1-1: one quiet round scopes the next; the two brakes are stated wherever the rule is."""
+        self.assertEqual(controller.SEVERITY_STOP_STREAK, 1)
+        for phrase in ("增量轮不得连续", "交付轮必须全量"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, SKILL_MD)
+                self.assertIn(phrase, STANDARD)
+        self.assertIn("交付轮必须全量", MANUAL)
+        self.assertIn("增量轮不得连续", MANUAL)
 
     def test_rollback_switches_are_documented(self) -> None:
         self.assertEqual(controller.REVIEW_STOP_POLICIES, ("severity", "fixed"))
@@ -659,6 +702,30 @@ class GrowthAndMirrorContractTests(unittest.TestCase):
         for asset in (SKILL_MD, MANUAL):
             self.assertIn("体积参照", asset)
             self.assertIn("冻结参照", asset)
+
+    def test_the_hard_growth_gate_and_its_reviewer_waiver_are_bounded_in_prose(self) -> None:
+        """P1-3: the hard block and its single escape are stated wherever the rule is read."""
+        self.assertTrue(callable(getattr(controller, "_document_growth_hard_check", None)))
+        self.assertTrue(callable(getattr(controller, "waive_growth", None)))
+        self.assertEqual(25.0, controller.GROWTH_BLOCK_PERCENT)
+        self.assertEqual(300, controller.LARGE_SECTION_LINES)
+        for token in ("document-growth-hard", "waive-growth"):
+            with self.subTest(token=token):
+                self.assertIn(token, SKILL_MD)
+                self.assertIn(token, MANUAL)
+        self.assertIn("GROWTH_BLOCK_PERCENT", MANUAL)
+        self.assertIn('"document-growth-hard"', CONTROLLER_SRC)
+        self.assertIn("25%", SKILL_MD)
+        self.assertIn("growth_waivers", MANUAL)
+        for asset in (SKILL_MD, MANUAL):
+            self.assertIn("large_sections", asset)
+        # the waiver is anchored to a latest-round Reviewer finding, not the orchestrator's own say-so
+        self.assertIn("最新一次终审轮", MANUAL)
+        self.assertIn("真实出现在最新终审报告", MANUAL)
+        self.assertIn("真实出现在最新终审报告", SKILL_MD)
+        self.assertIn("重写该节", AGENTS["tech-refiner"])
+        self.assertIn("体积增长的裁定", AGENTS["tech-reviewer"])
+        self.assertIn("无可压缩冗余", STANDARD)
 
     def test_the_orchestrator_is_told_not_to_read_whole_documents(self) -> None:
         """PR-5c is a rule about the controller's own output surfaces, so both pages state it."""

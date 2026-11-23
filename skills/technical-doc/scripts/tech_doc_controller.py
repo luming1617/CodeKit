@@ -11,6 +11,7 @@ that has no recorded evidence is reported ``BLOCKED`` instead of being trusted.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -94,6 +95,13 @@ FIX_STATUSES = ("FIXED", "PENDING_CONFIRMATION", "REJECTED")
 # Body growth that no blocking finding paid for, above this share of the reference version, is
 # flagged as a soft ``gate`` warning -- see ``_document_growth_check``.
 GROWTH_WARN_PERCENT = 8.0
+# P1-3: the same unattributed growth past this share blocks delivery outright
+# (``document-growth-hard``); the only way through is a Reviewer adjudication recorded by
+# ``waive-growth`` and bound to the latest review round.
+GROWTH_BLOCK_PERCENT = 25.0
+# A single section longer than this many lines is named by ``show`` as a compression target:
+# the per-section signal that tells the Refiner which chapter to rewrite instead of append to.
+LARGE_SECTION_LINES = 300
 REVIEW_STATUSES = ("APPROVE", "APPROVE_WITH_FOLLOW_UPS", "REQUEST_CHANGES", "BLOCKED")
 PASSING_REVIEW_STATUSES = ("APPROVE", "APPROVE_WITH_FOLLOW_UPS")
 
@@ -133,7 +141,16 @@ MARKED_FIELDS = {
     "FIND": ("id", "sev", "loc"),
     "FIX": ("id", "status", "loc"),
 }
-MARKED_OPTIONAL = {"FIND": ("must_fix",), "FIX": ()}
+MARKED_OPTIONAL = {"FIND": ("must_fix", "gap_ref"), "FIX": ()}
+# A triaged inherent gap cites where the question is already registered: a CONF entry in this
+# run's ledger, or a PRD section.  The shape is enforced so a free-text "gap somewhere" cannot
+# pass as a citation, and a CONF citation must name an entry the state actually holds.
+GAP_REF = re.compile(r"^(?:CONF-\d{3}|PRD:\S+)$")
+# P1-2 channel ①: the gate checks whose failures a semantically-neutral deletion may fix
+# without paying a review round.  The whitelist is the boundary of the exception -- anything
+# else still goes through the landing rewind and a fresh review.
+MECHANICAL_PATCH_CHECKS = ("ledger-matches-state", "markers-match-confirmations")
+HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 PRD_FILE = "product-doc.md"
 TDD_FILE = "technical-doc.md"
@@ -251,9 +268,9 @@ CONFIRMATION_REQUIRED_FIELDS = ("来源", "阻断", "位置", "问题")
 # up to round 1; the saving is real but it is two rounds, not the three an early estimate claimed.
 REVIEW_STOP_POLICIES = ("severity", "fixed")
 REVIEW_SCOPES = ("full", "incremental")
-# Rounds of quiet review that license the smaller scope.  One quiet round is a coincidence;
-# two is the trend the measure is about.
-SEVERITY_STOP_STREAK = 2
+# Rounds of quiet review that license the smaller scope.  One quiet round is enough (P1-1);
+# the no-consecutive-incremental brake and the full delivery door bound the relaxation.
+SEVERITY_STOP_STREAK = 1
 SECTION_SNAPSHOT = "review-sections-r{round}.json"
 
 # --- delivery scale and greenfield ------------------------------------------------------
@@ -622,8 +639,9 @@ def _verify_locator(root: Path, source_id: str, kind: str, locator: str, status:
     return {"resolved": str(candidate), "resolved_kind": kind}
 
 
-def record_source(
-    state_path: str | Path,
+def _append_source(
+    state: dict[str, Any],
+    root: Path,
     source_id: str,
     kind: str,
     locator: str,
@@ -632,8 +650,7 @@ def record_source(
     summary: str,
     confidence: str,
 ) -> dict[str, Any]:
-    """Register one frozen input item so ``NOT_FOUND`` is a fact, not a guess."""
-    path, state = load_state(state_path)
+    """Validate and append one frozen input item; the single and batch faces share this path."""
     if kind not in SOURCE_KINDS:
         raise ControllerError(f"unsupported source kind: {kind} (expected {', '.join(SOURCE_KINDS)})")
     if status not in READ_STATUSES:
@@ -645,9 +662,7 @@ def record_source(
             raise ControllerError(f"{label} is required")
     if any(item["source_id"] == source_id for item in state["sources"]):
         raise ControllerError(f"duplicate source-id: {source_id}")
-    evidence = _verify_locator(
-        _require_repo_root(state["repository"]["root"]), source_id, kind, locator, status
-    )
+    evidence = _verify_locator(root, source_id, kind, locator, status)
     entry = {
         "source_id": source_id,
         "kind": kind,
@@ -660,8 +675,64 @@ def record_source(
         "recorded_at": _now(),
     }
     state["sources"].append(entry)
+    return entry
+
+
+def record_source(
+    state_path: str | Path,
+    source_id: str,
+    kind: str,
+    locator: str,
+    status: str,
+    revision: str,
+    summary: str,
+    confidence: str,
+) -> dict[str, Any]:
+    """Register one frozen input item so ``NOT_FOUND`` is a fact, not a guess."""
+    path, state = load_state(state_path)
+    entry = _append_source(
+        state, _require_repo_root(state["repository"]["root"]),
+        source_id, kind, locator, status, revision, summary, confidence,
+    )
     _save(path, state)
     return entry
+
+
+def record_sources(state_path: str | Path, file: str | Path) -> dict[str, Any]:
+    """Register a whole manifest of frozen inputs in one call, atomically.
+
+    Every item walks the same validation as ``record_source`` (disk verification included);
+    the batch is only a transport.  Any failure leaves the state untouched -- a half-registered
+    manifest would make ``finalize-inputs`` judge a freeze that never happened.
+    """
+    path, state = load_state(state_path)
+    manifest = json.loads(_read_document(Path(file), "source manifest"))
+    if not isinstance(manifest, list) or not manifest:
+        raise ControllerError("source manifest must be a non-empty JSON array of source items")
+    root = _require_repo_root(state["repository"]["root"])
+    working = copy.deepcopy(state)
+    registered: list[str] = []
+    failed: list[dict[str, Any]] = []
+    for position, item in enumerate(manifest, start=1):
+        if not isinstance(item, dict):
+            failed.append({"item": position, "error": "manifest item must be a JSON object"})
+            continue
+        source_id = str(item.get("source_id") or "").strip()
+        try:
+            for key in ("source_id", "kind", "locator", "status", "summary", "confidence"):
+                if not str(item.get(key) or "").strip():
+                    raise ControllerError(f"{key} is required")
+            _append_source(
+                working, root, source_id, item["kind"], item["locator"], item["status"],
+                str(item.get("revision") or ""), item["summary"], item["confidence"],
+            )
+            registered.append(source_id)
+        except ControllerError as exc:
+            failed.append({"item": position, "source_id": source_id, "error": str(exc)})
+    if failed:
+        return {"status": "PARTIAL", "registered": [], "failed": failed}
+    _save(path, working)
+    return {"status": "OK", "registered": registered, "failed": []}
 
 
 def _scale_signals(prd_text: str) -> dict[str, list[str]]:
@@ -928,11 +999,12 @@ def _polish_followups(state: dict[str, Any]) -> dict[str, list[str]]:
 def _severity_stop(state: dict[str, Any]) -> dict[str, Any]:
     """Decide whether a further *full* review can still be expected to pay for itself.
 
-    The condition is the measured one: two finished rounds that surfaced no Blocker/High and
-    no must_fix left open.  Anything past that point has been shown to produce Medium/Low and
-    bookkeeping findings at the same per-finding cost as a blocker round, so the round is
-    scoped to what moved instead.  This never closes a round early: an open ``must_fix`` still
-    forces more review, and ``gate`` still refuses delivery on a non-passing verdict.
+    One finished round that surfaced no Blocker/High and left no must_fix open is enough to
+    scope the next round to what moved (P1-1).  Two mechanical brakes keep the relaxation
+    bounded: an incremental round may not follow another incremental round, and the delivery
+    door demands a full verdict -- so the worst case of a noisy quiet round is one extra full
+    round, never an unreviewed delivery.  An open ``must_fix`` still forces more review, and
+    ``gate`` still refuses delivery on a non-passing verdict.
     """
     policy = state.get("review_stop_policy") or REVIEW_STOP_POLICIES[0]
     verdicts = state["reviews"]
@@ -943,9 +1015,12 @@ def _severity_stop(state: dict[str, Any]) -> dict[str, Any]:
         for verdict in window
     )
     open_fix = _open_must_fix(state)
+    previous_incremental = bool(verdicts) and verdicts[-1].get("scope") == "incremental"
     return {
         "policy": policy,
-        "forced": policy == "severity" and quiet and not open_fix,
+        "forced": (
+            policy == "severity" and quiet and not open_fix and not previous_incremental
+        ),
         "quiet": quiet,
         "quiet_rounds": [verdict["round"] for verdict in window] if quiet else [],
         "open_must_fix": open_fix,
@@ -1277,17 +1352,33 @@ def start_stage(state_path: str | Path, target_stage: str, review_scope: str | N
             _require_evidence(state, "CRITIC", "critic-findings")
         elif current == "DELIVERY":
             _require_rewind_within_budget(state)
-            # The run pays a review round for this, so the ledger keeps the reason: a
-            # delivery report that has to explain round N+1 can read it off state.json
-            # instead of the orchestrator's memory.
+            # The landing rewind never demands an undisposed finding: a settled decision (or a
+            # gate failure that needs the body rewritten) is a different debt, and since P1-1
+            # an incremental last verdict also licenses the rewind to pay for a full delivery
+            # round.  The ledger keeps the reason so the delivery report can read it off
+            # state.json instead of the orchestrator's memory.
+            needs_full_delivery = bool(state["reviews"]) and state["reviews"][-1].get("scope") != "full"
             state.setdefault("rewinds", []).append({
                 "from": current,
                 "review_round": state["review_round"],
                 "unlanded": _unlanded_decisions(state),
+                "full_delivery_required": needs_full_delivery,
                 "at": _now(),
             })
         else:
-            _require_undisposed_findings(state)
+            # From REVIEW the round back normally answers an undisposed finding.  Since P1-1
+            # there is one more legal reason: the verdict just recorded is passing but
+            # incremental, and the delivery door demands a full pass -- the run pays a round
+            # to buy it, with nothing undisposed to point at.
+            last = state["reviews"][-1] if state["reviews"] else None
+            paying_full_delivery = (
+                last is not None
+                and last["round"] == state["review_round"]
+                and last["status"] in PASSING_REVIEW_STATUSES
+                and last.get("scope") != "full"
+            )
+            if not paying_full_delivery:
+                _require_undisposed_findings(state)
     elif target == "REVIEW":
         _require_no_blocking_confirmations(state, target)
         _require_evidence(state, "REFINER", "refiner-map", artifact_round=round_)
@@ -1297,11 +1388,23 @@ def start_stage(state_path: str | Path, target_stage: str, review_scope: str | N
                 "deliver a blocking report instead of opening another round"
             )
         stop = _severity_stop(state)
-        if asked == "incremental" and not stop["forced"]:
+        # P1-2 channel ②: a landing rewind buys a re-review of what the repair touched, not a
+        # full re-read -- the previous verdict was full and passing, and the gate's coverage
+        # proof still binds every changed section to some round's scope.
+        prior = state["reviews"][-1] if state["reviews"] else None
+        rewind_recheck = (
+            bool(state.get("rewinds"))
+            and state["rewinds"][-1]["review_round"] == round_
+            and prior is not None
+            and prior.get("scope") == "full"
+            and prior["status"] in PASSING_REVIEW_STATUSES
+        )
+        if asked == "incremental" and not stop["forced"] and not rewind_recheck:
             raise ControllerError(
-                f"round {round_ + 1} may not be scoped yet: the last {SEVERITY_STOP_STREAK} review "
-                "rounds have not both come back without Blocker/High, so a full pass is still what "
-                "pays (init --review-stop-policy fixed restores the unconditional cap)"
+                f"round {round_ + 1} may not be scoped yet: the previous review round has not "
+                "come back without Blocker/High with no must_fix open (or it was itself an "
+                "incremental round, which may not be followed by another), so a full pass is "
+                "still what pays (init --review-stop-policy fixed restores the unconditional cap)"
             )
         if asked == "full" and stop["forced"]:
             raise ControllerError(
@@ -1313,7 +1416,7 @@ def start_stage(state_path: str | Path, target_stage: str, review_scope: str | N
                 "(init --review-stop-policy fixed restores the unconditional cap)"
             )
         plan: dict[str, Any] | None = None
-        if stop["forced"] and state["reviews"]:
+        if (stop["forced"] or rewind_recheck) and asked != "full" and state["reviews"]:
             try:
                 derived = _derive_incremental_scope(path, state)
             except ControllerError:
@@ -1503,6 +1606,27 @@ def _require_approved_review(state: dict[str, Any]) -> None:
             f"review round {last['round']} returned {last['status']}; only "
             f"{', '.join(PASSING_REVIEW_STATUSES)} may reach delivery"
         )
+    if last.get("scope") != "full":
+        # P1-2 channel ② exception: the re-review round right after a landing rewind may be
+        # incremental -- the round before it was full and passing, the scope came from the
+        # repair diff, and the gate's coverage proof still binds every changed section.
+        rewinds = state.get("rewinds") or []
+        prior = next(
+            (item for item in state["reviews"] if item["round"] == last["round"] - 1), None
+        )
+        rewind_recheck = (
+            any(item["review_round"] == last["round"] - 1 for item in rewinds)
+            and prior is not None
+            and prior.get("scope") == "full"
+            and prior["status"] in PASSING_REVIEW_STATUSES
+        )
+        if not rewind_recheck:
+            raise ControllerError(
+                f"the delivery round must be a full review: round {last['round']} was incremental, "
+                "so its verdict only covers the sections it was handed; pay one more round via "
+                "start-stage --to REFINER (allowed from REVIEW or DELIVERY even with nothing "
+                "undisposed) and open a full round with a fresh reviewer"
+            )
 
 
 def _require_all_findings_tracked(state: dict[str, Any]) -> None:
@@ -1775,8 +1899,15 @@ def record_finding(
     evidence: str,
     must_fix: bool | None,
     round_override: int | None,
+    gap_ref: str | None = None,
 ) -> dict[str, Any]:
-    """Add a structured Finding; Critic runs once, Reviewer findings are round-scoped."""
+    """Add a structured Finding; Critic runs once, Reviewer findings are round-scoped.
+
+    ``gap_ref`` marks an inherent gap already registered as an open question (a CONF entry or
+    a PRD section).  It is a citation, not a downgrade switch: it may only ride on a
+    non-blocking finding, and a CONF citation must name an entry the ledger holds -- the
+    triage judgement itself stays with the Critic and is re-audited by the Reviewer.
+    """
     path, state = load_state(state_path)
     source = source.upper()
     if source not in FINDING_ID:
@@ -1792,16 +1923,36 @@ def record_finding(
     _validate_finding_id(source, round_, finding_id)
     if any(item["id"] == finding_id for item in state["findings"]):
         raise ControllerError(f"duplicate finding id: {finding_id}")
+    blocking = severity in MUST_FIX_SEVERITIES if must_fix is None else must_fix
+    citation = (gap_ref or "").strip()
+    if citation:
+        if not GAP_REF.fullmatch(citation):
+            raise ControllerError(
+                f"gap_ref must cite CONF-<NNN> or PRD:<section>, got '{citation}'"
+            )
+        if blocking:
+            raise ControllerError(
+                f"{finding_id}: gap_ref marks a triaged inherent gap, which cannot ride on a "
+                "must_fix finding; an unregistered or design-level gap keeps its severity"
+            )
+        if citation.startswith("CONF-") and not any(
+            item["id"] == citation for item in state.get("confirmations") or []
+        ):
+            raise ControllerError(
+                f"gap_ref cites {citation}, which the confirmation ledger does not hold; "
+                "sync-confirmations first, or cite the PRD section instead"
+            )
     entry = {
         "id": finding_id,
         "source": source,
         "round": round_,
         "severity": severity,
-        "must_fix": severity in MUST_FIX_SEVERITIES if must_fix is None else must_fix,
+        "must_fix": blocking,
         "location": location,
         "evidence": evidence,
         "status": "OPEN",
         "recorded_at": _now(),
+        **({"gap_ref": citation} if citation else {}),
     }
     state["findings"].append(entry)
     _save(path, state)
@@ -2012,10 +2163,11 @@ def record_findings(
                 fields["sev"] in MUST_FIX_SEVERITIES if must_fix is None else must_fix == "true"
             ),
             "location": locations[0],
+            "gap_ref": fields.get("gap_ref"),
         }
         existing = stored.get(finding_id)
         if existing is not None:
-            same = all(existing[key] == value for key, value in wanted.items())
+            same = all(existing.get(key) == value for key, value in wanted.items())
             if same:
                 already.append(finding_id)
                 continue
@@ -2030,6 +2182,7 @@ def record_findings(
                 path, "CRITIC" if finding_id.startswith("CRITIC") else "REVIEWER", finding_id,
                 wanted["severity"], wanted["location"], body,
                 None if must_fix is None else must_fix == "true", None,
+                fields.get("gap_ref"),
             )
             registered.append(finding_id)
         except ControllerError as exc:
@@ -2080,6 +2233,58 @@ def _batch_report(
         "failed": failed,
         **({"multi_location": multi} if multi else {}),
     }
+
+
+def settle_agent(
+    state_path: str | Path,
+    session_id: str,
+    status: str = "COMPLETED",
+    artifact: str | None = None,
+    register: str | Path | None = None,
+) -> dict[str, Any]:
+    """Close one dispatch and register what it produced, in a single call.
+
+    A transport composite, not a bypass: the close walks ``record_agent``, the artifact walks
+    ``write_artifact`` (mirror check and draft baseline included), and the report walks
+    ``record_findings``/``record_fixes`` item by item.  Steps run in that order and each saves
+    independently, so a failure stops the chain at a consistent state and the error names the
+    step that refused; the steps already done stay done, exactly as if they had been called
+    one by one.
+    """
+    if status not in AGENT_STATUSES or status == "DISPATCHED":
+        raise ControllerError("settle-agent closes a dispatch: status must be COMPLETED, ABORTED or BLOCKED")
+    if status != "COMPLETED" and (artifact or register):
+        raise ControllerError("--artifact/--register only apply to a COMPLETED close")
+    path, state = load_state(state_path)
+    open_entry = next(
+        (item for item in state["agents"]
+         if item["session_id"] == session_id and item["status"] == "DISPATCHED"),
+        None,
+    )
+    if open_entry is None:
+        raise ControllerError(f"no open dispatch for session {session_id}; open it with record-agent --status DISPATCHED")
+    out: dict[str, Any] = {}
+    entry = record_agent(path, open_entry["role"], open_entry["name"], session_id, "", status)
+    out["settled"] = {key: entry[key] for key in ("session_id", "role", "round", "status")}
+    if artifact:
+        kind, separator, file = artifact.partition(":")
+        if not separator or not kind.strip() or not file.strip():
+            raise ControllerError("--artifact expects <kind>:<path>, e.g. critic-findings:/abs/report.md")
+        out["artifact"] = write_artifact(path, kind.strip(), file.strip(), None, None)
+    if register:
+        text = _read_document(Path(register), "settle-agent report")
+        if "@@FIND" in text:
+            report = record_findings(path, register)
+        elif "@@FIX" in text:
+            report = record_fixes(path, register)
+        else:
+            raise ControllerError("--register file carries neither @@FIND nor @@FIX markers")
+        out["registered"] = report
+        if report["status"] == "PARTIAL":
+            out["status"] = "PARTIAL"
+            return out
+    out["status"] = "OK"
+    return out
 
 
 def record_review(
@@ -2384,9 +2589,10 @@ def _parse_confirmation_log(text: str) -> list[dict[str, Any]]:
         if current is None:
             current = {"id": None, "start": number, "fields": {}, "lines": {}}
         if key in current["fields"]:
+            entry_label = current["id"] or f"at line {current['start']}"
             raise ControllerError(
                 f"confirmation line {number}: field '{key}' repeats inside entry "
-                f"{current['id'] or f'at line {current['start']}'}"
+                f"{entry_label}"
             )
         current["fields"][key] = value
         current["lines"][key] = number
@@ -3077,6 +3283,36 @@ def _freeze_growth_baseline(state: dict[str, Any]) -> None:
         state["document_growth"] = _growth_baseline(text, "draft")
 
 
+def _growth_facts(state: dict[str, Any], doc_text: str) -> dict[str, Any] | None:
+    """The one measurement both growth checks share; ``None`` when no reference version exists.
+
+    Keeping the drivers/only_minor derivation in one place is what stops the soft warning and
+    the hard block from disagreeing about who paid for the growth.
+    """
+    baseline = state.get("document_growth") or {}
+    base = baseline.get("baseline_lines")
+    if not base:
+        return None
+    assert isinstance(base, int)
+    body = _body_lines(doc_text)
+    round_ = state["review_round"]
+    drivers = [
+        item for item in state["findings"]
+        if item["round"] == round_ or (round_ <= 1 and item["round"] == 0)
+    ]
+    return {
+        "body": body,
+        "base": base,
+        "percent": (body - base) / base * 100,
+        "drivers": drivers,
+        # ``all()`` over no findings is True, and that is the answer wanted: a round that raised
+        # nothing and still grew the document by a third is the case with no payer at all, so it
+        # must warn/block, not fall through as "nothing to attribute".
+        "only_minor": all(item["severity"] not in MUST_FIX_SEVERITIES for item in drivers),
+        "basis": baseline.get("baseline", "?"),
+    }
+
+
 def _document_growth_check(state: dict[str, Any], doc_text: str) -> dict[str, Any]:
     """Soft size-discipline check: body growth the review loop did not pay for.
 
@@ -3086,28 +3322,18 @@ def _document_growth_check(state: dict[str, Any], doc_text: str) -> dict[str, An
     the last run (1834 → 2111 body lines).  Putting the number in the gate report is what makes
     the delivery report able to state it.
     """
-    body = _body_lines(doc_text)
-    baseline = state.get("document_growth") or {}
-    base = baseline.get("baseline_lines")
-    if not base:
+    facts = _growth_facts(state, doc_text)
+    if facts is None:
         return {
             "name": "document-growth", "ok": True, "warn": False,
             "detail": [
-                f"body {body} lines; no reference version recorded yet (init for an UPDATE run, "
-                "write-artifact --kind draft or start-stage --to CRITIC for a NEW run)",
+                f"body {_body_lines(doc_text)} lines; no reference version recorded yet (init for "
+                "an UPDATE run, write-artifact --kind draft or start-stage --to CRITIC for a NEW run)",
             ],
         }
-    assert isinstance(base, int)
-    percent = (body - base) / base * 100
+    body, base, percent = facts["body"], facts["base"], facts["percent"]
     round_ = state["review_round"]
-    drivers = [
-        item for item in state["findings"]
-        if item["round"] == round_ or (round_ <= 1 and item["round"] == 0)
-    ]
-    # ``all()`` over no findings is True, and that is the answer wanted: a round that raised
-    # nothing and still grew the document by a third is the case with no payer at all, so it
-    # must warn, not fall through as "nothing to attribute".
-    only_minor = all(item["severity"] not in MUST_FIX_SEVERITIES for item in drivers)
+    drivers, only_minor = facts["drivers"], facts["only_minor"]
     warn = percent > GROWTH_WARN_PERCENT and only_minor
     if percent <= GROWTH_WARN_PERCENT:
         note = f"growth within the {GROWTH_WARN_PERCENT:g}% threshold"
@@ -3129,11 +3355,159 @@ def _document_growth_check(state: dict[str, Any], doc_text: str) -> dict[str, An
         )
     detail = [
         "body {} lines vs baseline {} ({:+.1f}%, baseline: {})".format(
-            body, base, percent, baseline.get("baseline", "?")
+            body, base, percent, facts["basis"]
         ),
         note,
     ]
     return {"name": "document-growth", "ok": True, "warn": warn, "detail": detail}
+
+
+def _growth_waiver(state: dict[str, Any]) -> dict[str, Any] | None:
+    """The latest growth waiver, valid only while it cites a Reviewer finding of the latest round.
+
+    A rewind that opens a new review round retires every earlier waiver without editing it: the
+    adjudication was about the document that round reviewed, not about whatever grew afterwards.
+    The finding is re-resolved against state on every gate, so a waiver cannot outlive the
+    verdict it was anchored to.
+    """
+    waivers = state.get("growth_waivers") or []
+    if not waivers or not state["reviews"]:
+        return None
+    latest = waivers[-1]
+    round_ = state["reviews"][-1]["round"]
+    if latest["round"] != round_:
+        return None
+    finding = next(
+        (
+            item for item in state["findings"]
+            if item["id"] == latest["finding_id"]
+            and item["source"] == "REVIEWER"
+            and item["round"] == round_
+        ),
+        None,
+    )
+    return latest if finding else None
+
+
+def _document_growth_hard_check(state: dict[str, Any], doc_text: str) -> dict[str, Any]:
+    """P1-3: unattributed growth past ``GROWTH_BLOCK_PERCENT`` blocks delivery.
+
+    The soft check records the bill; this one refuses to deliver a document the loop inflated
+    by a quarter with no Blocker/High to pay for it.  The single escape is a Reviewer
+    adjudication (``waive-growth``) bound to the latest review round -- the orchestrator cannot
+    waive its own growth, and a new round retires the waiver automatically.  A waived growth
+    still rides ``warn`` so the adjudication is quoted in the delivery report, not buried.
+    """
+    facts = _growth_facts(state, doc_text)
+    if facts is None:
+        return {
+            "name": "document-growth-hard", "ok": True, "warn": False,
+            "detail": ["no reference version recorded yet; nothing to measure"],
+        }
+    body, base, percent = facts["body"], facts["base"], facts["percent"]
+    measure = "body {} lines vs baseline {} ({:+.1f}%, baseline: {})".format(
+        body, base, percent, facts["basis"]
+    )
+    if percent <= GROWTH_BLOCK_PERCENT:
+        return {
+            "name": "document-growth-hard", "ok": True, "warn": False,
+            "detail": [measure, f"growth within the {GROWTH_BLOCK_PERCENT:g}% hard threshold"],
+        }
+    if not facts["only_minor"]:
+        return {
+            "name": "document-growth-hard", "ok": True, "warn": False,
+            "detail": [measure, "a Blocker/High finding of this round pays for the growth"],
+        }
+    waiver = _growth_waiver(state)
+    if waiver:
+        return {
+            "name": "document-growth-hard", "ok": True, "warn": True,
+            "detail": [
+                measure,
+                "growth waived by {} (round {}): {} -- quote this adjudication in the "
+                "delivery report".format(waiver["finding_id"], waiver["round"], waiver["reason"]),
+            ],
+        }
+    round_ = state["reviews"][-1]["round"] if state["reviews"] else state["review_round"]
+    return {
+        "name": "document-growth-hard", "ok": False, "warn": False,
+        "detail": [
+            measure,
+            "the body grew past the {0:g}% hard threshold and no Blocker/High finding of this "
+            "round paid for it; compress the body (rewrite the inflated sections, do not append) "
+            "or record a Reviewer adjudication via waive-growth bound to round {1}".format(
+                GROWTH_BLOCK_PERCENT, round_
+            ),
+        ],
+    }
+
+
+def waive_growth(state_path: str | Path, finding_id: str, reason: str) -> dict[str, Any]:
+    """P1-3: record a Reviewer adjudication that unattributed body growth is justified.
+
+    DELIVERY only, after ``document-growth-hard`` refused: the citation must be a REVIEWER
+    finding of the latest review round, so the waiver is anchored to a verdict that actually
+    read the grown document -- a Critic finding or an older round cannot waive it.  The finding
+    must also survive in the verdict's own report (``@@FIND`` line, report digest unchanged):
+    the orchestrator can register a finding after the verdict but cannot rewrite the reviewer's
+    report, so a self-made anchor is refused.  The reason is mandatory and lands in the chapter
+    16 ledger and the delivery report.
+    """
+    path, state = load_state(state_path)
+    if state["stage"] != "DELIVERY":
+        raise ControllerError("waive-growth runs at DELIVERY, after document-growth-hard refused")
+    if not reason.strip():
+        raise ControllerError(
+            "waive-growth needs a reason: the adjudication is quoted in the delivery report"
+        )
+    if not state["reviews"]:
+        raise ControllerError("no review verdict exists to anchor a growth waiver")
+    round_ = state["reviews"][-1]["round"]
+    finding = next((item for item in state["findings"] if item["id"] == finding_id), None)
+    if finding is None:
+        raise ControllerError(f"unknown finding id: {finding_id} (record the finding first)")
+    if finding["source"] != "REVIEWER":
+        raise ControllerError("a growth waiver must cite a Reviewer finding, not a Critic one")
+    if finding["round"] != round_:
+        raise ControllerError(
+            f"the waiver must cite round {round_} (the latest review); "
+            f"{finding_id} was raised in round {finding['round']}"
+        )
+    # The citation must survive in the verdict's own report, not only in state.json: the
+    # orchestrator can register a finding after the verdict, but it cannot rewrite the
+    # reviewer's report without breaking the digest record-review bound.  A self-made
+    # "Reviewer finding" therefore has nowhere to anchor a waiver -- this is what keeps the
+    # escape a Reviewer adjudication instead of the orchestrator waiving its own growth.
+    last = state["reviews"][-1]
+    report_path = Path(state["repository"]["root"]) / last["report"]
+    try:
+        report_text = _read_document(report_path, "review report")
+    except (OSError, ControllerError) as exc:
+        raise ControllerError(f"the round {round_} review report cannot be read: {exc}")
+    if _text_digest(report_text) != last["report_digest"]:
+        raise ControllerError(
+            "the review report changed after the verdict was bound; a waiver must cite the "
+            "report the reviewer actually wrote"
+        )
+    try:
+        items = _parse_marked_items(report_text, "FIND")
+    except ControllerError:
+        items = []
+    if not any(item["fields"].get("id") == finding_id for item in items):
+        raise ControllerError(
+            f"{finding_id} does not appear in the round {round_} review report's @@FIND lines; "
+            "a growth waiver must cite a finding the reviewer actually raised, not one "
+            "registered after the verdict"
+        )
+    entry = {
+        "finding_id": finding_id,
+        "round": round_,
+        "reason": reason.strip(),
+        "recorded_at": _now(),
+    }
+    state.setdefault("growth_waivers", []).append(entry)
+    _save(path, state)
+    return entry
 
 
 def _reject_stray_ledger_rows(state: dict[str, Any]) -> None:
@@ -3238,6 +3612,26 @@ def _run_metadata_body(state: dict[str, Any], doc_text: str, run_dir: str) -> li
     scopes = "、".join(
         f"r{item['round']} {item.get('scope') or 'full'}" for item in state["reviews"]
     ) or "尚无终审"
+    patches = state.get("mechanical_patches") or []
+    patch_cell = (
+        "；".join(
+            "{} 删 {} 行（{}）".format(
+                item["check"], item["deleted_lines"], "、".join(item["sections_credited"]) or "无章节影响"
+            )
+            for item in patches
+        )
+        if patches
+        else "无"
+    )
+    waivers = state.get("growth_waivers") or []
+    waiver_cell = (
+        "；".join(
+            "{}（r{}）：{}".format(item["finding_id"], item["round"], item["reason"])
+            for item in waivers
+        )
+        if waivers
+        else "无"
+    )
     rows = [
         "| 项目 | 值 |",
         "|---|---|",
@@ -3249,6 +3643,8 @@ def _run_metadata_body(state: dict[str, Any], doc_text: str, run_dir: str) -> li
         f"| 规模判定 | {_cell(scale_cell)} |",
         f"| 工程结构分支 | {_cell(structure_cell)} |",
         f"| 交付门禁 | {_cell(gate_summary)} |",
+        f"| 机械补丁 | {_cell(patch_cell)} |",
+        f"| 体积豁免 | {_cell(waiver_cell)} |",
         "| Finding 合计 | {}（Blocker {} / High {} / Medium {} / Low {}；must_fix 未闭环 {}） |".format(
             len(state["findings"]),
             severities["Blocker"],
@@ -3371,17 +3767,25 @@ def _mirror_table_header(lines: list[str], index: int) -> str:
     return lines[start].strip()
 
 
-def _reject_handwritten_mirror(lines: list[str], blocks: dict[str, tuple[int, int]]) -> None:
-    """A hand-copied ledger beside the generated one reintroduces the drift this removes."""
+def _handwritten_mirror_lines(lines: list[str], blocks: dict[str, tuple[int, int]]) -> list[int]:
+    """Indices of hand-copied Finding rows outside the generated blocks (the mirror predicate)."""
     covered = {index for start, end in blocks.values() for index in range(start, end + 1)}
-    stray = [
-        f"line {index + 1}: {line.strip()[:60]}"
+    return [
+        index
         for index, line in enumerate(lines)
         if index not in covered
         and line.lstrip().startswith("|")
         and re.search(r"(?:CRITIC-\d|REVIEW-\d{1,2}-\d)", line)
         and LEDGER_FINDING_COLUMN.search(_mirror_table_header(lines, index))
         and LEDGER_TABLE_COLUMNS.search(_mirror_table_header(lines, index))
+    ]
+
+
+def _reject_handwritten_mirror(lines: list[str], blocks: dict[str, tuple[int, int]]) -> None:
+    """A hand-copied ledger beside the generated one reintroduces the drift this removes."""
+    stray = [
+        f"line {index + 1}: {lines[index].strip()[:60]}"
+        for index in _handwritten_mirror_lines(lines, blocks)
     ]
     if stray:
         raise ControllerError(
@@ -4319,8 +4723,10 @@ def gate(state_path: str | Path, tdd_file: str | Path) -> dict[str, Any]:
         ok, detail = _project_structure_check(path, state, tdd, doc_text)
         add("project-structure-branch", ok, detail)
         # Soft by construction: ``ok`` is always True, so it can never join ``failures``; it
-        # rides on ``warn`` and out through the report's ``warnings`` list.
+        # rides on ``warn`` and out through the report's ``warnings`` list.  The hard twin below
+        # is the one that can block: unattributed growth past GROWTH_BLOCK_PERCENT.
         checks.append(_document_growth_check(state, doc_text))
+        checks.append(_document_growth_hard_check(state, doc_text))
         if state["reviews"]:
             ok, detail = _incremental_coverage(path, state, tdd)
             add("incremental-review-covers-changes", ok, detail)
@@ -4375,6 +4781,229 @@ def gate(state_path: str | Path, tdd_file: str | Path) -> dict[str, Any]:
     return report
 
 
+def _apply_deletion_only_diff(text: str, patch: str) -> tuple[str, list[int]]:
+    """Apply a unified diff that may only DELETE lines; return the new text and deleted indices.
+
+    Any added line, any context mismatch, any overlapping hunk is a refusal, not a skip: the
+    mechanical-patch channel is an exception to "the orchestrator never edits the body", so
+    its input has to be verifiable line by line.
+    """
+    original = text.splitlines()
+    result: list[str] = []
+    deleted: list[int] = []
+    cursor = 0
+    in_hunk = False
+    old_remaining = 0
+    for number, line in enumerate(patch.splitlines(), start=1):
+        if line.startswith("---") or line.startswith("+++"):
+            continue
+        if line.startswith("+"):
+            raise ControllerError(f"patch line {number}: mechanical patches may only delete lines")
+        match = HUNK_HEADER.match(line)
+        if match:
+            start = int(match.group(1))
+            if start - 1 < cursor:
+                raise ControllerError(f"patch line {number}: hunk overlaps an already-applied region")
+            result.extend(original[cursor:start - 1])
+            cursor = start - 1
+            old_remaining = int(match.group(2) or "1")
+            in_hunk = True
+            continue
+        if not in_hunk:
+            if line.strip():
+                raise ControllerError(f"patch line {number}: expected a @@ hunk header")
+            continue
+        if line.startswith("\\"):
+            continue
+        if not line or line[0] not in "- ":
+            raise ControllerError(f"patch line {number}: unrecognized diff line")
+        if cursor >= len(original) or original[cursor] != line[1:]:
+            raise ControllerError(f"patch line {number}: line does not match the document")
+        if line[0] == "-":
+            deleted.append(cursor)
+        else:
+            result.append(original[cursor])
+        cursor += 1
+        old_remaining -= 1
+        if old_remaining == 0:
+            in_hunk = False
+    if not deleted:
+        raise ControllerError("the patch deletes nothing")
+    result.extend(original[cursor:])
+    return "\n".join(result) + ("\n" if text.endswith("\n") else ""), deleted
+
+
+def apply_mechanical_patch(
+    state_path: str | Path, tdd_file: str | Path, check: str, patch_file: str | Path
+) -> dict[str, Any]:
+    """P1-2 channel ①: fix a whitelisted mechanical gate failure without paying a review round.
+
+    The exception is bounded by code, not by trust: the declared check must actually have failed
+    in the latest gate, the body must still match the verdict's snapshot byte for byte (ledger
+    stripped), the diff may only delete lines, and every deleted line must satisfy the declared
+    check's predicate -- mirror rows for ``ledger-matches-state``, whole-line markers of APPLIED
+    entries outside fences and the generated ledger for ``markers-match-confirmations``.  The
+    verdict's digest is then rebound to the patched body and the touched sections are credited
+    into both the last verdict's and the last FULL verdict's snapshots (the coverage proof
+    baselines on the latter), so the coverage proof stays honest even on an incremental delivery
+    round.  Anything outside the whitelist keeps the old price: a landing rewind and a fresh
+    review.
+    """
+    path, state = load_state(state_path)
+    if state["stage"] != "DELIVERY":
+        raise ControllerError("apply-mechanical-patch runs at DELIVERY, after a gate refusal")
+    if check not in MECHANICAL_PATCH_CHECKS:
+        raise ControllerError(
+            f"check '{check}' is not patchable; the whitelist is {', '.join(MECHANICAL_PATCH_CHECKS)} "
+            "-- anything else goes through the landing rewind and a fresh review"
+        )
+    if not state["reviews"]:
+        raise ControllerError("no review verdict exists to rebind")
+    tdd = Path(tdd_file).expanduser().resolve()
+    if tdd != Path(state["output_document"]["absolute"]).resolve():
+        raise ControllerError("the patch must target the run's frozen output document")
+    last = state["reviews"][-1]
+    if _document_digest(tdd) != last["tdd_digest"]:
+        raise ControllerError(
+            "the body changed after the verdict; a mechanical patch may only delete the "
+            "whitelisted defect lines -- use the landing rewind (start-stage --to REFINER) instead"
+        )
+    text = _read_document(tdd, "TDD")
+    lines = text.splitlines()
+    patch_text = _read_document(Path(patch_file), "mechanical patch")
+    new_text, deleted = _apply_deletion_only_diff(text, patch_text)
+    if check == "ledger-matches-state":
+        allowed = set(_handwritten_mirror_lines(lines, _ledger_blocks(lines)))
+        if not allowed:
+            raise ControllerError("no hand-written Finding table found to delete")
+        offenders = [index for index in deleted if index not in allowed]
+        if offenders:
+            raise ControllerError(
+                f"the patch deletes non-mirror lines: {[index + 1 for index in offenders][:5]}"
+            )
+    else:
+        # The gate's marker predicate ignores fenced and generated-ledger text (example content
+        # in both directions); the patch must ignore it too, or a line the gate never flagged
+        # could be deleted through the channel and laundered into a reviewed edit.
+        fenced = _fence_line_mask(lines)
+        generated = _ledger_line_mask(lines)
+        applied_norms = {
+            _norm_question(item["question"])
+            for item in state.get("confirmations") or []
+            if item.get("applied")
+        }
+        for index in deleted:
+            if index in fenced or index in generated:
+                raise ControllerError(
+                    f"line {index + 1}: fenced or generated-ledger text is example content the "
+                    "gate never flagged; a mechanical patch may only delete lines the declared "
+                    "check actually refuses"
+                )
+            stripped = lines[index].strip()
+            if not CONFIRMATION.fullmatch(stripped):
+                raise ControllerError(
+                    f"line {index + 1}: only a whole-line [需人工确认: ...] marker may be deleted"
+                )
+            found = _document_markers(stripped)
+            if len(found) != 1 or found[0][0] not in applied_norms:
+                raise ControllerError(
+                    f"line {index + 1}: the marker's entry is not APPLIED; an open question's "
+                    "marker may not be deleted -- answer it or register the entry instead"
+                )
+    # A patch fixes a refusal, not a hypothetical one: the declared check must actually have
+    # failed in the latest gate report.  Without this, a passing (or never-run) gate could still
+    # see body lines deleted through the channel.
+    latest_gate = state["gates"][-1] if state["gates"] else None
+    refused = latest_gate and next(
+        (item for item in latest_gate["checks"] if item["name"] == check and not item["ok"]),
+        None,
+    )
+    if not refused:
+        raise ControllerError(
+            f"the latest gate did not refuse '{check}'; a mechanical patch fixes a reported "
+            "failure -- run gate first and patch only the check it actually failed"
+        )
+    # Which sections the deletion touches, measured on the pre-patch index: the credit below
+    # exempts exactly these from the coverage proof, and nothing else.
+    pre_index = _fresh_index(path, state, tdd)
+    touched = sorted({
+        item["key"]
+        for item in pre_index["sections"]
+        if any(item["start"] - 1 <= index <= item["end"] - 1 for index in deleted)
+    })
+    tdd.write_text(new_text, encoding="utf-8")
+    last["tdd_digest"] = _document_digest(tdd)
+    index = _fresh_index(path, state, tdd)
+    by_key = {item["key"]: item["digest"] for item in index["sections"]}
+    # Credit every snapshot the coverage proof may baseline on: the last verdict's own, and the
+    # last FULL verdict's.  _incremental_coverage diffs against the latter, so when the delivery
+    # round is the incremental re-review exception, crediting only reviews[-1] would turn a
+    # patchable defect into an "unreviewed section" BLOCKED.  Only the touched sections are
+    # credited -- any other unreviewed change still fails coverage.
+    targets = [last]
+    last_full = next(
+        (item for item in reversed(state["reviews"]) if item.get("scope") == "full"), None
+    )
+    if last_full is not None and last_full is not last:
+        targets.append(last_full)
+    for verdict in targets:
+        stored = verdict.get("section_snapshot")
+        if not stored:
+            continue
+        snapshot = path.parent / stored
+        payload = json.loads(snapshot.read_text(encoding="utf-8"))
+        digests = payload.get("digests") or {}
+        for key in touched:
+            if key in by_key:
+                digests[key] = by_key[key]
+        payload["digests"] = digests
+        payload["tdd_digest"] = last["tdd_digest"]
+        _atomic_json(snapshot, payload)
+    credited = touched
+    entry = {
+        "check": check,
+        "deleted_lines": len(deleted),
+        "sections_credited": credited,
+        "patch_digest": _text_digest(patch_text),
+        "at": _now(),
+    }
+    state.setdefault("mechanical_patches", []).append(entry)
+    _save(path, state)
+    return entry
+
+
+def deliver(state_path: str | Path, tdd_file: str | Path) -> dict[str, Any]:
+    """Run the fixed delivery sequence: render-ledger -> gate -> render-ledger -> CLOSED.
+
+    The sequence is the one ``show --next`` already quotes; this face only saves the
+    round-trips.  From REVIEW it first walks ``start-stage --to DELIVERY`` (the same evidence
+    door the manual path passes); from DELIVERY it retries the sequence directly.  A BLOCKED
+    gate stops the chain right there -- no second render, no CLOSED -- and the gate report is
+    returned verbatim so the refusal is the same one the manual gate call would print.
+    """
+    path, state = load_state(state_path)
+    if state["stage"] == "REVIEW":
+        start_stage(path, "DELIVERY")
+    elif state["stage"] != "DELIVERY":
+        raise ControllerError(
+            f"deliver runs from REVIEW or DELIVERY; the current stage is {state['stage']}"
+        )
+    first = render_ledger(state_path, tdd_file)
+    report = gate(state_path, tdd_file)
+    if report["status"] == "BLOCKED":
+        return {"status": "BLOCKED", "gate": report}
+    second = render_ledger(state_path, tdd_file)
+    closed = start_stage(state_path, "CLOSED")
+    return {
+        "status": report["status"],
+        "gate_status": report["status"],
+        "warnings": report["warnings"],
+        "rendered": second["rendered"],
+        "closed": closed,
+        "first_render": first["rendered"],
+    }
+
+
 def _cached_index(state_path: Path) -> dict[str, Any] | None:
     """The index file as it stands on disk, without reading or rebuilding the TDD.
 
@@ -4386,7 +5015,18 @@ def _cached_index(state_path: Path) -> dict[str, Any] | None:
         return None
     try:
         index = json.loads(cached.read_text(encoding="utf-8"))
-        return {**_index_summary(index), "path": str(cached)}
+        return {
+            **_index_summary(index),
+            "path": str(cached),
+            # P1-3 per-section signal, derived from the same on-disk index read: chapters past
+            # LARGE_SECTION_LINES are the compression targets.  Kept here so ``show`` does not
+            # open the index file a second time.
+            "large_sections": [
+                f"{item['key']}:{item['end'] - item['start'] + 1}"
+                for item in index.get("sections", [])
+                if item["end"] - item["start"] + 1 > LARGE_SECTION_LINES
+            ],
+        }
     except (OSError, ValueError, KeyError, TypeError):
         return {"status": "unreadable", "path": str(cached)}
 
@@ -4721,7 +5361,15 @@ def show(state_path: str | Path, next_only: bool = False) -> dict[str, Any]:
             ],
         },
         "context_window": state.get("context_window") or DEFAULT_CONTEXT_WINDOW,
-        "doc_index": _cached_index(path),
+        "doc_index": (index := _cached_index(path)),
+        # P1-3 per-section signal: chapters past LARGE_SECTION_LINES are the compression targets
+        # the Refiner should rewrite rather than append to.  Cheap enough to keep in the compact
+        # summary -- it is a handful of keys, not the full index.
+        "large_sections": (index or {}).get("large_sections", []),
+        "growth_waivers": [
+            f"{item['finding_id']}@r{item['round']}"
+            for item in state.get("growth_waivers") or []
+        ],
     }
 
 
@@ -4760,6 +5408,19 @@ def _fixer_commands(sub: argparse._SubParsersAction) -> None:
     source.add_argument("--revision", default="")
     source.add_argument("--summary", required=True)
     source.add_argument("--confidence", required=True, choices=CONFIDENCES)
+
+    sources_batch = sub.add_parser(
+        "record-sources",
+        help="register a whole JSON manifest of frozen inputs in one atomic call",
+    )
+    sources_batch.add_argument("--state", required=True)
+    sources_batch.add_argument(
+        "--from-file",
+        required=True,
+        dest="file",
+        help="JSON array of items with source_id/kind/locator/status/summary/confidence "
+        "(revision optional); any invalid item refuses the whole batch without touching state",
+    )
 
     finalize = sub.add_parser("finalize-inputs", help="set input_status")
     finalize.add_argument("--state", required=True)
@@ -4808,6 +5469,24 @@ def _fixer_commands(sub: argparse._SubParsersAction) -> None:
     artifact.add_argument("--role", default=None)
     artifact.add_argument("--round", type=int, default=None, dest="round_override")
 
+    settle = sub.add_parser(
+        "settle-agent",
+        help="close one dispatch and optionally register its artifact and @@FIND/@@FIX report",
+    )
+    settle.add_argument("--state", required=True)
+    settle.add_argument("--session-id", required=True)
+    settle.add_argument("--status", default="COMPLETED", choices=("COMPLETED", "ABORTED", "BLOCKED"))
+    settle.add_argument(
+        "--artifact",
+        default=None,
+        help="<kind>:<absolute path>, registered through the same write-artifact checks",
+    )
+    settle.add_argument(
+        "--register",
+        default=None,
+        help="role report file; @@FIND walks record-findings, @@FIX walks record-fixes",
+    )
+
     finding = sub.add_parser(
         "record-finding",
         help="add one Critic or Reviewer finding (a whole report: record-findings)",
@@ -4819,6 +5498,12 @@ def _fixer_commands(sub: argparse._SubParsersAction) -> None:
     finding.add_argument("--location", required=True)
     finding.add_argument("--evidence", required=True)
     finding.add_argument("--must-fix", choices=("true", "false"), default=None)
+    finding.add_argument(
+        "--gap-ref",
+        default=None,
+        help="inherent-gap citation: CONF-<NNN> (must exist in the ledger) or PRD:<section>; "
+        "only valid on a non-blocking finding",
+    )
     finding.add_argument("--round", type=int, default=None, dest="round_override")
 
     findings_batch = sub.add_parser(
@@ -4906,6 +5591,40 @@ def _fixer_commands(sub: argparse._SubParsersAction) -> None:
     gate_cmd = sub.add_parser("gate", help="run the deterministic delivery gate")
     gate_cmd.add_argument("--state", required=True)
     gate_cmd.add_argument("--tdd-file", required=True)
+    gate_cmd.add_argument(
+        "--verbose",
+        action="store_true",
+        help="print every check with its detail; the default keeps failures/warnings in full "
+        "and reduces the passing checks to their names",
+    )
+
+    delivery = sub.add_parser(
+        "deliver",
+        help="run the fixed delivery sequence: render-ledger -> gate -> render-ledger -> CLOSED",
+    )
+    delivery.add_argument("--state", required=True)
+    delivery.add_argument("--tdd-file", required=True)
+
+    mech_patch = sub.add_parser(
+        "apply-mechanical-patch",
+        help="fix a whitelisted mechanical gate failure by verified deletion-only patch, "
+        "without paying a review round",
+    )
+    mech_patch.add_argument("--state", required=True)
+    mech_patch.add_argument("--tdd-file", required=True)
+    mech_patch.add_argument("--check", required=True, choices=MECHANICAL_PATCH_CHECKS)
+    mech_patch.add_argument(
+        "--patch", required=True, help="unified diff file; only deletion lines are accepted"
+    )
+
+    waive = sub.add_parser(
+        "waive-growth",
+        help="record a Reviewer adjudication that unattributed body growth past the hard "
+        "threshold is justified (DELIVERY only, cites a latest-round REVIEWER finding)",
+    )
+    waive.add_argument("--state", required=True)
+    waive.add_argument("--finding-id", required=True, dest="finding_id")
+    waive.add_argument("--reason", required=True)
 
     ledger = sub.add_parser(
         "render-ledger", help="write the chapter 16 blocks from state.json"
@@ -4954,6 +5673,11 @@ def _fixer_commands(sub: argparse._SubParsersAction) -> None:
         help="skip the summary and print only the one command this run is waiting on, "
         "already carrying the arguments it needs",
     )
+    shown.add_argument(
+        "--verbose",
+        action="store_true",
+        help="include the full doc index in the summary; the default reports its section count only",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -4977,6 +5701,11 @@ def main(argv: list[str] | None = None) -> int:
                 args.state, args.source_id, args.kind, args.locator,
                 args.status, args.revision, args.summary, args.confidence,
             ), ensure_ascii=False))
+        elif args.command == "record-sources":
+            report = record_sources(args.state, args.file)
+            print(json.dumps(report, ensure_ascii=False))
+            if report["status"] == "PARTIAL":
+                return 2
         elif args.command == "finalize-inputs":
             print(json.dumps(
                 finalize_inputs(args.state, args.status, args.reason, args.prd_changes),
@@ -5005,12 +5734,18 @@ def main(argv: list[str] | None = None) -> int:
                 write_artifact(args.state, args.kind, args.file, args.role, args.round_override),
                 ensure_ascii=False,
             ))
+        elif args.command == "settle-agent":
+            report = settle_agent(args.state, args.session_id, args.status, args.artifact, args.register)
+            print(json.dumps(report, ensure_ascii=False))
+            if report.get("status") == "PARTIAL":
+                return 2
         elif args.command == "record-finding":
             must_fix = None if args.must_fix is None else args.must_fix == "true"
             print(json.dumps(
                 record_finding(
                     args.state, args.source, args.finding_id, args.severity,
                     args.location, args.evidence, must_fix, args.round_override,
+                    args.gap_ref,
                 ),
                 ensure_ascii=False,
             ))
@@ -5069,11 +5804,45 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(dump(args.state, args.finding_id, args.fields), ensure_ascii=False))
         elif args.command == "gate":
             report = gate(args.state, args.tdd_file)
-            print(json.dumps(report, ensure_ascii=False, indent=2))
+            if args.verbose:
+                printed = report
+            else:
+                # The passing checks collapse to names (already in ``passed``); the failing
+                # ones keep their full detail, because that detail is what the orchestrator
+                # acts on.  The stored report stays complete either way.
+                printed = {
+                    key: value for key, value in report.items() if key != "checks"
+                }
+                printed["failed_checks"] = [item for item in report["checks"] if not item["ok"]]
+            print(json.dumps(printed, ensure_ascii=False, indent=2 if args.verbose else None))
             if report["status"] == "BLOCKED":
                 return 2
+        elif args.command == "deliver":
+            report = deliver(args.state, args.tdd_file)
+            print(json.dumps(report, ensure_ascii=False))
+            if report["status"] == "BLOCKED":
+                return 2
+        elif args.command == "apply-mechanical-patch":
+            print(json.dumps(
+                apply_mechanical_patch(args.state, args.tdd_file, args.check, args.patch),
+                ensure_ascii=False,
+            ))
+        elif args.command == "waive-growth":
+            print(json.dumps(
+                waive_growth(args.state, args.finding_id, args.reason), ensure_ascii=False
+            ))
         elif args.command == "show":
             payload = show(args.state, args.next_only)
+            if not args.next_only and not args.verbose:
+                # The full section index is the one bulky field in the summary; the count is
+                # what a status check needs, and `index`/`locate` serve the rest on demand.
+                index = payload.get("doc_index")
+                payload = dict(payload)
+                payload["doc_index"] = (
+                    {"sections": index["sections"], "present": True}
+                    if index and "sections" in index
+                    else index
+                )
             # ``--next`` is the one face called dozens of times per run for a five-line answer,
             # so it skips the indent the full summary pays for.
             print(json.dumps(payload, ensure_ascii=False, indent=None if args.next_only else 2))
