@@ -25,6 +25,7 @@
 - `settle-task` — 判定：范围检查 + `VALIDATING → PASS|FAILED`
 - `record-validation` — 登记一条验证证据（命令、退出码、证据、工作树指纹）
 - `record-validations` — 从 JSON 文件批量登记整轮验证（一次状态写入）
+- `reuse-validation` — 同一工作树下复用任务级 PASS 证据为整体证据（P1-3 提效，机械边界）
 - `record-failure` — 登记一次失败归属（根因 + 错误指纹）
 - `record-failures` — 从 JSON 文件批量登记多次失败归属（一次状态写入）
 - `replan` — 推进计划版本并取代未完成的旧版本任务
@@ -37,7 +38,7 @@
 ## 命令
 
 - `init --repo-root <path> --feature-directory <path> --run-id <id> [--allow-lossy-decoding]` — 校验三份文档、记录 Base SHA/分支/digest/预存快照，建立 `.codekit/code-impl/<run-id>/`；返回 `state.json` 路径。运行目录已存在时拒绝（resume 而非覆盖）；文档非 UTF-8 时给出检测到的编码。
-- `validate-contract --kind <kind> <path>` — 机械校验契约文件；`--kind` 取 `input|task-contract|task-dag|failure|handoff`。退出码非 0 不得继续。
+- `validate-contract --kind <kind> <path>` — 机械校验契约文件；`--kind` 取 `input|task-contract|task-dag|failure|handoff`。退出码非 0 不得继续。handoff 的 `review_mode` 取 `FULL|DELTA`；DELTA 必须携带 `delta_recheck`（上一轮 FULL 报告路径+digest、非空 `repaired_findings`，每项的 `finding_id` 必须是上轮报告的阻塞 Finding 且带非空 `locations`）。
 - `record-agent --state <s> --role <r> --name <n> --session-id <id> --input-digest <d> --status <st>` — 登记/收口 Agent；`--status` 只接受 `RUNNING|DONE|ARCHIVED|FAILED|BLOCKED`，**不接受结论值**（`APPROVE` 之类走 `record-review`）。同一 session 的角色名与 digest 不可变更。
 - `record-task --state <s> --task-id <id> --allowed-file <rel> [--plan-version <n>]` — 登记任务与写入范围（`--allowed-file` 可重复）；`--plan-version` 默认当前版本，重规划后必须显式传新版本。
 - `record-tasks --state <s> --from-dag <path>` — 校验并一次登记整份 DAG，返回 `registered/already_present/tasks_total`；幂等，任何一条不合法则整份不写入。
@@ -46,16 +47,17 @@
 - `check-scope --state <s> --task-id <id>` — 任务绑定范围检查，授权集合由控制器推导（本任务范围 ∪ 已 PASS 任务范围），不接受调用方声明文件；只诊断、不改状态，返回有界摘要。
 - `expand-scope --state <s> --task-id <id> --add-file <rel> --reason <why>` — 扩充非终态任务的写入范围（`--add-file` 可重复）；理由进台账与报告。终态任务不可扩权。
 - `settle-task --state <s> --task-id <id> --status PASS|FAILED [--error-fingerprint <fp>] [--note <t>]` — 先推进到 `VALIDATING`，执行一次范围检查并落盘，再落定结论。`PASS` 在范围 BLOCKED 时被拒（停在 `VALIDATING`）；`FAILED` 必须带指纹（重试预算的唯一键）。
-- `record-validation --state <s> --scope task|overall --name <n> --command <cmd> --cwd <dir> --result PASS|FAIL|NOT_RUN [--task-id <id>] [--exit-code <n>] [--evidence <t>|--evidence-file <path>] [--not-run-reason <t>]` — 登记一条证据并绑定当前工作树指纹。`PASS` 须 `--exit-code 0` 且有证据；`FAIL` 须非 0；`NOT_RUN` 须理由且不带退出码。整体验证不接受 `--task-id`。
-- `record-validations --state <s> --from-file <path>` — 批量面：一次登记整轮验证（步骤 12 的全量测试/编译/Lint/契约/Migration/构建）。文件为 `{"validations": [...]}` 或裸数组，字段与 `record-validation` 同名（`scope`/`name`/`command`/`cwd`/`exit_code`/`result`/`task_id`/`evidence`/`evidence_file`/`not_run_reason`/`started_at`/`finished_at`）。逐条仍走同一套规则；任一条不合法则**整份拒绝**并点名 `validations[N]`，状态文件不变。整批共用一次工作树指纹。
+- `record-validation --state <s> --scope task|overall --name <n> --command <cmd> --cwd <dir> --result PASS|FAIL|NOT_RUN [--task-id <id>] [--exit-code <n>] [--evidence <t>|--evidence-file <path>] [--not-run-reason <t>]` — 登记一条证据并绑定当前工作树指纹；整轮登记用 `record-validations`，本单条面用于轮中即时登记。`PASS` 须 `--exit-code 0` 且有证据；`FAIL` 须非 0；`NOT_RUN` 须理由且不带退出码。整体验证不接受 `--task-id`。
+- `record-validations --state <s> --from-file <path>` — 批量面：一次登记一整轮验证（步骤 07 的任务级格式/编译/单测/Lint/静态检查，或步骤 12 的整体全量测试/编译/Lint/契约/Migration/构建）；`scope=task` 的条目必须带 `task_id`。文件为 `{"validations": [...]}` 或裸数组，字段与 `record-validation` 同名（`scope`/`name`/`command`/`cwd`/`exit_code`/`result`/`task_id`/`evidence`/`evidence_file`/`not_run_reason`/`started_at`/`finished_at`）。逐条仍走同一套规则；任一条不合法则**整份拒绝**并点名 `validations[N]`，状态文件不变。整批共用一次工作树指纹。
+- `reuse-validation --state <s> --source-index <n> --name <n>` — P1-3 提效：把第 n 条（1 基）任务级验证复用为一条 `scope=overall` 的 PASS 记录，免重跑同一命令。机械边界全部由脚本执行：源必须是 `scope=task` 且 `result=PASS`（不得是整体记录，禁止复用链）；源的 `command` 与解析后 `cwd` 必须逐字命中 `record-tasks --from-dag` 登记的 `overall_validation` 计划条目；当前工作树 `head_sha`/`diff_digest` 必须与源记录采集时完全一致。新记录带 `reused_from`（源索引/任务/时间），`show` 的 `review.reused_validations` 计数，最终报告必须披露复用了几项。
 - `record-failure --state <s> --failure-scope task|overall --root-cause <rc> --error-fingerprint <fp> [--impacted-task-id <id>]` — 登记失败归属；整体失败无 `--impacted-task-id` 时记录 `BLOCKED_MISSING_TASK_MAPPING`，多任务影响记 `REPLAN_MULTI_TASK_IMPACT`（须 `replan`）。同一指纹按归一化形式计数，第 5 次出现强制 `human_intervention`。
 - `record-failures --state <s> --from-file <path>` — 批量面：文件为 `{"failures": [...]}` 或裸数组，字段 `failure_scope`/`impacted_task_ids`/`root_cause`/`error_fingerprint`。逐条走同一套规则，坏条目点名 `failures[N]` 并整份拒绝；批内同指纹按先后顺序正确累计出现次数（预算不会因批量而失效）。
 - `replan --state <s> --new-plan-version <n>` — 递增计划版本，把旧版本中 `PENDING|READY|FAILED|BLOCKED` 的任务标为 `SUPERSEDED`（`RUNNING`/`VALIDATING` 须先处理完），重算 `authorized_files` 只保留 PASS 任务范围；返回 `superseded_tasks` 与单独列出的 `superseded_blocked`。
 - `freeze-review --state <s>` — 冻结审查快照（写 `review-snapshot.json`）；最多 `MAX_REVIEW_FREEZES=3` 次（首次 + 2 轮审查修复），第 4 次被拒并须进入步骤 17。
-- `record-review --state <s> --verdict <v> --report-path <p> --validator-exit-code <n> [--summary <t>]` — 登记审查结论，绑定最后一次冻结的 Diff 指纹；`--verdict` 取 `APPROVE|APPROVE_WITH_FOLLOW_UPS|REQUEST_CHANGES|BLOCKED`。未冻结或报告文件不存在时拒绝。
+- `record-review --state <s> --verdict <v> --report-path <p> --validator-exit-code <n> [--summary <t>] [--review-mode FULL|DELTA]` — 登记审查结论，绑定最后一次冻结的 Diff 指纹；`--verdict` 取 `APPROVE|APPROVE_WITH_FOLLOW_UPS|REQUEST_CHANGES|BLOCKED`。未冻结或报告文件不存在时拒绝。`--review-mode` 默认 FULL；DELTA 增量复核轮只允许紧跟在一轮 FULL 的 `REQUEST_CHANGES` 之后（首轮必须 FULL、DELTA 不得连续），DELTA 轮不得登记 `APPROVE`；登记时读报告 JSON 交叉校验 `review_context.review_mode`（null 视同 FULL）与声明一致，DELTA 报告改标 FULL 会被拒；交付轮必须 FULL（由 `gate` 的 `review-delivery-round-full` 兜底）。
 - `render-ledger --state <s> [--output <path>] [--print]` — 从 `state.json` 渲染 `task-ledger.md` 托管块（幂等，保留块外手写内容，块内不得手写）；脚注含验证/失败/范围检查/冻结/作废计数。
 - `show --state <s> [--tasks]` — 有界视图：阶段、任务状态分布、未完成/未收口（`open_agents` 列出仍为 `RUNNING` 的 `role@session`）、预算（冻结次数、prose 重试数、作废派发数）、验证与失败计数、三份文档是否漂移（`drifted_materials`）。**会话中断后恢复以此为准**；`--tasks` 追加每行一条台账行。
-- `gate --state <s> [--mode enforce|warn-only]` — 逐条核对交付条件（当前计划任务全 PASS、任务级/整体验证齐备且与冻结指纹一致、审查结论可交付且绑定最后一次冻结、报告文件在位、**所有派发已收口**、最终范围干净），写 `gate-report.json`；退出码 2 = 不得宣称编码完成。`warn-only` 仅供排障，返回体仍标 `BLOCKED`。
+- `gate --state <s> [--mode enforce|warn-only]` — 逐条核对交付条件（当前计划任务全 PASS、任务级/整体验证齐备且与冻结指纹一致、审查结论可交付且绑定最后一次冻结、**交付轮必须是 FULL 审查**（`review-delivery-round-full`）、报告文件在位、**所有派发已收口**、最终范围干净），写 `gate-report.json`；退出码 2 = 不得宣称编码完成。`warn-only` 仅供排障，返回体仍标 `BLOCKED`。
 
 ## 预算（机械执行，不由主控自评）
 

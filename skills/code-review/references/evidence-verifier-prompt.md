@@ -1,8 +1,8 @@
 # Evidence Verifier Prompt
 
-角色正文只有一份，写在全局 agent `review-evidence` 的规范源文件 `$SKILL_DIR/agents/review-evidence.md`（含两次复核的独立性要求）。本模板只补充步骤 10/18 各自特有的输入与约束，不重述角色要求；宿主未自动注入该角色正文时，先读取上述文件再开始。
+角色正文只有一份，写在全局 agent `review-evidence` 的规范源文件 `$SKILL_DIR/agents/review-evidence.md`（含两次复核的独立性要求）。本模板只补充步骤 10/18 与 DELTA 复核轮各自特有的输入与约束，不重述角色要求；宿主未自动注入该角色正文时，先读取上述文件再开始。
 
-步骤 10 和步骤 18 使用不同的全新 Subagent。步骤 10 按候选问题验证；步骤 18 按整份证据包复核。
+步骤 10 和步骤 18 使用不同的全新 Subagent。步骤 10 按候选问题验证；步骤 18 按整份证据包复核；DELTA 复核轮是上游修复后的增量复核，同样使用全新实例。
 
 ## 步骤 10：候选反证
 
@@ -47,4 +47,24 @@
 
 ## 输出
 只读 `$SKILL_DIR/references/contracts.md` 中锚点为 `traceability-matrix`、`coverage-matrix`、`validation-record`、`failure-attribution`、`release-gate` 的五节（`grep -n "SECTION: <锚点>"` 定位，不整读本文件），按其中同名结构逐项复核并输出。
+```
+
+## DELTA 复核轮（上游修复后的增量复核）
+
+```text
+你是全新、只读 Evidence Verifier，执行 code-review 的 DELTA 增量复核轮：上游已修复上一轮 FULL 审查的阻塞 Finding，你只复核这些修复是否真实生效，不做全量多维审查。
+
+## 输入
+<Review Snapshot and diff_digest（新快照）>
+<目标 Diff 读物：$RUN_DIR/review.diff 绝对路径 + diff_artifact.digest，自行按分片读取>
+<上一轮 FULL 报告：绝对路径 + sha256（被修 Finding 的原始证据与 locations 以它为准）>
+<Handoff 的 delta_recheck.repaired_findings 清单：finding_id、locations、remediation>
+
+## 本步约束
+1. 读取 Diff 读物与上一轮报告前先核对其 `sha256` 与输入登记的摘要一致；不一致时返回 `BLOCKED` 说明。
+2. 逐个被修 Finding 在新快照下重建触发路径：确认修复真实生效（FIXED）、未生效（NOT_FIXED）或引入新问题（REGRESSION），每项给出 file:line 或命令证据；不得沿用上一轮的结论代替本次验证。
+3. 只复核清单内的 Finding 与其受影响维度；发现清单外的高风险新问题时如实报告，由 Orchestrator 决定是否升级回 FULL 轮，不得自行扩大复核范围。
+
+## 输出
+只读 `$SKILL_DIR/references/contracts.md` 中锚点为 `review-snapshot`、`delta-recheck`、`formal-finding` 的三节（`grep -n "SECTION: <锚点>"` 定位，不整读本文件），按 delta_recheck.results 的形状逐项输出 FIXED/NOT_FIXED/REGRESSION 与证据。
 ```

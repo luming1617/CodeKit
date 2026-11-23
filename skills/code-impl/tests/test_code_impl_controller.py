@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -254,6 +255,63 @@ class ControllerTests(unittest.TestCase):
             # PASS with a non-zero exit code is the exact claim the gate exists to stop
             {"scope": "overall", "name": "compile", "command": "tsc --noEmit",
              "cwd": str(self.repo), "exit_code": 1, "result": "PASS", "evidence": "looks fine"},
+        ]}, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_validations_from_file(state_path, batch)
+        self.assertIn("validations[2] rejected", str(ctx.exception))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["validations"], [])
+
+    def test_task_round_batch_is_equivalent_to_single_records(self) -> None:
+        """P0 提效：任务级整轮批量与逐条单记的台账终态必须一致（除时间戳）。
+
+        批量面不是更松的门：同一工作树下，两种登记方式产出的 validations
+        除 recorded_at 外逐字段相等，指纹绑定与单条面完全一致。
+        """
+        entries = [
+            {"scope": "task", "task_id": "T01", "name": "unit", "command": "pytest -q",
+             "cwd": str(self.repo), "exit_code": 0, "result": "PASS", "evidence": "3 passed"},
+            {"scope": "task", "task_id": "T01", "name": "lint", "command": "ruff check .",
+             "cwd": str(self.repo), "exit_code": 1, "result": "FAIL", "evidence": "E501"},
+            {"scope": "task", "task_id": "T01", "name": "mypy", "command": "mypy src",
+             "cwd": str(self.repo), "exit_code": None, "result": "NOT_RUN",
+             "not_run_reason": "toolchain missing"},
+        ]
+        single_path = controller.init_run(self.repo, self.feature, "run-eq-single")
+        batch_path = controller.init_run(self.repo, self.feature, "run-eq-batch")
+        for path in (single_path, batch_path):
+            controller.record_task(path, "T01", ["src/a.py"])
+        for entry in entries:
+            controller.record_validation(
+                single_path, entry["scope"], entry["name"], entry["command"], entry["cwd"],
+                entry["exit_code"], entry["result"], task_id=entry["task_id"],
+                evidence=entry.get("evidence"), not_run_reason=entry.get("not_run_reason"),
+            )
+        # 批量文件放在仓库外：写进工作树会改变指纹，那正是指纹绑定要拦的事，
+        # 不属于两种登记方式的差异。
+        batch = Path(self.temp.name).parent / "task-round.json"
+        batch.write_text(json.dumps({"validations": entries}, ensure_ascii=False), encoding="utf-8")
+        try:
+            controller.record_validations_from_file(batch_path, batch)
+        finally:
+            batch.unlink(missing_ok=True)
+
+        def without_timestamps(path: Path) -> list[dict]:
+            records = json.loads(path.read_text(encoding="utf-8"))["validations"]
+            return [{k: v for k, v in record.items() if k != "recorded_at"} for record in records]
+
+        self.assertEqual(without_timestamps(single_path), without_timestamps(batch_path))
+
+    def test_task_batch_with_unregistered_task_rejects_the_whole_file(self) -> None:
+        """任务级批量的对抗面：未登记任务的条目必须整份拒绝，不留半轮证据。"""
+        state_path = controller.init_run(self.repo, self.feature, "run-bv3")
+        controller.record_task(state_path, "T01", ["src/a.py"])
+        batch = self.repo / "bad-task.json"
+        batch.write_text(json.dumps({"validations": [
+            {"scope": "task", "task_id": "T01", "name": "unit", "command": "pytest -q",
+             "cwd": str(self.repo), "exit_code": 0, "result": "PASS", "evidence": "ok"},
+            {"scope": "task", "task_id": "T404", "name": "lint", "command": "ruff check .",
+             "cwd": str(self.repo), "exit_code": 0, "result": "PASS", "evidence": "clean"},
         ]}, ensure_ascii=False), encoding="utf-8")
         with self.assertRaises(controller.ControllerError) as ctx:
             controller.record_validations_from_file(state_path, batch)
@@ -1703,6 +1761,407 @@ class ControllerTests(unittest.TestCase):
         """A manual nobody is pointed at is not a discovery face."""
         skill = (self.SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("references/controller-contract.md", skill)
+
+
+class EfficiencyRelaxationTests(unittest.TestCase):
+    """P1-1/P1-3 提效放宽的对抗面：每项放宽都必须拦得住变形输入与绕过尝试。"""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.repo = Path(self.temp.name)
+        git(self.repo, "init", "-q")
+        git(self.repo, "config", "user.email", "test@example.invalid")
+        git(self.repo, "config", "user.name", "CodeKit Test")
+        git(self.repo, "config", "gc.auto", "0")
+        (self.repo / "README.md").write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-qm", "base")
+        self.feature = self.repo / "docs" / "feature"
+        self.feature.mkdir(parents=True)
+        for name, content in {
+            "product-doc.md": "# PRD\nThe product requirement is explicit and testable.\n",
+            "technical-doc.md": "# TDD\nThe technical design defines the implementation boundary.\n",
+            "release-doc.md": "# RPD\nThe release plan defines validation and rollback steps.\n",
+        }.items():
+            (self.feature / name).write_text(content, encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    # ── P1-3: reuse-validation 的机械边界 ────────────────────────────────
+
+    def _reuse_run(self, run_id: str, *, command: str = "pytest -q", cwd: str | None = None,
+                   result: str = "PASS", with_plan: bool = True) -> Path:
+        state_path = controller.init_run(self.repo, self.feature, run_id)
+        if with_plan:
+            dag = self.repo / f"{run_id}-dag.json"
+            dag.write_text(json.dumps({
+                "tasks": [{"id": "T01", "objective": "impl", "allowed_write_files": ["src/a.py"],
+                           "depends_on": []}],
+                "requirement_trace": [
+                    {"source": "product_requirements", "requirement": "r", "covered_by": ["T01"]}
+                ],
+                "overall_validation": [
+                    {"command": "pytest -q", "cwd": ".", "proves": "full suite", "required": True}
+                ],
+                "unresolved": [],
+            }, ensure_ascii=False), encoding="utf-8")
+            controller.record_tasks_from_dag(state_path, dag)
+        else:
+            controller.record_task(state_path, "T01", ["src/a.py"])
+        kwargs: dict = {"evidence": "3 passed"} if result == "PASS" else {}
+        if result == "FAIL":
+            kwargs = {"evidence": "1 failed"}
+        if result == "NOT_RUN":
+            kwargs = {"not_run_reason": "toolchain missing"}
+        controller.record_validation(
+            state_path, "task", "unit", command, cwd or str(self.repo),
+            0 if result == "PASS" else (1 if result == "FAIL" else None),
+            result, task_id="T01", **kwargs,
+        )
+        return state_path
+
+    def test_reuse_validation_registers_overall_pass_with_provenance(self) -> None:
+        state_path = self._reuse_run("run-reuse-ok")
+        outcome = controller.reuse_validation(state_path, 1, "全量测试")
+        self.assertEqual(outcome["reused_from"], 1)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        record = state["validations"][-1]
+        self.assertEqual(record["scope"], "overall")
+        self.assertEqual(record["result"], "PASS")
+        self.assertEqual(record["reused_from"]["task_id"], "T01")
+        # 复用证据与源描述同一棵树：指纹必须相等，gate 的新鲜度判据才成立
+        self.assertEqual(record["diff_digest"], state["validations"][0]["diff_digest"])
+        self.assertEqual(controller.show(state_path)["review"]["reused_validations"], 1)
+
+    def test_reuse_rejects_changed_tree(self) -> None:
+        state_path = self._reuse_run("run-reuse-drift")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "a.py").write_text("edited after task validation\n", encoding="utf-8")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.reuse_validation(state_path, 1, "全量测试")
+        self.assertIn("working tree changed", str(ctx.exception))
+
+    def test_reuse_rejects_fail_and_not_run_sources(self) -> None:
+        for result in ("FAIL", "NOT_RUN"):
+            with self.subTest(result=result):
+                state_path = self._reuse_run(f"run-reuse-{result.lower()}", result=result)
+                with self.assertRaises(controller.ControllerError) as ctx:
+                    controller.reuse_validation(state_path, 1, "全量测试")
+                self.assertIn("only PASS", str(ctx.exception))
+
+    def test_reuse_rejects_overall_source_chain(self) -> None:
+        state_path = self._reuse_run("run-reuse-chain")
+        controller.reuse_validation(state_path, 1, "全量测试")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.reuse_validation(state_path, 2, "全量测试再复用")
+        self.assertIn("no reuse chains", str(ctx.exception))
+
+    def test_reuse_rejects_command_outside_overall_plan(self) -> None:
+        """任务级子集命令不得冒充整体检查：这是放宽的核心绕过面。"""
+        state_path = self._reuse_run("run-reuse-subset", command="pytest -q tests/test_t01.py")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.reuse_validation(state_path, 1, "全量测试")
+        self.assertIn("overall_validation", str(ctx.exception))
+
+    def test_reuse_rejects_whitespace_variant_of_plan_command(self) -> None:
+        state_path = self._reuse_run("run-reuse-space", command="pytest  -q")
+        with self.assertRaises(controller.ControllerError):
+            controller.reuse_validation(state_path, 1, "全量测试")
+
+    def test_reuse_rejects_cwd_mismatch(self) -> None:
+        (self.repo / "src").mkdir()
+        state_path = self._reuse_run("run-reuse-cwd", cwd=str(self.repo / "src"))
+        with self.assertRaises(controller.ControllerError):
+            controller.reuse_validation(state_path, 1, "全量测试")
+
+    def test_reuse_rejects_without_registered_plan(self) -> None:
+        state_path = self._reuse_run("run-reuse-noplan", with_plan=False)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.reuse_validation(state_path, 1, "全量测试")
+        self.assertIn("record-tasks", str(ctx.exception))
+
+    def test_reuse_rejects_out_of_range_index(self) -> None:
+        state_path = self._reuse_run("run-reuse-idx")
+        for index in (0, 99):
+            with self.subTest(index=index):
+                with self.assertRaises(controller.ControllerError):
+                    controller.reuse_validation(state_path, index, "全量测试")
+
+    # ── P1-1: DELTA handoff 与轮次谓词 ──────────────────────────────────
+
+    def _handoff(self) -> dict:
+        head_sha = controller._git(self.repo, "rev-parse", "HEAD").strip()
+        return {
+            "review_mode": "FULL",
+            "repo_root": str(self.repo),
+            "review_input": {"materials": [
+                {"kind": kind, "access": "available",
+                 "locator": str(self.feature / name)}
+                for kind, name in (("PRD", "product-doc.md"), ("TDD", "technical-doc.md"),
+                                   ("RPD", "release-doc.md"))
+            ]},
+            "snapshot": {
+                "schema_version": controller.SNAPSHOT_SCHEMA_VERSION,
+                "produced_by": controller.PRODUCED_BY,
+                "digest_scheme": controller._DIGEST_SCHEME,
+                "committed_range": None,
+                "target_id": controller._handoff_target_id(self.repo, head_sha),
+                "worktree_state": {
+                    "head_sha": head_sha,
+                    "diff_digest": "0" * 64,
+                    "changed_files": ["A:src/app.py"],
+                },
+            },
+        }
+
+    def _previous_report(self, state_path: Path, verdict: str = "REQUEST_CHANGES") -> tuple[Path, str]:
+        report = state_path.parent / "previous-review-report.json"
+        report.write_text(json.dumps({
+            "verdict": verdict,
+            "findings": [{"id": "F-001", "blocking": True}, {"id": "F-002", "blocking": False}],
+        }, ensure_ascii=False), encoding="utf-8")
+        return report, hashlib.sha256(report.read_bytes()).hexdigest()
+
+    def _delta_handoff(self, state_path: Path) -> dict:
+        report, digest = self._previous_report(state_path)
+        payload = self._handoff()
+        payload["review_mode"] = "DELTA"
+        payload["delta_recheck"] = {
+            "previous_report_path": str(report),
+            "previous_report_digest": digest,
+            "repaired_findings": [
+                {"finding_id": "F-001", "locations": ["src/app.py:1"], "remediation": "restored guard"}
+            ],
+        }
+        return payload
+
+    def test_delta_handoff_accepts_valid_recheck_block(self) -> None:
+        state_path = controller.init_run(self.repo, self.feature, "run-dh-ok")
+        controller.validate_contract(self._delta_handoff(state_path), "handoff")  # must not raise
+
+    def test_delta_handoff_requires_delta_block(self) -> None:
+        state_path = controller.init_run(self.repo, self.feature, "run-dh-noblock")
+        payload = self._handoff()
+        payload["review_mode"] = "DELTA"
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.validate_contract(payload, "handoff")
+        self.assertIn("delta_recheck", str(ctx.exception))
+
+    def test_delta_handoff_rejects_digest_mismatch(self) -> None:
+        state_path = controller.init_run(self.repo, self.feature, "run-dh-digest")
+        payload = self._delta_handoff(state_path)
+        payload["delta_recheck"]["previous_report_digest"] = "f" * 64
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.validate_contract(payload, "handoff")
+        self.assertIn("does not match", str(ctx.exception))
+
+    def test_delta_handoff_rejects_previous_not_request_changes(self) -> None:
+        state_path = controller.init_run(self.repo, self.feature, "run-dh-verdict")
+        payload = self._delta_handoff(state_path)
+        report, _ = self._previous_report(state_path, verdict="APPROVE")
+        payload["delta_recheck"]["previous_report_digest"] = hashlib.sha256(report.read_bytes()).hexdigest()
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.validate_contract(payload, "handoff")
+        self.assertIn("REQUEST_CHANGES", str(ctx.exception))
+
+    def test_delta_handoff_rejects_non_blocking_finding_id(self) -> None:
+        state_path = controller.init_run(self.repo, self.feature, "run-dh-nonblock")
+        payload = self._delta_handoff(state_path)
+        payload["delta_recheck"]["repaired_findings"][0]["finding_id"] = "F-002"
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.validate_contract(payload, "handoff")
+        self.assertIn("not a blocking finding", str(ctx.exception))
+
+    def test_delta_handoff_rejects_empty_locations_or_repaired_list(self) -> None:
+        state_path = controller.init_run(self.repo, self.feature, "run-dh-empty")
+        payload = self._delta_handoff(state_path)
+        payload["delta_recheck"]["repaired_findings"][0]["locations"] = []
+        with self.assertRaises(controller.ControllerError):
+            controller.validate_contract(payload, "handoff")
+        payload = self._delta_handoff(state_path)
+        payload["delta_recheck"]["repaired_findings"] = []
+        with self.assertRaises(controller.ControllerError):
+            controller.validate_contract(payload, "handoff")
+
+    def _review_run(self, run_id: str) -> tuple[Path, Path]:
+        state_path = controller.init_run(self.repo, self.feature, run_id)
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+        controller.record_task(state_path, "T01", ["src/app.py"])
+        controller.freeze_review(state_path)
+        report = state_path.parent / "review-report.json"
+        report.write_text(json.dumps({"verdict": "placeholder"}), encoding="utf-8")
+        return state_path, report
+
+    def test_first_review_round_must_be_full(self) -> None:
+        state_path, report = self._review_run("run-dr-first")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_review(state_path, "REQUEST_CHANGES", str(report), 0,
+                                     review_mode="DELTA")
+        self.assertIn("first review round must be FULL", str(ctx.exception))
+
+    def test_delta_requires_prior_request_changes(self) -> None:
+        state_path, report = self._review_run("run-dr-afterapprove")
+        controller.record_review(state_path, "APPROVE", str(report), 0)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_review(state_path, "APPROVE_WITH_FOLLOW_UPS", str(report), 0,
+                                     review_mode="DELTA")
+        self.assertIn("REQUEST_CHANGES", str(ctx.exception))
+
+    def test_delta_round_cannot_approve(self) -> None:
+        state_path, report = self._review_run("run-dr-approve")
+        controller.record_review(state_path, "REQUEST_CHANGES", str(report), 0)
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_review(state_path, "APPROVE", str(report), 0, review_mode="DELTA")
+        self.assertIn("cannot return APPROVE", str(ctx.exception))
+
+    def test_delta_rounds_cannot_be_consecutive(self) -> None:
+        state_path, report = self._review_run("run-dr-consec")
+        controller.record_review(state_path, "REQUEST_CHANGES", str(report), 0)
+        controller.record_review(state_path, "APPROVE_WITH_FOLLOW_UPS", str(report), 0,
+                                 review_mode="DELTA")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_review(state_path, "APPROVE_WITH_FOLLOW_UPS", str(report), 0,
+                                     review_mode="DELTA")
+        self.assertIn("consecutive", str(ctx.exception))
+
+    def test_gate_blocks_delivery_on_delta_round(self) -> None:
+        state_path, report = self._review_run("run-dr-gate")
+        controller.record_review(state_path, "REQUEST_CHANGES", str(report), 0)
+        controller.record_review(state_path, "APPROVE_WITH_FOLLOW_UPS", str(report), 0,
+                                 review_mode="DELTA")
+        blocked = controller.gate(state_path)
+        self.assertIn("review-delivery-round-full", blocked["failures"])
+        # 最终 FULL 轮后该检查放行（其余门禁项不在本用例范围）
+        controller.freeze_review(state_path)
+        controller.record_review(state_path, "APPROVE", str(report), 0)
+        after = controller.gate(state_path)
+        self.assertNotIn("review-delivery-round-full", after["failures"])
+
+    def test_delta_report_cannot_be_relabeled_full(self) -> None:
+        """对抗面：同一份 DELTA 报告不做新冻结、改标 FULL 再登记，不得绕过交付门禁。"""
+        state_path, report = self._review_run("run-dr-relabel")
+        controller.record_review(state_path, "REQUEST_CHANGES", str(report), 0)
+        report.write_text(json.dumps({
+            "verdict": "APPROVE_WITH_FOLLOW_UPS",
+            "review_context": {"review_mode": "DELTA", "documents_status": "available"},
+        }, ensure_ascii=False), encoding="utf-8")
+        controller.record_review(state_path, "APPROVE_WITH_FOLLOW_UPS", str(report), 0,
+                                 review_mode="DELTA")
+        with self.assertRaises(controller.ControllerError) as ctx:
+            controller.record_review(state_path, "APPROVE_WITH_FOLLOW_UPS", str(report), 0)
+        self.assertIn("relabeled", str(ctx.exception))
+
+    def test_matching_report_mode_is_accepted(self) -> None:
+        """交叉校验不误伤：报告声明与登记模式一致时正常入账。"""
+        state_path, report = self._review_run("run-dr-match")
+        controller.record_review(state_path, "REQUEST_CHANGES", str(report), 0)
+        report.write_text(json.dumps({
+            "verdict": "APPROVE_WITH_FOLLOW_UPS",
+            "review_context": {"review_mode": "DELTA", "documents_status": "available"},
+        }, ensure_ascii=False), encoding="utf-8")
+        outcome = controller.record_review(state_path, "APPROVE_WITH_FOLLOW_UPS", str(report), 0,
+                                           review_mode="DELTA")
+        self.assertEqual(outcome["review_mode"], "DELTA")
+
+
+class ContractAnchorDriftTests(unittest.TestCase):
+    """P0 提效：契约节锚点、角色路由表与 prompt 三方必须互相对得上。
+
+    锚点切片把“整读 contracts.md”换成按节读取；若新增契约节没被路由、
+    或 prompt 点名的锚点与路由表漂移，省 token 的读取规则就会静默失效。
+    """
+
+    SKILL_DIR = MODULE_PATH.parent.parent
+    PROMPT_ROLE = {
+        "planner-prompt.md": "Planner",
+        "implementer-prompt.md": "Implementer",
+        "debugger-prompt.md": "Debugger",
+    }
+
+    def _contracts(self) -> str:
+        return (self.SKILL_DIR / "references" / "contracts.md").read_text(encoding="utf-8")
+
+    def _defined(self, text: str) -> list[str]:
+        ids = re.findall(r"^<!-- SECTION: ([a-z0-9-]+) -->$", text, re.M)
+        self.assertEqual(len(ids), len(set(ids)), "锚点 id 必须唯一")
+        lines = text.split("\n")
+        for index, line in enumerate(lines):
+            if line.startswith("<!-- SECTION: "):
+                self.assertTrue(lines[index - 1].startswith("## "), line)
+        # 每个 fence 外的契约节标题都必须带锚点，新增节不得静默漏标。
+        in_fence = False
+        for index, line in enumerate(lines):
+            if line.startswith("```"):
+                in_fence = not in_fence
+                continue
+            if not in_fence and line.startswith("## ") and line != "## 节锚点与按角色读取":
+                self.assertTrue(
+                    lines[index + 1].startswith("<!-- SECTION: "),
+                    f"契约节缺少锚点：{line}",
+                )
+        return ids
+
+    def _used(self, text: str, defined: set[str]) -> set[str]:
+        return {anchor for anchor in defined if f"`{anchor}`" in text}
+
+    def _routes(self, text: str, defined: set[str]) -> dict[str, set[str]]:
+        table = text.split("## 节锚点与按角色读取", 1)[1].split("\n## ", 1)[0]
+        rows: dict[str, set[str]] = {}
+        for label, cells in re.findall(r"^\| ([^|]+) \| ([^|]+) \|$", table, re.M):
+            rows.setdefault(label.strip(), set()).update(self._used(cells, defined))
+        return rows
+
+    def test_every_anchor_is_routed_and_no_route_is_invented(self) -> None:
+        text = self._contracts()
+        defined = self._defined(text)
+        self.assertEqual(len(defined), 15)
+        routed: set[str] = set()
+        for anchors in self._routes(text, set(defined)).values():
+            routed |= anchors
+        self.assertEqual(routed, set(defined), "有契约节没被任何角色路由，等于没人读它")
+        skill = (self.SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        self.assertTrue(self._used(skill, set(defined)), "SKILL.md 必须点名主 Agent 自己读哪几节")
+
+    def test_skill_phase_mapping_matches_the_routing_table(self) -> None:
+        """SKILL.md 的“NN–NN 读 …”必须与路由表 Orchestrator 行逐阶段相等。
+
+        只查“提到任意锚点”的弱断言拦不住阶段映射漂移：某阶段漏写一个锚点
+        或写错区间，“按阶段读节”就会静默漏读，而看守测试仍然全绿。
+        """
+        def span_key(start: str, end: str | None) -> str:
+            return f"{start}–{end or start}"
+
+        text = self._contracts()
+        defined = set(self._defined(text))
+        table_rows: dict[str, set[str]] = {}
+        for label, anchors in self._routes(text, defined).items():
+            if label.startswith("Orchestrator"):
+                match = re.search(r"(\d{2})(?:–(\d{2}))?", label)
+                self.assertIsNotNone(match, f"Orchestrator 行缺少阶段区间：{label}")
+                table_rows[span_key(match.group(1), match.group(2))] = anchors
+        skill = (self.SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        skill_rows: dict[str, set[str]] = {}
+        for start, end, anchors in re.findall(r"(\d{2})(?:–(\d{2}))? 读 ([^，。]+)", skill):
+            skill_rows.setdefault(span_key(start, end), set()).update(self._used(anchors, defined))
+        self.assertTrue(skill_rows, "SKILL.md 必须用‘NN–NN 读 …’句式声明阶段锚点")
+        self.assertEqual(skill_rows, table_rows, "SKILL.md 阶段锚点映射与契约路由表漂移")
+
+    def test_prompts_name_exactly_the_anchors_the_table_routes(self) -> None:
+        text = self._contracts()
+        defined = set(self._defined(text))
+        rows = self._routes(text, defined)
+        for prompt, role in self.PROMPT_ROLE.items():
+            with self.subTest(prompt=prompt):
+                body = (self.SKILL_DIR / "references" / prompt).read_text(encoding="utf-8")
+                expected: set[str] = set()
+                for label, anchors in rows.items():
+                    if label.startswith(role):
+                        expected |= anchors
+                self.assertTrue(expected, f"角色表里没有 {role} 这一行")
+                self.assertEqual(self._used(body, defined), expected)
+                self.assertIn("$SKILL_DIR/references/contracts.md", body)
 
 
 if __name__ == "__main__":

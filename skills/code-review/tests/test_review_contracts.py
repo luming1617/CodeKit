@@ -1933,6 +1933,204 @@ class SkillCommandDriftTests(unittest.TestCase):
                 self.assertNotIn("<目标 Diff>\n", text)
 
 
+class DeltaRecheckTests(unittest.TestCase):
+    """P1-1 提效：DELTA 增量复核轮的机械契约与对抗面。
+
+    放宽的是派发覆盖面，不是判据：每条用例都试图把“受限复核”伪装成
+    “完整审查”或借机改写结论，校验器必须逐一拦下。
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.dir = Path(self.temp.name)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _previous(self, verdict: str = "REQUEST_CHANGES") -> tuple[dict, Path, str]:
+        report = valid_report()
+        report["verdict"] = verdict
+        report["verdict_basis"] = ["blocking finding confirmed"]
+        report["findings"] = [valid_finding()]
+        path = self.dir / "previous-review-report.json"
+        path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+        return report, path, sha256(path.read_bytes())
+
+    def _delta(self, prev: dict, prev_path: Path, digest: str, **overrides: object) -> dict:
+        report = valid_report()
+        report["review_context"] = {"review_mode": "DELTA", "documents_status": "available"}
+        report["verdict"] = "APPROVE_WITH_FOLLOW_UPS"
+        report["verdict_basis"] = ["repaired finding verified fixed against the new snapshot"]
+        report["findings"] = []
+        report["traceability"] = json.loads(json.dumps(prev["traceability"]))
+        report["release_gate"] = json.loads(json.dumps(prev["release_gate"]))
+        report["coverage"] = [
+            {**entry, "owner": "EV-DELTA-01", "evidence": ["rechecked"], "reason": "rechecked"}
+            if entry["dimension"] == "correctness"
+            else {**entry, "status": "NOT_VERIFIED", "owner": "none", "evidence": [],
+                  "reason": "DELTA round: dimension not rechecked"}
+            for entry in report["coverage"]
+        ]
+        report["limitations"] = [
+            "DELTA_RECHECK: only the repaired finding and its dimension were rechecked",
+            "DELTA_CARRY_FORWARD: traceability and release_gate inherited verbatim from the previous full report",
+        ]
+        report["delta_recheck"] = {
+            "previous_report_locator": str(prev_path),
+            "previous_report_digest": digest,
+            "recheck_instance_id": "EV-DELTA-01",
+            "results": [
+                {"finding_id": "F-001", "status": "FIXED", "evidence": ["src/app.py:1 guard restored"]}
+            ],
+        }
+        report.update(overrides)
+        return report
+
+    def _ledger(self, instance: str = "EV-DELTA-01") -> list[dict]:
+        return [{
+            "step": 10, "role": "review-evidence", "instance_id": instance,
+            "input_diff_digest": DIGEST, "returned_status": "COMPLETED",
+            "started_at": "2026-09-09T00:00:00Z", "ended_at": "2026-09-09T00:01:00Z",
+        }]
+
+    def test_delta_report_with_real_recheck_passes(self) -> None:
+        prev, path, digest = self._previous()
+        errors = ReportValidator(None, self._ledger()).validate(self._delta(prev, path, digest))
+        self.assertEqual(errors, [])
+
+    def test_delta_cannot_approve(self) -> None:
+        prev, path, digest = self._previous()
+        report = self._delta(prev, path, digest, verdict="APPROVE")
+        errors = ReportValidator(None, self._ledger()).validate(report)
+        self.assertTrue(any("cannot be APPROVE" in item for item in errors), errors)
+
+    def test_delta_requires_recheck_block(self) -> None:
+        prev, path, digest = self._previous()
+        report = self._delta(prev, path, digest)
+        del report["delta_recheck"]
+        errors = ReportValidator(None, self._ledger()).validate(report)
+        self.assertTrue(any(item.startswith("$.delta_recheck") for item in errors), errors)
+
+    def test_delta_requires_disclosure_markers(self) -> None:
+        prev, path, digest = self._previous()
+        report = self._delta(prev, path, digest, limitations=[])
+        errors = ReportValidator(None, self._ledger()).validate(report)
+        self.assertTrue(any("DELTA_RECHECK" in item for item in errors), errors)
+        self.assertTrue(any("DELTA_CARRY_FORWARD" in item for item in errors), errors)
+
+    def test_not_fixed_must_remain_a_blocking_finding(self) -> None:
+        prev, path, digest = self._previous()
+        report = self._delta(prev, path, digest)
+        report["delta_recheck"]["results"][0]["status"] = "NOT_FIXED"
+        errors = ReportValidator(None, self._ledger()).validate(report)
+        self.assertTrue(any("must remain a blocking finding" in item for item in errors), errors)
+
+    def test_fixed_must_not_remain_blocking(self) -> None:
+        prev, path, digest = self._previous()
+        report = self._delta(prev, path, digest, findings=[valid_finding()])
+        errors = ReportValidator(None, self._ledger()).validate(report)
+        self.assertTrue(any("must not remain a blocking finding" in item for item in errors), errors)
+
+    def test_release_gate_carry_forward_must_be_verbatim(self) -> None:
+        prev, path, digest = self._previous()
+        report = self._delta(prev, path, digest, release_gate=release_gate("READY"))
+        errors = ReportValidator(None, self._ledger()).validate(report)
+        self.assertTrue(any(item.startswith("$.release_gate") and "verbatim" in item for item in errors), errors)
+
+    def test_traceability_carry_forward_must_be_verbatim(self) -> None:
+        prev, path, digest = self._previous()
+        report = self._delta(prev, path, digest)
+        report["traceability"][0]["status"] = "COVERED"
+        report["traceability"].append({
+            "id": "REQ-002", "kind": "requirement", "source": "prd#2",
+            "statement": "invented extra coverage", "links": {
+                "requirements": [], "designs": [], "code": ["src/app.py:2"],
+                "tests": [], "releases": []},
+            "status": "COVERED", "evidence": ["src/app.py:2"], "gap": None,
+        })
+        errors = ReportValidator(None, self._ledger()).validate(report)
+        self.assertTrue(any(item.startswith("$.traceability") and "verbatim" in item for item in errors), errors)
+
+    def test_previous_report_digest_must_match_disk(self) -> None:
+        prev, path, _ = self._previous()
+        report = self._delta(prev, path, "f" * 64)
+        errors = ReportValidator(None, self._ledger()).validate(report)
+        self.assertTrue(any("does not match the previous report" in item for item in errors), errors)
+
+    def test_previous_round_must_be_request_changes(self) -> None:
+        prev, path, digest = self._previous(verdict="APPROVE")
+        report = self._delta(prev, path, digest)
+        errors = ReportValidator(None, self._ledger()).validate(report)
+        self.assertTrue(any("REQUEST_CHANGES" in item for item in errors), errors)
+
+    def test_recheck_instance_must_be_a_real_dispatch(self) -> None:
+        prev, path, digest = self._previous()
+        report = self._delta(prev, path, digest)
+        errors = ReportValidator(None, self._ledger(instance="EV-OTHER-99")).validate(report)
+        self.assertTrue(any("recheck_instance_id" in item for item in errors), errors)
+
+    def test_full_report_cannot_carry_delta_block(self) -> None:
+        report = valid_report()
+        report["delta_recheck"] = {}
+        errors = ReportValidator(None, None).validate(report)
+        self.assertTrue(any("only a DELTA review" in item for item in errors), errors)
+
+    def test_delta_requires_documents_available(self) -> None:
+        prev, path, digest = self._previous()
+        report = self._delta(prev, path, digest)
+        report["review_context"]["documents_status"] = "NOT_AVAILABLE"
+        errors = ReportValidator(None, self._ledger()).validate(report)
+        self.assertTrue(any("documents_status must be available" in item for item in errors), errors)
+
+    def test_delta_results_cannot_be_empty(self) -> None:
+        prev, path, digest = self._previous()
+        report = self._delta(prev, path, digest)
+        report["delta_recheck"]["results"] = []
+        errors = ReportValidator(None, self._ledger()).validate(report)
+        self.assertTrue(any("at least one rechecked finding" in item for item in errors), errors)
+
+    def test_results_cannot_invent_findings_outside_previous_blocking(self) -> None:
+        """对抗面：伪造上轮不存在的 finding_id 冒充复核对象。"""
+        prev, path, digest = self._previous()
+        report = self._delta(prev, path, digest)
+        report["delta_recheck"]["results"] = [
+            {"finding_id": "F-999", "status": "FIXED", "evidence": ["invented"]}
+        ]
+        errors = ReportValidator(None, self._ledger()).validate(report)
+        self.assertTrue(any("not a blocking finding of the previous" in item for item in errors), errors)
+
+    def test_previous_blocking_finding_cannot_be_silently_dropped(self) -> None:
+        """对抗面：不登记即降级——把未修的上轮阻塞问题从 results 里拿掉。"""
+        prev, path, digest = self._previous()
+        report = self._delta(prev, path, digest)
+        report["delta_recheck"]["results"] = [
+            {"finding_id": "F-999", "status": "FIXED", "evidence": ["invented"]}
+        ]
+        errors = ReportValidator(None, self._ledger()).validate(report)
+        self.assertTrue(any("silently dropped" in item for item in errors), errors)
+
+    def test_all_not_verified_coverage_is_rejected(self) -> None:
+        """对抗面：全维度 NOT_VERIFIED 的“空转 DELTA”什么都没复核。"""
+        prev, path, digest = self._previous()
+        report = self._delta(prev, path, digest)
+        report["coverage"] = [
+            {**entry, "status": "NOT_VERIFIED", "owner": "none", "evidence": [],
+             "reason": "DELTA round: dimension not rechecked"}
+            for entry in report["coverage"]
+        ]
+        errors = ReportValidator(None, self._ledger()).validate(report)
+        self.assertTrue(any("reviewed nothing" in item for item in errors), errors)
+
+    def test_previous_report_must_be_full_not_delta(self) -> None:
+        """对抗面：DELTA-of-DELTA 报告链在报告侧也必须被拦下。"""
+        prev, path, digest = self._previous()
+        prev["review_context"]["review_mode"] = "DELTA"
+        path.write_text(json.dumps(prev, ensure_ascii=False), encoding="utf-8")
+        report = self._delta(prev, path, sha256(path.read_bytes()))
+        errors = ReportValidator(None, self._ledger()).validate(report)
+        self.assertTrue(any("must be a FULL review" in item for item in errors), errors)
+
+
 class ContractAnchorDriftTests(unittest.TestCase):
     """CW3-b：契约节锚点、角色表与 prompt 三方必须互相对得上（D1 的看守）。"""
 
@@ -1963,7 +2161,7 @@ class ContractAnchorDriftTests(unittest.TestCase):
     def test_every_anchor_is_routed_and_no_route_is_invented(self) -> None:
         text = self._contracts()
         defined = self._defined(text)
-        self.assertEqual(len(defined), 16)
+        self.assertEqual(len(defined), 17)
         table = text.split("## 节锚点与按角色读取", 1)[1].split("\n## ", 1)[0]
         routed: set[str] = set()
         for row in re.findall(r"^\| ([^|]+) \| ([^|]+) \|$", table, re.M):

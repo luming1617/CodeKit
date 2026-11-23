@@ -17,7 +17,9 @@ allowed-tools: 'Bash, Read, Write, Agent, Grep, LSP, Skill'
 
 本 Skill 自带 `scripts/code_impl_controller.py`，用于输入冻结、运行状态、Agent 调用登记、预存 Diff 隔离、范围检查、审查快照和失败归属；编译、测试、Lint 等 Local Validator 仍使用目标仓库自己的工具。**该控制器的全部子命令的参数、语义与预算上限统一见 [controller-contract.md](references/controller-contract.md)，需要"下一步敲什么"时读它，不要回读控制器源码**（源码 2600+ 行，读回上下文既慢又容易与文档漂移；命令条数以该手册为准，本文不写死数字）。**`SKILL_DIR` = 本文档所在目录的绝对路径**（插件安装时为 `<plugin-cache>/skills/code-impl`）只用于定位 `references/`、`agents/` 和该控制器；在命令行、Agent 提示或任何外部进程中引用这些路径时统一使用 `$SKILL_DIR`，并在调用前解析为绝对路径，不要假设当前目录、当前插件目录或仓库根目录就是 Skill 目录。正文内联的资源描述（例如 `references/contracts.md`）按“相对 `SKILL_DIR`”理解，由主 Agent 读取时解析。
 
-派发 Sub-agent 时，必须在输入中显式给出：`SKILL_DIR` 的绝对路径、`<feature-directory>` 的绝对路径与其中的固定文件名（`product-doc.md`、`technical-doc.md`、`release-doc.md`）、代码变更所在的 `repo_root` 绝对路径，以及要读取的角色文件名；不得让 Sub-agent 自行猜测资源文件、输入文档或工作目录。
+派发 Sub-agent 时，必须在输入中显式给出：`SKILL_DIR` 的绝对路径、`<feature-directory>` 的绝对路径与其中的固定文件名（`product-doc.md`、`technical-doc.md`、`release-doc.md`）、代码变更所在的 `repo_root` 绝对路径，以及要读取的角色文件名；不得让 Sub-agent 自行猜测资源文件、输入文档或工作目录。大体积产物（冻结输入契约、方案文档、Diff、日志、状态文件）一律以**绝对路径 + 内容 digest** 传递，由角色自行读取并核对摘要；不得把全文粘贴进任务正文，也不得把 `state.json` 整份读回或转发。
+
+各门禁与预算的设计理由和历史决策见 [rationale.md](references/rationale.md)：它运行时不注入，执行中不需要读取；本文与契约只保留操作规则。
 
 ## 确定性控制器与证据目录
 
@@ -47,9 +49,7 @@ Base SHA、分支、文档 digest 和预存工作树快照，并拒绝覆盖已�
 <PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" show --state "$state_path"
 ```
 
-`show` 返回当前阶段、各状态任务数、未完成任务、验证记录计数、冻结/审查结论计数、
-剩余重试预算，以及三份文档是否与冻结时一致（`drifted_materials`）。会话中断后恢复、
-或任何“我现在到哪一步”的判断，都以它为准。
+`show` 返回当前阶段、任务状态分布、未完成/未收口项、验证与审查计数、剩余预算和文档漂移（`drifted_materials`），字段清单见控制器手册 `show` 行。会话中断后恢复、或任何“我现在到哪一步”的判断，都以它为准。
 
 控制器对文档解码失败（非 UTF-8、含 BOM）会给出 `BLOCKED:` 与检测到的编码，而不是
 traceback；确需继续时以 `init --allow-lossy-decoding` 重开一个 run，该选择会记录在
@@ -75,13 +75,13 @@ traceback；确需继续时以 `init --allow-lossy-decoding` 重开一个 run，
 
 ### 审查模式声明
 
-`codekit:code-review` 现在接受为空的 `feature-directory`，并在解析不到有效 PRD/TDD/RPD 时自行降级为代码与证据驱动的审查（记录 `DOCUMENTS: NOT_AVAILABLE`，结论最多为 `APPROVE_WITH_FOLLOW_UPS`），不再因缺文档直接 `BLOCKED`。本 Skill 的输入门禁已在步骤 01 强校验三份文档，因此 Handoff 一律显式声明 `review_mode: FULL`，并逐份附上 `product-doc.md`、`technical-doc.md`、`release-doc.md` 的 locator、revision 和内容摘要且 `access: available`（对下游即 `materials.documents: available`），不得让下游自行推定。
+首轮与最终交付轮的 Handoff 显式声明 `review_mode: FULL`；修复轮可用 `review_mode: DELTA` 增量复核（见步骤 15，必须携带 `delta_recheck` 块：上一轮 FULL 报告路径 + 裸 sha256 digest、非空 `repaired_findings`）。两种模式都逐份附上 `product-doc.md`、`technical-doc.md`、`release-doc.md` 的 locator、revision 和内容摘要且 `access: available`（对下游即 `materials.documents: available`），不得让下游自行推定（输入门禁已在步骤 01 强校验三份文档）。轮次合法性由控制器机械执行：首轮必须 FULL，DELTA 只紧跟 FULL 的 `REQUEST_CHANGES`、不得连续、不得登记 `APPROVE`，交付轮必须 FULL（`gate` 的 `review-delivery-round-full`）。
 
-下游返回的任何“文档缺失”降级都是 Handoff 与仓库状态不一致的信号：若它返回带文档缺失 Open Question 的 `APPROVE_WITH_FOLLOW_UPS`，或因读不到 Handoff 所列文档而 `BLOCKED`，说明它没有拿到本 Skill 冻结的三份文档（目录漂移、文档被移动或 Handoff 漏写字段）。此时不得当作审查通过交付：能定位原因时重新冻结 Handoff 后重新调用，否则进入步骤 17。本 Skill 不使用 `WAIVED`（`codekit:code-review` 收到 `WAIVED` 会直接返回 `BLOCKED`）。
+下游返回的任何“文档缺失”降级（带文档缺失 Open Question 的 `APPROVE_WITH_FOLLOW_UPS`，或因读不到文档而 `BLOCKED`）都是 Handoff 与冻结文档不一致的信号，不得当作审查通过交付：能定位原因时重新冻结 Handoff 后重新调用，否则进入步骤 17。本 Skill 不使用 `WAIVED`（下游收到会直接 `BLOCKED`）。降级机制的来龙去脉见 [rationale.md](references/rationale.md)。
 
 唯一输入参数是 `<feature-directory>`，必须指向当前仓库中的本次需求专用工作目录，例如 `docs/YYYY-MM-DD-<feature-name>`。本 Skill 只接受该目录中已经存在且通过强校验的 `product-doc.md`（PRD）、`technical-doc.md`（TDD）和 `release-doc.md`（RPD）；不接受用户临时粘贴的需求、单独的代码任务、未生成的方案或缺任一文档的目录。
 
-- PRD/TDD/RPD 首项校验通过后，每次执行先读取 [contracts.md](references/contracts.md)，使用其中的输入契约、Task DAG、Task Contract、验证记录、任务登记和最终报告结构。
+- PRD/TDD/RPD 首项校验通过后，按锚点切片读取 [contracts.md](references/contracts.md)：主 Agent 只读当前阶段需要的节，不整读全文。阶段与锚点的对应关系以该文件顶部「节锚点与按角色读取」表为准：步骤 01–02 读 `input-contract`，03–04 读 `task-dag`，05–08 读 `task-contract`、`validation-record`、`retry-budget`、`task-ledger`，09–11 读 `debugger-result`、`failure-attribution`、`retry-budget`、`task-ledger`，12–13 读 `validation-record`，14–15 读 `code-review-handoff`、`review-verdict-record`、`code-review-result`、`decision-adapter`，16 读 `delivery-gate`、`delivery-report`、`task-ledger`。定位方式：`grep -n "SECTION: <id>"` 取行号后按区间读取。
 - 机器可校验的输入契约、Task Contract 和失败归属记录统一使用 JSON；Markdown/YAML 只作为面向用户的渲染格式。
 - 首项校验后必须额外登记 PRD/TDD/RPD 当前版本、三类变更项、旧→新映射、影响的 Task/验证和历史来源；该登记应进入 Planner 输入和最终报告。
 - 派发 Planner 时读取 [planner-prompt.md](references/planner-prompt.md)。
@@ -89,7 +89,7 @@ traceback；确需继续时以 `init --allow-lossy-decoding` 重开一个 run，
 - 出现验证失败时读取 [debugger-prompt.md](references/debugger-prompt.md)。
 - 整体验证通过后，按 [contracts.md](references/contracts.md) 的 Code Review Handoff 和 Code Review Decision Adapter 调用系统 `codekit:code-review` Skill；不要读取仓库中的 `code-review/SKILL.md` 来模拟调用。
 
-只在对应阶段读取角色模板；不要一次性把所有模板装入上下文。
+只在对应阶段读取角色模板；不要一次性把所有模板装入上下文。这条纪律同样覆盖 contracts.md：主 Agent 按阶段读节，派发 Planner、Implementer、Debugger 时把「节锚点与按角色读取」表中该角色的锚点清单原样写进任务正文，角色只读自己那几节，两侧都不把整份契约搬进上下文。
 
 ## 需求变更解析与实现边界
 
@@ -220,7 +220,7 @@ Orchestrator 的第一项工作是校验 `<feature-directory>` 及其中固定�
 
 ## 03 任务规划
 
-派发一个全新、只读的 Planner Subagent。向它提供冻结的输入契约、仓库基线、相关方案原文或精确片段，以及读取仓库所需的只读权限；不要提供写权限。
+派发一个全新、只读的 Planner Subagent。向它提供冻结输入契约（`input-contract.json`）的路径与 digest、**步骤 01 建立的权限闭包摘要**（该文件的 `permissions` 是 init 占位 `pending-step-03`，真实权限必须由主控按 planner-prompt.md 的槽位显式传入）、仓库基线、三份文档的 locator 与 digest（由 Planner 自行读取当前有效正文，不粘贴文档全文），以及读取仓库所需的只读权限；不要提供写权限。
 
 Planner 必须返回 [contracts.md](references/contracts.md) 定义的 Task DAG。每个任务都要有明确依赖、目标、允许修改文件、只读上下文、验收标准、任务级验证命令、风险和人工验收候选。无法从仓库验证的路径或命令不得伪造。
 
@@ -309,9 +309,7 @@ Orchestrator 自觉。`--retry-policy prose` 是回退开关，只用于门禁�
 
 ### 派发中断：作废而不是记为失败
 
-Implementer 会话断连、宿主中断或 Subagent 无返回时，任务停在 `RUNNING`，而它既没有结论也没有错误指纹。这种情况**不得**记作 `FAILED`——`FAILED` 的语义是"任务被判失败"，会把一次传输故障写进台账、占用一次派发预算，并且随后的重派还会被 `gated` 重试门禁拦下（因为它要求一条 `record-failure`，而这里没有可诊断的东西）。
-
-控制器为此提供唯一的作废迁移 `RUNNING → PENDING`，它必须带 `--reason`：
+Implementer 会话断连、宿主中断或 Subagent 无返回时，任务停在 `RUNNING`。这种情况**不得**记作 `FAILED`；用唯一的作废迁移 `RUNNING → PENDING`，它必须带 `--reason`（为什么这样设计见 [rationale.md](references/rationale.md)）：
 
 ```bash
 <PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" update-task \
@@ -323,7 +321,7 @@ Implementer 会话断连、宿主中断或 Subagent 无返回时，任务停在 
 
 作废必须同时收口死会话：被作废的 Implementer 在 Agent 登记表里仍是 `RUNNING`，要补一条 `record-agent --status ARCHIVED`，否则步骤 16 的 `gate` 会以 `dispatched-agents-closed` 拒绝交付（是哪一个，看 `show` 的 `open_agents`）。
 
-作废自身也有预算：同一任务最多作废 `MAX_TASK_ABANDONS=3` 次。作废是唯一不占派发预算的迁移，若没有上限，"宣称会话没返回"就成了绕开 `MAX_TASK_ATTEMPTS` 与指纹重试预算的无限后门，所以第 4 次作废会被控制器直接拒绝。被拒后只剩两条诚实出路：`settle-task --status FAILED` 带 `dispatch-lost-repeatedly::<task-id>` 这类指纹并 `record-failure`，或转 `BLOCKED` 升级步骤 17（人工介入）。
+同一任务最多作废 `MAX_TASK_ABANDONS=3` 次，第 4 次被控制器直接拒绝。被拒后只剩两条出路：`settle-task --status FAILED` 带 `dispatch-lost-repeatedly::<task-id>` 这类指纹并 `record-failure`，或转 `BLOCKED` 升级步骤 17（人工介入）。
 
 非法迁移（如 PENDING 直接跳至 PASS、从终态再次转移）控制器会以 `ControllerError` 拒绝并退出码 2，不得绕过。
 
@@ -357,7 +355,14 @@ Orchestrator 使用本地工具对本次任务产生的新 Diff 执行：
 3. 记录精确命令、工作目录、开始/结束时间、退出码、关键日志与未运行原因。
 4. 不把未执行、超时、跳过或日志缺失记为 PASS。
 
-每条任务级命令跑完必须立刻落成验证记录，控制器拒绝与退出码矛盾的自报结论：
+每条验证证据都必须落成控制器记录，控制器拒绝与退出码矛盾的自报结论。**整轮批量登记**：本任务适用的全部检查跑完后，把结果写成 `<run>/validations-<task-id>.json`（字段与单条面同名，见控制器手册 `record-validations` 行），一次调用登记整轮，取代逐条 `record-validation` 的 N 次状态读写：
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" record-validations \
+  --state "$state_path" --from-file '<run>/validations-<task-id>.json'
+```
+
+逐条仍走同一套规则，任一条不合法整份拒绝并点名，不会留下“半轮”证据。单条面保留给轮中即时登记（如某条失败后中止本轮、先落失败证据再进步骤 09）：
 
 ```bash
 <PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" record-validation \
@@ -414,16 +419,11 @@ Implementer 返回 `NEEDS_SCOPE` 且 Orchestrator 决定扩充授权时，必须
 
 `settle-task --status FAILED` 不要求范围检查通过，但**必须**带 `--error-fingerprint`：它是重试预算计数、Debugger 归档和步骤 16 追溯的唯一键，缺失时控制器在推进状态之前直接拒绝（任务停留在 `RUNNING`）。需要先单独排查越界时可用 `check-scope`。被拒绝的 PASS 不会写入任务状态：范围越界要么经 `expand-scope` 合法化后重判，要么按 `FAILED` 进入步骤 09。
 
-判定成功时控制器把这一行写进台账：完成时间、结束时的 `final_diff_digest`/`final_head_sha`、
-该任务实际改动的文件（`changed_files`，按任务自己的范围归因，不是全局 Diff）、累计错误
-指纹和本次尝试的收尾结果；返回体只回显 `status`、`scope_result`、越界清单、
-`changed_files` 与 12 位 `diff_digest`。这里的 12 位只是回显截断，台账里存的是完整 64 位十六进制；
-任务台账的 `changed_files` 是纯仓库相对路径（拿去和授权清单、Finding `locations` 做映射），
-与快照里 `STATUS:path` 记法的 `changed_files` 不是同一个字段，不要互相复制。
+判定成功时控制器把这一行写进台账：完成时间、结束时的 `final_diff_digest`/`final_head_sha`、该任务实际改动的文件（`changed_files`，按任务自己的范围归因，不是全局 Diff）、累计错误指纹和本次尝试的收尾结果；返回体只回显 `status`、`scope_result`、越界清单、`changed_files` 与 12 位 `diff_digest`（台账里存完整 64 位）。注意两个同名 `changed_files` 不是同一个字段：任务台账的是纯仓库相对路径（拿去和授权清单、Finding `locations` 做映射），快照里是 `STATUS:path` 记法，不要互相复制。
 
 ## 09 失败诊断
 
-派发全新只读 Debugger Subagent。它只能分析固定的失败材料，不得改代码或直接执行修复。输出根因类别、证据、错误指纹、责任范围、最小修复建议和建议处置；根因类别使用：
+派发全新只读 Debugger Subagent。失败材料按 debugger-prompt.md 的槽位以路径 + digest + 关键摘录传递（完整日志与 Diff 由它自行读取）。它只能分析固定的失败材料，不得改代码或直接执行修复。输出根因类别、证据、错误指纹、责任范围、最小修复建议和建议处置；根因类别使用：
 
 - `CODE_OR_TEST`
 - `TASK_PLAN`
@@ -459,13 +459,7 @@ Orchestrator 根据证据决策：
 `BLOCKED_MISSING_TASK_MAPPING` 并阻止继续修复；多个任务受影响时记录
 `REPLAN_MULTI_TASK_IMPACT`，必须递增 `plan_version` 后重新规划。
 
-同一错误指纹最多重试 3 次，且由控制器机械执行：每次失败必须通过 `record-failure` 登记，同一指纹的第 1 次出现记为初始失败，第 2–4 次仍返回 `RETRY_MAPPED_TASK`；第 5 次出现时控制器自动把处置改为 `human_intervention`、resolution 改为 `ATTEMPT_CAP`（见控制器 `MAX_FINGERPRINT_ATTEMPTS`），不得靠改写或换用指纹绕过。错误指纹至少包含失败命令、测试名或诊断位置、异常类型和归一化关键信息；只改变日志中的时间戳、临时路径或行号漂移不算新错误。
-
-“换用指纹”现在也无法绕过预算：控制器按归一化形式计数（十六进制串、数字、引号内文本、
-路径分别折叠为 `<hex>`、`#`、`<str>`、`<path>`），因此同一条断言在 412 行和 517 行失败、
-或 token 值变了，都记作同一个错误。`record-failure` 同时保存原文与归一化形式，`show` 会
-显示该指纹已出现几次。除指纹预算外，单个任务累计派发次数受 `MAX_TASK_ATTEMPTS`（=6）
-约束，且 `FAILED → RUNNING` 必须有一条不早于本次失败的 `record-failure`（见步骤 05）。
+同一错误指纹最多重试 3 次，且由控制器机械执行：每次失败必须通过 `record-failure` 登记，同一指纹的第 1 次出现记为初始失败，第 2–4 次仍返回 `RETRY_MAPPED_TASK`；第 5 次出现时控制器自动把处置改为 `human_intervention`、resolution 改为 `ATTEMPT_CAP`（见控制器 `MAX_FINGERPRINT_ATTEMPTS`）。错误指纹至少包含失败命令、测试名或诊断位置、异常类型和归一化关键信息。控制器按归一化形式计数（十六进制串、数字、引号内文本、路径分别折叠），换行号、时间戳、临时路径或 token 值不算新错误，也无法绕过预算（原理见 [rationale.md](references/rationale.md)）。除指纹预算外，单个任务累计派发次数受 `MAX_TASK_ATTEMPTS`（=6）约束，且 `FAILED → RUNNING` 必须有一条不早于本次失败的 `record-failure`（见步骤 05）。
 
 ### 重规划（TASK_PLAN 或 REPLAN_MULTI_TASK_IMPACT）
 
@@ -485,7 +479,7 @@ Orchestrator 根据证据决策：
 
 ## 11 任务登记
 
-任务台账是控制器产物，不再靠 Orchestrator 手抄。每次任务判定后重新渲染：
+任务台账是控制器产物，不再靠 Orchestrator 手抄。在台账被消费前必须重新渲染：生成 Code Review Handoff 前（步骤 14）与最终报告前（步骤 16）各一次；执行中可按需渲染向用户展示进度，不必每次判定后都渲染：
 
 ```bash
 <PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" render-ledger --state "$state_path"
@@ -544,6 +538,15 @@ Code Review Handoff 的 `snapshot` 整块（`target_id`、`digest_scheme`、`com
   --state "$state_path" --from-file '<run>/validations.json'
 ```
 
+**证据复用（P1-3 提效）**：某项整体检查的命令若已在任务级验证中逐字跑过（同命令、同 cwd），且此后工作树未变，可用 `reuse-validation` 把该任务级 PASS 记录复用为整体证据，免重跑：
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" reuse-validation \
+  --state "$state_path" --source-index '<任务级 PASS 记录的 1 基序号>' --name '<整体检查名>'
+```
+
+边界由控制器机械执行：源必须是任务级 PASS；命令与 cwd 必须逐字命中 `record-tasks --from-dag` 登记的 `overall_validation` 计划（任务级子集命令不得冒充整体检查）；当前工作树指纹必须与源记录采集时完全一致。未被复用的整体检查（跨模块/集成/契约/Migration/构建等）仍须新鲜执行。复用记录带 `reused_from`，`show` 计数，最终报告必须披露复用了几项。
+
 一次失败产生多条归属时同样有批量面 `record-failures --from-file`（批内同指纹按先后顺序
 正确累计出现次数，预算不会因批量而失效）。
 
@@ -559,7 +562,7 @@ Code Review Handoff 的 `snapshot` 整块（`target_id`、`digest_scheme`、`com
 
 Orchestrator 先确认系统 Skill 注册表中存在且可调用 `codekit:code-review`。这里的“调用”是使用宿主原生 Skill 加载/调用机制执行该 Skill 的完整流程，不是执行 shell 命令、向用户输出一条 Slash Command、读取仓库副本后自行模拟，也不是重新派发旧 Reviewer Subagent。
 
-Code Review Handoff 的输入必须同时固定 `<feature-directory>/product-doc.md`（PRD）、`<feature-directory>/technical-doc.md`（TDD）和 `<feature-directory>/release-doc.md`（RPD），三者均不得缺失或使用未验证版本，并按「审查模式声明」声明 `review_mode: FULL` 且三份文档的 `access` 均为 `available`；`codekit:code-review` 只有在 `FULL` 且这三份文档可访问时才可能返回 `APPROVE`。
+Code Review Handoff 的输入必须同时固定 `<feature-directory>/product-doc.md`（PRD）、`<feature-directory>/technical-doc.md`（TDD）和 `<feature-directory>/release-doc.md`（RPD），三者均不得缺失或使用未验证版本，并按「审查模式声明」声明 `review_mode`（首轮/交付轮 FULL，修复轮可 DELTA）且三份文档的 `access` 均为 `available`；`codekit:code-review` 只有在 FULL 且这三份文档可访问时才可能返回 `APPROVE`（DELTA 轮封顶 `APPROVE_WITH_FOLLOW_UPS`）。
 
 调用前按 [contracts.md](references/contracts.md) 生成 Code Review Handoff，固定用户请求、技术方案、发布方案、仓库规范、`target_id`（规范化 `repository_root` + 当前 `HEAD SHA`）、`digest_scheme`、预检时的已有修改快照、本轮任务自有完整 Diff、`worktree_state.diff_digest`、`changed_files`（`STATUS:path` 记法）、Task DAG、Task Ledger、任务级和整体验证证据，并将审查目标限定为 `local_diff`。`codekit:code-review` 必须继承当前权限闭包，禁止修改代码、发布评论、审批、commit、push 或部署。
 
@@ -570,17 +573,19 @@ Code Review Handoff 的输入必须同时固定 `<feature-directory>/product-doc
 发出 Handoff 前必须校验它，收到报告后必须把结论登记进状态；两步都是控制器命令，退出码非 0 时不得继续：
 
 ```bash
-# 1) 冻结 Handoff 的机械校验（review_mode=FULL、三份文档 access=available 且 locator 真实可读、
+# 1) 冻结 Handoff 的机械校验（review_mode=FULL 或 DELTA；DELTA 额外校验 delta_recheck 块；
+#    三份文档 access=available 且 locator 真实可读、
 #    snapshot 就是 freeze-review 的形状：digest_scheme/committed_range=null/64 位裸 hex，且 target_id 可由 repo_root+head_sha 重算）
 <PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" validate-contract \
   --kind handoff "$handoff_path"
 
-# 2) 登记审查结论：digest 取自控制器自己的最后一次冻结，不由调用方填写
+# 2) 登记审查结论：digest 取自控制器自己的最后一次冻结，不由调用方填写；
+#    修复轮用 --review-mode DELTA（首轮/交付轮默认 FULL）
 <PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" record-review \
   --state "$state_path" --verdict '<APPROVE|APPROVE_WITH_FOLLOW_UPS|REQUEST_CHANGES|BLOCKED>' \
   --report-path '<run>/review-report.json' \
   --validator-exit-code '<code-review 自带校验器的退出码>' \
-  --summary '<一句话结论摘要>'
+  --summary '<一句话结论摘要>' [--review-mode DELTA]
 ```
 
 `record-review` 在任何 `freeze-review` 之前会被拒绝（结论必须绑定一个已定义 Diff），
@@ -595,14 +600,14 @@ Code Review Handoff 的输入必须同时固定 `<feature-directory>/product-doc
 
 Orchestrator 严格使用 [contracts.md](references/contracts.md) 的 Code Review Decision Adapter：
 
-- `APPROVE`：进入最终报告。
-- `APPROVE_WITH_FOLLOW_UPS`：进入最终报告；Findings、Open Questions、Release Gate 条件和剩余风险作为非阻塞事项登记，不自动扩大本轮范围。
-- `REQUEST_CHANGES` 且修复轮次少于 2：把阻塞 Finding、目标变更导致的 `FAIL_INTRODUCED` 或 `NOT_READY` Release Gate 项转换为修复任务。先按 Finding 的 `locations` 映射到 Task Ledger 中拥有对应文件的任务；无法唯一映射、需要新文件、改变依赖或超出原计划范围时，回到步骤 03 重规划。修复后必须重新执行受影响的任务验证、整体验证，并以新快照重新调用 `codekit:code-review`。
+- `APPROVE`：进入最终报告（仅 FULL 轮可能给出）。
+- `APPROVE_WITH_FOLLOW_UPS`：FULL 轮时进入最终报告；Findings、Open Questions、Release Gate 条件和剩余风险作为非阻塞事项登记，不自动扩大本轮范围。**DELTA 轮给出该结论时不直接交付**：必须再执行一次 FULL 审查轮（新冻结 + 完整 code-review）作为交付确认，这是增量复核的安全边界。
+- `REQUEST_CHANGES` 且修复轮次少于 2：把阻塞 Finding、目标变更导致的 `FAIL_INTRODUCED` 或 `NOT_READY` Release Gate 项转换为修复任务。先按 Finding 的 `locations` 映射到 Task Ledger 中拥有对应文件的任务；无法唯一映射、需要新文件、改变依赖或超出原计划范围时，回到步骤 03 重规划。修复后必须重新执行受影响的任务验证、整体验证，并以新快照重新调用 `codekit:code-review`：**首轮 FULL 被拒后的修复轮用 DELTA 增量复核**（Handoff 携带 `delta_recheck`：上一轮报告路径 + digest、被修阻塞 Finding 的 id/locations/remediation，登记用 `record-review --review-mode DELTA`）；DELTA 轮再被拒或 DELTA 通过后的交付确认轮，都用 FULL。
 - `BLOCKED`：进入步骤 17，向用户说明缺失的关键证据、权限、环境或宿主能力。
-- 完成 2 轮审查修复后仍为 `REQUEST_CHANGES`：进入人工介入。修复轮的重新冻结与步骤 12 共享 `MAX_REVIEW_FREEZES` 预算，控制器在第 4 次 `freeze-review` 时直接拒绝，作为该上限的机械兜底。
+- 完成 2 轮审查修复后仍为 `REQUEST_CHANGES`：进入人工介入。修复轮的重新冻结与步骤 12 共享 `MAX_REVIEW_FREEZES` 预算（典型序列 FULL→DELTA→FULL 恰好 3 次），控制器在第 4 次 `freeze-review` 时直接拒绝，作为该上限的机械兜底。
 
-每一轮的结论都要用 `record-review` 重新登记（新快照 + 新报告 + 该校验器的退出码）；判定
-只看最后一次冻结对应的记录，历史条目仅用于展示修复轮次。
+每一轮的结论都要用 `record-review` 重新登记（新快照 + 新报告 + 该校验器的退出码 + 轮次模式）；判定
+只看最后一次冻结对应的记录，历史条目仅用于展示修复轮次。轮次合法性（首轮 FULL、DELTA 不连续、DELTA 不得 APPROVE、交付轮 FULL）由控制器与 `gate` 机械执行，不由 Orchestrator 自评。
 
 ## 16 最终报告
 
@@ -612,15 +617,7 @@ Orchestrator 严格使用 [contracts.md](references/contracts.md) 的 Code Revie
 <PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" gate --state "$state_path"
 ```
 
-`gate` 逐条核对：当前计划版本的任务是否全部 `PASS`；每个任务是否有 `--scope task` 的
-验证记录；是否存在 `--scope overall` 且指纹与最后一次冻结一致的整体证据；是否已冻结审查
-快照、快照产物是否可读；最新审查结论是否存在、是否为可交付结论（`APPROVE` /
-`APPROVE_WITH_FOLLOW_UPS`）、其结构校验是否退出 0、结论绑定的 Diff 指纹是否就是最后一次
-冻结；报告文件是否仍在磁盘上；**所有派发是否都已收口**（没有仍为 `RUNNING` 的 Agent
-条目——未收口的派发意味着这一轮有一份工作没被交代，也让角色耗时无从度量，补一次
-`record-agent --status ARCHIVED` 即可，`show` 的 `open_agents` 会列出是哪一个）；以及最终
-范围检查是否干净。任一不满足即退出码 2 并打印 `BLOCKED: ...`，详情写入
-`<run>/gate-report.json`。
+`gate` 逐条核对交付条件：当前计划版本任务全部 `PASS`、任务级与整体验证齐备且指纹与最后一次冻结一致、审查结论可交付且绑定最后一次冻结、**交付轮必须是 FULL 审查**（`review-delivery-round-full`，DELTA 轮的结论不直接支撑交付）、报告文件在位、所有派发已收口（没有仍为 `RUNNING` 的 Agent 条目，补一次 `record-agent --status ARCHIVED` 即可，`show` 的 `open_agents` 会列出是哪一个）、最终范围干净。逐项判据见 contracts.md 的 `delivery-gate` 节；任一不满足即退出码 2 并打印 `BLOCKED: ...`，详情写入 `<run>/gate-report.json`。
 
 `gate` 的退出码就是“能否宣称编码完成”的判据：不得用 `--mode warn-only` 绕过它出报告
 （该模式仅供排障和盘点，仍会在返回体里标 `BLOCKED (warn-only)`）。若门禁挡住，回到对应
@@ -632,8 +629,8 @@ Orchestrator 严格使用 [contracts.md](references/contracts.md) 的 Code Revie
 - PRD/TDD/RPD 的需求变更三类数量、逐项实现映射及历史版本摘要；
 - Task DAG 完成状态和重规划/重试记录；
 - 任务级及整体本地验证命令、退出码和结果；
-- `codekit:code-review` verdict、报告校验证据、审查修复轮次及剩余非阻塞项；
-- 未运行检查、已知风险、基线失败和权限限制；
+- `codekit:code-review` verdict、报告校验证据、审查修复轮次（含 DELTA 增量复核轮）及剩余非阻塞项；
+- 未运行检查、已知风险、基线失败和权限限制；经 `reuse-validation` 复用的整体检查项数（`show` 的 `review.reused_validations`）；
 - 仅列自动化无法证明的人工验收项，并写清预期行为与验证方法。
 
 不要声称已 push、部署、真实迁移或完成外部验收，除非对应操作确实执行且有证据。
@@ -660,7 +657,7 @@ Orchestrator 严格使用 [contracts.md](references/contracts.md) 的 Code Revie
 1. `gate --state "$state_path"` 退出码为 0（`gate-report.json` 的 `status` 为 `PASS`）；
 2. 所有 Task 均登记为 PASS；
 3. 整体验证满足发布方案中的全部本地要求，且证据以 `record-validation` 落盘；
-4. 系统 `codekit:code-review` 返回经结构校验且快照匹配的 `APPROVE` 或 `APPROVE_WITH_FOLLOW_UPS`（匹配 = `target_id` 相同且共有字段相等，`SCOPE_SUPERSET` 不算不匹配），并以 `record-review` 登记；
+4. 系统 `codekit:code-review` 在 **FULL 轮**返回经结构校验且快照匹配的 `APPROVE` 或 `APPROVE_WITH_FOLLOW_UPS`（匹配 = `target_id` 相同且共有字段相等，`SCOPE_SUPERSET` 不算不匹配），并以 `record-review` 登记；DELTA 轮的结论只作修复确认，交付必须落在最终 FULL 轮（`gate` 的 `review-delivery-round-full` 机械兜底）；
 5. 未决事项均明确归类为非阻塞风险或人工验收项；
 6. 最终报告可以让用户从命令、退出码、Diff 和 SHA 复核结论。
 

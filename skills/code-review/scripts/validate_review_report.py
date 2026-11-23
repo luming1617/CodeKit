@@ -96,6 +96,11 @@ RELEASE_CHECK_STATUSES = {"PASS", "CONDITIONAL", "FAIL", "NOT_VERIFIED", "NOT_AP
 # 进而强制 BLOCKED —— 实测「如实标注未核实」比「改标 NOT_APPLICABLE」多一次驳回，
 # 等于给漏报发奖金。分级后如实标注非关键项只落 APPROVE_WITH_FOLLOW_UPS。
 RELEASE_CHECK_CRITICALITY = {"critical", "non_critical"}
+# P1-1 提效：DELTA 增量复核轮。上游修复 REQUEST_CHANGES 后只复核被修 Finding，
+# 覆盖不全是设计使然：结论封顶 APPROVE_WITH_FOLLOW_UPS，交付仍须最终 FULL 轮
+# （code-impl 侧 gate 的 review-delivery-round-full 兜底）。
+DELTA_RESULT_STATUSES = {"FIXED", "NOT_FIXED", "REGRESSION"}
+DELTA_LIMITATION_MARKERS = ("DELTA_RECHECK", "DELTA_CARRY_FORWARD")
 FINDING_FIELDS = {
     "id",
     "candidate_id",
@@ -247,6 +252,7 @@ class ReportValidator:
         limitations = self.require_string_list(report.get("limitations"), "$.limitations")
         residual_risks = self.require_string_list(report.get("residual_risks"), "$.residual_risks")
         self.validate_signed_disclosures(limitations)
+        self.validate_delta_recheck(report, review_context, limitations, coverage)
         self.validate_dispatches(snapshot_digest, coverage)
         self.validate_verdict(
             verdict,
@@ -267,8 +273,8 @@ class ReportValidator:
         context = self.require_object(value, "$.review_context")
         self.require_fields(context, {"review_mode", "documents_status"}, "$.review_context")
         review_mode = context.get("review_mode")
-        if review_mode is not None and review_mode not in {"FULL", "LITE", "WAIVED"}:
-            self.error("$.review_context.review_mode", "must be FULL, LITE, WAIVED, or null")
+        if review_mode is not None and review_mode not in {"FULL", "LITE", "WAIVED", "DELTA"}:
+            self.error("$.review_context.review_mode", "must be FULL, LITE, WAIVED, DELTA, or null")
         documents_status = context.get("documents_status")
         if documents_status not in {"available", "NOT_AVAILABLE"}:
             self.error(
@@ -279,6 +285,12 @@ class ReportValidator:
             self.error(
                 "$.review_context",
                 "LITE requires documents_status NOT_AVAILABLE",
+            )
+        if review_mode == "DELTA" and documents_status != "available":
+            self.error(
+                "$.review_context",
+                "DELTA rechecks repair a prior FULL round with frozen documents; "
+                "documents_status must be available",
             )
         return context
 
@@ -1070,6 +1082,173 @@ class ReportValidator:
                 f"step 18 must use a fresh Evidence Verifier; {shared} already rebutted at step 10",
             )
 
+    def validate_delta_recheck(
+        self,
+        report: dict[str, Any],
+        review_context: dict[str, Any],
+        limitations: list[str],
+        coverage: list[dict[str, Any]],
+    ) -> None:
+        """P1-1 提效：DELTA 增量复核轮的机械契约。
+
+        放宽的是派发覆盖面，不是判据：上一轮 FULL 报告必须真实存在且 digest 对得上，
+        traceability 与 release_gate 必须逐字继承（不得借增量轮改写更有利的结论），
+        每个 NOT_FIXED/REGRESSION 必须仍是本报告里的阻塞 Finding，每个 FIXED 不得
+        仍挂阻塞，复核者必须是台账里真实派发过的 review-evidence 实例。
+        """
+        if review_context.get("review_mode") != "DELTA":
+            if "delta_recheck" in report:
+                self.error("$.delta_recheck", "only a DELTA review may carry a delta_recheck block")
+            return
+        for marker in DELTA_LIMITATION_MARKERS:
+            if not any(marker in item for item in limitations):
+                self.error(
+                    "$.limitations",
+                    f"DELTA reviews must disclose the {marker} marker verbatim: a bounded "
+                    "recheck must not read as a clean full review",
+                )
+        delta = self.require_object(report.get("delta_recheck"), "$.delta_recheck")
+        self.require_fields(
+            delta,
+            {"previous_report_locator", "previous_report_digest", "recheck_instance_id", "results"},
+            "$.delta_recheck",
+        )
+        locator = self.require_string(delta.get("previous_report_locator"), "$.delta_recheck.previous_report_locator")
+        digest = self.require_string(delta.get("previous_report_digest"), "$.delta_recheck.previous_report_digest")
+        if digest and not DIGEST_RE.fullmatch(digest):
+            self.error("$.delta_recheck.previous_report_digest", "must be a lowercase SHA-256 digest")
+        instance = self.require_string(delta.get("recheck_instance_id"), "$.delta_recheck.recheck_instance_id")
+        results = self.require_list(delta.get("results"), "$.delta_recheck.results")
+        if not results:
+            self.error("$.delta_recheck.results", "must contain at least one rechecked finding")
+        seen_ids: set[str] = set()
+        for index, raw in enumerate(results):
+            path = f"$.delta_recheck.results[{index}]"
+            entry = self.require_object(raw, path)
+            self.require_fields(entry, {"finding_id", "status", "evidence"}, path)
+            finding_id = self.require_string(entry.get("finding_id"), f"{path}.finding_id")
+            if finding_id and not re.fullmatch(r"F-\d+", finding_id):
+                self.error(f"{path}.finding_id", "must match F-<digits>")
+            if finding_id in seen_ids:
+                self.error(f"{path}.finding_id", "must be unique")
+            seen_ids.add(finding_id)
+            if entry.get("status") not in DELTA_RESULT_STATUSES:
+                self.error(f"{path}.status", f"must be one of {sorted(DELTA_RESULT_STATUSES)}")
+            self.require_string_list(entry.get("evidence"), f"{path}.evidence", nonempty=True)
+        blocking_ids = {
+            item.get("id")
+            for item in report.get("findings", [])
+            if isinstance(item, dict) and item.get("blocking") is True
+        }
+        for index, raw in enumerate(results):
+            if not isinstance(raw, dict):
+                continue
+            finding_id, status = raw.get("finding_id"), raw.get("status")
+            path = f"$.delta_recheck.results[{index}]"
+            if status in {"NOT_FIXED", "REGRESSION"} and finding_id not in blocking_ids:
+                self.error(
+                    f"{path}.status",
+                    f"{status} finding {finding_id!r} must remain a blocking finding in "
+                    "$.findings; an unfixed problem cannot be downgraded by the recheck",
+                )
+            if status == "FIXED" and finding_id in blocking_ids:
+                self.error(
+                    f"{path}.status",
+                    f"FIXED finding {finding_id!r} must not remain a blocking finding in $.findings",
+                )
+        previous: Any = None
+        if locator:
+            prev_path = Path(locator)
+            if not prev_path.is_file():
+                self.error("$.delta_recheck.previous_report_locator", f"does not resolve to a file: {locator}")
+            else:
+                raw_bytes = prev_path.read_bytes()
+                if digest and hashlib.sha256(raw_bytes).hexdigest() != digest:
+                    self.error(
+                        "$.delta_recheck.previous_report_digest",
+                        "does not match the previous report file on disk",
+                    )
+                try:
+                    previous = json.loads(raw_bytes.decode("utf-8"))
+                except ValueError:
+                    self.error("$.delta_recheck.previous_report_locator", "previous report is not valid JSON")
+        if isinstance(previous, dict):
+            if previous.get("verdict") != "REQUEST_CHANGES":
+                self.error(
+                    "$.delta_recheck.previous_report_locator",
+                    "the previous full review must carry verdict REQUEST_CHANGES; a DELTA "
+                    "recheck only repairs findings from a rejected full round",
+                )
+            prev_context = previous.get("review_context")
+            if not isinstance(prev_context, dict) or prev_context.get("review_mode") != "FULL":
+                self.error(
+                    "$.delta_recheck.previous_report_locator",
+                    "the previous report must be a FULL review; a DELTA recheck of a DELTA "
+                    "report is not a legal round",
+                )
+            prev_blocking = {
+                item.get("id")
+                for item in previous.get("findings", [])
+                if isinstance(item, dict) and item.get("blocking") is True
+            }
+            # results 必须锚定到上轮阻塞 Finding：伪造一个不存在的 finding_id 而把
+            # 真正未修的问题从清单里拿掉，就是“不登记即降级”的绕过路径。
+            rechecked_ids = {
+                item.get("finding_id")
+                for item in results
+                if isinstance(item, dict)
+            }
+            for index, raw in enumerate(results):
+                if isinstance(raw, dict) and raw.get("finding_id") not in prev_blocking:
+                    self.error(
+                        f"$.delta_recheck.results[{index}].finding_id",
+                        f"{raw.get('finding_id')!r} is not a blocking finding of the previous "
+                        "full report; the recheck may only address those findings",
+                    )
+            dropped = sorted(prev_blocking - rechecked_ids - blocking_ids)
+            if dropped:
+                self.error(
+                    "$.delta_recheck.results",
+                    f"previous blocking findings {dropped} were neither rechecked nor kept "
+                    "blocking in this report; an unrechecked problem cannot be silently dropped",
+                )
+            if report.get("traceability") != previous.get("traceability"):
+                self.error(
+                    "$.traceability",
+                    "DELTA rounds must carry the previous full report's traceability forward "
+                    "verbatim; re-derive it in the final FULL round instead of rewriting it here",
+                )
+            if report.get("release_gate") != previous.get("release_gate"):
+                self.error(
+                    "$.release_gate",
+                    "DELTA rounds must carry the previous full report's release_gate forward "
+                    "verbatim; re-evaluate it in the final FULL round instead of rewriting it here",
+                )
+        if self.dispatch_ledger is not None and instance:
+            dispatched = any(
+                isinstance(record, dict)
+                and record.get("role") == "review-evidence"
+                and record.get("instance_id") == instance
+                for record in self.dispatch_ledger
+            )
+            if not dispatched:
+                self.error(
+                    "$.delta_recheck.recheck_instance_id",
+                    f"{instance!r} never appears in the dispatch ledger as review-evidence; "
+                    "the recheck must be a real independent dispatch",
+                )
+        # 增量轮也必须真的复核了至少一个维度，且归属复核实例：全维度
+        # NOT_VERIFIED 的“空转 DELTA”不得通过校验。
+        if instance and not any(
+            entry.get("status") == "REVIEWED" and entry.get("owner") == instance
+            for entry in coverage
+        ):
+            self.error(
+                "$.coverage",
+                "a DELTA round must mark at least one dimension REVIEWED with owner equal "
+                "to delta_recheck.recheck_instance_id; an all-NOT_VERIFIED recheck reviewed nothing",
+            )
+
     def validate_rejected(self, value: Any) -> None:
         entries = self.require_list(value, "$.rejected_candidates")
         for index, raw in enumerate(entries):
@@ -1097,8 +1276,13 @@ class ReportValidator:
     ) -> None:
         blocking_findings = [item for item in findings if item.get("blocking") is True]
         blocking_questions = [item for item in questions if item.get("blocking") is True]
+        delta_review = review_context.get("review_mode") == "DELTA"
+        # DELTA 轮的未复核维度标 NOT_VERIFIED 是设计使然，不把它当作“关键证据缺失”
+        # 拖进 BLOCKED；覆盖缺口由 DELTA_RECHECK 限制项披露，交付仍须最终 FULL 轮。
         missing_required_coverage = [
-            item for item in coverage if item.get("required") is True and item.get("status") == "NOT_VERIFIED"
+            item for item in coverage
+            if item.get("required") is True and item.get("status") == "NOT_VERIFIED"
+            and not delta_review
         ]
         introduced_failures = [item for item in validation if item.get("status") == "FAIL_INTRODUCED"]
         traceability_gaps = [
@@ -1108,7 +1292,7 @@ class ReportValidator:
         ]
         validation_gaps = [item for item in validation if item.get("status") != "PASS"]
         restricted_review = (
-            review_context.get("review_mode") == "LITE"
+            review_context.get("review_mode") in {"LITE", "DELTA"}
             or review_context.get("documents_status") == "NOT_AVAILABLE"
         )
         waived_review = review_context.get("review_mode") == "WAIVED"
@@ -1146,7 +1330,7 @@ class ReportValidator:
         if waived_review and verdict != "BLOCKED":
             self.error("$.verdict", "WAIVED reviews must return BLOCKED")
         if restricted_review and verdict == "APPROVE":
-            self.error("$.verdict", "reviews without complete documents cannot be APPROVE")
+            self.error("$.verdict", "restricted reviews (LITE, missing documents, DELTA recheck) cannot be APPROVE")
 
         if change_required and verdict != "REQUEST_CHANGES":
             self.error("$.verdict", "must be REQUEST_CHANGES when blocking findings, introduced failures, or NOT_READY release gate exist")

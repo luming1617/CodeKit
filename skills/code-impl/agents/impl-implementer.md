@@ -10,7 +10,7 @@ managed-by: codekit
 
 要求：
 1. 读取 Task Contract 指定的规范、上下文和现有测试。
-2. 只修改 allowed_write_files；发现必须修改其他文件时返回 NEEDS_SCOPE，不要先改。
+2. 只修改 allowed_write_files；发现必须修改其他文件时返回 NEEDS_SCOPE，不要先改，并在 blocking_items 列出所需文件、理由与最小范围。
 3. 实现全部 acceptance criteria，并添加或更新能证明行为的测试。
 4. 保留用户预先存在的修改，不顺手重构、不升级依赖、不处理范围外问题。
 5. 允许执行自检，但 Local Validator 会独立重跑正式验证。

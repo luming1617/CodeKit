@@ -181,7 +181,7 @@ flowchart TB
 
 文档不是本 Skill 的硬性前置条件，但文档缺失会限缩可给出的结论：`DOCUMENTS: NOT_AVAILABLE` 时，需求追踪与 Release Gate 只能基于仓库规范、代码证据和调用方提供的审查意图，必须把文档缺失登记为 Open Question，结论不得为 `APPROVE`（最多 `APPROVE_WITH_FOLLOW_UPS`），并在报告中说明规格覆盖缺口。
 
-由其他 Skill 调用本 Skill 时（例如 `codekit:bugfix` 的 Code Review Handoff），调用方会随 Handoff 一起传入 `review_mode: FULL | LITE | WAIVED` 和 `materials.documents: available | NOT_AVAILABLE`，本 Skill 必须按同一语义处理，不得另立判断：`LITE` 表示上游无有效 PRD/TDD/RPD，仍须完整执行代码、证据、验证和发布检查，但只能返回 `APPROVE_WITH_FOLLOW_UPS`、`REQUEST_CHANGES` 或 `BLOCKED`；`WAIVED` 表示上游已取得用户批准跳过系统审查，收到该值时直接返回 `BLOCKED` 并说明原因。Handoff 与本次冻结的一致性由步骤 02 的 `--handoff` 机械比对（见步骤 02 与 contracts.md 的 `handoff` 段）：只在同一 `target_id`（规范化仓库根 + `head_sha`）前提下比对两侧共有的字段，`target_id` 不同、上游声明的已提交范围与本轮回放出的范围互斥、或工作树层 digest 在上游冻结后又变了，才是 `BLOCKED`；上游快照不含已提交范围而本轮审查含时记录 `SCOPE_SUPERSET` 限制并继续，**不得**判 `BLOCKED`。
+由其他 Skill 调用本 Skill 时（例如 `codekit:bugfix` 的 Code Review Handoff），调用方会随 Handoff 一起传入 `review_mode: FULL | LITE | WAIVED | DELTA` 和 `materials.documents: available | NOT_AVAILABLE`，本 Skill 必须按同一语义处理，不得另立判断：`LITE` 表示上游无有效 PRD/TDD/RPD，仍须完整执行代码、证据、验证和发布检查，但只能返回 `APPROVE_WITH_FOLLOW_UPS`、`REQUEST_CHANGES` 或 `BLOCKED`；`WAIVED` 表示上游已取得用户批准跳过系统审查，收到该值时直接返回 `BLOCKED` 并说明原因；`DELTA` 表示上游修复 `REQUEST_CHANGES` 后的增量复核轮，必须携带 `delta_recheck` 块，按下文「DELTA 增量复核轮」执行，结论封顶 `APPROVE_WITH_FOLLOW_UPS`。Handoff 与本次冻结的一致性由步骤 02 的 `--handoff` 机械比对（见步骤 02 与 contracts.md 的 `handoff` 段）：只在同一 `target_id`（规范化仓库根 + `head_sha`）前提下比对两侧共有的字段，`target_id` 不同、上游声明的已提交范围与本轮回放出的范围互斥、或工作树层 digest 在上游冻结后又变了，才是 `BLOCKED`；上游快照不含已提交范围而本轮审查含时记录 `SCOPE_SUPERSET` 限制并继续，**不得**判 `BLOCKED`。
 
 `review_mode` 与文档解析结果冲突时取更严格的一方：声明为 `FULL` 但 `materials.documents: NOT_AVAILABLE`（或本 Skill 按上述规则未能解析到任何有效文档）时，仍按文档缺失降级，结论不得为 `APPROVE`；反过来，文档齐备也不能把无法取证的 Release Gate 项拉高到 `APPROVE`。
 
@@ -275,6 +275,17 @@ manifest 由脚本追加三项来源指纹：`produced_by`（固定字面量）�
 **排除披露：**`.codekit/` 排除只针对未跟踪的运行时产物；任何其他目录的未跟踪文件、以及已被版本控制的 `.codekit/` 变更，仍照常计入审查范围。需要在该排除之外快照时，用显式 `--base-sha/--head-sha` 模式并人工核对 `changed_files`。
 
 步骤 01 实际解析到的每份文档（`feature-directory` 非空时为该目录及其子目录命中的文件，为空时为 `docs/` 递归收集到的文件）由上文的 `--documents`/`--document-revision` 交给脚本冻结：内容摘要、revision 与绝对路径写进签名 manifest 的 `documents[]`，并由 `--emit-skeleton` 预填进报告 `snapshot.documents`，Orchestrator 不再手工登记，也不得把清单抄进角色任务正文。取不到稳定版本时以本次读取的内容摘要作为冻结版本（脚本的缺省行为）；`DOCUMENTS: NOT_AVAILABLE` 时只登记资料缺失本身，不得伪造文档路径或版本。
+
+## DELTA 增量复核轮（上游修复后的受限复核）
+
+Handoff 声明 `review_mode: DELTA` 时，本轮是上游（如 `codekit:code-impl`）修复上一轮 FULL 审查 `REQUEST_CHANGES` 后的增量复核：只复核被修 Finding 与受影响维度，不做全量多维审查。契约与机械规则见 [contracts.md](references/contracts.md) 的 `delta-recheck` 节；执行流程：
+
+1. 步骤 01–02 照常：校验 Handoff 的 `delta_recheck` 块（上一轮 FULL 报告路径 + digest、非空 `repaired_findings`），用 `--handoff` 冻结新快照；上一轮报告不可读、digest 不符或其结论不是 `REQUEST_CHANGES` 时 `BLOCKED`。
+2. 跳过步骤 03/05/07 的全量分析：`traceability` 与 `release_gate` 逐字继承上一轮 FULL 报告（校验器会核对），不得借增量轮改写更有利的结论。
+3. 派发一个全新只读 `review-evidence` 实例（按 evidence-verifier-prompt.md 的 DELTA 模板，台账登记为步骤 10），逐个被修 Finding 在新快照下重建触发路径，返回 `FIXED | NOT_FIXED | REGRESSION` 与证据；`recheck_instance_id` 必须与台账一致。
+4. 步骤 14 的机械检查（编译/测试/Lint 等）仍须针对新快照新鲜执行，不得沿用旧结果。
+5. 覆盖矩阵：被复核维度 `REVIEWED`（owner 为复核实例），其余维度 `NOT_VERIFIED` 及理由；`limitations` 逐字携带 `DELTA_RECHECK` 与 `DELTA_CARRY_FORWARD` 两条标记。
+6. 结论：`NOT_FIXED`/`REGRESSION` 必须仍是阻塞 Finding（进而 `REQUEST_CHANGES`）；全部修复且无新阻塞问题时最多 `APPROVE_WITH_FOLLOW_UPS`，**不得 `APPROVE`**；复核发现清单外的高风险新问题时如实登记并建议上游升级回 FULL 轮。交付与否由上游的最终 FULL 轮决定（code-impl 侧 `gate` 的 `review-delivery-round-full` 兜底），本轮不直接支撑交付。
 
 ## 03 上下文分析
 

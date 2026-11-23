@@ -14,7 +14,8 @@
 | Evidence Verifier（10） | `review-snapshot`、`candidate-finding`、`evidence-verdict`、`formal-finding`、`open-question` |
 | Failure Analyst（16） | `validation-record`、`failure-attribution`、`candidate-finding` |
 | Evidence Verifier（18） | `traceability-matrix`、`coverage-matrix`、`validation-record`、`failure-attribution`、`release-gate` |
-| Orchestrator（01/20/21） | `review-input-contract`、`review-snapshot`、`dispatch-ledger`、`normalized-report-json`、`markdown-delivery` |
+| Evidence Verifier（DELTA 复核） | `review-snapshot`、`delta-recheck`、`formal-finding` |
+| Orchestrator（01/20/21） | `review-input-contract`、`review-snapshot`、`dispatch-ledger`、`normalized-report-json`、`markdown-delivery`、`delta-recheck` |
 
 ## Review Input Contract
 <!-- SECTION: review-input-contract -->
@@ -41,11 +42,11 @@ review_input:
       revision: string | null
       content_digest: string
       access: available | unavailable | partial
-  review_mode: FULL | LITE | WAIVED | null
+  review_mode: FULL | LITE | WAIVED | DELTA | null
   documents_status: available | NOT_AVAILABLE
 ```
 
-`review_mode` 和 `documents_status` 是上游 Skill（如 `codekit:bugfix`、`codekit:code-impl`）Handoff 中 `review_mode` 与 `materials.documents` 的归一化落点：调用方声明的值优先于本 Skill 自己的推断，不得另立判断。独立调用（无 Handoff）时，`review_mode` 写 `null`，`documents_status` 由步骤 01 的文档解析结果填写：至少一份有效 PRD/TDD/RPD 为 `available`，否则为 `NOT_AVAILABLE`。`WAIVED` 只可能来自调用方，收到该值时结论固定为 `BLOCKED`。
+`review_mode` 和 `documents_status` 是上游 Skill（如 `codekit:bugfix`、`codekit:code-impl`）Handoff 中 `review_mode` 与 `materials.documents` 的归一化落点：调用方声明的值优先于本 Skill 自己的推断，不得另立判断。独立调用（无 Handoff）时，`review_mode` 写 `null`，`documents_status` 由步骤 01 的文档解析结果填写：至少一份有效 PRD/TDD/RPD 为 `available`，否则为 `NOT_AVAILABLE`。`WAIVED` 只可能来自调用方，收到该值时结论固定为 `BLOCKED`。`DELTA` 是上游修复 `REQUEST_CHANGES` 后的增量复核轮，只可能来自携带 `delta_recheck` 块的 Handoff（见 `delta-recheck` 节），结论封顶 `APPROVE_WITH_FOLLOW_UPS`。
 
 `external_mutations` 默认为空。审查请求不等于授权发布评论、批准 PR/MR 或改变远端状态。
 
@@ -372,6 +373,54 @@ dispatch_record:
 
 校验器在发现 manifest 同目录的台账文件时自动核对：`REVIEWED`/`VALIDATED` 维度的 `owner` 必须出现在 `instance_id` 集合里（`local-validator` 除外）；同一 `role`+`instance_id` 不得重复派发；步骤 10 与步骤 18 的 `review-evidence` 实例必须互不重叠且 18 不早于 10；步骤 10 不早于步骤 08；每条记录的 `input_diff_digest` 必须等于报告 `snapshot.diff_digest`；台账条数不得超过 `MAX_DISPATCHES=14`（CW4-a 的派发预算，`record_review_dispatch.py` 在写入侧同样拒绝第 15 条）。台账缺失时这些核对跳过，交付说明必须如实写明未启用台账，不得把"跳过"当成"通过"。
 
+## DELTA Recheck
+<!-- SECTION: delta-recheck -->
+
+DELTA 是上游（如 `codekit:code-impl`）修复 `REQUEST_CHANGES` 后的增量复核轮：只复核被修
+Finding 与受影响维度，不做全量多维审查。放宽的是派发覆盖面，不是判据；交付仍须上游
+的最终 FULL 轮（code-impl 侧 `gate` 的 `review-delivery-round-full` 兜底）。
+
+上游 Handoff 携带的 `delta_recheck` 块（由 code-impl 控制器的 `validate-contract --kind handoff` 机械校验）：
+
+```yaml
+delta_recheck:
+  previous_report_path: absolute-path     # 上一轮 FULL 审查的规范化 JSON 报告
+  previous_report_digest: sha256-hex      # 裸 64 位小写 hex，与磁盘文件逐字节对应
+  repaired_findings:
+    - finding_id: F-001                   # 必须是上轮报告的阻塞 Finding
+      locations: [repo-relative-path:line]
+      remediation: string
+```
+
+本 Skill 报告的 `review_context.review_mode` 写 `DELTA`（`documents_status` 必须 `available`），
+并在报告顶层携带同名 `delta_recheck` 块：
+
+```yaml
+delta_recheck:
+  previous_report_locator: absolute-path
+  previous_report_digest: sha256-hex
+  recheck_instance_id: string             # 必须是派发台账里真实登记过的 review-evidence 实例
+  results:
+    - finding_id: F-001
+      status: FIXED | NOT_FIXED | REGRESSION
+      evidence: [string]                  # 非空，引用新快照下的 file:line 或命令证据
+```
+
+机械规则（`validate_review_report.py` 执行）：
+
+- 上一轮报告必须真实可读、digest 对得上、`verdict` 为 `REQUEST_CHANGES` 且 `review_context.review_mode` 为 `FULL`（DELTA-of-DELTA 报告链不合法）；
+- `results[].finding_id` 必须属于上一轮报告的阻塞 Finding 集合；上轮每个阻塞 Finding 要么出现在 `results`，要么仍在本报告阻塞清单中（不得“不登记即降级”静默丢弃）；
+- 报告的 `traceability` 与 `release_gate` 必须逐字继承上一轮 FULL 报告（不得借增量轮
+  改写更有利的结论；重新推导/评估留给最终 FULL 轮）；
+- 每个 `NOT_FIXED`/`REGRESSION` 的 finding 必须仍是本报告里的阻塞 Finding；每个
+  `FIXED` 不得仍挂阻塞；`results` 非空且 finding_id 唯一；
+- `limitations` 必须逐字携带 `DELTA_RECHECK`（只复核了被修 Finding 与受影响维度）与
+  `DELTA_CARRY_FORWARD`（追踪与 Gate 继承自上轮）两条标记；
+- 覆盖矩阵：至少一个维度 `REVIEWED` 且 owner 等于 `recheck_instance_id`（全维度
+  NOT_VERIFIED 的“空转 DELTA”不合法），其余维度 `NOT_VERIFIED` 及理由；
+  未复核维度不强制 BLOCKED，但结论封顶 `APPROVE_WITH_FOLLOW_UPS`，不得 `APPROVE`；
+- 非 DELTA 报告不得携带 `delta_recheck` 块；验证记录仍须针对新快照新鲜执行。
+
 ## 规范化报告 JSON
 <!-- SECTION: normalized-report-json -->
 
@@ -449,7 +498,7 @@ dispatch_record:
 
 详细数组元素分别遵循上方同名契约。`rejected_candidates` 的每项至少包含 `candidate_id` 和 `reason`；`limitations` 与 `residual_risks` 使用非空字符串。
 
-`review_context` 是最终报告的有效降级上下文：`WAIVED` 必须得到 `BLOCKED`；`LITE` 或 `documents_status: NOT_AVAILABLE` 不得得到 `APPROVE`，并必须记录文档缺失限制或 Open Question。`snapshot` 必须逐字段复制 `freeze_review_snapshot.py` 生成的 manifest（`changed_files` 按上文两种形状之一，两种形状都由脚本预选），校验器核对 `manifest_digest`、三项来源指纹、`changed_files_digest` 和 `documents` 的清单形状，抬高手写 manifest 的成本，并可用 `--check-worktree` 重放工作树核对新鲜度。
+`review_context` 是最终报告的有效降级上下文：`WAIVED` 必须得到 `BLOCKED`；`LITE`、`DELTA` 或 `documents_status: NOT_AVAILABLE` 不得得到 `APPROVE`，并必须记录相应限制或 Open Question（DELTA 轮必须逐字携带 `DELTA_RECHECK` 与 `DELTA_CARRY_FORWARD` 两条限制，见 `delta-recheck` 节）。`snapshot` 必须逐字段复制 `freeze_review_snapshot.py` 生成的 manifest（`changed_files` 按上文两种形状之一，两种形状都由脚本预选），校验器核对 `manifest_digest`、三项来源指纹、`changed_files_digest` 和 `documents` 的清单形状，抬高手写 manifest 的成本，并可用 `--check-worktree` 重放工作树核对新鲜度。
 
 步骤 22 的修复循环读校验器的 `--errors-json` 输出，形状固定为：
 

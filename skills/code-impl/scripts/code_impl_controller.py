@@ -85,6 +85,9 @@ AGENT_STATUSES = {"RUNNING", "DONE", "ARCHIVED", "FAILED", "BLOCKED"}
 # the delivery gate. They live in ``record-review`` records, not agent entries.
 REVIEW_VERDICTS = {"APPROVE", "APPROVE_WITH_FOLLOW_UPS", "REQUEST_CHANGES", "BLOCKED"}
 PASSING_REVIEW_VERDICTS = {"APPROVE", "APPROVE_WITH_FOLLOW_UPS"}
+# P1-1 提效：审查轮次模式。FULL 是完整审查；DELTA 是修复后的增量复核轮，
+# 只复核被修 Finding 与受影响维度，轮次合法性由 record_review 与 gate 机械执行。
+REVIEW_MODES = {"FULL", "DELTA"}
 VALIDATION_RESULTS = {"PASS", "FAIL", "NOT_RUN"}
 VALIDATION_SCOPES = {"task", "overall"}
 # KW1-f: the sources a plan requirement may trace back to. ``user_request``
@@ -515,6 +518,7 @@ def init_run(
         "scope_checks": [],
         "scope_checks_total": 0,
         "validations": [],
+        "overall_validation": [],
         "reviews": [],
         "review_snapshots": [],
     }
@@ -1551,12 +1555,108 @@ def record_validations_from_file(state_path: str | Path, file_path: str | Path) 
     }
 
 
+def reuse_validation(state_path: str | Path, source_index: int, name: str) -> dict[str, Any]:
+    """Register an overall PASS by reusing a task-level record of the same command (P1-3 提效).
+
+    Re-running a full suite that a task already ran against the identical tree
+    buys no evidence, only wall time. The relaxation is fenced mechanically:
+
+      * the source must be a ``scope=task`` ``PASS`` record (never FAIL/NOT_RUN,
+        never another reused overall record — no reuse chains);
+      * its command and resolved cwd must literally match an entry of the
+        registered DAG ``overall_validation`` plan, so a task-scoped subset
+        command can never be passed off as the overall sweep;
+      * the working tree must be byte-identical to the one the source was
+        collected against (same ``head_sha`` and ``diff_digest``); any edit
+        after the task validation invalidates the reuse.
+
+    The new overall record carries ``reused_from`` so the delivery report can
+    disclose how many checks were reused instead of freshly run.
+    """
+    path, state = load_state(state_path)
+    root = _require_repo_root(state["repository"]["root"])
+    validations = state.get("validations", [])
+    if isinstance(source_index, bool) or not isinstance(source_index, int) or not 1 <= source_index <= len(validations):
+        raise ControllerError(
+            f"--source-index must address an existing validation record (1..{len(validations)}), "
+            f"got {source_index!r}"
+        )
+    source = validations[source_index - 1]
+    if source.get("scope") != "task":
+        raise ControllerError(
+            f"validations[{source_index}] is scope={source.get('scope')!r}; only task-level "
+            "records can be reused as overall evidence (no reuse chains)"
+        )
+    if source.get("result") != "PASS":
+        raise ControllerError(
+            f"validations[{source_index}] is {source.get('result')!r}; only PASS evidence can be reused"
+        )
+    if not name.strip():
+        raise ControllerError("reuse-validation --name is required (the overall check name)")
+    plan = state.get("overall_validation", [])
+    if not plan:
+        raise ControllerError(
+            "no overall_validation plan is registered; run record-tasks --from-dag first "
+            "(reuse is only legal for commands the plan declares as overall checks)"
+        )
+    matched = next(
+        (item for item in plan
+         if item["command"] == source.get("command") and item["cwd"] == source.get("cwd")),
+        None,
+    )
+    if matched is None:
+        raise ControllerError(
+            f"validations[{source_index}] command {source.get('command')!r} (cwd {source.get('cwd')!r}) "
+            "does not literally match any registered overall_validation entry; a task-scoped "
+            "check cannot be reused as overall evidence — run the overall check freshly"
+        )
+    current = dirty_snapshot(root)
+    if source.get("head_sha") != current["head_sha"] or source.get("diff_digest") != current["digest"]:
+        raise ControllerError(
+            f"the working tree changed since validations[{source_index}] was collected "
+            f"(source {str(source.get('diff_digest', ''))[:12]} vs current {current['digest'][:12]}); "
+            "reused evidence must describe the delivered tree — run the overall check freshly"
+        )
+    record: dict[str, Any] = {
+        "scope": "overall",
+        "name": name.strip(),
+        "command": source["command"],
+        "cwd": source["cwd"],
+        "exit_code": 0,
+        "result": "PASS",
+        "recorded_at": _now(),
+        "head_sha": current["head_sha"],
+        "diff_digest": current["digest"],
+        "reused_from": {
+            "validation_index": source_index,
+            "task_id": source.get("task_id"),
+            "recorded_at": source.get("recorded_at"),
+        },
+        "evidence": (
+            f"reuse of task validations[{source_index}] ({source.get('task_id')}): "
+            + str(source.get("evidence", ""))
+        )[:4000],
+    }
+    state["validations"].append(record)
+    _atomic_json(path, state)
+    return {
+        "name": record["name"],
+        "scope": "overall",
+        "result": "PASS",
+        "reused_from": source_index,
+        "task_id": source.get("task_id"),
+        "diff_digest": record["diff_digest"][:12],
+        "validations_total": len(state["validations"]),
+    }
+
+
 def record_review(
     state_path: str | Path,
     verdict: str,
     report_path: str,
     validator_exit_code: int,
     summary: str | None = None,
+    review_mode: str = "FULL",
 ) -> dict[str, Any]:
     """Bind a code-review verdict to the frozen snapshot it was produced on (KW1-c).
 
@@ -1568,6 +1668,8 @@ def record_review(
     """
     if verdict not in REVIEW_VERDICTS:
         raise ControllerError(f"review verdict must be one of {sorted(REVIEW_VERDICTS)}")
+    if review_mode not in REVIEW_MODES:
+        raise ControllerError(f"review mode must be one of {sorted(REVIEW_MODES)}, got {review_mode!r}")
     path, state = load_state(state_path)
     freezes = state.get("review_snapshots", [])
     if not freezes:
@@ -1575,6 +1677,34 @@ def record_review(
             "cannot record a review verdict before freeze-review: the verdict must be bound "
             "to a frozen snapshot, otherwise it certifies an undefined diff"
         )
+    # P1-1 提效：DELTA 增量复核轮的轮次谓词。首轮必须 FULL；DELTA 只能紧跟在
+    # 一轮 FULL 的 REQUEST_CHANGES 之后（因此不会连续，也不会是首轮）；DELTA 轮
+    # 不得给出 APPROVE（下游覆盖不全，结论封顶 APPROVE_WITH_FOLLOW_UPS）；交付轮
+    # 必须 FULL 由 gate 的 review-delivery-round-full 检查兜底。
+    previous = (state.get("reviews") or [None])[-1]
+    if review_mode == "DELTA":
+        if previous is None:
+            raise ControllerError(
+                "the first review round must be FULL; a DELTA recheck presupposes a prior "
+                "full review whose REQUEST_CHANGES findings are being repaired"
+            )
+        if previous.get("review_mode", "FULL") != "FULL":
+            raise ControllerError(
+                "DELTA rounds must not be consecutive: the previous round was already DELTA; "
+                "run a FULL review round instead"
+            )
+        if previous.get("verdict") != "REQUEST_CHANGES":
+            raise ControllerError(
+                "a DELTA recheck is only legal after a FULL round returned REQUEST_CHANGES "
+                f"(previous verdict: {previous.get('verdict')!r}); it rechecks repaired findings, "
+                "it is not a cheaper substitute for a full review"
+            )
+        if verdict == "APPROVE":
+            raise ControllerError(
+                "a DELTA round cannot return APPROVE: its coverage is partial by design; "
+                "the downstream report caps at APPROVE_WITH_FOLLOW_UPS and delivery still "
+                "requires a final FULL round"
+            )
     last = freezes[-1]
     root = _require_repo_root(state["repository"]["root"])
     report = Path(report_path).expanduser()
@@ -1582,8 +1712,27 @@ def record_review(
     report = report.resolve(strict=False)
     if not report.is_file():
         raise ControllerError(f"review --report-path is not a readable file: {report}")
+    # 声明模式与报告内容交叉校验：把一份 DELTA 报告改标 FULL 再登记，就能绕过
+    # gate 的 review-delivery-round-full——模式不能只是调用方写出来的标签。
+    # 报告非 JSON 或缺 review_context 时不在此拦（结构问题由 --validator-exit-code
+    # 面负责）；独立调用的 code-review 报告 review_mode 可为 null，视同 FULL。
+    try:
+        report_payload = json.loads(report.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        report_payload = None
+    if isinstance(report_payload, dict):
+        context = report_payload.get("review_context")
+        if isinstance(context, dict):
+            declared = context.get("review_mode") or "FULL"
+            if declared != review_mode:
+                raise ControllerError(
+                    f"report declares review_context.review_mode={declared!r} but "
+                    f"--review-mode is {review_mode!r}; a DELTA report cannot be relabeled "
+                    "FULL to pass the delivery gate — run a real FULL review round"
+                )
     record: dict[str, Any] = {
         "verdict": verdict,
+        "review_mode": review_mode,
         "report_path": str(report),
         "report_digest": _path_digest(report),
         "validator_exit_code": int(validator_exit_code),
@@ -1602,6 +1751,7 @@ def record_review(
     _atomic_json(path, state)
     return {
         "verdict": verdict,
+        "review_mode": review_mode,
         "diff_digest": record["diff_digest"][:12],
         "freeze_index": record["freeze_index"],
         "validator_exit_code": record["validator_exit_code"],
@@ -1702,6 +1852,18 @@ def gate(state_path: str | Path, mode: str = "enforce") -> dict[str, Any]:
             ),
         )
         add("review-report-file-present", Path(last.get("report_path", "")).is_file(), last.get("report_path", ""))
+        # P1-1 提效：增量复核轮可以省掉中间一轮的全量审查，但交付轮必须是 FULL：
+        # DELTA 的覆盖不全由设计保证，最终结论必须落在一次完整审查上。
+        add(
+            "review-delivery-round-full",
+            last.get("review_mode", "FULL") == "FULL",
+            (
+                "the newest verdict comes from a DELTA recheck; run a final FULL review "
+                "round (new freeze + full code-review) before delivery"
+                if last.get("review_mode", "FULL") != "FULL"
+                else "FULL"
+            ),
+        )
 
     # A final scope pass is the only way to catch writes that landed after the
     # last task settled (including writes made while the review was running).
@@ -2002,7 +2164,11 @@ def show(state_path: str | Path, tasks: bool = False) -> dict[str, Any]:
             "freeze_budget": MAX_REVIEW_FREEZES,
             "frozen_diff_digest": str(last_freeze.get("diff_digest", ""))[:12],
             "verdict": last_review.get("verdict"),
+            "review_mode": last_review.get("review_mode", "FULL"),
             "verdict_diff_digest": str(last_review.get("diff_digest", ""))[:12],
+            "reused_validations": sum(
+                1 for v in state.get("validations", []) if v.get("reused_from")
+            ),
         },
         "materials": materials,
         "drifted_materials": drifted,
@@ -2050,6 +2216,23 @@ def record_tasks_from_dag(state_path: str | Path, dag_path: str | Path) -> dict[
             entry["depends_on"] = list(spec["depends_on"])
         state["tasks"].append(entry)
         added.append(task_id)
+    # P1-3 提效：整体检查清单随 DAG 落盘，reuse-validation 据此机械判定
+    # “这条任务级证据跑的就是整体命令”，而不是靠调用方自报。
+    overall: list[dict[str, Any]] = []
+    for index, spec in enumerate(contract.get("overall_validation", [])):
+        if not isinstance(spec, dict):
+            raise ControllerError(f"overall_validation[{index}] must be an object")
+        for field in ("command", "cwd", "proves"):
+            _required(spec.get(field), f"overall_validation[{index}].{field}", str)
+        if not isinstance(spec.get("required"), bool):
+            raise ControllerError(f"overall_validation[{index}].required must be boolean")
+        overall.append({
+            "command": spec["command"],
+            "cwd": str(_resolve_within_repo(root, spec["cwd"], what=f"overall_validation[{index}].cwd")),
+            "proves": spec["proves"],
+            "required": spec["required"],
+        })
+    state["overall_validation"] = overall
     _atomic_json(path, state)
     return {
         "registered": added,
@@ -2249,10 +2432,75 @@ def validate_contract(payload: dict[str, Any], kind: str) -> None:
     if kind == "handoff":  # P1-1
         rm = payload.get("review_mode")
         _required(rm, "review_mode", str)
-        if rm != "FULL":
+        if rm not in REVIEW_MODES:
             raise ControllerError(
-                f"code-impl must always declare review_mode: FULL, got {rm!r}"
+                f"code-impl Handoff must declare review_mode FULL or DELTA, got {rm!r}"
             )
+        if rm == "DELTA":
+            # 增量复核轮的 Handoff 必须携带上一轮 FULL 报告与被修 Finding 清单：
+            # 没有它们，下游无从知道该复核什么，“增量”就成了无根据的缩减。
+            delta = payload.get("delta_recheck")
+            _required(delta, "delta_recheck", dict)
+            prev_path = delta.get("previous_report_path")
+            _required(prev_path, "delta_recheck.previous_report_path", str)
+            prev = Path(prev_path).expanduser().resolve(strict=False)
+            if not prev.is_file():
+                raise ControllerError(
+                    f"delta_recheck.previous_report_path does not resolve to a file: {prev}"
+                )
+            prev_digest = delta.get("previous_report_digest")
+            _required(prev_digest, "delta_recheck.previous_report_digest", str)
+            # 跨 SKILL 摘要一律裸 64 位 hex（与 code-review 的 digest_scheme 同一约定），
+            # 不用控制器内部带 sha256: 前缀的 _path_digest 形态。
+            if not HEX64_RE.fullmatch(prev_digest):
+                raise ControllerError(
+                    "delta_recheck.previous_report_digest must be 64 lowercase hex characters "
+                    f"(bare sha256, no prefix), got {prev_digest!r}"
+                )
+            if prev_digest != hashlib.sha256(prev.read_bytes()).hexdigest():
+                raise ControllerError(
+                    "delta_recheck.previous_report_digest does not match the report file on "
+                    "disk; the recheck must target the exact report that returned REQUEST_CHANGES"
+                )
+            try:
+                prev_payload = json.loads(prev.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ControllerError(
+                    f"delta_recheck.previous_report_path is not readable JSON: {exc}"
+                ) from exc
+            if not isinstance(prev_payload, dict) or prev_payload.get("verdict") != "REQUEST_CHANGES":
+                raise ControllerError(
+                    "the previous full review report must carry verdict REQUEST_CHANGES; "
+                    "a DELTA recheck only repairs findings from a rejected full round"
+                )
+            repaired = delta.get("repaired_findings")
+            if not isinstance(repaired, list) or not repaired:
+                raise ControllerError(
+                    "delta_recheck.repaired_findings must be a non-empty list: a DELTA round "
+                    "without findings to recheck has no reason to exist"
+                )
+            prev_blocking = {
+                item.get("id")
+                for item in prev_payload.get("findings", [])
+                if isinstance(item, dict) and item.get("blocking") is True
+            }
+            for i, item in enumerate(repaired):
+                if not isinstance(item, dict):
+                    raise ControllerError(f"delta_recheck.repaired_findings[{i}] must be an object")
+                fid = item.get("finding_id")
+                _required(fid, f"delta_recheck.repaired_findings[{i}].finding_id", str)
+                if fid not in prev_blocking:
+                    raise ControllerError(
+                        f"delta_recheck.repaired_findings[{i}].finding_id {fid!r} is not a "
+                        "blocking finding of the previous report; only blocking findings "
+                        "drive a repair round"
+                    )
+                locations = item.get("locations")
+                if not isinstance(locations, list) or not locations:
+                    raise ControllerError(
+                        f"delta_recheck.repaired_findings[{i}].locations must be a non-empty "
+                        "list so the recheck can be attributed to files"
+                    )
         review_input = payload.get("review_input")
         _required(review_input, "review_input", dict)
         materials = review_input.get("materials")
@@ -2520,6 +2768,16 @@ def build_parser() -> argparse.ArgumentParser:
     batch_val.add_argument("--state", required=True)
     batch_val.add_argument("--from-file", required=True)
 
+    # P1-3 提效：同一工作树下任务级已跑过的整体命令可复用为整体证据，
+    # 边界（PASS 源、命令逐字命中 overall_validation 计划、指纹不变）由脚本机械执行。
+    rv = sub.add_parser("reuse-validation",
+                        help="Register an overall PASS by reusing a task-level record of the "
+                             "same command against the identical working tree")
+    rv.add_argument("--state", required=True)
+    rv.add_argument("--source-index", required=True, type=int,
+                    help="1-based index into state validations of the task-level PASS record")
+    rv.add_argument("--name", required=True, help="Name of the overall check being satisfied")
+
     # KW1-c: the review verdict, bound to the frozen snapshot by the controller
     rr = sub.add_parser("record-review",
                         help="Record the code-review verdict against the newest frozen snapshot")
@@ -2528,6 +2786,10 @@ def build_parser() -> argparse.ArgumentParser:
     rr.add_argument("--report-path", required=True)
     rr.add_argument("--validator-exit-code", required=True, type=int)
     rr.add_argument("--summary", default=None)
+    rr.add_argument("--review-mode", default="FULL", choices=sorted(REVIEW_MODES),
+                    help="FULL (default) or DELTA: a DELTA recheck is only legal after a "
+                         "FULL round returned REQUEST_CHANGES, cannot be consecutive, "
+                         "cannot return APPROVE, and cannot be the delivery round")
 
     # KW1-a: the delivery gate, decided from recorded evidence
     gt = sub.add_parser("gate",
@@ -2613,13 +2875,16 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "record-validations":
             print(json.dumps(record_validations_from_file(args.state, args.from_file),
                              ensure_ascii=False))
+        elif args.command == "reuse-validation":
+            print(json.dumps(reuse_validation(args.state, args.source_index, args.name),
+                             ensure_ascii=False))
         elif args.command == "record-failures":
             print(json.dumps(record_failures_from_file(args.state, args.from_file),
                              ensure_ascii=False))
         elif args.command == "record-review":
             print(json.dumps(record_review(
                 args.state, args.verdict, args.report_path, args.validator_exit_code,
-                summary=args.summary,
+                summary=args.summary, review_mode=args.review_mode,
             ), ensure_ascii=False))
         elif args.command == "gate":
             report = gate(args.state, args.mode)

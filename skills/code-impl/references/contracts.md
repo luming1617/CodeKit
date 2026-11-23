@@ -2,7 +2,25 @@
 
 本文件定义 Orchestrator 与各角色之间的最小数据契约。字段可以使用 YAML、JSON 或等价的结构化 Markdown 表达，但不得省略必填信息，也不得记录密钥、Token、Cookie 或完整凭据。
 
+## 节锚点与按角色读取
+
+每个契约节标题下都有机器可读锚点 `<!-- SECTION: <id> -->`。角色与主 Agent **只按锚点定位并读取自己需要的节**（例如 `grep -n "SECTION: task-contract" contracts.md` 取行号后按区间读取），不要整读本文件。下表与 SKILL.md 的按阶段读取规则一致，两侧由测试互相核对；派发子代理时必须把该角色对应的锚点清单原样写进任务正文：
+
+| 角色 / 步骤 | 必读锚点 |
+|---|---|
+| Planner（03） | `input-contract`、`task-dag` |
+| Implementer（06） | `task-contract`、`implementation-result` |
+| Debugger（09） | `validation-record`、`debugger-result`、`failure-attribution`、`retry-budget` |
+| Orchestrator（01–02） | `input-contract` |
+| Orchestrator（03–04） | `task-dag` |
+| Orchestrator（05–08） | `task-contract`、`validation-record`、`retry-budget`、`task-ledger` |
+| Orchestrator（09–11） | `debugger-result`、`failure-attribution`、`retry-budget`、`task-ledger` |
+| Orchestrator（12–13） | `validation-record` |
+| Orchestrator（14–15） | `code-review-handoff`、`review-verdict-record`、`code-review-result`、`decision-adapter` |
+| Orchestrator（16） | `delivery-gate`、`delivery-report`、`task-ledger` |
+
 ## 编码输入契约
+<!-- SECTION: input-contract -->
 
 ```yaml
 input_contract:
@@ -57,6 +75,7 @@ shift_jis/cp1252/utf-16），不会退化成 traceback；只有在人工确认�
 MSYS 环境把 `/c/...` 重写过的路径会被识别并提示改用 Windows 绝对路径。
 
 ## Task DAG
+<!-- SECTION: task-dag -->
 
 ```yaml
 task_dag:
@@ -104,6 +123,7 @@ task_dag:
 - 所有命令必须来自仓库规范、构建配置、CI 或已验证的工具帮助；不确定时放入 `unresolved`，不得编造。
 - 每项验收标准必须映射到至少一个验证证据或人工验收候选。
 - `unresolved` 非空时计划不能确认。
+- `overall_validation` 清单由 `record-tasks --from-dag` 随任务一起落盘进状态（命令、解析后 cwd、proves、required）；它是 `reuse-validation` 判定“这条任务级证据跑的就是整体命令”的唯一依据，重规划后必须重新登记。
 
 **机械校验（控制器 P1-1）：**计划确认前必须执行以下命令；校验失败时不得冻结 `plan_version`：
 
@@ -120,6 +140,7 @@ task_dag:
 - `requirement_trace` 必须为非空列表。
 
 ## Task Contract
+<!-- SECTION: task-contract -->
 
 ```yaml
 task_contract:
@@ -158,6 +179,7 @@ task_contract:
 修改范围扩大、权限变化或验收标准变化时，必须生成新的 Task Contract；不要口头追加隐含范围。写入范围的机械扩权只能由控制器的 `expand-scope`（`--task-id` + `--reason`，登记进任务台账）完成；`check-scope` 与 `settle-task` 按 Task Ledger 推导授权集合（任务登记范围 ∪ 已 `PASS` 任务范围），不接受调用方现场声明的文件。
 
 ## Implementation Result
+<!-- SECTION: implementation-result -->
 
 ```yaml
 implementation_result:
@@ -177,6 +199,7 @@ implementation_result:
 只有 `DONE` 才进入常规任务验证；其他状态由 Orchestrator 处理。`DONE` 也不代表任务已经 PASS。
 
 ## Validation Record
+<!-- SECTION: validation-record -->
 
 ```yaml
 validation_record:
@@ -202,8 +225,10 @@ validation_record:
 
 `NOT_RUN` 不能满足 `required: true` 的验证项。日志过长时保留稳定摘要和原始日志位置，不要只写“tests passed”。
 
-**机械落盘（控制器 KW1-b）：**上面这份记录不能只存在于对话里。每跑完一条验证命令必须
-执行一次 `record-validation`，由控制器把它写进 `state.json` 的 `validations`：
+**机械落盘（控制器 KW1-b）：**上面这份记录不能只存在于对话里。验证证据必须经控制器写进
+`state.json` 的 `validations`：一整轮检查（任务级的格式/编译/单测/Lint/静态检查，或步骤 12 的
+整体全量检查）跑完后用批量面 `record-validations --from-file` 一次登记；单条面
+`record-validation` 保留给轮中即时登记（如某条失败后中止本轮、先落失败证据）：
 
 ```bash
 <PYTHON> "$SKILL_DIR/scripts/code_impl_controller.py" record-validation \
@@ -219,7 +244,17 @@ validation_record:
 指纹），`--cwd` 必须解析到仓库内；调用方无法声明证据属于别的树，这是步骤 16 门禁判断
 “证据是否覆盖被交付的 Diff”的基础。
 
+**证据复用（P1-3 提效）：**整体检查的命令若已在任务级验证中逐字跑过（同命令、同解析后
+cwd）且此后工作树未变，可用 `reuse-validation --source-index <n> --name <整体检查名>` 把该
+任务级 PASS 记录复用为一条 `scope=overall` 的 PASS 记录，免重跑。机械边界：源必须是
+`scope=task` 且 `result=PASS`（禁止复用链）；命令与 cwd 必须逐字命中 `record-tasks --from-dag`
+登记的 `overall_validation` 计划条目（任务级子集命令不得冒充整体检查）；当前工作树
+`head_sha`/`diff_digest` 必须与源记录采集时完全一致。新记录带 `reused_from`（源索引/任务/
+时间），`show` 的 `review.reused_validations` 计数，最终报告必须披露。未被复用的整体检查
+仍须新鲜执行；复用不豁免 `gate` 的任何指纹判据。
+
 ## Retry Budget
+<!-- SECTION: retry-budget -->
 
 重试预算由控制器持有，不靠 Orchestrator 记忆：
 
@@ -246,6 +281,7 @@ retry_budget:
 换临时目录不会重置预算。
 
 ## Debugger Result
+<!-- SECTION: debugger-result -->
 
 ```yaml
 debugger_result:
@@ -263,6 +299,7 @@ debugger_result:
 ```
 
 ## Failure Attribution
+<!-- SECTION: failure-attribution -->
 
 整体验证失败不能直接归属于任意一个任务。Debugger 必须返回受影响任务集合；
 Orchestrator 使用控制器登记并据此决定重试、重规划或人工介入：
@@ -286,6 +323,7 @@ failure_attribution:
 `$SKILL_DIR/scripts/code_impl_controller.py record-failure` 写入运行状态。
 
 ## Task Ledger
+<!-- SECTION: task-ledger -->
 
 ```yaml
 task_ledger:
@@ -330,6 +368,7 @@ task_ledger:
 应调用 `show`，而不是读取 `state.json` 或 `scope-checks/`。
 
 ## Code Review Handoff
+<!-- SECTION: code-review-handoff -->
 
 ```yaml
 code_review_handoff:
@@ -359,7 +398,14 @@ code_review_handoff:
         revision: string | null
         content_digest: string
         access: available | unavailable | partial
-  review_mode: FULL
+  review_mode: FULL | DELTA        # 首轮/交付轮 FULL；修复轮可 DELTA（增量复核）
+  delta_recheck:                   # 仅 review_mode=DELTA 时必填，由 validate-contract 机械校验
+    previous_report_path: absolute-path   # 上一轮 FULL 审查的规范化 JSON 报告
+    previous_report_digest: sha256-hex    # 裸 64 位小写 hex，与磁盘文件逐字节对应
+    repaired_findings:
+      - finding_id: F-001          # 必须是上轮报告的阻塞 Finding
+        locations: [repo-relative-path:line]
+        remediation: string
   snapshot:                          # 即 freeze-review 落盘的 review-snapshot.json 本体，不得手抄
     schema_version: 2
     produced_by: "codekit:code-impl/scripts/code_impl_controller.py"
@@ -396,7 +442,7 @@ code_review_handoff:
   工作树三层摘要（`staged_digest`/`unstaged_digest`/`untracked_digest`）在本轮回放中变了、或同
   `produced_by` 同 `digest_scheme` 的 `diff_digest` 不等。
 - `external_mutations` 必须为空。Handoff 不授予评论、审批、commit、push、部署或其他外部变更权限。
-- `review_mode` 固定为 `FULL`，且 `materials` 里 `kind` 为 `PRD`、`TDD`、`RPD` 的三条必须各存一条且 `access: available`（相当于上游约定的 `materials.documents: available`）：本 Skill 的输入门禁已强校验三份文档。`code-review` 已支持为空的 `feature-directory` 并在缺文档时自行降级为 `NOT_AVAILABLE`（最多 `APPROVE_WITH_FOLLOW_UPS`），因此它报告中任何“文档缺失”的 Open Question 或 limitation 都意味着 Handoff 与本 Skill 冻结的文档不一致，必须重新冻结 Handoff 后重调或进入人工介入，不得作为审查通过证据。
+- `review_mode` 取 `FULL` 或 `DELTA`：首轮与最终交付轮必须 FULL；DELTA 只用于首轮 FULL 被 `REQUEST_CHANGES` 拒绝后的修复复核轮，必须携带 `delta_recheck` 块（上一轮报告真实可读、digest 逐字节对应、其结论为 `REQUEST_CHANGES`，`repaired_findings` 非空且每项的 `finding_id` 是上轮阻塞 Finding、`locations` 非空）。轮次合法性另由 `record-review` 与 `gate` 机械执行（见 `review-verdict-record` 与 `delivery-gate` 节）。两种模式都要求 `materials` 里 `kind` 为 `PRD`、`TDD`、`RPD` 的三条各存一条且 `access: available`（相当于上游约定的 `materials.documents: available`）：本 Skill 的输入门禁已强校验三份文档。`code-review` 已支持为空的 `feature-directory` 并在缺文档时自行降级为 `NOT_AVAILABLE`（最多 `APPROVE_WITH_FOLLOW_UPS`），因此它报告中任何“文档缺失”的 Open Question 或 limitation 都意味着 Handoff 与本 Skill 冻结的文档不一致，必须重新冻结 Handoff 后重调或进入人工介入，不得作为审查通过证据。
 - `validator_record` 的退出码必须为 0；它应以 `validator.exit_code` 形式出现在接收封套中，或由 `validator_record` artifact 明确引用；否则报告不能进入审查判定。
 
 **机械校验（控制器 P1-1）：**调用 `codekit:code-review` 前必须执行以下命令；校验失败时不得发出 Handoff：
@@ -407,7 +453,7 @@ code_review_handoff:
 ```
 
 控制器校验内容（顺序即诊断顺序）：
-- `review_mode` 必须等于 `"FULL"`；
+- `review_mode` 必须等于 `"FULL"` 或 `"DELTA"`；DELTA 时逐项校验 `delta_recheck` 块（上一轮报告存在、digest 匹配、结论为 REQUEST_CHANGES、repaired_findings 非空且引用上轮阻塞 Finding）；
 - `review_input.materials` 中 `PRD`、`TDD`、`RPD` 各一条且 `access: "available"`；
 - 上述三份文档的 `locator` 必须解析到磁盘上真实存在、可读的文件（`http(s)://`、`s3://`、
   `gs://`、`rev:`、`git@` 形式除外）。`access: available` 从此是**测出来的**，不是写出来的：
@@ -423,6 +469,7 @@ code_review_handoff:
   （重命名 `R:old->new`）；缺键、贴入 code-review 的 8 字段扁平 manifest、或摘要带 `sha256:` 前缀都在此被拒。
 
 ## Review Verdict Record
+<!-- SECTION: review-verdict-record -->
 
 Handoff 的返回结论必须以控制器记录的形式留在状态里，否则“审查通过”只是会话里的一句话：
 
@@ -437,6 +484,7 @@ Handoff 的返回结论必须以控制器记录的形式留在状态里，否则
 ```yaml
 review_record:
   verdict: APPROVE | APPROVE_WITH_FOLLOW_UPS | REQUEST_CHANGES | BLOCKED
+  review_mode: FULL | DELTA      # 登记时的轮次模式，默认 FULL
   report_path: absolute-path
   report_digest: string          # 控制器对报告文件算得
   validator_exit_code: integer   # code-review 自带校验器
@@ -452,7 +500,18 @@ review_record:
 `record-agent` 的 `--status` 只接受 `RUNNING|DONE|ARCHIVED|FAILED|BLOCKED`（角色存活状态），
 审查结论只能经 `record-review` 入账。
 
+**轮次谓词（P1-1 提效，控制器机械执行）：**首轮必须 `FULL`；`DELTA` 只允许紧跟在一轮
+`FULL` 的 `REQUEST_CHANGES` 之后（因此 DELTA 不会连续、也不会是首轮）；`DELTA` 轮不得
+登记 `APPROVE`（下游覆盖不全，结论封顶 `APPROVE_WITH_FOLLOW_UPS`）；交付轮必须 `FULL`
+（由 `gate` 的 `review-delivery-round-full` 兜底）。登记时控制器还会读报告 JSON 做
+**声明模式交叉校验**：报告 `review_context.review_mode`（null 视同 FULL）与 `--review-mode`
+不一致即拒绝——把 DELTA 报告改标 FULL 再登记无法绕过交付门禁（报告非 JSON 或缺
+`review_context` 时不在此拦，结构问题由 `--validator-exit-code` 面负责）。典型序列
+FULL→DELTA→FULL 恰好消耗 `MAX_REVIEW_FREEZES=3` 次冻结；DELTA 轮通过后仍须一次 FULL
+交付确认轮，这是增量复核的安全边界：最坏后果是多花一轮，而不是漏检。
+
 ## Code Review Result
+<!-- SECTION: code-review-result -->
 
 ```yaml
 code_review_result:
@@ -486,6 +545,7 @@ code_review_result:
 本结构是 `code-impl` 对系统 Skill 交付物的接收封套，不替代 `code-review` 自身的规范化报告。`verdict`、Finding、Open Question、Release Gate、限制和风险均以通过校验的规范化 JSON 为唯一事实源。
 
 ## Code Review Decision Adapter
+<!-- SECTION: decision-adapter -->
 
 ```yaml
 code_review_decision:
@@ -512,7 +572,7 @@ code_review_decision:
 |---|---|---|
 | `APPROVE` | 快照匹配且报告校验 PASS | `final_report` |
 | `APPROVE_WITH_FOLLOW_UPS` | 快照匹配且报告校验 PASS，且无阻塞项 | `final_report`，登记非阻塞事项 |
-| `REQUEST_CHANGES` | 修复轮次少于 2，问题可映射到原任务范围 | `repair` |
+| `REQUEST_CHANGES` | 修复轮次少于 2，问题可映射到原任务范围 | `repair`（首轮 FULL 被拒后的修复复核轮用 DELTA，见下） |
 | `REQUEST_CHANGES` | 需要新文件、依赖或范围变化 | `replan` |
 | `REQUEST_CHANGES` | 已完成 2 轮修复 | `human_intervention` |
 | `BLOCKED` | 任意 | `human_intervention` |
@@ -523,7 +583,15 @@ code_review_decision:
 以及 `uncomparable_digests` 非空，都不改变本判据 —— 它们是要写进报告的限制，不是不匹配。
 快照不匹配、报告校验不是 PASS、系统 Skill 不可用或宿主不支持嵌套 Skill 调用时，不读取 `source_verdict` 作通过判断，统一使用 `human_intervention`。Formal Finding 没有旧 Reviewer 的 `task_hint` 字段；Orchestrator 必须用 `locations` 与 Task Ledger 的 `changed_files` 做确定性映射，不能猜测归属。
 
+**DELTA 增量复核轮的处置（P1-1 提效）：**首轮 FULL 返回 `REQUEST_CHANGES` 且问题可映射时，
+修复后的复核轮用 `review_mode: DELTA`（Handoff 携带 `delta_recheck`，登记用
+`record-review --review-mode DELTA`）；DELTA 轮返回 `REQUEST_CHANGES` 时再修复并以 FULL 轮
+复核（DELTA 不得连续）；DELTA 轮返回 `APPROVE_WITH_FOLLOW_UPS` 时不直接交付，必须再执行
+一次 FULL 交付确认轮。DELTA 轮的 `BLOCKED` 同样进入 `human_intervention`。轮次合法性由
+控制器机械执行，不靠 Orchestrator 记忆（见 `review-verdict-record` 节）。
+
 ## Delivery Gate
+<!-- SECTION: delivery-gate -->
 
 “编码完成”的判定权在控制器，不在 Orchestrator：
 
@@ -547,12 +615,14 @@ code_review_decision:
 | `review-verdict-passing` | 最新结论为 `APPROVE` 或 `APPROVE_WITH_FOLLOW_UPS` |
 | `review-validator-exited-0` | 该结论的 `validator_exit_code == 0` |
 | `review-verdict-bound-to-frozen-diff` | 结论的 `diff_digest` 等于最后一次冻结（否则要求新冻结 + 复审） |
+| `review-delivery-round-full` | 最新结论的 `review_mode` 为 `FULL`（DELTA 增量复核轮的结论不直接支撑交付，须再跑一次 FULL 轮） |
 | `review-report-file-present` | 报告文件仍在磁盘且摘要一致 |
 | `final-scope-clean` | 最后一次任务判定之后没有新的越界写入 |
 
 `--mode warn-only` 只做盘点，仍返回 `BLOCKED (warn-only)` 且退出码 0，不得用它出报告。
 
 ## 最终交付报告
+<!-- SECTION: delivery-report -->
 
 ```markdown
 ## 编码交付结果
