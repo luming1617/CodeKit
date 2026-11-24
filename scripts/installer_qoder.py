@@ -27,7 +27,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_config as config  # noqa: E402
-from installer_platform import has_contents, rmtree, text_kwargs  # noqa: E402
+from installer_platform import execute, has_contents, rmtree  # noqa: E402
 
 
 PLUGIN_NAME = config.PLUGIN_NAME
@@ -126,19 +126,10 @@ def platform_for_component(component_id: str) -> Optional[Platform]:
 
 def run(args: Sequence[str], timeout: float = 20.0) -> tuple[int, str]:
     """Run a probe or CLI command; failures and timeouts become a failed result."""
-    try:
-        completed = subprocess.run(
-            [str(item) for item in args],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            check=False,
-            **text_kwargs(),
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    result = execute(args, stdin=subprocess.DEVNULL, timeout=timeout)
+    if result.error:
         return 1, ""
-    return completed.returncode, completed.stdout.strip()
+    return result.returncode, result.stdout.strip()
 
 
 def utc_timestamp() -> str:

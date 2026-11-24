@@ -15,7 +15,6 @@ import shutil
 import subprocess
 import sys
 import unicodedata
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -139,18 +138,10 @@ class Context:
 
 def run_command_capture(args: list[str], timeout: float = 15.0) -> tuple[int, str, str]:
     """静默执行探测命令，返回 (退出码, stdout, stderr)；异常与超时按失败处理。"""
-    try:
-        completed = subprocess.run(
-            platform_layer.resolve_argv(args),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
-            **platform_layer.text_kwargs(),
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return 1, "", str(exc)
-    return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
+    result = platform_layer.execute(args, timeout=timeout, stderr=subprocess.PIPE)
+    if result.error:
+        return 1, "", result.error
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
 def run_command(args: list[str], timeout: float = 15.0) -> str:
@@ -263,17 +254,12 @@ def saved_marketplace_sha(context: Context) -> str:
 
 def fetch_json(url: str) -> Any:
     """获取版本接口 JSON；GitHub 地址只走 gh-proxy，避免拖慢启动前的状态检查。"""
-    for candidate in config.probe_urls(url):
-        request = urllib.request.Request(
-            candidate,
-            headers={"Accept": "application/json", "User-Agent": "CodeKit-installer"},
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=5) as response:
-                return json.load(response)
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
-    return None
+    return config.fetch_first(
+        config.probe_urls(url),
+        timeout=5,
+        headers={"Accept": "application/json", "User-Agent": "CodeKit-installer"},
+        parse=json.load,
+    )
 
 
 def version_source_url(component: str) -> tuple[str, str]:
@@ -353,6 +339,20 @@ def repository_plugin_version(context: Context) -> str:
         return "installed"
 
 
+def plugin_cache_dir(component: str, home: Path) -> Optional[Path]:
+    """非 Qoder 插件的缓存根目录；未知组件返回 None。
+
+    状态检测、残留判定、安装路径展示与卸载清理共用这一份路径事实——各处各拼
+    一遍时会出现「检测说在这里、清理却删别处」的漂移。Qoder 的缓存按 marketplace
+    分目录，由 installer_qoder.cached_copies 逐项解析，不走这张表。
+    """
+    return {
+        "claude_plugin": home / ".claude" / "plugins" / "cache" / config.MARKETPLACE_NAME,
+        "codex_plugin": home / ".codex" / "plugins" / "cache" / config.MARKETPLACE_NAME,
+        "opencode_plugin": home / ".config" / "opencode" / "node_modules" / config.PLUGIN_NAME,
+    }.get(component)
+
+
 def claude_installed_version(home: Path) -> str:
     """读取 Claude 插件注册表中记录的实际安装版本。"""
     document = config.read_json(home / ".claude" / "plugins" / "installed_plugins.json")
@@ -368,7 +368,7 @@ def claude_installed_version(home: Path) -> str:
 
 def codex_installed_version(home: Path) -> str:
     """读取 Codex 插件缓存中以版本号命名的目录，取其中最新的一版。"""
-    root = home / ".codex" / "plugins" / "cache" / config.MARKETPLACE_NAME / config.PLUGIN_NAME
+    root = plugin_cache_dir("codex_plugin", home) / config.PLUGIN_NAME
     try:
         versions = [item.name for item in root.iterdir() if item.is_dir()]
     except OSError:
@@ -407,6 +407,18 @@ def qoder_present(descriptor: Any, context: Context) -> bool:
     return platform_subagents_state(context, descriptor.key) in {"installed", "up_to_date"}
 
 
+def legacy_plugin_tool(component: str) -> Optional[str]:
+    """非 Qoder 插件组件对应的平台键；Qoder 插件与命令组件返回 None。
+
+    「哪些插件走 claude/codex/opencode 各自的注册表探测」与「组件→平台键」两个
+    事实都从 agents 注册表派生，不再在检测逻辑里手写一份字面量集合与映射表。
+    """
+    entry = agents.component_agent(component)
+    if entry is None or entry.key in qoder.PLATFORMS:
+        return None
+    return entry.key
+
+
 def component_version(component: str, context: Context) -> str:
     """按组件类型选版本来源：根接管组件先取清单实测，再退到 CLI 命令，插件取自身配置。"""
     definition = registry.component_by_id(component)
@@ -422,7 +434,7 @@ def component_version(component: str, context: Context) -> str:
         # （`gh --version`、`lark-cli --version` 都是），结果页只需要三段版本号；
         # 提取不到版本号时原样返回，避免把探测结果整条丢掉。
         return config.extract_version(value) or value
-    if component in {"claude_plugin", "opencode_plugin", "codex_plugin"}:
+    if legacy_plugin_tool(component) is not None:
         return installed_plugin_version(component, context)
     qoder_platform = qoder.platform_for_component(component)
     if qoder_platform is not None:
@@ -439,7 +451,7 @@ def component_version(component: str, context: Context) -> str:
 
 def claude_cache_present(home: Path) -> bool:
     """判断 Claude 插件缓存是否已由 CLI 或 Desktop 写入共享目录。"""
-    return (home / ".claude" / "plugins" / "cache" / config.MARKETPLACE_NAME / config.PLUGIN_NAME).is_dir()
+    return (plugin_cache_dir("claude_plugin", home) / config.PLUGIN_NAME).is_dir()
 
 
 def present(component: str, context: Context) -> bool:
@@ -499,11 +511,7 @@ def component_leftovers(component: str, context: Context) -> list[Path]:
             return []
         candidates: tuple[Path, ...] = tuple(qoder.cached_copies(root))
     else:
-        candidate = {
-            "claude_plugin": context.home / ".claude" / "plugins" / "cache" / config.MARKETPLACE_NAME,
-            "codex_plugin": context.home / ".codex" / "plugins" / "cache" / config.MARKETPLACE_NAME,
-            "opencode_plugin": context.home / ".config" / "opencode" / "node_modules" / config.PLUGIN_NAME,
-        }.get(component)
+        candidate = plugin_cache_dir(component, context.home)
         candidates = (candidate,) if candidate is not None else ()
     return [path for path in candidates if platform_layer.has_contents(path)]
 
@@ -546,8 +554,8 @@ def detect_component(component: str, context: Context, latest: dict[str, str]) -
                 return state
         state.status = "up_to_date"
         return state
-    if component in {"claude_plugin", "opencode_plugin", "codex_plugin"}:
-        tool = {"claude_plugin": "claude", "opencode_plugin": "opencode", "codex_plugin": "codex"}[component]
+    tool = legacy_plugin_tool(component)
+    if tool is not None:
         agents_state = platform_subagents_state(context, tool)
         if context.marketplace_local and agents_state != "up_to_date":
             state.status = "installed"
@@ -747,12 +755,7 @@ def component_install_path(component: str, context: Context) -> str:
         except ValueError:
             return "—"
         return display_path(qoder.plugin_cache_root(root), context.home)
-    plugin_paths = {
-        "claude_plugin": context.home / ".claude" / "plugins" / "cache" / config.MARKETPLACE_NAME,
-        "opencode_plugin": context.home / ".config" / "opencode" / "node_modules" / config.PLUGIN_NAME,
-        "codex_plugin": context.home / ".codex" / "plugins" / "cache" / config.MARKETPLACE_NAME,
-    }
-    path = plugin_paths.get(component)
+    path = plugin_cache_dir(component, context.home)
     return display_path(path, context.home) if path else "—"
 
 

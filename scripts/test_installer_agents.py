@@ -463,6 +463,7 @@ class AgentPresenceTests(unittest.TestCase):
             installer.home = Path(directory)
             installer.os_name = "Linux"
             installer.logger = Mock()
+            installer.agent_cli_cache = {}
 
             with patch.object(detector, "agent_cli_presence", return_value=""):
                 result = installer.preflight_agents()

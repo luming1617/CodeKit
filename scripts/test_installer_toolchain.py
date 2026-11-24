@@ -640,6 +640,12 @@ def toolchain_installer(home: Path, *, system: str = "Windows"):
     installer.logger = Mock()
     installer.toolchain = toolchain.RuntimeState()
     installer.command_exists = Mock(return_value=False)
+    # 会话状态空值与 __init__ 保持一致：读取点已不再 getattr 兜底。
+    installer.toolchain_migration = []
+    installer.toolchain_health = []
+    installer.toolchain_manifest = {}
+    installer.agent_cli_cache = {}
+    installer.setup_path_selected = False
     return installer
 
 

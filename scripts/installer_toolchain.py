@@ -241,35 +241,14 @@ def _write_current(home: Path, platform, tag: str, python: Path) -> None:
 
 def _probe_runtime(python: Path) -> tuple[bool, str]:
     """Cheap reuse probe: the interpreter must start and expose venv/ensurepip."""
-    try:
-        completed = subprocess.run(
-            [str(python), "-c", "import venv, ensurepip, sys; print(sys.version.split()[0])"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=60,
-            check=False,
-            **platform_layer.text_kwargs(),
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    result = platform_layer.execute(
+        [str(python), "-c", "import venv, ensurepip, sys; print(sys.version.split()[0])"],
+        timeout=60,
+    )
+    if result.error or result.returncode != 0:
         return False, ""
-    if completed.returncode != 0:
-        return False, ""
-    lines = (completed.stdout or "").strip().splitlines()
+    lines = result.stdout.strip().splitlines()
     return True, (lines[-1] if lines else "")
-
-
-def _extract_archive(archive: Path, destination: Path) -> None:
-    """Extract a tar.gz/zip asset into ``destination``."""
-    if zipfile.is_zipfile(archive):
-        with zipfile.ZipFile(archive) as package:
-            package.extractall(destination)
-        return
-    with tarfile.open(archive) as package:
-        try:
-            package.extractall(destination, filter="data")
-        except TypeError:
-            # Python < 3.12 has no extraction filter.
-            package.extractall(destination)
 
 
 def _interpreter_root(staging: Path, platform) -> Optional[Path]:
@@ -301,7 +280,7 @@ def _install_archive(
         raw = staging / "raw"
         raw.mkdir()
         try:
-            _extract_archive(archive, raw)
+            platform_layer.extract_archive(archive, raw)
         except (OSError, tarfile.TarError, zipfile.BadZipFile, ValueError) as exc:
             return False, f"运行时压缩包无法解开：{exc}"
         root = _interpreter_root(raw, platform)
@@ -598,20 +577,14 @@ def _venv_package_version(python: Path, package: str) -> str:
     """
     if not python.is_file():
         return ""
-    try:
-        completed = subprocess.run(
-            [str(python), "-c", f"import importlib.metadata as m; print(m.version({package!r}))"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=60,
-            check=False,
-            **platform_layer.text_kwargs(),
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    result = platform_layer.execute(
+        [str(python), "-c", f"import importlib.metadata as m; print(m.version({package!r}))"],
+        stderr=subprocess.DEVNULL,
+        timeout=60,
+    )
+    if result.error or result.returncode != 0:
         return ""
-    if completed.returncode != 0:
-        return ""
-    lines = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     return lines[-1] if lines else ""
 
 

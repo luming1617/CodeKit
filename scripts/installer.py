@@ -10,20 +10,15 @@ the lifecycle and error boundary around them.
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import os
-import platform
 import shlex
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
-import urllib.request
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Optional, Sequence, Union
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -41,13 +36,16 @@ except ValueError as exc:
     raise SystemExit(1)
 
 import installer_agents as agents  # noqa: E402
+import installer_channels as channels  # noqa: E402
 import installer_codex as codex  # noqa: E402
+import installer_components as components  # noqa: E402
 import installer_platform as platform_layer  # noqa: E402
 import installer_preflight as preflight  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 import installer_sources as source_builder  # noqa: E402
 import installer_state as detector  # noqa: E402
 import installer_toolchain as toolchain  # noqa: E402
+from installer_platform import InstallerError, RunResult  # noqa: E402
 
 # 由 CodeKit 自持工具链根接管落点的组件：它们的命令必须能被受限宿主（沙箱按路径
 # 拒绝访问）在会话里读到并启动，因此安装位置与启动表达式都由 toolchain.json 描述。
@@ -59,16 +57,6 @@ TOOLCHAIN_COMPONENTS = detector.registry.root_bound_ids()
 # 恰好是 Qoder IDE 唯一扫描的共享技能目录。安装与回收共用这一份名单。
 GRAPHIFY_HOST_TARGETS = ("claude", "codex", "opencode")
 GRAPHIFY_ALWAYS_TARGETS = ("agents",)
-
-
-class InstallerError(RuntimeError):
-    """An expected installer failure with a user-facing message."""
-
-
-@dataclass
-class RunResult:
-    returncode: int
-    stdout: str = ""
 
 
 class Logger:
@@ -183,6 +171,16 @@ class Installer:
         self.states: dict[str, detector.ComponentState] = {}
         self.selected: list[str] = []
         self.install_records: list[tuple[str, str, str]] = []
+        # 以下会话状态由对应阶段填写，这里先给出空值：读取点不再各自 getattr 兜底。
+        # 需要迁移到工具链根的已装组件（setup_toolchain 填写）。
+        self.toolchain_migration: list[str] = []
+        # 清单实测的逐工具落点态（report_toolchain_health 填写）与清单文档本身。
+        self.toolchain_health: list[tuple[str, str]] = []
+        self.toolchain_manifest: dict = {}
+        # 平台 CLI 探测结果的会话内缓存（agent_cli_status 填写）。
+        self.agent_cli_cache: dict[str, tuple[str, str]] = {}
+        # 选择器里 PATH 配置项是否勾选（select_components 填写）。
+        self.setup_path_selected = False
         # 本次是否由 CodeKit 把飞书 skills 同步进全局技能库；save_versions 落档，
         # 卸载侧凭它决定能不能回收 ~/.agents/skills/lark-*。
         self.feishu_skills_synced = False
@@ -319,7 +317,7 @@ class Installer:
     def toolchain_targets(self) -> list[str]:
         """本次要物化到工具链根的组件：选中的 + 需要迁移的已装组件。"""
         targets = list(self.toolchain_components())
-        for component_id in getattr(self, "toolchain_migration", []):
+        for component_id in self.toolchain_migration:
             if component_id not in targets:
                 targets.append(component_id)
         return targets
@@ -439,7 +437,7 @@ class Installer:
         能不能用」，所以按注册表现测一次。判据是落点本身，不是命令在不在 PATH 上——
         受限宿主里 PATH 条目齐全而 ``stat`` 被拒，用 ``command_exists`` 会把已装说成没装。
         """
-        for component, state in getattr(self, "toolchain_health", []):
+        for component, state in self.toolchain_health:
             if component == component_id:
                 return state
         definition = self.component(component_id)
@@ -453,7 +451,7 @@ class Installer:
         取代原先「命令是否只靠用户级 PATH 可见」的自检：那个判据已被实测证伪——
         PATH 里用户级条目是全的，真正被拒绝的是对这些目录的文件系统访问。
         """
-        document = getattr(self, "toolchain_manifest", None) or {}
+        document = self.toolchain_manifest or {}
         entries = document.get("tools") if isinstance(document, dict) else None
         entries = entries if isinstance(entries, dict) else {}
         self.toolchain_health = []
@@ -489,28 +487,8 @@ class Installer:
         return f"未安装；运行安装器（{command}）并勾选该组件。"
 
     def install_npm_package_into_prefix(self, prefix: Path, package: str, command: str) -> bool:
-        """把全局 CLI 装进 CodeKit 私有 npm 前缀并让本进程可见。
-
-        与默认路径分开而不是加参数，是为了让既有组件（钉钉/飞书 CLI 等）的调用与
-        行为完全不变：私有前缀只服务于必须在受限宿主里可读可执行的 gitnexus。
-        """
-        prefix = Path(prefix)
-        previous = os.environ.get("npm_config_prefix")
-        os.environ["npm_config_prefix"] = str(prefix)
-        os.environ["npm_config_registry"] = config.NPM_REGISTRY
-        try:
-            result = self.run_command(
-                ["npm", "install", "-g", "--prefix", str(prefix), f"{package}@latest"]
-            )
-        finally:
-            if previous is None:
-                os.environ.pop("npm_config_prefix", None)
-            else:
-                os.environ["npm_config_prefix"] = previous
-        if result.returncode != 0:
-            return False
-        self.prepend_path(self.platform.npm_bin_dir(prefix))
-        return self.command_exists(command)
+        """把全局 CLI 装进 CodeKit 私有 npm 前缀并让本进程可见。"""
+        return channels.install_npm_package_into_prefix(self, prefix, package, command)
 
     @staticmethod
     def _resolve_command(command: Sequence[str]) -> list[str]:
@@ -540,34 +518,17 @@ class Installer:
         command = self._resolve_command(args)
         if not quiet:
             self.logger.command_start(command)
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=str(cwd) if cwd else None,
-                env=os.environ.copy(),
-                stdin=None,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=1,
-                **platform_layer.text_kwargs(),
-            )
-        except OSError as exc:
-            self.logger.command_finished(command, 127, str(exc))
+        result = platform_layer.execute(command, cwd=cwd, timeout=timeout)
+        if result.error and not result.timed_out:
+            self.logger.command_finished(command, 127, result.error)
             if check:
-                raise InstallerError(f"could not run {' '.join(command)}: {exc}") from exc
+                raise InstallerError(f"could not run {' '.join(command)}: {result.error}")
             return RunResult(127)
-        timed_out = False
-        try:
-            output_text, _ = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            process.kill()
-            output_text, _ = process.communicate()
-        output_text = output_text or ""
+        output_text = result.stdout
         for line in output_text.splitlines(True):
             self.logger.command_output(line)
-        returncode = self.TIMEOUT_RETURNCODE if timed_out else process.returncode
-        if timed_out:
+        returncode = self.TIMEOUT_RETURNCODE if result.timed_out else result.returncode
+        if result.timed_out:
             self.logger.warn(
                 f"命令超时（{timeout:g}s），已终止：{self.logger.command_text(command)}"
             )
@@ -581,18 +542,13 @@ class Installer:
         self, args: Sequence[str], *, timeout: float = 15, cwd: Optional[Path] = None
     ) -> RunResult:
         """静默执行探测命令并返回结果，失败或超时统一返回失败结果。"""
-        try:
-            result = subprocess.run(
-                self._resolve_command(args),
-                cwd=str(cwd) if cwd else None,
-                env=os.environ.copy(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                timeout=timeout,
-                check=False,
-                **platform_layer.text_kwargs(),
-            )
-        except (OSError, subprocess.TimeoutExpired):
+        result = platform_layer.execute(
+            self._resolve_command(args),
+            cwd=cwd,
+            timeout=timeout,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.error:
             return RunResult(1)
         return RunResult(result.returncode, result.stdout.strip())
 
@@ -603,17 +559,8 @@ class Installer:
         merged_env = os.environ.copy()
         if env:
             merged_env.update(env)
-        try:
-            result = subprocess.run(
-                command,
-                input=content,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env=merged_env,
-                check=False,
-                **platform_layer.text_kwargs(),
-            )
-        except OSError:
+        result = platform_layer.execute(command, input=content, env=merged_env)
+        if result.error:
             self.logger.command_finished(command, 127)
             return RunResult(127)
         for line in result.stdout.splitlines(True):
@@ -652,20 +599,8 @@ class Installer:
         return shutil.which(command, path=machine_path) is not None
 
     def codex_can_run_rtk(self) -> bool:
-        """Codex 会话能否执行 ``rtk``：只有桌面端会丢掉用户级 PATH。
-
-        装了桌面版且 ``rtk`` 不在机器级 PATH 上时，``rtk init -g --codex`` 写出的
-        ``RTK.md`` 前缀约束在 Codex 里永远无法执行；CLI 从终端启动时会继承完整
-        PATH，因此不跳过它的注册。
-        """
-        path = codex.config_path(self.home)
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            return True
-        if not codex.desktop_app_present(text):
-            return True
-        return self.visible_without_user_path("rtk")
+        """Codex 会话能否执行 ``rtk``：只有桌面端会丢掉用户级 PATH。"""
+        return components.codex_can_run_rtk(self)
 
     def set_brew_mirror(self) -> None:
         """把 Homebrew 切到中科大镜像并关闭自动更新。
@@ -689,26 +624,26 @@ class Installer:
         args = ["list", "--cask", name] if cask else ["list", name]
         return self.brew(*args, capture=True).returncode == 0
 
-    def brew_install_or_upgrade(self, formula: str, probe: Optional[str] = None) -> bool:
-        """经 Homebrew 安装或升级一个 formula，并返回该通道是否已接管该组件。
+    def _managed_install_or_upgrade(
+        self,
+        probe: str,
+        *,
+        manages: Callable[[], bool],
+        install: Callable[[], RunResult],
+        upgrade: Callable[[], RunResult],
+        outside_note: str,
+        upgrade_fail_note: Callable[[int], str],
+        after_run: Optional[Callable[[], None]] = None,
+    ) -> bool:
+        """包管理器通道共用的三段式；控制流实现见 installer_channels。"""
+        return channels._managed_install_or_upgrade(
+            self, probe, manages=manages, install=install, upgrade=upgrade,
+            outside_note=outside_note, upgrade_fail_note=upgrade_fail_note, after_run=after_run,
+        )
 
-        只有「命令缺失」或「命令由 brew 自己管理」时 brew 才是正确的通道：命令已存在
-        但不由 brew 管理（例如官方脚本装的 rtk）时直接让位，否则只会装出第二份拷贝，
-        而原来的 script/release 通道才是能真正完成升级的那个。
-        """
-        probe = probe or formula
-        if not self.command_exists(probe):
-            result = self.brew("install", formula)
-            return result.returncode == 0 and self.command_exists(probe)
-        if not self.brew_manages(formula):
-            self.logger.info(f"{formula} 不在 Homebrew 管理下，跳过 brew 通道交给原通道升级。")
-            return False
-        result = self.brew("upgrade", formula)
-        if result.returncode != 0:
-            # brew 管着这个命令、只是这次升级没成功：命令仍可用，不降级到其他通道，
-            # 否则会在 script/release 里再装一份把 brew 的拷贝遮住。
-            self.logger.warn(f"{formula} 升级未成功，保持现有 Homebrew 安装。")
-        return True
+    def brew_install_or_upgrade(self, formula: str, probe: Optional[str] = None) -> bool:
+        """经 Homebrew 安装或升级一个 formula，并返回该通道是否已接管该组件。"""
+        return channels.brew_install_or_upgrade(self, formula, probe)
 
     def linux_package_manager(self) -> Optional[str]:
         """返回本机的 Linux 包管理器；非 Linux 一律返回 None。"""
@@ -766,14 +701,7 @@ class Installer:
 
     def fetch_text(self, url: str) -> str:
         """获取远程脚本文本；GitHub 地址优先走 gh-proxy，失败再回退直连。"""
-        for candidate in config.download_urls(url):
-            try:
-                request = urllib.request.Request(candidate, headers={"User-Agent": "CodeKit-installer"})
-                with urllib.request.urlopen(request, timeout=config.REMOTE_FETCH_TIMEOUT) as response:
-                    return response.read().decode("utf-8")
-            except (OSError, UnicodeError):
-                continue
-        return ""
+        return channels.fetch_text(self, url)
 
     def agent_notice_box(self, lines: Sequence[str]) -> str:
         """按终端显示宽度渲染提示边框，避免中英文混排时边框错位。"""
@@ -859,9 +787,7 @@ class Installer:
 
     def agent_cli_status(self, platform_key: str) -> tuple[str, str]:
         """返回平台 CLI 的发现来源与版本；同一次运行内复用探测结果。"""
-        cache = getattr(self, "agent_cli_cache", None)
-        if cache is None:
-            cache = self.agent_cli_cache = {}
+        cache = self.agent_cli_cache
         if platform_key not in cache:
             source = detector.agent_cli_presence(platform_key, self.home)
             version = agents.cli_version(platform_key, self.home) if source else ""
@@ -870,9 +796,7 @@ class Installer:
 
     def refresh_agent_cli_status(self, platform_key: str) -> tuple[str, str]:
         """安装 CLI 后丢弃缓存，让后续状态展示读取最新探测结果。"""
-        cache = getattr(self, "agent_cli_cache", None)
-        if cache is not None:
-            cache.pop(platform_key, None)
+        self.agent_cli_cache.pop(platform_key, None)
         return self.agent_cli_status(platform_key)
 
     def component_tag(self, component_id: str) -> str:
@@ -975,6 +899,56 @@ class Installer:
             )
         self.logger.info("\n".join(lines))
 
+    def _run_selector(
+        self, mode: str, default: Sequence[str], path_selected: bool
+    ) -> tuple[list[str], bool]:
+        """调用交互选择器并解析返回协议；安装与卸载共用这一份实现。
+
+        返回 (选中的组件 ID, PATH 配置是否勾选)。退出码协议：2 = 拿不到终端，
+        显式降级为默认选择并播报；10 = 用户退出；130 = 中断；其余非零为失败。
+        选择器只消费临时 TSV；finally 保证异常、取消和正常返回都会清理它。
+        """
+        manifest = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="codekit-selector-", suffix=".tsv", delete=False)
+        manifest_path = Path(manifest.name)
+        try:
+            for index, component in enumerate(self.components, 1):
+                fields = (
+                    str(index), component.description, component.group,
+                    detector.registry.GROUPS[component.group],
+                    self.component_tag(component.component_id),
+                    "1" if component.component_id in default else "0",
+                )
+                manifest.write("\t".join(value.replace("\t", " ") for value in fields) + "\n")
+            manifest.close()
+            configured = self.shell_config()
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT_DIR / "component-selector.py"), "--mode", mode, "--manifest", str(manifest_path), "--path-selected", "1" if path_selected else "0", "--shell-config", str(configured[0]) if configured else ""],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                **platform_layer.text_kwargs(),
+            )
+        finally:
+            manifest_path.unlink(missing_ok=True)
+        if result.returncode == 2:
+            # 选择器拿不到可用终端（例如没有控制台的 Windows 会话）：显式降级，
+            # 不把缺少终端当成失败。
+            self.announce_default_selection(default)
+            return list(default), path_selected
+        if result.returncode == 10:
+            raise SystemExit(0)
+        if result.returncode == 130:
+            raise KeyboardInterrupt
+        if result.returncode != 0:
+            raise InstallerError(f"Interactive selector failed: {result.stderr.strip()}")
+        payload = result.stdout.strip()
+        if not payload.startswith("selected=") or ";path=" not in payload:
+            raise InstallerError("Interactive selector returned an invalid result.")
+        selected_text, path_text = payload.removeprefix("selected=").split(";path=", 1)
+        indices = [int(value) for value in selected_text.split(",") if value]
+        return (
+            [self.components[index - 1].component_id for index in indices],
+            path_text == "1",
+        )
+
     def select_components(self) -> list[str]:
         """按安装状态生成默认选择，并在交互模式下调用选择器回填用户选择。"""
         default = [
@@ -992,48 +966,9 @@ class Installer:
             if not self.auto_yes:
                 self.announce_default_selection(default)
             return default
-
-        # 选择器只消费临时 TSV；finally 保证异常、取消和正常返回都会清理它。
-        manifest = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="codekit-selector-", suffix=".tsv", delete=False)
-        manifest_path = Path(manifest.name)
-        try:
-            for index, component in enumerate(self.components, 1):
-                fields = (
-                    str(index), component.description, component.group,
-                    detector.registry.GROUPS[component.group],
-                    self.component_tag(component.component_id),
-                    "1" if component.component_id in default else "0",
-                )
-                manifest.write("\t".join(value.replace("\t", " ") for value in fields) + "\n")
-            manifest.close()
-            configured = self.shell_config()
-            result = subprocess.run(
-                [sys.executable, str(SCRIPT_DIR / "component-selector.py"), "--mode", "install", "--manifest", str(manifest_path), "--path-selected", "1" if path_selected else "0", "--shell-config", str(configured[0]) if configured else ""],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-                **platform_layer.text_kwargs(),
-            )
-        finally:
-            manifest_path.unlink(missing_ok=True)
-        if result.returncode == 2:
-            # 选择器拿不到可用终端（例如没有控制台的 Windows 会话）：显式降级，
-            # 不把缺少终端当成失败。
-            self.setup_path_selected = path_selected
-            self.selected = default
-            self.announce_default_selection(default)
-            return default
-        if result.returncode == 10:
-            raise SystemExit(0)
-        if result.returncode == 130:
-            raise KeyboardInterrupt
-        if result.returncode != 0:
-            raise InstallerError(f"Interactive selector failed: {result.stderr.strip()}")
-        payload = result.stdout.strip()
-        if not payload.startswith("selected=") or ";path=" not in payload:
-            raise InstallerError("Interactive selector returned an invalid result.")
-        selected_text, path_text = payload.removeprefix("selected=").split(";path=", 1)
-        indices = [int(value) for value in selected_text.split(",") if value]
-        self.setup_path_selected = path_text == "1"
-        self.selected = [self.components[index - 1].component_id for index in indices]
+        selected, path_flag = self._run_selector("install", default, path_selected)
+        self.setup_path_selected = path_flag
+        self.selected = selected
         return self.selected
 
     def marketplace_sha(self) -> str:
@@ -1053,463 +988,87 @@ class Installer:
 
     def requirements_met(self, component) -> tuple[bool, str]:
         """校验组件的硬前置（如 node>=24.11.0），返回 (是否满足, 原因)。"""
-        for requirement in component.requires:
-            name, separator, minimum = requirement.partition(">=")
-            if name == "node":
-                current = self.command_version("node", ["-v"])
-                if not separator or not current or not config.version_greater_or_equal(current, minimum):
-                    return False, f"需要 Node.js >= {minimum}，当前 {current or '未安装'}"
-                continue
-            if name == "python":
-                current = self.python_dependency_version()
-                if not separator or not config.version_greater_or_equal(current, minimum):
-                    return False, f"需要 Python >= {minimum}，当前 {current}"
-                continue
-            if not self.command_exists(name):
-                return False, f"需要命令 {name}"
-        return True, ""
+        return channels.requirements_met(self, component)
 
     def channel_available(self, kind: str) -> bool:
         """判断通道在当前平台是否可用；只做探测，不触发安装。"""
-        if kind == "npm":
-            return self.command_exists("npm")
-        if kind in {"brew", "brew_cask"}:
-            return self.command_exists("brew")
-        if kind == "apt":
-            # apt 通道的 target 是 Debian/Ubuntu 包名，只在该包管理器下可用。
-            return self.linux_package_manager() == "apt-get"
-        if kind == "winget":
-            # winget 只在 Windows 上存在；其他平台的同名命令即使有也不应使用。
-            return self.platform.is_windows and self.command_exists("winget")
-        if kind == "venv":
-            # 内置运行时才是会被使用的那一个：用系统 Python 建出的 venv 在受限宿主里
-            # 起不来（pyvenv.cfg 的 home 落在读不到的目录）。运行时不可用时诚实返回
-            # False，让 install_via_channels 把这个组件如实判失败，而不是产出跑不起来
-            # 的 venv，也不是退到根外的落点。
-            if not self.toolchain.usable:
-                return False
-            return self.run_capture(
-                [self.toolchain_python(), "-c", "import venv, ensurepip"]
-            ).returncode == 0
-        if kind == "script":
-            # 官方 .sh 安装脚本只在类 Unix 环境里跑。Git for Windows 也会把 bash 放进
-            # PATH，所以不能只判断"有没有 shell"：否则 Windows 上会退化成用 Git Bash
-            # 执行 Unix 安装脚本，把文件装进 MSYS 目录树而不是 Windows 的 npm 目录。
-            return not self.platform.is_windows and bool(
-                platform_layer.remote_script_command("bash")
-            )
-        if kind == "powershell":
-            # 严格限定 Windows：pwsh 在 macOS/Linux 上也可能存在，但那些 .ps1
-            # 是 Windows 专用的安装脚本，不能跨平台执行。
-            return self.platform.is_windows and bool(
-                platform_layer.remote_script_command("powershell")
-            )
-        if kind == "release":
-            return self.command_exists("curl") or self.command_exists("wget")
-        return False
+        return channels.channel_available(self, kind)
 
     def manual_note(self, component) -> str:
         """生成组件的手动安装指引，供所有通道都失败时提示。"""
-        channels = component.channels
-        # Windows 上没有可用的 Unix shell，`curl … | bash` 这条提示会把人引到不存在的
-        # 解释器上；按 Windows 真正可用的通道给指引。
-        if self.platform.is_windows:
-            if "winget" in channels:
-                return f"winget install --id {channels['winget']} --exact"
-            if "npm" in channels:
-                registry = " ".join(config.NPM_REGISTRY_ARGS)
-                return f"npm install -g {channels['npm']} {registry}"
-            if "powershell" in channels:
-                return (
-                    "powershell -NoProfile -ExecutionPolicy Bypass -Command "
-                    f"\"irm {channels['powershell']} | iex\""
-                )
-            if component.release is not None:
-                return (
-                    f"从 {component.release.repo} 的 Releases 下载对应的 Windows 资产"
-                    f"（{component.release.binary}）手工安装并加入 PATH"
-                )
-            return "请参考官方文档"
-        if "script" in channels:
-            return f"curl -fsSL {config.github_proxy_url(channels['script'])} | bash"
-        if "powershell" in channels:
-            return (
-                "powershell -NoProfile -ExecutionPolicy Bypass -Command "
-                f"\"irm {channels['powershell']} | iex\""
-            )
-        if "npm" in channels:
-            registry = " ".join(config.NPM_REGISTRY_ARGS)
-            return f"npm install -g {channels['npm']} {registry}"
-        if "winget" in channels:
-            return f"winget install --id {channels['winget']} --exact"
-        if "brew" in channels:
-            return f"brew install {channels['brew']}（建议先按 INSTALL-STRATEGY.md §2.3 配置中科大镜像）"
-        if "apt" in channels:
-            return f"sudo apt-get install -y {channels['apt']}"
-        return "请参考官方文档"
+        return channels.manual_note(self, component)
 
     def channel_order(self, component) -> tuple[str, ...]:
-        """通道优先级；根接管的组件只剩 ``entry_kind`` 允许的那一根根内通道。
-
-        过滤而不是排序是刻意的：留下的候选全部指向工具链根内，venv 失败之后没有第二
-        根通道可以漏到根外去。
-        """
-        allowed = detector.registry.ENTRY_KIND_CHANNELS.get(component.entry_kind)
-        order = tuple(
-            kind for kind in detector.registry.CHANNEL_ORDER if kind in component.channels
-        )
-        if allowed is None:
-            return order
-        return tuple(kind for kind in order if kind in allowed)
+        """通道优先级；根接管的组件只剩 ``entry_kind`` 允许的那一根根内通道。"""
+        return channels.channel_order(self, component)
 
     def install_via_channels(self, component_id: str) -> bool:
         """按全局通道优先级，选用第一个可用通道安装组件。"""
-        component = self.component(component_id)
-        if component is None:
-            return False
-        met, reason = self.requirements_met(component)
-        if not met:
-            self.logger.error(f"{component.description} 已跳过：{reason}")
-            return False
-        # 工具链根接管的组件只能落在根内：受限宿主（Codex 桌面端）读不到根外的落点，
-        # 装上了也起不来。所以候选通道就是 entry_kind 允许的那几根，一根都不可用时如实
-        # 失败——循环里不存在退到根外的第二条通道。
-        candidates = self.channel_order(component)
-        if component.entry_kind and not any(
-            self.channel_available(kind) for kind in candidates
-        ):
-            if "venv" in candidates and not self.toolchain.usable:
-                reason = f"内置 Python 运行时不可用（{self.toolchain.reason or '原因未知'}）"
-            else:
-                reason = f"根内通道 {'、'.join(candidates) or '（未声明）'} 当前不可用"
-            self.logger.error(
-                f"{component.description} 已跳过：{reason}。"
-                f"它的落点必须在 {self.platform.toolchain_root(self.home)} 内"
-                "才能在受限宿主里启动；修复网络或补齐依赖后重跑安装器。"
-            )
-            return False
-        for kind in candidates:
-            if kind == "release":
-                if component.release is None:
-                    continue
-                label = component.release.repo
-            else:
-                label = component.channels.get(kind, "")
-                if not label:
-                    continue
-            if not self.channel_available(kind):
-                continue
-            self.logger.info(f"使用 {kind} 通道安装 {component.description}（{label}）")
-            if self.install_channel(component, kind):
-                return True
-            self.logger.warn(f"{kind} 通道未成功，尝试下一通道。")
-        self.logger.error(
-            f"{component.description} 安装失败；请手动安装：{self.manual_note(component)}"
-        )
-        return False
+        return channels.install_via_channels(self, component_id)
 
     def install_channel(self, component, kind: str) -> bool:
         """执行单个通道的安装动作，并以组件命令校验最终可用性。"""
-        target = component.channels.get(kind, "")
-        if kind == "npm":
-            if component.entry_kind == "npm-private":
-                return self.install_npm_package_in_root(component)
-            return self.install_npm_package(target, component.command)
-        if kind == "brew":
-            return self.brew_install_or_upgrade(target, component.command)
-        if kind == "brew_cask":
-            return self.install_brew_cask(target, component.command)
-        if kind == "apt":
-            return self.install_apt_package(target, component.command)
-        if kind == "winget":
-            return self.install_winget_package(target, component.command)
-        if kind == "venv":
-            return self.install_venv_package(target, component.command)
-        if kind == "script":
-            return self.run_remote_script(target) and self.command_exists(component.command)
-        if kind == "powershell":
-            return self.run_remote_script(target, shell="powershell") and self.command_exists(component.command)
-        if kind == "release":
-            return self.install_release(component)
-        return False
+        return channels.install_channel(self, component, kind)
 
     def install_npm_package(self, package: str, command: str) -> bool:
         """使用用户态 npm 前缀安装或升级一个全局 CLI，镜像源由 set_npm 注入的环境变量提供。"""
-        self.set_npm()
-        result = self.run_command(["npm", "install", "-g", f"{package}@latest"])
-        return result.returncode == 0 and self.command_exists(command)
+        return channels.install_npm_package(self, package, command)
 
     def install_brew_cask(self, cask: str, command: str) -> bool:
         """经 Homebrew cask 安装或升级；cask 不在 brew 管理下时让位给下一通道。"""
-        if not self.command_exists(command):
-            result = self.brew("install", "--cask", cask)
-            return result.returncode == 0 and self.command_exists(command)
-        if not self.brew_manages(cask, cask=True):
-            self.logger.info(f"{cask} 不在 Homebrew cask 管理下，跳过该通道交给原通道升级。")
-            return False
-        result = self.brew("upgrade", "--cask", cask)
-        if result.returncode != 0:
-            self.logger.warn(f"{cask} 升级未成功，保持现有 Homebrew cask 安装。")
-        return True
+        return channels.install_brew_cask(self, cask, command)
 
     def install_apt_package(self, package: str, command: str) -> bool:
         """经 sudo 安装 Debian/Ubuntu 包；包不在源中时返回 False 以便降级。"""
-        if self.run_capture(["apt-cache", "show", package]).returncode != 0:
-            self.logger.warn(f"apt 源中不存在 {package}，跳过 apt 通道。")
-            return False
-        if self.run_linux_package("install", package).returncode != 0:
-            return False
-        return self.command_exists(command)
+        return channels.install_apt_package(self, package, command)
 
     def winget_manages(self, package: str) -> bool:
         """判断该包是否由 winget 自己管理；本地查询，不触发安装。"""
-        result = self.run_capture(
-            [
-                "winget", "list", "--id", package, "--exact",
-                "--accept-source-agreements", "--disable-interactivity",
-            ],
-            timeout=180,
-        )
-        return result.returncode == 0 and package.lower() in result.stdout.lower()
+        return channels.winget_manages(self, package)
 
     def install_winget_package(self, package: str, command: str) -> bool:
-        """经 winget 安装或升级一个组件。
-
-        非交互场景必须显式接受包协议与源协议，否则 winget 会挂起等待输入。语义与 brew
-        通道对齐：命令缺失才 install；命令已存在时先确认由 winget 管理再 upgrade，且
-        upgrade 返回"已是最新"（实测退出码 43）不算失败 —— 否则会降级到下一通道装出
-        第二份拷贝。
-        """
-        common = (
-            "--id", package, "--exact", "--silent",
-            "--accept-package-agreements", "--accept-source-agreements",
-            "--disable-interactivity",
-        )
-        if not self.command_exists(command):
-            result = self.run_command(["winget", "install", *common], timeout=1200)
-            # winget 只改注册表：不刷新会把"装好了"误判成"通道失败"。
-            self.refresh_path()
-            return result.returncode == 0 and self.command_exists(command)
-        if not self.winget_manages(package):
-            self.logger.info(f"{package} 不在 winget 管理下，跳过 winget 通道交给原通道升级。")
-            return False
-        result = self.run_command(["winget", "upgrade", *common], timeout=1200)
-        self.refresh_path()
-        if result.returncode != 0:
-            self.logger.warn(
-                f"{package} 升级未返回成功（退出码 {result.returncode}），保持现有 winget 安装。"
-            )
-        return True
+        """经 winget 安装或升级一个组件，控制流与 brew 通道共用同一骨架。"""
+        return channels.install_winget_package(self, package, command)
 
     def install_npm_package_in_root(self, component) -> bool:
-        """把根接管的 npm 组件装进 CodeKit 私有前缀，并给人类 shell 留一个转发入口。
-
-        私有前缀落在工具链根内（实测可读可执行）。转发入口只是给人用的：它在受限宿主里
-        读不到，CodeKit 自己的代码路径一律走 toolchain.json 的绝对 argv，所以建不出来
-        不影响工具本身——POSIX 下需要符号链接能力，Windows 上没有开发者模式/管理员权限
-        时必然失败。
-        """
-        prefix = self.platform.npm_prefix_private(self.home)
-        if not self.install_npm_package_into_prefix(
-            prefix, component.channels["npm"], component.command
-        ):
-            return False
-        try:
-            self.platform.expose_command(
-                self.bin_dir,
-                component.command,
-                self.platform.npm_bin_dir(prefix) / self.platform.shim_name(component.command),
-            )
-        except OSError as exc:
-            self.logger.warn(
-                f"未能为交互式 shell 暴露 {component.command} 转发入口（{exc}）；"
-                f"不影响 CodeKit 使用它，安装器走 toolchain.json 里的绝对 argv。"
-            )
-        return True
+        """把根接管的 npm 组件装进 CodeKit 私有前缀，并给人类 shell 留一个转发入口。"""
+        return channels.install_npm_package_in_root(self, component)
 
     def install_venv_package(self, package: str, command: str) -> bool:
-        """把 PyPI 包装进独立 venv，并把它的命令暴露到用户 bin 目录。
-
-        venv 一律用内置运行时创建，并加 ``--copies``：用系统 Python 建出的 venv 会把
-        ``pyvenv.cfg`` 的 ``home`` 指向可能被沙箱拒绝的目录，入口存在却启动不起来；
-        实体解释器留在 venv 内则不受符号链接解析的限制。
-        """
-        venv = self.platform.venv_dir(self.home, command)
-        if venv.exists():
-            platform_layer.rmtree(venv, ignore_errors=True)
-        pip = self.platform.venv_pip(venv)
-        if self.run_command(
-            [self.toolchain_python(), "-m", "venv", "--copies", str(venv)]
-        ).returncode != 0:
-            return False
-        if not pip.exists() or self.run_command([str(pip), "install", "-U", package]).returncode != 0:
-            return False
-        executable = self.platform.venv_exe(venv, command)
-        if not executable.exists():
-            return False
-        # Windows 上不能靠符号链接暴露 venv 命令，适配层会改写成 .cmd 转发脚本。
-        self.platform.expose_command(self.bin_dir, command, executable)
-        return self.command_exists(command)
+        """把 PyPI 包装进独立 venv，并把它的命令暴露到用户 bin 目录。"""
+        return channels.install_venv_package(self, package, command)
 
     def release_arch(self) -> str:
         """把平台机器名归一化为发布资产的架构标记。"""
-        return {
-            "x86_64": "x86_64",
-            "amd64": "x86_64",
-            "aarch64": "arm64",
-            "arm64": "arm64",
-        }.get(platform.machine().lower(), "")
+        return channels.release_arch(self)
 
     def release_asset_name(self, spec, version: str) -> str:
         """按 release 模板展开当前平台的资产文件名。"""
-        arch = self.release_arch()
-        return spec.asset.format(
-            version=version,
-            os=spec.os_tokens.get(self.os_name, ""),
-            arch=spec.arch_tokens.get(arch, ""),
-            ext=spec.ext_tokens.get(self.os_name, ""),
-            target=spec.target_tokens.get(f"{self.os_name}-{arch}", ""),
-        )
+        return channels.release_asset_name(self, spec, version)
 
     def fetch_json_url(self, url: str):
         """获取发布接口 JSON；GitHub 地址优先走 gh-proxy，失败再回退直连。"""
-        for candidate in config.download_urls(url):
-            try:
-                request = urllib.request.Request(
-                    candidate,
-                    headers={"Accept": "application/json", "User-Agent": "CodeKit-installer"},
-                )
-                with urllib.request.urlopen(request, timeout=config.REMOTE_FETCH_TIMEOUT) as response:
-                    return json.load(response)
-            except (OSError, ValueError, json.JSONDecodeError):
-                continue
-        return None
+        return channels.fetch_json_url(self, url)
 
     def resolve_release(self, spec) -> Optional[tuple[str, str, str]]:
         """解析最新发布版本，返回 (版本, 下载地址, sha256)；失败返回 None。"""
-        kind, _, ident = spec.repo.partition(":")
-        if kind == "github":
-            document = self.fetch_json_url(
-                f"https://api.github.com/repos/{ident}/releases/latest"
-            )
-            if not document:
-                return None
-            version = str(document.get("tag_name", "")).lstrip("v")
-            asset_name = self.release_asset_name(spec, version)
-            for asset in document.get("assets", []):
-                if asset.get("name") == asset_name:
-                    digest = str(asset.get("digest", "")).split(":", 1)[-1]
-                    return version, str(asset.get("browser_download_url", "")), digest
-            return None
-        if kind == "gitlab":
-            document = self.fetch_json_url(
-                f"https://gitlab.com/api/v4/projects/{ident}/releases/permalink/latest"
-            )
-            if not document:
-                return None
-            version = str(document.get("tag_name", "")).lstrip("v")
-            asset_name = self.release_asset_name(spec, version)
-            links = (document.get("assets") or {}).get("links", [])
-            for link in links:
-                if link.get("name") == asset_name:
-                    return version, str(link.get("direct_asset_url", "")), ""
-            return None
-        return None
+        return channels.resolve_release(self, spec)
 
     def download_release(self, url: str, digest: str) -> Optional[Path]:
         """下载发布资产并校验摘要；GitHub 地址优先走 gh-proxy，失败再回退直连。"""
-        options = [
-            "--fail", "--location", "--connect-timeout", "10", "--speed-limit", "51200",
-            "--speed-time", "20", "--retry", "2", "--retry-max-time", "180",
-            "--continue-at", "-", "--progress-bar",
-        ]
-        fd, name = tempfile.mkstemp(prefix="codekit-release-", dir=self.platform.temp_dir())
-        os.close(fd)
-        temporary = Path(name)
-        result = RunResult(1)
-        for candidate in config.download_urls(url):
-            # --continue-at - 会续传上一个地址留下的半成品，切换地址前必须清空。
-            temporary.write_bytes(b"")
-            result = self.run_command(["curl", *options, "-o", str(temporary), candidate])
-            if result.returncode == 0:
-                break
-        if result.returncode != 0:
-            temporary.unlink(missing_ok=True)
-            return None
-        if digest and hashlib.sha256(temporary.read_bytes()).hexdigest() != digest:
-            temporary.unlink(missing_ok=True)
-            self.logger.error("发布包摘要校验失败，已删除下载文件。")
-            return None
-        return temporary
+        return channels.download_release(self, url, digest)
 
     def extract_release_binary(self, archive: Path, binary: str) -> Optional[Path]:
-        """从 tar.gz/zip 发布包中定位目标可执行文件。
-
-        Windows 构建的可执行文件带 ``.exe``，因此按平台文件名与裸名各找一次，
-        这样同一个发布说明在 macOS/Linux 与 Windows 上都能命中。
-        """
-        directory = Path(tempfile.mkdtemp(prefix="codekit-extract-"))
-        try:
-            if zipfile.is_zipfile(archive):
-                with zipfile.ZipFile(archive) as package:
-                    package.extractall(directory)
-            else:
-                with tarfile.open(archive) as package:
-                    try:
-                        package.extractall(directory, filter="data")
-                    except TypeError:
-                        # Python < 3.12 has no extraction filter.
-                        package.extractall(directory)
-        except (OSError, tarfile.TarError, zipfile.BadZipFile, ValueError):
-            return None
-        for name in dict.fromkeys((self.platform.binary_filename(binary), binary)):
-            for candidate in directory.rglob(name):
-                if candidate.is_file():
-                    return candidate
-        return None
+        """从 tar.gz/zip 发布包中定位目标可执行文件。"""
+        return channels.extract_release_binary(self, archive, binary)
 
     def install_release(self, component) -> bool:
         """按 release 通道解析、下载并安装组件的最新发布包。"""
-        resolved = self.resolve_release(component.release)
-        if not resolved or not resolved[1]:
-            self.logger.warn(f"未能解析 {component.description} 的发布包地址。")
-            return False
-        version, url, digest = resolved
-        self.logger.info(f"下载 {component.description} {version}：{url}")
-        archive = self.download_release(url, digest)
-        if archive is None:
-            return False
-        try:
-            binary = self.extract_release_binary(archive, component.release.binary)
-        finally:
-            archive.unlink(missing_ok=True)
-        if binary is None:
-            return False
-        target = self.platform.release_target(self.bin_dir, component.release.binary)
-        target.unlink(missing_ok=True)
-        shutil.move(str(binary), str(target))
-        if not self.platform.is_windows:
-            target.chmod(0o755)
-        self.track(target)
-        return self.command_exists(component.command)
+        return channels.install_release(self, component)
 
     def run_remote_script(self, url: str, shell: str = "bash", env: Optional[dict[str, str]] = None) -> bool:
-        """下载远程安装脚本后交给平台原生的 shell 执行。
-
-        shell="powershell" 用于 Windows 专用的 .ps1 安装器（Qoder 等官方只提供
-        .ps1），脚本同样经 stdin 喂入，避免落盘与执行策略的额外处理。
-        """
-        script = self.fetch_text(url)
-        if not script:
-            return False
-        command = platform_layer.remote_script_command(shell)
-        if not command:
-            return False
-        if self.run_with_input(list(command), script, env).returncode != 0:
-            return False
-        # 官方 .ps1 安装器同样把 PATH 写进注册表，刷新后才能校验命令可用性。
-        self.refresh_path()
-        return True
+        """下载远程安装脚本后交给平台原生的 shell 执行。"""
+        return channels.run_remote_script(self, url, shell, env)
 
     # rtk 的按宿主参数表：(注册用的完整参数, 撤销时附加在 `rtk init -g … --uninstall`
     # 上的平台选择器)。撤销只带选择器——``--auto-patch`` 是注册时的模式参数，带着它去
@@ -1868,37 +1427,15 @@ class Installer:
 
     def platform_agents_plan(self, action: str, tool: str) -> Optional[tuple[list[str], Path]]:
         """构造平台全局 subagent 的同步/清理命令与目标目录；无可执行动作时返回 None。"""
-        helper = SCRIPT_DIR / "manage-global-agents.py"
-        if not helper.is_file():
-            return None
-        args = [sys.executable, str(helper), action, "--home", str(self.home), "--tool", tool]
-        if action == "install":
-            source = self.marketplace_local / "skills" if self.marketplace_local else None
-            if source is None or not source.is_dir():
-                return None
-            args.extend(["--source", str(source)])
-        flags, agents_dir = agents.global_agent_plan(tool, self.home)
-        args.extend(flags)
-        return args, agents_dir
+        return components.platform_agents_plan(self, action, tool)
 
     def run_platform_agents(self, action: str, tool: str) -> bool:
         """同步或清理某平台的全局 subagent；安装与卸载共用同一实现与路径解析。"""
-        try:
-            plan = self.platform_agents_plan(action, tool)
-        except ValueError as exc:
-            self.logger.error(str(exc))
-            return False
-        if plan is None:
-            return True
-        args, agents_dir = plan
-        result = self.run_command(args)
-        if result.returncode == 0:
-            self.track(agents_dir)
-        return result.returncode == 0
+        return components.run_platform_agents(self, action, tool)
 
     def install_platform_agents(self, tool: str) -> bool:
         """随对应插件同步该平台的全局 subagent。"""
-        return self.run_platform_agents("install", tool)
+        return components.install_platform_agents(self, tool)
 
     def ensure_agent_cli(self, platform_key: str) -> bool:
         """安装插件前确保平台 CLI 可用；缺失时自动安装 CLI 本体。"""
@@ -1924,22 +1461,15 @@ class Installer:
         for directory in reversed(agents.cli_extra_paths(entry, self.home)):
             self.prepend_path(directory)
         installed = False
-        for kind, target in agents.channel_plan(entry):
+        # CLI 与可选组件共用同一张通道描述表；差别只在成败以 presence 复测为准，
+        # 不看通道返回值（官方脚本装完即生效，命令可用性由复测证明）。
+        cli_component = SimpleNamespace(
+            entry_kind="", command=entry.commands[0], channels=entry.channels, release=None
+        )
+        for kind, _target in agents.channel_plan(entry):
             if not self.channel_available(kind):
                 continue
-            if kind == "npm":
-                self.set_npm()
-                self.run_command(["npm", "install", "-g", f"{target}@latest"])
-            elif kind == "brew":
-                self.brew_install_or_upgrade(target, entry.commands[0])
-            elif kind == "brew_cask":
-                self.install_brew_cask(target, entry.commands[0])
-            elif kind == "winget":
-                self.install_winget_package(target, entry.commands[0])
-            elif kind == "script":
-                self.run_remote_script(target)
-            elif kind == "powershell":
-                self.run_remote_script(target, shell="powershell")
+            self.install_channel(cli_component, kind)
             if detector.agent_cli_presence(platform_key, self.home):
                 installed = True
                 break
@@ -1963,137 +1493,29 @@ class Installer:
             f"{detector.component_description(component_id)} v{version} 已安装（{path}）"
         )
 
-    # 每个插件组件的构建产物属性名：为空说明 prepare_sources 没产出对应源，注册表不能
-    # 继续写，否则会留下指向不存在源的注册项。
-    PLUGIN_SOURCE_ATTR = {
-        "claude": "market_dir",
-        "codex": "market_dir",
-        "opencode": "opencode_source_dir",
-        "qoder": "qoder_source_dir",
-        "qodercn": "qoder_source_dir",
-    }
-
     def install_plugin_component(self, component_id: str) -> bool:
-        """插件组件的统一安装骨架：CLI 前置 → 全局 subagent → 平台注册 → 播报。
-
-        四个平台的差别只在 `_register_<platform>_plugin` 这一段，其余顺序与前置检查
-        完全一致。抄四遍的结果是任何一处新增前置都要记得改四个地方。
-        """
-        entry = agents.component_agent(component_id)
-        if entry is None:
-            return False
-        source_attr = self.PLUGIN_SOURCE_ATTR.get(entry.key)
-        if source_attr is None or not getattr(self, source_attr, None):
-            return False
-        registrar = self._plugin_registrar(entry.key)
-        if registrar is None:
-            return False
-        # 勾选插件但缺少 CLI 时先自动安装 CLI，再安装插件。
-        if not self.ensure_agent_cli(entry.key):
-            return False
-        # 先同步全局 subagent：失败即中止且不写注册表，避免“插件已写入并启用、组件却
-        # 上报失败”的半安装状态。
-        if not self.install_platform_agents(entry.key):
-            return False
-        if not registrar():
-            return False
-        self.announce_plugin_install(component_id)
-        return True
+        """插件组件的统一安装骨架：CLI 前置 → 全局 subagent → 平台注册 → 播报。"""
+        return components.install_plugin_component(self, component_id)
 
     def _plugin_registrar(self, tool: str) -> Optional[Callable[[], bool]]:
         """按平台键取注册实现；Qoder 两个发行版共用同一份（共享配置根）。"""
-        if tool in qoder.PLATFORMS:
-            return lambda: self._register_qoder_plugin(tool)
-        return {
-            "claude": self._register_claude_plugin,
-            "codex": self._register_codex_plugin,
-            "opencode": self._register_opencode_plugin,
-        }.get(tool)
+        return components._plugin_registrar(self, tool)
 
     def _register_claude_plugin(self) -> bool:
         """注册本地 Claude marketplace，并按已安装状态执行插件安装或更新。"""
-        if self.run_command(["claude", "plugin", "marketplace", "add", str(self.market_dir)]).returncode != 0:
-            return False
-        self.track(self.home / ".claude" / "plugins" / "known_marketplaces.json")
-        self.run_command(["claude", "plugin", "marketplace", "update", config.MARKETPLACE_NAME])
-        listing = self.run_capture(["claude", "plugin", "list"]).stdout
-        package = f"{config.PLUGIN_NAME}@{config.MARKETPLACE_NAME}"
-        result = self.run_command(["claude", "plugin", "update", package]) if package in listing else self.run_command(["claude", "plugin", "install", package, "--scope", "user"])
-        if result.returncode != 0:
-            return False
-        self.track(self.home / ".claude" / "plugins" / "installed_plugins.json")
-        self.record_marketplace_sha()
-        return True
+        return components.register_claude_plugin(self)
 
     def _register_opencode_plugin(self) -> bool:
         """把本地 OpenCode 插件源写入全局配置；已存在时尝试强制刷新插件。"""
-        # 写 opencode 自己解析到的那份配置：它按 opencode.json → opencode.jsonc
-        # 的顺序取第一个存在的文件，写错文件会让同一个插件出现在两份配置里。
-        path = config.opencode_config_file(self.home / ".config" / "opencode")
-        # 必须用 file URI 而不是直接拼路径：Windows 盘符路径含冒号与反斜杠，
-        # `file://C:\...` 会被解析成主机名为盘符的 UNC 路径。
-        plugin = f"codekit@{self.opencode_source_dir.as_uri()}"
-        try:
-            if config.opencode_has_plugin(path):
-                result = self.run_command(["opencode", "plugin", plugin, "-g", "-f"]) if self.run_capture(["opencode", "plugin", "--help"]).returncode == 0 else RunResult(0)
-            else:
-                config.add_opencode_plugin(path, plugin)
-                result = RunResult(0)
-        except ValueError:
-            return False
-        if result.returncode != 0:
-            return False
-        self.track(path)
-        return True
+        return components.register_opencode_plugin(self)
 
     def _register_codex_plugin(self) -> bool:
         """注册本地 Codex marketplace，清理旧技能残留后添加 CodeKit 插件。"""
-        # 旧版本可能把兼容技能放进 ~/.agents；安装前清掉旧生成物，避免重复加载。
-        for path in (self.home / ".agents" / "skills").glob("keel-*"):
-            if path.is_dir():
-                platform_layer.rmtree(path)
-        added = self.run_command(["codex", "plugin", "marketplace", "add", str(self.market_dir)]).returncode == 0
-        if not added and config.MARKETPLACE_NAME in self.run_capture(["codex", "plugin", "marketplace", "list"]).stdout:
-            added = True
-        if not added:
-            return False
-        self.track(self.home / ".codex" / "config.toml")
-        result = self.run_command(["codex", "plugin", "add", f"{config.PLUGIN_NAME}@{config.MARKETPLACE_NAME}"])
-        if result.returncode != 0:
-            return False
-        self.record_marketplace_sha()
-        return True
+        return components.register_codex_plugin(self)
 
     def _register_qoder_plugin(self, platform_key: str) -> bool:
         """把插件写进 Qoder 的共享配置根，并确认注册表里确实已安装且启用。"""
-        descriptor = qoder.PLATFORMS[platform_key]
-        try:
-            root = qoder.resolve_config_root(descriptor, self.home)
-        except ValueError as exc:
-            raise InstallerError(str(exc)) from exc
-        if qoder.foreign_os_roots(descriptor) and not (root / "plugins").is_dir():
-            self.logger.warn(
-                "Qoder keeps a separate configuration root per OS; this install "
-                f"only reaches {root}, so a Qoder running on Windows stays unaware."
-            )
-        command = qoder.capable_cli(descriptor)
-        try:
-            if command:
-                qoder.install_via_cli(command, root, self.qoder_source_dir, runner=self.qoder_run)
-            else:
-                # Desktop-only machines get the same registry the CLI would write.
-                qoder.install_direct(root, self.qoder_source_dir, self.plugin_version)
-            self.track(qoder.registry_path(root))
-            self.track(qoder.settings_path(root))
-            state = qoder.inspect(descriptor, self.home)
-        except ValueError as exc:
-            raise InstallerError(str(exc)) from exc
-        if not state.installed or not state.enabled:
-            raise InstallerError(
-                f"{qoder.PLUGIN_ID} is not enabled in {qoder.registry_path(state.root)} "
-                "after install; the shared Qoder registry was not updated"
-            )
-        return True
+        return components.register_qoder_plugin(self, platform_key)
 
     def codex_probe_runner(self, argv: Sequence[str], timeout: float) -> tuple[int, str]:
         """在空目录里跑一次探测。
@@ -2244,7 +1666,7 @@ class Installer:
             else:
                 self.logger.error(f"{label}未完成，请查看日志：{self.logger.log_path}")
             self.install_records.append((component_id, action, "1" if ok else "0"))
-        for component_id in getattr(self, "toolchain_migration", []):
+        for component_id in self.toolchain_migration:
             label = detector.component_description(component_id)
             self.logger.section(f"迁移到工具链根：{label}")
             ok = self.install_component(component_id)
@@ -2319,7 +1741,7 @@ class Installer:
             rows.append(("仓库根目录执行：gitnexus analyze --embeddings --skills --verbose", "对当前仓库建立gitnexus索引"))
         # 工具链落点的实测结论：非 ok 的组件给出一步就能照做的修复。
         repair = self.repair_command()
-        for component_id, state in getattr(self, "toolchain_health", []):
+        for component_id, state in self.toolchain_health:
             if state == "ok":
                 continue
             rows.append(
@@ -2378,6 +1800,32 @@ class Installer:
             + f"\n\n日志：{self.logger.log_path}"
         )
 
+    def _finish(
+        self,
+        mode: str,
+        records: Sequence[tuple[str, str, str]],
+        *,
+        failure_note: str,
+    ) -> int:
+        """安装/卸载共用的收尾：重探渲染汇总、按名报失败并给出退出码。
+
+        空记录（未选择任何组件）也走这里：汇总表照样要渲染，只是不会有失败项。
+        """
+        recap_name = "installation" if mode == "install" else "uninstall"
+        try:
+            detector.render_recap(mode, ("\t".join(row) for row in records), self.context)
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.logger.warn(f"Could not render {recap_name} recap: {exc}")
+        failed = [row for row in records if row[2] == "0"]
+        if failed:
+            self.logger.error(
+                f"{len(failed)} 个组件{failure_note}："
+                + "、".join(row[0] for row in failed)
+                + f"；详见日志 {self.logger.log_path}"
+            )
+            return 1
+        return 0
+
     def run(self) -> int:
         """执行完整安装生命周期：前置检查、安装、配置和结果收尾。"""
         self.logger.info(f"\n \n === CodeKit Plugin Install v{self.plugin_version} ===")
@@ -2399,36 +1847,20 @@ class Installer:
         # 阶段也会依据它判断通道可用性。空选择也要先过这一步——需要迁移的组件与本次勾选
         # 无关，「只勾插件」和「什么都没勾」正是落点留在根外的那批人。
         self.setup_toolchain()
-        migration = list(getattr(self, "toolchain_migration", []))
+        migration = list(self.toolchain_migration)
         if not self.selected and not migration:
             self.logger.info("No components selected. Nothing to do.")
-            try:
-                detector.render_recap("install", (), self.context)
-            except (OSError, ValueError, RuntimeError) as exc:
-                self.logger.warn(f"Could not render installation recap: {exc}")
-            return 0
+            return self._finish("install", (), failure_note="未完成")
         self.run_installs()
         self.write_toolchain_manifest()
         self.report_toolchain_health()
         self.configure_git()
         self.save_versions()
-        if getattr(self, "setup_path_selected", False):
+        if self.setup_path_selected:
             self.setup_shell_path()
         self.configure_agent_capabilities()
         self.print_next_steps()
-        try:
-            detector.render_recap("install", ("\t".join(row) for row in self.install_records), self.context)
-        except (OSError, ValueError, RuntimeError) as exc:
-            self.logger.warn(f"Could not render installation recap: {exc}")
-        failed = [row for row in self.install_records if row[2] == "0"]
-        if failed:
-            self.logger.error(
-                f"{len(failed)} 个组件未完成："
-                + "、".join(row[0] for row in failed)
-                + f"；详见日志 {self.logger.log_path}"
-            )
-            return 1
-        return 0
+        return self._finish("install", self.install_records, failure_note="未完成")
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:

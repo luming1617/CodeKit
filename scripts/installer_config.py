@@ -18,9 +18,10 @@ import re
 import sys
 import tempfile
 import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 
 VERSION_PATTERN = re.compile(r"(?<!\d)(\d+)(?:\.(\d+)){1,3}(?!\d)")
@@ -83,7 +84,9 @@ REQUIRED_HELPER_FILES = (
     "component-selector.py",
     "installer.py",
     "installer_agents.py",
+    "installer_channels.py",
     "installer_codex.py",
+    "installer_components.py",
     "installer_config.py",
     "installer_platform.py",
     "installer_preflight.py",
@@ -166,6 +169,29 @@ def probe_urls(url: str) -> tuple[str, ...]:
     不如把预算留给可用地址，避免拖慢每次安装前的组件状态检查。
     """
     return (github_proxy_url(url),)
+
+
+def fetch_first(
+    candidates: Iterable[str],
+    *,
+    timeout: float,
+    headers: Mapping[str, str],
+    parse: Callable[[Any], Any],
+) -> Any:
+    """按候选地址顺序抓取，返回第一个解析成功的结果；全部失败返回 None。
+
+    解析失败（坏 JSON、无法解码的字节，均为 ValueError 子类）与网络失败一样
+    换下一个地址——保持各调用方原有的回退语义。URL 策略（download_urls vs
+    probe_urls）与超时仍由调用方决定。
+    """
+    for candidate in candidates:
+        try:
+            request = urllib.request.Request(candidate, headers=dict(headers))
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return parse(response)
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def linux_application_dirs(

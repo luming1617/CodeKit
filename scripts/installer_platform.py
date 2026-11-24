@@ -32,7 +32,9 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional, Sequence, Tuple
@@ -101,6 +103,83 @@ def text_kwargs() -> dict:
     return {"text": True, "encoding": SUBPROCESS_ENCODING, "errors": "replace"}
 
 
+@dataclass(frozen=True)
+class ExecResult:
+    """一次外部命令的结果：退出码、输出，以及启动/超时错误。"""
+
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+    error: str = ""
+    timed_out: bool = False
+
+
+@dataclass
+class RunResult:
+    """安装器对外报告的一次命令执行结果（退出码 + 合并输出）。
+
+    定义在平台层是为了让 installer_channels 与 installer 共用同一个类型而不
+    产生循环导入；installer.py 仍以 ``from installer_platform import RunResult``
+    重新导出，外部 ``from installer import RunResult`` 的用法不变。
+    """
+
+    returncode: int
+    stdout: str = ""
+
+
+class InstallerError(RuntimeError):
+    """An expected installer failure with a user-facing message.
+
+    定义在平台层供 installer / installer_components 共用，避免循环导入；
+    installer.py 重新导出，外部 ``from installer import InstallerError`` 不变。
+    """
+
+
+def execute(
+    args: Sequence[str],
+    *,
+    timeout: Optional[float] = None,
+    cwd: Optional[Path] = None,
+    env: Optional[Mapping[str, str]] = None,
+    input: Optional[str] = None,
+    stderr: int = subprocess.STDOUT,
+    stdin: Optional[int] = None,
+) -> ExecResult:
+    """外部命令的唯一执行核：argv[0] 解析成全路径，输出按 UTF-8 解码。
+
+    启动失败与超时不抛异常，用 ``error`` / ``timed_out`` 表达，由各调用方映射成
+    自己的失败语义（探测返回空、带日志的执行返回 127/124 等）；超时时子进程已被
+    ``subprocess.run`` 终止。stderr 的合并/分离/丢弃由调用方按原语义传入。
+    """
+    kwargs: dict = {}
+    if input is not None:
+        kwargs["input"] = input
+    elif stdin is not None:
+        kwargs["stdin"] = stdin
+    try:
+        completed = subprocess.run(
+            resolve_argv(args),
+            cwd=str(cwd) if cwd else None,
+            env=dict(env) if env is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            timeout=timeout,
+            check=False,
+            **kwargs,
+            **text_kwargs(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = exc.output or ""
+        if isinstance(output, bytes):
+            output = output.decode(SUBPROCESS_ENCODING, errors="replace")
+        return ExecResult(124, output, error=str(exc), timed_out=True)
+    except OSError as exc:
+        return ExecResult(127, error=str(exc))
+    return ExecResult(
+        completed.returncode, completed.stdout or "", completed.stderr or ""
+    )
+
+
 def configure_stdout_encoding() -> None:
     """把本进程的标准输出切到 UTF-8。
 
@@ -152,6 +231,24 @@ def rmtree(path: Path, *, ignore_errors: bool = False) -> None:
     shutil.rmtree(path, onerror=onerror)
 
 
+def extract_archive(archive: Path, destination: Path) -> None:
+    """解开 tar.gz/zip 压缩包；Python < 3.12 没有提取过滤器时退回普通解包。
+
+    发布包与内置运行时共用这一份实现；解包异常原样抛出，由调用方按自己的
+    失败语义处理。
+    """
+    if zipfile.is_zipfile(archive):
+        with zipfile.ZipFile(archive) as package:
+            package.extractall(destination)
+        return
+    with tarfile.open(archive) as package:
+        try:
+            package.extractall(destination, filter="data")
+        except TypeError:
+            # Python < 3.12 has no extraction filter.
+            package.extractall(destination)
+
+
 def has_contents(path: Path) -> bool:
     """判断路径是否还留着内容，供「卸载残留」判定使用。
 
@@ -194,19 +291,8 @@ def run_powershell_script(script: str, timeout: float = 300) -> int:
     command = remote_script_command("powershell")
     if not command:
         return 127
-    try:
-        completed = subprocess.run(
-            list(command),
-            input=script,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            check=False,
-            **text_kwargs(),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return 127
-    return completed.returncode
+    result = execute(list(command), input=script, timeout=timeout)
+    return 127 if result.error else result.returncode
 
 
 def powershell_literal(value: str) -> str:
@@ -255,16 +341,11 @@ def run_elevated(command: Sequence[str], timeout: float = 600) -> int:
             " -ErrorAction Stop -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',"
             f" '-File', {powershell_literal(str(steps))})"
         )
-        try:
-            completed = subprocess.run(
-                [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", launcher],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=timeout,
-                check=False,
-                **text_kwargs(),
-            )
-        except (OSError, subprocess.SubprocessError):
+        result = execute(
+            [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", launcher],
+            timeout=timeout,
+        )
+        if result.error:
             return 127
         try:
             recorded = code_file.read_text(encoding="ascii", errors="replace").strip()
@@ -275,7 +356,7 @@ def run_elevated(command: Sequence[str], timeout: float = 600) -> int:
         if recorded.isdigit():
             return int(recorded)
         # 没有退出码 = 提权那一步就没跑起来（UAC 被拒、无交互桌面等）。
-        return ELEVATION_CANCELLED if completed.returncode != 0 else 127
+        return ELEVATION_CANCELLED if result.returncode != 0 else 127
 
 
 def refresh_process_path(environ: Optional[dict] = None) -> Tuple[str, ...]:
@@ -358,19 +439,15 @@ def probe_npm_prefix(timeout: float = 15) -> str:
     executable = resolve_exe("npm")
     if not executable:
         return ""
-    try:
-        completed = subprocess.run(
-            [executable, "prefix", "-g"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout,
-            check=False,
-            **text_kwargs(),
-        )
-    except (OSError, subprocess.SubprocessError):
+    result = execute(
+        [executable, "prefix", "-g"],
+        stdin=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=timeout,
+    )
+    if result.error:
         return ""
-    text = (completed.stdout or "").strip()
+    text = result.stdout.strip()
     return text.splitlines()[0].strip() if text else ""
 
 

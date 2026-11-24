@@ -15,13 +15,14 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import installer_config as config  # noqa: E402
+import installer_platform as platform_layer  # noqa: E402
 import installer_qoder as qoder  # noqa: E402
 
 
@@ -174,19 +175,15 @@ def cli_version(
     path = cli_command_path(entry, home, environ)
     if not path:
         return ""
-    try:
-        completed = subprocess.run(
-            [path, "--version"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    result = platform_layer.execute(
+        [path, "--version"],
+        stdin=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=timeout,
+    )
+    if result.error:
         return ""
-    first_line = completed.stdout.strip().splitlines()[0] if completed.stdout.strip() else ""
+    first_line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
     return config.extract_version(first_line) or first_line
 
 
@@ -212,32 +209,58 @@ def cli_extra_paths(entry: AgentCLI, home: Path) -> tuple[Path, ...]:
     return (root / "entry", root / "bin")
 
 
+def manual_install_note(
+    channels: Mapping[str, str],
+    order: Sequence[str],
+    *,
+    release: Any = None,
+    default: str = "",
+    proxy_script: bool = False,
+    brew_suffix: str = "",
+) -> str:
+    """按通道优先序渲染手动安装指引；组件侧与 CLI 侧共用这一份文案模板。
+
+    两侧的差异只在优先序与少量选项（script 是否走 gh-proxy、brew 后缀、兼容
+    release 资产指引、全部落空时的默认文案），模板本身只有这一份。
+    """
+    for kind in order:
+        if kind == "release":
+            if release is not None:
+                return (
+                    f"从 {release.repo} 的 Releases 下载对应的 Windows 资产"
+                    f"（{release.binary}）手工安装并加入 PATH"
+                )
+            continue
+        target = channels.get(kind, "")
+        if not target:
+            continue
+        if kind == "npm":
+            registry_args = " ".join(config.NPM_REGISTRY_ARGS)
+            return f"npm install -g {target} {registry_args}"
+        if kind == "winget":
+            return f"winget install --id {target} --exact"
+        if kind == "powershell":
+            return (
+                "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+                f"\"irm {target} | iex\""
+            )
+        if kind == "script":
+            url = config.github_proxy_url(target) if proxy_script else target
+            return f"curl -fsSL {url} | bash"
+        if kind == "brew":
+            return f"brew install {target}{brew_suffix}"
+        if kind == "brew_cask":
+            return f"brew install --cask {target}"
+        if kind == "apt":
+            return f"sudo apt-get install -y {target}"
+    return default
+
+
 def fallback_note(entry: AgentCLI, *, windows: bool = False) -> str:
     """Describe the manual install command to show when automation fails.
 
     ``windows=True`` 时只给出 Windows 上真实可用的命令：Qoder 系在 Windows 只发布
     ``install.ps1``，``curl | bash`` 那条提示会把用户引到并不存在的 bash 上。
     """
-    if windows:
-        if entry.npm_package:
-            registry_args = " ".join(config.NPM_REGISTRY_ARGS)
-            return f"npm install -g {entry.npm_package} {registry_args}"
-        winget_id = entry.channels.get("winget", "")
-        if winget_id:
-            return f"winget install --id {winget_id} --exact"
-        if entry.powershell_url:
-            return (
-                "powershell -NoProfile -ExecutionPolicy Bypass -Command "
-                f"\"irm {entry.powershell_url} | iex\""
-            )
-        return ""
-    if entry.script_url:
-        return f"curl -fsSL {entry.script_url} | bash"
-    if entry.npm_package:
-        registry_args = " ".join(config.NPM_REGISTRY_ARGS)
-        return f"npm install -g {entry.npm_package} {registry_args}"
-    brew_target = entry.channels.get("brew") or entry.channels.get("brew_cask")
-    if brew_target:
-        action = "brew install --cask" if "brew_cask" in entry.channels else "brew install"
-        return f"{action} {brew_target}"
-    return ""
+    order = ("npm", "winget", "powershell") if windows else ("script", "npm", "brew", "brew_cask")
+    return manual_install_note(entry.channels, order)

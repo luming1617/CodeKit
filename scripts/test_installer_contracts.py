@@ -86,6 +86,12 @@ def bare_installer(home: Path) -> Installer:
     # __init__ 会建这个快照；绕过 __init__ 的夹具必须自己补上，否则任何走到
     # requirements_met / toolchain_python 的路径都会 AttributeError。
     installer.toolchain = toolchain.RuntimeState()
+    # 会话状态空值与 __init__ 保持一致：读取点已不再 getattr 兜底。
+    installer.toolchain_migration = []
+    installer.toolchain_health = []
+    installer.toolchain_manifest = {}
+    installer.agent_cli_cache = {}
+    installer.setup_path_selected = False
     return installer
 
 
@@ -161,7 +167,9 @@ class HelperContractTests(unittest.TestCase):
                 "component-selector.py",
                 "installer.py",
                 "installer_agents.py",
+                "installer_channels.py",
                 "installer_codex.py",
+                "installer_components.py",
                 "installer_config.py",
                 "installer_platform.py",
                 "installer_preflight.py",

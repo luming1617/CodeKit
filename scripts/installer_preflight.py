@@ -115,24 +115,13 @@ def default_probe(command: str, version_args: Sequence[str]) -> tuple[bool, str]
     executable = platform_layer.resolve_exe(command)
     if not executable:
         return False, ""
-    try:
-        completed = subprocess.run(
-            [executable, *version_args],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=15,
-            check=False,
-            **platform_layer.text_kwargs(),
-        )
-    except (OSError, subprocess.SubprocessError):
+    result = platform_layer.execute(
+        [executable, *version_args], stdin=subprocess.DEVNULL, timeout=15
+    )
+    if result.error:
         return True, ""
     return True, next(
-        (
-            line.strip()
-            for line in (completed.stdout or "").splitlines()
-            if line.strip()
-        ),
+        (line.strip() for line in result.stdout.splitlines() if line.strip()),
         "",
     )
 

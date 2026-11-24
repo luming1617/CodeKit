@@ -11,9 +11,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
@@ -88,65 +86,9 @@ class Uninstaller(Installer):
                 self.announce_default_selection(default)
             return default
 
-        # 选择器只消费临时 TSV；finally 保证异常、取消和正常返回都会清理它。
-        manifest = tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            prefix="codekit-selector-",
-            suffix=".tsv",
-            delete=False,
-        )
-        manifest_path = Path(manifest.name)
-        try:
-            for index, component in enumerate(self.components, 1):
-                fields = (
-                    str(index),
-                    component.description,
-                    component.group,
-                    detector.registry.GROUPS[component.group],
-                    self.component_tag(component.component_id),
-                    "1" if component.component_id in default else "0",
-                )
-                manifest.write("\t".join(value.replace("\t", " ") for value in fields) + "\n")
-            manifest.close()
-            configured = self.shell_config()
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT_DIR / "component-selector.py"),
-                    "--mode",
-                    "uninstall",
-                    "--manifest",
-                    str(manifest_path),
-                    "--path-selected",
-                    "0",
-                    "--shell-config",
-                    str(configured[0]) if configured else "",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                **platform_layer.text_kwargs(),
-            )
-        finally:
-            manifest_path.unlink(missing_ok=True)
-        if result.returncode == 2:
-            # 选择器拿不到可用终端：显式降级为默认选择，不当作失败。
-            self.selected = default
-            self.announce_default_selection(default)
-            return default
-        if result.returncode == 10:
-            raise SystemExit(0)
-        if result.returncode == 130:
-            raise KeyboardInterrupt
-        if result.returncode != 0:
-            raise InstallerError(f"Interactive selector failed: {result.stderr.strip()}")
-        payload = result.stdout.strip()
-        if not payload.startswith("selected=") or ";path=" not in payload:
-            raise InstallerError("Interactive selector returned an invalid result.")
-        selected_text, _ = payload.removeprefix("selected=").split(";path=", 1)
-        indices = [int(value) for value in selected_text.split(",") if value]
-        self.selected = [self.components[index - 1].component_id for index in indices]
+        # 选择器协议（TSV 清单、退出码、返回解析）与安装侧共用基类实现。
+        selected, _path_flag = self._run_selector("uninstall", default, False)
+        self.selected = selected
         return self.selected
 
     def uninstall_platform_agents(self, tool: str) -> bool:
@@ -207,7 +149,7 @@ class Uninstaller(Installer):
         # The plugin cache is shared with the desktop app, so it is always
         # removed; a missing CLI must not leave a loadable plugin behind.
         platform_layer.rmtree(
-            self.home / ".claude" / "plugins" / "cache" / config.MARKETPLACE_NAME, ignore_errors=True
+            detector.plugin_cache_dir("claude_plugin", self.home), ignore_errors=True
         )
         return plugin_ok
 
@@ -722,11 +664,7 @@ class Uninstaller(Installer):
         if not self.selected:
             self.logger.info("No components selected. Nothing to uninstall.")
             self.purge_toolchain()
-            try:
-                detector.render_recap("uninstall", (), self.context)
-            except (OSError, ValueError, RuntimeError) as exc:
-                self.logger.warn(f"Could not render uninstall recap: {exc}")
-            return 0
+            return self._finish("uninstall", (), failure_note="未卸干净")
         self.run_uninstalls()
         self.purge_toolchain()
         if not self.toolchain_purged:
@@ -748,19 +686,7 @@ class Uninstaller(Installer):
         self.logger.info(
             f"Note: {self.state_dir} and {self.npm_prefix} remain. {toolchain_note}"
         )
-        try:
-            detector.render_recap("uninstall", ("\t".join(row) for row in self.uninstall_records), self.context)
-        except (OSError, ValueError, RuntimeError) as exc:
-            self.logger.warn(f"Could not render uninstall recap: {exc}")
-        failed = [row for row in self.uninstall_records if row[2] == "0"]
-        if failed:
-            self.logger.error(
-                f"{len(failed)} 个组件未卸干净："
-                + "、".join(row[0] for row in failed)
-                + f"；详见日志 {self.logger.log_path}"
-            )
-            return 1
-        return 0
+        return self._finish("uninstall", self.uninstall_records, failure_note="未卸干净")
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:

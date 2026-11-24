@@ -779,6 +779,7 @@ class PreflightTests(unittest.TestCase):
         installer.home = home
         installer.os_name = "Linux"
         installer.logger = Mock()
+        installer.agent_cli_cache = {}
         return installer
 
     def test_shared_qoder_root_alone_does_not_satisfy_the_preflight(self) -> None:
@@ -845,6 +846,7 @@ def build_installer(home: Path, stage: Path | None) -> Installer:
     installer.marketplace_local = REPO_DIR
     installer.changed_paths = []
     installer.qoder_source_dir = stage
+    installer.agent_cli_cache = {}
     installer.context = detector.Context(
         home=home, marketplace_local=REPO_DIR, version_file=home / "installed_versions"
     )
