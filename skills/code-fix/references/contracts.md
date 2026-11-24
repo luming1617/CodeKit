@@ -2,20 +2,41 @@
 
 本文件定义 Code-Fix 各阶段必须保留的最小数据契约。可以使用 YAML、JSON 或等价的结构化 Markdown，但不得省略关键字段或记录密钥、Token、Cookie 和完整个人数据。
 
+## 节锚点与按角色读取
+
+本文件按锚点切片读取，不整读：主 Agent 启动只读 §0–7（锚点 `artifacts-and-gates` 至 `approval-record`），获批后再读 §8–11；`NOT_A_BUG` / `INSUFFICIENT_EVIDENCE` 提前终止路径永不读 §8–11。派发角色时把对应锚点清单写进任务正文，角色只读自己那几节。
+
+| 节 | 锚点 | 读取者与时机 |
+|---|---|---|
+| §0 产物落盘与确定性门禁 | `artifacts-and-gates` | 主 Agent 启动 |
+| §1 Input Contract | `input-contract` | 主 Agent 启动 |
+| §2 Evidence levels | `evidence-levels` | 主 Agent 启动；Investigator / Challenger |
+| §3 Business Model | `business-model` | 主 Agent 启动；Investigator |
+| §4 Hypothesis Ledger | `hypothesis-ledger` | 主 Agent 启动；Investigator / Challenger |
+| §5 Diagnosis Result | `diagnosis-result` | 主 Agent 启动；Investigator / Challenger |
+| §6 Fix Proposal | `fix-proposal` | 主 Agent 启动（写提案前） |
+| §7 Approval Record | `approval-record` | 主 Agent 启动（审批门禁） |
+| §8 Implementation Contract | `implementation-contract` | 主 Agent 获批后；Implementer |
+| §9 Validation Record | `validation-record` | 主 Agent 获批后；Implementer |
+| §10 System Code Review Result | `review-result` | 主 Agent 步骤 16–17 |
+| §11 System Code Review Handoff | `review-handoff` | 主 Agent 步骤 15–16 |
+
 ## 0. 产物落盘与确定性门禁
+<!-- SECTION: artifacts-and-gates -->
 
 所有契约都落在 `RUN_DIR = <仓库根目录>/.codekit/code-fix/<run-id>/`（自带 `.gitignore` 内容 `*`，因此不产生受版本控制的变化）：
 
 | 文件 | 内容 | 写入者 |
 |---|---|---|
-| `state.json` | Input Contract 的仓库快照、`fix_proposal` 绑定、`approval_record` | `code_fix_state.py preflight / start / record-proposal / verify-approval` |
+| `state.json` | Input Contract 的仓库快照、`fix_proposal` 绑定、`approval_record`、`review_freezes`/`review_rounds` 台账 | `code_fix_state.py preflight / start / record-proposal / verify-approval / freeze-review / record-review` |
 | `doc-map.md` | 每份 PRD/TDD/RPD 的 digest、行数、`approx_tokens` 与标题→行区间 | `code_fix_state.py preflight / start` |
 | `investigation.md` | 步骤 03–07 的 Business Model、Hypothesis Ledger、Diagnosis Result 与反证结论 | Investigator / Challenger 按节追加 |
 | `proposal.md` | Fix Proposal 正文（按 `assets/code-fix-proposal-template.md`） | 主 Agent |
 | `approval.txt` | 用户批准原文（含审批口令） | 主 Agent 逐字保存 |
 | `implementation-contract.json` | Implementation Contract（允许范围、禁止项、不变量、起始摘要、重试预算） | `code_fix_state.py freeze-contract` |
 | `validation-plan.json` | 从提案第 5 节验证表渲染的命令清单 | `code_fix_state.py freeze-contract` |
-| `validation-record.json` | Validation Record（真实执行的命令、退出码、错误指纹） | `code_fix_state.py run-plan / run-validation` |
+| `validation-record.json` | Validation Record（真实执行的命令、退出码、错误指纹、工作树绑定） | `code_fix_state.py run-plan / run-validation` |
+| `review-validation-evidence.json` | 绑定当前工作树的验证证据产物（下游 code-review 继承复用的唯一来源） | `code_fix_state.py freeze-review` |
 | `delivery-report.md` | 最终交付报告（按 `assets/code-fix-delivery-report-template.md`） | 主 Agent |
 
 标为“写入者：脚本”的契约不得由 Agent 手写或事后补写；脚本不可用时对应阶段为 `BLOCKED`，而不是改用自述文本。
@@ -30,6 +51,7 @@
 - 每条门禁命令的输出面向决策：`preflight`、`verify-gates`、`freeze-contract`、`run-plan` 各一次调用即可完成对应步骤，不得拆成多次调用后由模型逐条复述。
 
 ## 1. Input Contract
+<!-- SECTION: input-contract -->
 
 ```yaml
 input_contract:
@@ -73,6 +95,7 @@ input_contract:
 `verify-scope` 的 `changed_files` 是纯仓库相对路径（要拿去匹配允许写清单），两者不是一回事。
 
 ## 2. Evidence levels
+<!-- SECTION: evidence-levels -->
 
 | 等级 | 定义 | 例子 |
 |---|---|---|
@@ -84,6 +107,7 @@ input_contract:
 `CONFIRMED_BUG` 的根因通常需要 E2 或 E3。E1 只能作为待验证假设。
 
 ## 3. Business Model
+<!-- SECTION: business-model -->
 
 第 3、4、5 节的契约统一写入 `RUN_DIR/investigation.md`，按节追加，不另建文件，也不在派发时复述正文。
 
@@ -103,6 +127,7 @@ business_model:
 ```
 
 ## 4. Hypothesis Ledger
+<!-- SECTION: hypothesis-ledger -->
 
 ```yaml
 hypothesis_ledger:
@@ -119,6 +144,7 @@ hypothesis_ledger:
 至少保留一个合理替代假设。只有一个未经挑战的假设不能直接成为高置信度根因。
 
 ## 5. Diagnosis Result
+<!-- SECTION: diagnosis-result -->
 
 ```yaml
 diagnosis_result:
@@ -144,6 +170,7 @@ diagnosis_result:
 `NOT_A_BUG` 时必须用权威规格和实际行为证据证明两者一致，或证明问题位于调用、数据、配置、环境或其他责任边界。`INSUFFICIENT_EVIDENCE` 时列出最小补充证据和采集方法。
 
 ## 6. Fix Proposal
+<!-- SECTION: fix-proposal -->
 
 ```yaml
 fix_proposal:
@@ -189,6 +216,7 @@ fix_proposal:
 `record-proposal` 对提案冻结两份摘要：`gate_digest` 覆盖提案里的承重标签与两张表（首列为 `文件/符号` 的计划修改表、首列为 `检查` 的验证计划表）的集合语义——`方案 ID`、`方案版本`、`状态`、`推荐方案`、`绑定快照`、`允许修改文件`、`明确不修改`、`必须保持的行为`、`备选方案及未选择原因`、`回归测试`、`人工验收`、`审批状态`、`审批范围`、`审批口令`，以及 `--review-mode`；全文 `digest` 只做审计留痕。叙述性章节的改写不会推翻 `gate_digest`，因此不必整轮重新审批（见第 7 节）。缺少关键标签时脚本退化为全文绑定，只会更严。
 
 ## 7. Approval Record
+<!-- SECTION: approval-record -->
 
 ```yaml
 approval_record:
@@ -210,6 +238,7 @@ approval_record:
 用户的批准必须明确指向当前提案，审批口令逐字包含 `批准执行 <proposal_id> v<proposal_version>`，并由 `verify-approval` 校验承重字段摘要、快照和口令绑定。若快照或方案发生实质变化，旧 Approval Record 失效。只有全文 `digest` 变化、`gate_digest` 与章节骨架（标题序列与篇幅）都未变时，才允许用 `--editorial` 放行一次编辑性修订并写入 `editorial_revisions`；`--editorial` 不能救回任何 gate、快照或口令失败，也不构成用户对新方案的批准。
 
 ## 8. Implementation Contract
+<!-- SECTION: implementation-contract -->
 
 ```yaml
 implementation_contract:
@@ -236,6 +265,7 @@ implementation_contract:
 本契约由 `code_fix_state.py freeze-contract` 从 `state.json` 的审批绑定与提案正文渲染成 `RUN_DIR/implementation-contract.json`，并同步生成 `RUN_DIR/validation-plan.json`（其 `contract_digest` 与合同自摘要一致）；主 Agent 只提供覆盖项，不手写摘要或允许范围。`verify-scope --contract` 直接读取该文件的 `allowed_write_files`，并用同样的 canonical-json 摘要复核合同是否被事后改写，结果写入 `contract_integrity`：`OK` / `TAMPERED`（硬失败）/ `MISSING_DIGEST`（升级前的旧合同）/ `NOT_APPLICABLE`（未用 `--contract`）。事后改合同只会让越界判定变得更宽松，因此 `out_of_scope` 为空并不代表范围合法，必须同时看 `contract_integrity`。
 
 ## 9. Validation Record
+<!-- SECTION: validation-record -->
 
 ```yaml
 validation_record:
@@ -243,7 +273,10 @@ validation_record:
   scope_check: PASS | FAIL
   checks:
     - command: [argv]
+      command_text: string         # shlex.join(argv)，下游复用按字符串逐字比对
       cwd: repo-relative-path
+      head_sha: git-sha | null     # 执行时刻的工作树绑定；非 git 目录记 null
+      diff_digest: string | null   # 执行时刻的工作树摘要（worktree_capture 口径）
       exit_code: integer | null
       result: PASS | FAIL | TIMEOUT | RETRY_BUDGET_EXCEEDED | NOT_AVAILABLE | NOT_RUN
       proves: string
@@ -256,9 +289,10 @@ validation_record:
   verdict: PASS | FAIL
 ```
 
-本记录由 `code_fix_state.py run-validation` 追加到 `RUN_DIR/validation-record.json`；`source: declared` 只用于登记确实无法执行的项目，不能被当作通过。`NOT_RUN`、`NOT_AVAILABLE` 和 `TIMEOUT` 不能满足必需验证项。不得把部分测试写成“全部测试通过”。
+本记录由 `code_fix_state.py run-validation` 追加到 `RUN_DIR/validation-record.json`；`source: declared` 只用于登记确实无法执行的项目，不能被当作通过。`NOT_RUN`、`NOT_AVAILABLE` 和 `TIMEOUT` 不能满足必需验证项。不得把部分测试写成“全部测试通过”。缺 `diff_digest` 绑定的旧记录在 `freeze-review` 导出侧直接排除，不得猜测它属于哪棵树。
 
 ## 10. System Code Review Result
+<!-- SECTION: review-result -->
 
 ```yaml
 review_result:
@@ -290,7 +324,10 @@ review_result:
 
 系统审查结果必须带有与 Handoff 同一 `target_id` 的快照，并由系统 `codekit:code-review` 自带的结构校验器验证。不得将普通 Subagent 的 `APPROVED` 或 `NEEDS_CHANGES` 摘要转换为系统审查通过。
 
+每轮结论由 `record-review` 登记到 `state.json` 的 `review_rounds`（verdict、review_mode、报告路径与摘要、结构校验退出码、绑定的冻结序号）；轮次谓词机械执行：首轮必须 FULL，DELTA 只紧跟 FULL 的 `REQUEST_CHANGES`、不得连续、不得登记 `APPROVE`，声明模式与报告 `review_context.review_mode` 交叉校验防改标。每轮登记必须消耗一次同模式的新冻结（最新冻结的 `review_mode` 与本轮一致，且冻结序号大于上一轮），不得把结论登记在别的模式的冻结上或在同一冻结上补登。交付资格 `delivery_eligible` = 最新一轮 FULL + 当前审查模式下的可接受 verdict；DELTA 轮的结论只作修复确认，不直接支撑交付。
+
 ## 11. System Code Review Handoff
+<!-- SECTION: review-handoff -->
 
 Code-Fix 实施后的独立审查必须交给宿主已注册的 `codekit:code-review` Skill，不得由本目录的 Reviewer Prompt 或普通 Subagent 模拟。Handoff 至少包含：
 
@@ -309,20 +346,29 @@ code_review_handoff:
   validation_record: reference        # RUN_DIR/validation-record.json
 ```
 
-`review-handoff.json` 由 `freeze-contract` 与实现合同同时写出，形状即 CW2-a 的统一 Handoff 快照：
+`review-handoff.json` 先由 `freeze-contract` 写出最小形状（向后兼容），验证通过后由 `freeze-review` 原子重写为增强形状（它是唯一增强写者）：补 `worktree_state.diff_digest`、`worktree_state.changed_files`（`STATUS:path` 记法）与 `validation_evidence` 引用。形状即 CW2-a 的统一 Handoff 快照：
 
 ```yaml
-# RUN_DIR/review-handoff.json
+# RUN_DIR/review-handoff.json（freeze-review 增强后）
 schema_version: 2
 produced_by: "codekit:code-fix/scripts/code_fix_state.py"
 digest_scheme: "sha256/hex"           # 裸小写 sha256 hex，无 `sha256:` 前缀（三家同一声明）
-target_id: "<absolute repository_root>@<start_head_sha>"
+target_id: "<absolute repository_root>@<head_sha>"
 committed_range: null                 # 本 Skill 从不 commit：显式声明"不含已提交范围"，而非缺键
 worktree_state:
-  head_sha: git-sha                   # 只声明 head_sha
+  head_sha: git-sha
+  diff_digest: string                 # worktree_capture 口径；与证据产物 worktree_diff_digest 逐字一致
+  changed_files: ["STATUS:path"]      # 重命名折成 R:old->new 一条
+validation_evidence:                  # 可选：freeze-review 后存在，下游复用验证证据的唯一凭据
+  path: absolute-path                 # RUN_DIR/review-validation-evidence.json
+  digest: sha256-hex                  # 证据产物文件字节摘要
 ```
 
-只声明 `head_sha` 是有意的：批准时冻结的 `working_tree_digest` 描述的是"动手前"的树，把它写成审查目标的摘要会是错的。
+`freeze-review` 只导出 `diff_digest` 等于当前工作树摘要的 executed 记录；树在验证后动过时旧记录自动被排除，下游冻结脚本还会逐文件重算与反向集合核对，冻结后再动树直接拒绝（退出码 3）。必需项判定以合同绑定的验证计划为准：plan 的检查项必须与实施合同冻结的 `validation_commands` 逐项一致，声明的 `contract_digest` 也必须与合同一致（事后改 required/换命令硬失败），每个必需项必须在当前工作树上有 PASS 记录（陈旧记录不得支撑冻结）；记录按 (name, command_text) 分组，同名异命令各自独立判定，不得互相掩蔽。下游复用只省重复执行不省判据：同目标同工作树、同命令同 cwd 的 PASS 证据才可继承，且必须披露 `REUSED_VALIDATION`（结论因此封顶 `APPROVE_WITH_FOLLOW_UPS`）。
+
+**DELTA 增量复核轮（P1-1）：**`freeze-review --review-mode DELTA` 时 handoff 改携 `review_mode: DELTA` 与 `delta_recheck` 块（`previous_report_path`/`previous_report_digest`/非空 `repaired_findings`，形状照 code-review contracts.md 的 `delta-recheck` 节），不再携带 `validation_evidence`（DELTA 轮下游禁用复用，验证必须新鲜执行）。机械准入：先内联 `check-repair-scope` 同一套 gate+scope 谓词（跳过该命令不得绕过）；提案 `review_mode` 为 FULL 且快照已冻结到有效文档；上一轮登记必须是 FULL 的 `REQUEST_CHANGES`；上轮报告可读、verdict/mode 核实、摘要与台账登记的 `report_digest` 逐字绑定（不得换报告缩小阻塞集合）、给出摘要时逐字比对；`repaired_findings` 非空、finding_id 不重复且全部属于上轮阻塞 Finding 集合，locations/remediation 非空。冻结预算 `MAX_REVIEW_FREEZES=3`（典型 FULL→DELTA→FULL），第 4 次拒绝即人工介入。修复是否落在已批范围由 `check-repair-scope` 判定（gate_digest 未变 + verify-scope 同一套谓词），不满足即回新提案 + 重新审批路径。
+
+只声明批准时点的 `head_sha` 是有意的：批准时冻结的 `working_tree_digest` 描述的是"动手前"的树，把它写成审查目标的摘要会是错的；增强后的 `diff_digest` 则描述实施完成后的当前树。
 
 比对规则（与 `code-review` 的 `--handoff` 实现一致，四条全部机械可判）：同一 `target_id` 才继续；只比两侧都声明了的字段（这里即 `head_sha`）；`digest_scheme` 不等时不比摘要，记 `HANDOFF_SCHEME_MISMATCH`；上游不含 `committed_range` 而本轮含已提交内容时记 `SCOPE_SUPERSET` 限制并继续审查，**不得**判 `BLOCKED`。
 

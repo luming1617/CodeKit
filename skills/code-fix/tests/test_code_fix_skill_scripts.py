@@ -72,6 +72,10 @@ FILLED = {
     "`<模块、接口、Schema、配置、依赖、业务行为>`": "不改对账 Job、不改 Schema",
     "`<business invariants and negative scope>`": "扣款唯一性、退款语义不变",
     "`<alternatives>`": "网关侧限流：只压症状，未消除根因",
+    # P1-2：样例提案是 S 档（2 文件 1 行计划），必须带规模裁剪披露。
+    "`<S 档小修复必填：业务建模只覆盖症状路径上的哪些参与者/权限/实体/不变量；M 档写不裁剪>`": (
+        "S 档：建模只覆盖扣款路径的调用方权限与扣款唯一性不变量"
+    ),
     "`<...>`": "无影响",
     "`<implementation/test/release estimate>`": "0.5 人日 + 1 条回归测试",
     "`<residual risks>`": "历史脏数据需人工核对",
@@ -283,7 +287,9 @@ class GitRepoFixture(unittest.TestCase):
             self.skipTest("git 不可用")
         self.workspace = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.workspace.cleanup)
-        self.root = Path(self.workspace.name)
+        # macOS 的 /var 是 /private/var 的符号链接；git 与脚本内部都用 resolve 后的
+        # 物理路径，夹具不先 realpath 会让路径断言恒不等（既有坑）。
+        self.root = Path(self.workspace.name).resolve()
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         subprocess.run(["git", "-C", str(self.root), "config", "user.email", "test@example.invalid"], check=True)
         subprocess.run(["git", "-C", str(self.root), "config", "user.name", "Test"], check=True)
@@ -785,6 +791,16 @@ class ContractAndPlan(CliFixture):
         plan_path = Path(payload["plan"])
         plan = self.read(plan_path)
         plan["checks"] = checks
+        # 模拟合法的新版合同：同步合同冻结的验证计划并重算合同自摘要，
+        # 否则 freeze-review 的 plan-合同内容绑定会拒绝（篡改形态由对抗用例覆盖）。
+        contract_path = self.run_dir / "implementation-contract.json"
+        contract = self.read(contract_path)
+        contract["validation_commands"] = checks
+        contract["contract_digest"] = state.canonical_digest(
+            {key: value for key, value in contract.items() if key != "contract_digest"}
+        )
+        contract_path.write_text(json.dumps(contract, ensure_ascii=False), encoding="utf-8")
+        plan["contract_digest"] = contract["contract_digest"]
         plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
         return plan_path
 
@@ -850,6 +866,258 @@ class ContractAndPlan(CliFixture):
         self.assertEqual(scoped["contract_integrity"], "TAMPERED")
         # 越界判定本身看不出来：allowed 正是从被改过的合同读出来的，只有摘要能识破。
         self.assertEqual(scoped["out_of_scope"], [])
+
+
+class ContractInlineGate(CliFixture):
+    """P0-2：freeze-contract 内联复核与 verify-gates 同一套谓词，失败不落盘合同。"""
+
+    def setUp(self):
+        super().setUp()
+        self.manifest = self.start()
+        self.run_dir = self.manifest.parent
+        self.proposal = self.run_dir / "proposal.md"
+        self.proposal.write_text(filled_proposal(), encoding="utf-8")
+        self.approval = self.run_dir / "approval.txt"
+        self.approval.write_text("批准执行 BF-20260909-order-retry v1，按当前绑定快照和允许修改文件实施。\n",
+                                 encoding="utf-8")
+        self.assertEqual(self.cli("record-proposal", "--manifest", str(self.manifest), "--proposal", str(self.proposal),
+                                  "--proposal-id", "BF-20260909-order-retry", "--version", "1")[0], 0)
+        self.assertEqual(self.cli("verify-approval", "--manifest", str(self.manifest),
+                                  "--approval-file", str(self.approval), "--proposal", str(self.proposal))[0], 0)
+
+    def freeze(self) -> tuple[int, dict]:
+        code, payload, _ = self.cli("freeze-contract", "--manifest", str(self.manifest))
+        return code, payload
+
+    def gates(self) -> tuple[int, dict]:
+        code, payload, _ = self.cli("verify-gates", "--manifest", str(self.manifest),
+                                    "--approval-file", str(self.approval), "--proposal", str(self.proposal))
+        return code, payload
+
+    def test_tampered_proposal_fails_with_same_checks_as_verify_gates(self):
+        # 承重字段篡改但判档输入不变（换掉推荐方案叙述）：走内联门禁的 checks 面；
+        # 若篡改同时改变允许文件数/计划行数，会先被 fix_scale 重算拦下（另一条对抗用例覆盖）。
+        self.proposal.write_text(
+            filled_proposal().replace("在 charge() 入口按幂等键去重", "在网关层按幂等键去重"),
+            encoding="utf-8")
+        freeze_code, freeze_payload = self.freeze()
+        gates_code, gates_payload = self.gates()
+        self.assertEqual(freeze_code, 1)
+        self.assertEqual(freeze_code, gates_code)
+        self.assertEqual(freeze_payload["approval"]["checks"], gates_payload["approval"]["checks"])
+        self.assertIn("proposal_gate_match", freeze_payload["approval"]["failed_checks"])
+        self.assertFalse((self.run_dir / "implementation-contract.json").exists(), "复核失败不得落盘合同")
+
+    def test_tree_drift_fails_with_same_drift_as_verify_gates(self):
+        (self.root / "src" / "pay.py").write_text("def charge():\n    return 99\n", encoding="utf-8")
+        freeze_code, freeze_payload = self.freeze()
+        gates_code, gates_payload = self.gates()
+        self.assertEqual(freeze_code, 1)
+        self.assertEqual(freeze_code, gates_code)
+        self.assertEqual(freeze_payload["snapshot"]["drift"], gates_payload["snapshot"]["drift"])
+        self.assertEqual(freeze_payload["snapshot"]["drift"], ["working-tree"])
+        self.assertFalse((self.run_dir / "implementation-contract.json").exists())
+
+    def test_editorial_waiver_still_freezes(self):
+        self.proposal.write_text(filled_proposal().replace("订单金额翻倍", "订单金额被翻倍计入"), encoding="utf-8")
+        code, _, _ = self.cli("verify-approval", "--manifest", str(self.manifest),
+                              "--approval-file", str(self.approval), "--proposal", str(self.proposal),
+                              "--editorial", "--editorial-note", "仅补充措辞")
+        self.assertEqual(code, 0)
+        code, payload = self.freeze()
+        self.assertEqual(code, 0, payload)
+
+    def test_inline_gate_equivalent_to_verify_gates_on_happy_path(self):
+        gates_code, gates_payload = self.gates()
+        freeze_code, freeze_payload = self.freeze()
+        self.assertEqual(gates_code, 0)
+        self.assertEqual(freeze_code, 0, freeze_payload)
+        self.assertEqual(gates_payload["approval"]["verdict"], "OK")
+        self.assertEqual(gates_payload["snapshot"]["verdict"], "OK")
+        # 通过路径上两者终态一致：合同落盘，起始摘要取自审批绑定快照。
+        contract = self.read(Path(freeze_payload["contract"]))
+        self.assertEqual(contract["start_head_sha"],
+                         self.read(self.manifest)["approval"]["approved_snapshot"]["head_sha"])
+
+
+class RenderProposal(CliFixture):
+    """P0-4：机械字段预渲染；模板与校验器零改动，渲染产物原样过既有校验。"""
+
+    def setUp(self):
+        super().setUp()
+        self.manifest = self.start()
+        self.run_dir = self.manifest.parent
+
+    def render(self, *extra: str) -> tuple[int, dict, str]:
+        return self.cli("render-proposal", "--manifest", str(self.manifest),
+                        "--proposal-id", "BF-20260909-order-retry", "--version", "1", *extra)
+
+    def test_skeleton_passes_draft_validation_and_keeps_anchor(self):
+        code, payload, err = self.render()
+        self.assertEqual(code, 0, err)
+        text = Path(payload["proposal"]).read_text(encoding="utf-8")
+        self.assertIn("<!-- code-fix:proposal-required-start -->", text)
+        self.assertEqual(validator.validate(Path(payload["proposal"]), TEMPLATE, True), [])
+
+    def test_skeleton_fails_content_validation_until_judgment_filled(self):
+        _, payload, _ = self.render()
+        errors = validator.validate(Path(payload["proposal"]), TEMPLATE, False)
+        self.assertTrue(any("未替换的模板占位符" in error for error in errors), errors)
+
+    def test_filled_render_passes_full_validation(self):
+        _, payload, _ = self.render()
+        text = Path(payload["proposal"]).read_text(encoding="utf-8")
+        # 只补判断性占位符；机械字段已被预填，FILLED 里对应条目不再命中也不得报错。
+        for source, target in FILLED.items():
+            text = text.replace(source, target)
+        path = self.run_dir / "filled.md"
+        path.write_text(text, encoding="utf-8")
+        self.assertEqual(validator.validate(path, TEMPLATE, False), [])
+
+    def test_prefilled_fields_match_state_verbatim(self):
+        _, payload, _ = self.render()
+        text = Path(payload["proposal"]).read_text(encoding="utf-8")
+        snapshot = self.read(self.manifest)["snapshot"]
+        self.assertIn(f"HEAD={snapshot['head_sha']} tree={snapshot['working_tree_digest']}", text)
+        self.assertIn("BF-20260909-order-retry", text)
+        self.assertIn("批准执行 BF-20260909-order-retry v1，按当前绑定快照和允许修改文件实施。", text)
+        self.assertNotIn("<proposal_id>", text)
+        self.assertNotIn("<proposal_version>", text)
+
+    def test_refuses_overwrite_without_force(self):
+        self.assertEqual(self.render()[0], 0)
+        with self.assertRaises(state.StateError) as caught:
+            self.render()
+        self.assertIn("--force", str(caught.exception))
+        self.assertEqual(self.render("--force")[0], 0)
+
+    def test_rejects_malformed_id_and_version(self):
+        with self.assertRaises(state.StateError):
+            self.cli("render-proposal", "--manifest", str(self.manifest),
+                     "--proposal-id", "not-a-bf-id", "--version", "1")
+        # 非整数版本在 argparse 层就被 type=int 拦下（SystemExit 2），不进 handler。
+        with self.assertRaises(SystemExit) as caught:
+            self.cli("render-proposal", "--manifest", str(self.manifest),
+                     "--proposal-id", "BF-20260909-order-retry", "--version", "x")
+        self.assertEqual(caught.exception.code, 2)
+
+
+class ContractsAnchors(unittest.TestCase):
+    """P0-3：contracts.md 每节都有锚点，顶部表与节一一对应，SKILL.md 按切片读取。"""
+
+    def test_every_numbered_section_has_an_anchor(self):
+        text = (SKILL_DIR / "references" / "contracts.md").read_text(encoding="utf-8")
+        headings = re.findall(r"^## (\d+)\. .+$", text, flags=re.MULTILINE)
+        anchors = re.findall(r"^<!-- SECTION: ([a-z-]+) -->$", text, flags=re.MULTILINE)
+        self.assertEqual(headings, [str(i) for i in range(0, 12)])
+        self.assertEqual(len(anchors), len(headings), "每个编号节都必须有锚点")
+        # 锚点必须紧跟在对应标题之后（中间不隔其他标题）。
+        for match in re.finditer(r"^## (\d+)\. .+$", text, flags=re.MULTILINE):
+            tail = text[match.end():]
+            next_heading = re.search(r"^## ", tail, flags=re.MULTILINE)
+            region = tail[:next_heading.start()] if next_heading else tail
+            self.assertRegex(region, r"<!-- SECTION: [a-z-]+ -->")
+
+    def test_anchor_table_covers_every_anchor(self):
+        text = (SKILL_DIR / "references" / "contracts.md").read_text(encoding="utf-8")
+        anchors = set(re.findall(r"^<!-- SECTION: ([a-z-]+) -->$", text, flags=re.MULTILINE))
+        table = text.split("## 0.")[0]
+        listed = set(re.findall(r"`([a-z-]+)`", table))
+        self.assertTrue(anchors <= listed, f"顶部表缺少锚点：{anchors - listed}")
+
+    def test_skill_md_reads_contracts_by_slice(self):
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("按锚点切片读取", text)
+        self.assertIn("artifacts-and-gates", text)
+        self.assertIn("获批后再读 §8–11", text)
+
+    def test_skill_md_accepts_downstream_reduction_markers(self):
+        # P1-3：四个降档标记的接纳语义必须留在步骤 16，防后续改写漂移。
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        for marker in ("S_TIER_REDUCED", "S_TIER_EMPTY_REGISTER", "SCOPED_FINAL_RECHECK", "REUSED_VALIDATION"):
+            self.assertIn(marker, text)
+        self.assertIn("不得误判为 `BLOCKED` 或要求重跑", text)
+        self.assertIn("逐字带入交付报告", text)
+
+
+class FixScaleTailoring(CliFixture):
+    """P1-2：S 档裁剪的机械判档与披露门禁；档位不可自报、不可手改。"""
+
+    def setUp(self):
+        super().setUp()
+        self.manifest = self.start()
+        self.run_dir = self.manifest.parent
+        self.proposal = self.run_dir / "proposal.md"
+        self.approval = self.run_dir / "approval.txt"
+        self.approval.write_text("批准执行 BF-20260909-order-retry v1，按当前绑定快照和允许修改文件实施。\n",
+                                 encoding="utf-8")
+
+    def record(self, text: str) -> tuple[int, dict, str]:
+        self.proposal.write_text(text, encoding="utf-8")
+        return self.cli("record-proposal", "--manifest", str(self.manifest), "--proposal", str(self.proposal),
+                        "--proposal-id", "BF-20260909-order-retry", "--version", "1")
+
+    def write(self, text: str) -> Path:
+        path = self.root / "validator-input.md"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_small_fix_is_tier_s_and_disclosure_required(self):
+        code, payload, err = self.record(filled_proposal())
+        self.assertEqual(code, 0, err)
+        self.assertEqual(payload["proposal"]["fix_scale"]["tier"], "S")
+        # 披露缺失：保留标签但值留占位符，必须命中 S 档披露检查的专属措辞
+        # （而非通用"缺少字段"面，防弱断言假绿）。
+        placeholder = "`<S 档小修复必填：业务建模只覆盖症状路径上的哪些参与者/权限/实体/不变量；M 档写不裁剪>`"
+        stripped = re.sub(r"(- \*\*规模裁剪\*\*：)[^\n]*", r"\1" + placeholder, filled_proposal())
+        errors = validator.validate(self.write(stripped), TEMPLATE, False)
+        self.assertTrue(any("S 档小修复" in error for error in errors), errors)
+        # 整行删除也会被抓（通用字段存在性面）
+        removed = re.sub(r"- \*\*规模裁剪\*\*：[^\n]*\n", "", filled_proposal())
+        errors = validator.validate(self.write(removed), TEMPLATE, False)
+        self.assertTrue(any("规模裁剪" in error for error in errors), errors)
+
+    def test_five_allowed_files_cannot_claim_s(self):
+        wide = filled_proposal().replace(
+            "src/pay/order.py, tests/test_pay.py",
+            "src/a.py, src/b.py, src/c.py, src/d.py, src/e.py",
+        )
+        code, payload, _ = self.record(wide)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["proposal"]["fix_scale"]["tier"], "M", "5 个允许文件必须判 M，不接受自报 S")
+        self.assertEqual(validator.proposal_fix_scale_tier(wide), "M")
+        # M 档不强制裁剪披露（但模板字段仍需存在，写不裁剪即可）
+        errors = validator.validate(self.write(wide), TEMPLATE, False)
+        self.assertFalse(any("S 档小修复" in error for error in errors), errors)
+
+    def test_planned_rows_over_threshold_is_m(self):
+        extra_rows = filled_proposal().replace(
+            "| src/pay/order.py:charge | 新增幂等键查询 | 消除重复扣款根因 |",
+            "| src/pay/order.py:charge | 新增幂等键查询 | 消除重复扣款根因 |\n"
+            "| src/pay/order.py:guard | 补守卫 | 根因相关 |\n"
+            "| tests/test_pay.py:a | 回归 A | 覆盖 |\n"
+            "| tests/test_pay.py:b | 回归 B | 覆盖 |",
+        )
+        self.assertEqual(validator.proposal_fix_scale_tier(extra_rows), "M", "4 行计划超过 S 档阈值")
+
+    def test_tampered_state_scale_rejected_at_freeze(self):
+        self.assertEqual(self.record(filled_proposal())[0], 0)
+        self.assertEqual(self.cli("verify-approval", "--manifest", str(self.manifest),
+                                  "--approval-file", str(self.approval), "--proposal", str(self.proposal))[0], 0)
+        # 提案未变（gate 检查会通过），仅手改 state 的判档计数冒充更小的 S 档：
+        # 只有 freeze-contract 的重算比对能识破。
+        data = self.read(self.manifest)
+        data["proposal"]["fix_scale"] = {"tier": "S", "allowed_files": 1, "planned_rows": 1}
+        self.manifest.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        code, payload, _ = self.cli("freeze-contract", "--manifest", str(self.manifest))
+        self.assertEqual(code, 1)
+        self.assertTrue(payload["fix_scale_tampered"])
+        self.assertEqual(payload["recomputed"]["allowed_files"], 2)
+        self.assertFalse((self.run_dir / "implementation-contract.json").exists())
+
+    def test_thresholds_match_between_validator_and_state(self):
+        self.assertEqual(validator.FIX_SCALE_S_MAX_FILES, state.FIX_SCALE_S_MAX_FILES)
+        self.assertEqual(validator.FIX_SCALE_S_MAX_PLANNED_ROWS, state.FIX_SCALE_S_MAX_PLANNED_ROWS)
 
 
 class LayoutGuard(unittest.TestCase):

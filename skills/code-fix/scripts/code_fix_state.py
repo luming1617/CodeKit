@@ -15,6 +15,11 @@
     verify-scope    用 git 计算实际变更文件，与获批允许文件做严格差集
     run-validation  以 shell=False 执行单条验证命令并记录真实退出码与错误指纹
     run-plan        在同一进程内顺序执行整份验证计划，逐条落盘，只回显摘要
+    freeze-review   验证通过后导出绑定当前工作树的证据产物，并增强 review-handoff.json；
+                    --review-mode DELTA 时校验上轮 FULL 报告并携带 delta_recheck 块
+    render-proposal 从模板预渲染提案骨架，机械字段（快照/ID/版本/审批口令）取自 state.json
+    record-review   登记系统 code-review 结论，机械执行轮次谓词与交付资格判定
+    check-repair-scope 判定审查反馈修复是否落在已批范围内（免重新审批分支的机械谓词）
 
 审批绑定分两层，缺一不可：`digest` 是提案全文摘要（审计用），`gate_digest` 只覆盖
 承重字段——方案 ID/版本、允许修改文件、明确不修改、必须保持的行为、计划修改表、
@@ -68,6 +73,7 @@ CONTRACT_NAME = "implementation-contract.json"
 # CW2-a③：交给 code-review 步骤 02 `--handoff` 的那一份自述块，单独成文件，
 # 不与 implementation-contract.json 混在一起（后者是实现合同，字段名服务于实施绑定）。
 REVIEW_HANDOFF_NAME = "review-handoff.json"
+REVIEW_EVIDENCE_NAME = "review-validation-evidence.json"
 PLAN_NAME = "validation-plan.json"
 DOC_MAP_NAME = "doc-map.md"
 INVESTIGATION_NAME = "investigation.md"
@@ -77,6 +83,14 @@ HEX_RUN = re.compile(r"\b[0-9a-fA-F]{7,}\b")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 OUTPUT_TAIL_LINES = 12
 DEFAULT_MAX_REPEATS = 3
+# STATUS:path 记法的状态字母集，与 code-impl `_status_letter`、code-review
+# `parse_name_status` 同一口径；?? 没有字母但同样记为新增。
+STATUS_LETTERS = "AMRCDTUX?"
+# P1-1：冻结预算 = 首轮 FULL + 一轮 DELTA 修复复核 + 最终 FULL 确认；第 4 次拒绝，
+# 再被拒即人工介入（镜像 code-impl MAX_REVIEW_FREEZES 的已验证边界）。
+MAX_REVIEW_FREEZES = 3
+REVIEW_VERDICTS = ("APPROVE", "APPROVE_WITH_FOLLOW_UPS", "REQUEST_CHANGES", "BLOCKED")
+REVIEW_ROUND_MODES = ("FULL", "DELTA")
 UNTRACKED_HASH_LIMIT = 500
 UNTRACKED_HASH_MAX_BYTES = 2 * 1024 * 1024
 
@@ -214,6 +228,97 @@ def untracked_entries(root: Path, exclude: str | None) -> list[str]:
         except OSError as exc:
             entries.append(f"{rel}\1unreadable:{type(exc).__name__}")
     return entries
+
+
+def worktree_file_digest(path: Path) -> str:
+    """与 code-impl `_path_digest`、code-review `_worktree_file_digest` 同一口径的逐文件摘要。
+
+    注意这里刻意带 `sha256:` 前缀并区分 symlink/missing/non-file：下游冻结脚本按这个
+    形态重算比对，把复用证据机械绑定到当前工作树；口径漂移会让比对恒不等。
+    它与本 Skill 其余裸 hex 摘要（DIGEST_SCHEME）不是一回事，不得互换。
+    """
+    if path.is_symlink():
+        return "symlink:" + os.readlink(path)
+    if not path.exists():
+        return "missing"
+    if not path.is_file():
+        return "non-file"
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def status_letter(status: str) -> str:
+    stripped = status.strip()
+    if not stripped or stripped == "??":
+        return "A"
+    return stripped[0] if stripped[0] in STATUS_LETTERS else "M"
+
+
+def worktree_capture(root: Path) -> dict:
+    """内容寻址的工作树视图，镜像 code-impl `dirty_snapshot` 的 material 与排除口径。
+
+    证据产物与验证记录的工作树绑定都用这一份摘要：下游只要求证据自洽
+    （记录 diff_digest == 证据 worktree_diff_digest == handoff diff_digest），
+    与 code-review 自家 diff_digest 的 material 不同会被记成 uncomparable，不是失败。
+    `.codekit/` 整体排除（不只本 run 目录），与下游反向集合核对的口径镜像。
+    """
+    raw = git(root, "status", "--porcelain=v1", "-z")
+    tokens = raw.split("\0")
+    entries: dict[str, str] = {}
+    renamed: dict[str, str] = {}
+    index = 0
+    while index < len(tokens) and tokens[index]:
+        token = tokens[index]
+        if len(token) < 4:
+            index += 1
+            continue
+        status, path = token[:2], token[3:]
+        if path.rstrip("/") != ".codekit" and not path.startswith(".codekit/"):
+            entries[path] = status
+        if "R" in status or "C" in status:
+            index += 1
+            if index < len(tokens) and tokens[index]:
+                old = tokens[index]
+                if old.rstrip("/") != ".codekit" and not old.startswith(".codekit/"):
+                    entries[old] = status
+                    renamed[path] = old
+        index += 1
+    for path in git(root, "ls-files", "--others", "--exclude-standard", "-z").split("\0"):
+        if not path or path.rstrip("/") == ".codekit" or path.startswith(".codekit/"):
+            continue
+        if path.endswith("/"):
+            entries.pop(path, None)
+        else:
+            for directory in list(entries):
+                if directory.endswith("/") and path.startswith(directory):
+                    entries.pop(directory, None)
+            entries[path] = "??"
+    files = [
+        {"path": relative, "status": status, "digest": worktree_file_digest(root / relative)}
+        for relative, status in sorted(entries.items())
+    ]
+    head = head_sha(root)
+    material = json.dumps({"head_sha": head, "files": files}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {
+        "head_sha": head,
+        "files": files,
+        "renamed": renamed,
+        "digest": hashlib.sha256(material.encode("utf-8", errors="surrogatepass")).hexdigest(),
+    }
+
+
+def changed_files_notation(capture: dict) -> list[str]:
+    """STATUS:path 清单；重命名折成 R:old->new 一条，与 code-review 冻结清单同记法。"""
+    renamed = capture.get("renamed", {})
+    rename_sources = set(renamed.values())
+    return sorted(
+        {
+            f"{status_letter(item['status'])}:{renamed[item['path']]}->{item['path']}"
+            if item["path"] in renamed
+            else f"{status_letter(item['status'])}:{item['path']}"
+            for item in capture["files"]
+            if item["path"] not in rename_sources
+        }
+    )
 
 
 def read_doc_text(path: Path) -> str:
@@ -535,6 +640,23 @@ def split_paths(value: str) -> list[str]:
     return [token.strip().strip("`") for token in re.split(r"[,，;；\s]+", value.strip()) if token.strip()]
 
 
+# P1-2：S 档裁剪的机械判档阈值。档位由脚本从提案算出，模型不自选；
+# 放宽的只是业务建模覆盖面，根因证据/替代假设/独立反证/审批/验证/系统审查一律不减。
+FIX_SCALE_S_MAX_FILES = 2
+FIX_SCALE_S_MAX_PLANNED_ROWS = 3
+
+
+def fix_scale_of(proposal_path: Path) -> dict:
+    """从提案的允许修改文件与计划修改表机械判档；判档输入与 gate 同源，不得自报。"""
+    labels = proposal_labels(proposal_path)
+    allowed: list[str] = []
+    for value in labels.get("允许修改文件", []):
+        allowed += split_paths(value)
+    rows = planned_changes_from_proposal(proposal_path)
+    tier = "S" if len(set(allowed)) <= FIX_SCALE_S_MAX_FILES and len(rows) <= FIX_SCALE_S_MAX_PLANNED_ROWS else "M"
+    return {"tier": tier, "allowed_files": len(set(allowed)), "planned_rows": len(rows)}
+
+
 # --------------------------------------------------------------------------- 子命令
 
 def create_run(root: Path, run_id: str, documents: list[Path], force: bool) -> tuple[Path, dict]:
@@ -667,6 +789,7 @@ def evaluate_record_proposal(args: argparse.Namespace) -> dict:
         "proposal_id": args.proposal_id,
         "version": str(args.version),
         "review_mode": args.review_mode,
+        "fix_scale": fix_scale_of(proposal),
         "recorded_at": now(),
         "head_sha": state["snapshot"]["head_sha"],
         "working_tree_digest": state["snapshot"]["working_tree_digest"],
@@ -791,12 +914,50 @@ def cmd_verify_gates(args: argparse.Namespace) -> int:
 
 
 def cmd_freeze_contract(args: argparse.Namespace) -> int:
-    """从 state.json 与提案正文机械冻结实施合同，杜绝手写 start_head_sha/diff digest。"""
+    """从 state.json 与提案正文机械冻结实施合同，杜绝手写 start_head_sha/diff digest。
+
+    P0-2：渲染前内联复核审批绑定与快照漂移，复用 verify-approval/check-snapshot 的
+    同一套谓词函数；步骤 11 与实施前不再各跑一次重复门禁。复核失败不落盘合同。
+    """
     manifest = state_path(args.manifest)
     state = load_state(manifest)
     approval = state.get("approval")
     if not approval:
         raise StateError("verify-approval 尚未通过，无法冻结实施合同")
+    record = state.get("proposal") or {}
+    proposal_path = Path(args.proposal or record.get("path", ""))
+    # P1-2：档位重算比对——手改 state 里的 fix_scale 想冒充 S 档裁剪，在这里硬失败。
+    # 放在内联门禁之前：提案未变而 state 被手改时，gate 检查会通过，只有重算能识破。
+    # 旧 run 没有 fix_scale 键时不追溯新义务（与 gate_digest 的向后兼容口径一致）。
+    if proposal_path.is_file() and record.get("fix_scale"):
+        live_scale = fix_scale_of(proposal_path)
+        if live_scale != record["fix_scale"]:
+            return emit({
+                "verdict": "FAIL",
+                "fix_scale_tampered": True,
+                "recorded": record["fix_scale"],
+                "recomputed": live_scale,
+                "note": "state 里的 fix_scale 与提案重算结果不符：档位由脚本判定，不得手改；请重新 record-proposal",
+            })
+    gates = {
+        "approval": evaluate_approval(argparse.Namespace(
+            manifest=str(manifest),
+            approval_file=approval["approval_file"],
+            proposal=args.proposal,
+            editorial=False,
+            editorial_note=None,
+        )),
+        "snapshot": evaluate_snapshot(argparse.Namespace(manifest=str(manifest), verbose=False)),
+    }
+    if gates["approval"]["verdict"] != "OK" or gates["snapshot"]["verdict"] != "OK":
+        return emit({
+            "verdict": "FAIL",
+            "approval": gates["approval"],
+            "snapshot": gates["snapshot"],
+            "note": "审批绑定或快照漂移复核失败，合同未落盘；先按 drift/checks 归因，再更新提案并重新审批",
+        })
+    state = load_state(manifest)
+    approval = state.get("approval")
     record = state.get("proposal") or {}
     proposal_path = Path(args.proposal or record.get("path", ""))
     labels = proposal_labels(proposal_path) if proposal_path.is_file() else {}
@@ -876,6 +1037,331 @@ def cmd_freeze_contract(args: argparse.Namespace) -> int:
     })
 
 
+def record_group_key(entry: dict, index: int) -> tuple:
+    """验证记录分组键：(name, command_text)。
+
+    同名异命令不得互相掩蔽（H1）：同命令重跑仍正确取最新，异命令同名各自独立判定；
+    缺 command_text 的旧记录用 argv 还原，两者都缺时按序号独立成组，不得退化成
+    同一个 "None" 键互相覆盖。
+    """
+    command_text = entry.get("command_text") or shlex.join(entry.get("command") or [])
+    name = entry.get("name")
+    if not name and not command_text:
+        return (f"__legacy_{index}", "")
+    return (str(name), command_text)
+
+
+def cmd_freeze_review(args: argparse.Namespace) -> int:
+    """P0-1：验证通过后导出绑定当前工作树的证据产物，供下游 code-review 继承复用。
+
+    只导出 diff_digest 等于当前工作树摘要的 executed 记录：树在验证后动过时，
+    旧记录自动被排除而不是静默继承；下游冻结脚本还会逐文件重算与反向集合核对，
+    冻结后再动树会被直接拒绝（退出码 3）。本命令是 review-handoff.json 的唯一增强写者。
+
+    P1-1：--review-mode DELTA 时校验上轮 FULL 报告与 repaired_findings，handoff 携带
+    delta_recheck 块；DELTA 轮不携带 validation_evidence（下游禁用复用，验证必须新鲜执行）。
+    冻结预算 MAX_REVIEW_FREEZES 对两种模式同样生效。
+    """
+    manifest = state_path(args.manifest)
+    state = load_state(manifest)
+    if not state.get("approval"):
+        raise StateError("尚未通过审批，无法冻结审查交接")
+    review_mode = getattr(args, "review_mode", "FULL")
+    if review_mode not in REVIEW_ROUND_MODES:
+        raise StateError(f"--review-mode 只能是 {REVIEW_ROUND_MODES}：{review_mode}")
+    freezes = state.get("review_freezes", [])
+    if len(freezes) >= MAX_REVIEW_FREEZES:
+        raise StateError(
+            f"审查冻结预算已用尽（{len(freezes)}/{MAX_REVIEW_FREEZES}）：首轮 FULL + 一轮 DELTA + 最终 FULL "
+            "是上限；再次 REQUEST_CHANGES 必须人工介入，不得继续冻结"
+        )
+    delta_block = None
+    if review_mode == "DELTA":
+        # L3：免审批分支的准入收进脚本——与 check-repair-scope 同一套 gate+scope 谓词，
+        # 跳过 check-repair-scope 直接冻结 DELTA 不得绕过越界判定。
+        repair = evaluate_repair_scope(argparse.Namespace(
+            manifest=str(manifest), contract=str(manifest.parent / CONTRACT_NAME), proposal=None,
+        ))
+        if repair["verdict"] != "OK":
+            return emit({"verdict": "FAIL", "repair_scope": repair,
+                         "note": "DELTA 冻结前范围内修复判定失败：越界或承重字段变化必须重新审批"})
+        delta_block = build_delta_recheck(manifest, state, args)
+    record_path = manifest.parent / VALIDATION_NAME
+    if not record_path.is_file():
+        raise StateError(f"缺少 {VALIDATION_NAME}：先执行 run-plan / run-validation 再冻结审查交接")
+    record = load_record(record_path)
+    capture = worktree_capture(Path(state["root"]))
+    # H1：required 标志以合同绑定的验证计划为准，不接受记录/模型可写文件里的自报；
+    # plan 声明的 contract_digest 必须与实施合同一致，事后改 plan（改 required/换命令）硬失败。
+    plan_path = manifest.parent / PLAN_NAME
+    plan_items: list[dict] = []
+    if plan_path.is_file():
+        plan_raw = json.loads(read_text_file(plan_path))
+        declared = plan_raw.get("contract_digest") if isinstance(plan_raw, dict) else None
+        contract_path = manifest.parent / CONTRACT_NAME
+        contract = json.loads(read_text_file(contract_path)) if contract_path.is_file() else {}
+        if declared and contract.get("contract_digest") and declared != contract["contract_digest"]:
+            return emit({
+                "verdict": "FAIL",
+                "plan_contract_mismatch": True,
+                "note": "validation-plan.json 的 contract_digest 与实施合同不符：计划被事后改写，请重新 freeze-contract",
+            })
+        plan_items = plan_raw.get("checks") if isinstance(plan_raw, dict) else plan_raw
+        if not isinstance(plan_items, list):
+            plan_items = []
+        # 内容级绑定：仅比声明摘要不够——篡改计划内容不会改变拷来的摘要值。
+        # 计划必须与合同里冻结的 validation_commands 逐项一致（合同自身受
+        # contract_digest 保护，verify-scope 会判 TAMPERED）；改 required/换命令都在这拦下。
+        frozen_commands = contract.get("validation_commands")
+        if plan_items and isinstance(frozen_commands, list) and plan_items != frozen_commands:
+            return emit({
+                "verdict": "FAIL",
+                "plan_contract_mismatch": True,
+                "note": "validation-plan.json 的检查项与实施合同冻结的验证计划不一致：计划被事后改写，请重新 freeze-contract",
+            })
+    latest: dict[tuple, dict] = {}
+    for index, entry in enumerate(record["checks"]):
+        latest[record_group_key(entry, index)] = entry
+    if plan_items:
+        unsatisfied = []
+        for item in plan_items:
+            if not item.get("required", True):
+                continue
+            command = item.get("command") or []
+            # 分组键用 argv 的规范形（shlex.join），与记录侧 command_text 同口径；
+            # 不用提案原文 command_text，避免引号/空白变体造成误拒。
+            key = (str(item.get("name")), shlex.join(command))
+            entry = latest.get(key)
+            # M1：必需项必须在当前工作树上 PASS；陈旧记录不得支撑冻结。
+            if entry is None or entry.get("result") != "PASS" or entry.get("diff_digest") != capture["digest"]:
+                unsatisfied.append(str(item.get("name")))
+    else:
+        unsatisfied = [
+            str(key[0]) for key, entry in latest.items()
+            if entry.get("required", True) and (
+                entry.get("result") != "PASS" or entry.get("diff_digest") != capture["digest"]
+            )
+        ]
+    if unsatisfied:
+        return emit({
+            "verdict": "FAIL",
+            "unsatisfied_required": unsatisfied,
+            "note": "必需验证项未全部在当前工作树上 PASS（含陈旧记录），不得冻结审查交接；先重跑验证再冻结",
+        })
+    exported = []
+    for index, entry in enumerate(record["checks"]):
+        if entry.get("source") != "executed" or entry.get("diff_digest") != capture["digest"]:
+            continue
+        exported.append({
+            "name": entry.get("name") or f"CHK-{index + 1:03d}",
+            "command": entry.get("command_text") or shlex.join(entry.get("command") or []),
+            "cwd": entry.get("cwd"),
+            "exit_code": entry.get("exit_code"),
+            "result": entry.get("result"),
+            "diff_digest": entry.get("diff_digest"),
+            "head_sha": entry.get("head_sha"),
+            "proves": entry.get("proves"),
+            "executed_at": entry.get("executed_at"),
+            "source": "executed",
+        })
+    target = target_id_for(Path(state["root"]), capture["head_sha"])
+    evidence = {
+        "produced_by": PRODUCED_BY,
+        "target_id": target,
+        "worktree_diff_digest": capture["digest"],
+        "worktree_files": [
+            {"path": item["path"], "digest": item["digest"]} for item in capture["files"]
+        ],
+        "records": exported,
+    }
+    evidence_path = manifest.parent / REVIEW_EVIDENCE_NAME
+    save_record(evidence_path, evidence)
+    handoff = {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "produced_by": PRODUCED_BY,
+        "digest_scheme": DIGEST_SCHEME,
+        # 本 Skill 从不 commit，审查目标始终是工作树差异，显式声明"不含已提交范围"。
+        "committed_range": None,
+        "target_id": target,
+        "worktree_state": {
+            "head_sha": capture["head_sha"],
+            "diff_digest": capture["digest"],
+            "changed_files": changed_files_notation(capture),
+        },
+    }
+    if delta_block is not None:
+        handoff["review_mode"] = "DELTA"
+        handoff["delta_recheck"] = delta_block
+    else:
+        handoff["review_mode"] = "FULL"
+        handoff["validation_evidence"] = {
+            "path": str(evidence_path),
+            "digest": sha256_file(evidence_path),
+        }
+    handoff_path = manifest.parent / REVIEW_HANDOFF_NAME
+    save_record(handoff_path, handoff)
+    state.setdefault("review_freezes", []).append({
+        "path": str(handoff_path),
+        "target_id": target,
+        "diff_digest": capture["digest"],
+        "review_mode": review_mode,
+        "frozen_at": now(),
+    })
+    save_state(manifest, state)
+    return emit({
+        "verdict": "OK",
+        "review_handoff": str(handoff_path),
+        "validation_evidence": str(evidence_path) if delta_block is None else None,
+        "review_mode": review_mode,
+        "target_id": target,
+        "worktree_diff_digest": capture["digest"],
+        "exported_records": len(exported),
+        "worktree_files": len(capture["files"]),
+        "freeze_index": len(state["review_freezes"]),
+        "note": (
+            "DELTA 增量复核轮：只复核被修 Finding 与受影响维度，验证必须新鲜执行；"
+            "通过后仍须一次最终 FULL 确认轮才能交付"
+            if delta_block is not None else
+            "把本 handoff 路径交给 code-review --handoff；同目标同命令的 PASS 证据可被下游继承，树再动则必须重跑验证"
+        ),
+    })
+
+
+def blocking_findings_of(report: dict) -> list[dict]:
+    findings = report.get("findings")
+    if not isinstance(findings, list):
+        raise StateError("上轮报告缺少 findings 数组，无法判定阻塞 Finding 集合")
+    return [item for item in findings if isinstance(item, dict) and item.get("blocking") is True]
+
+
+def build_delta_recheck(manifest: Path, state: dict, args: argparse.Namespace) -> dict:
+    """P1-1：DELTA 轮的机械准入（镜像 code-impl validate-contract --kind handoff 的已验证边界）。
+
+    只放宽派发覆盖面，不放宽判据：上轮必须是 FULL 的 REQUEST_CHANGES，repaired_findings
+    非空且全部属于上轮阻塞 Finding 集合；LITE/WAIVED（无有效文档）不适用 DELTA。
+    """
+    proposal = state.get("proposal") or {}
+    if proposal.get("review_mode") != "FULL" or not state["snapshot"].get("documents"):
+        raise StateError(
+            "DELTA 增量复核只适用于 FULL 模式（快照已冻结到有效文档）；"
+            "LITE/WAIVED 保持全量重审，不得声明 DELTA"
+        )
+    rounds = state.get("review_rounds", [])
+    if not rounds:
+        raise StateError("首轮审查必须 FULL：DELTA 预设了一轮 FULL 的 REQUEST_CHANGES")
+    previous_round = rounds[-1]
+    if previous_round.get("review_mode") != "FULL" or previous_round.get("verdict") != "REQUEST_CHANGES":
+        raise StateError(
+            "DELTA 只能紧跟一轮 FULL 的 REQUEST_CHANGES（不得连续、不得接在 APPROVE/BLOCKED 之后）；"
+            f"上一轮：{previous_round.get('review_mode')}/{previous_round.get('verdict')}"
+        )
+    if not args.previous_report:
+        raise StateError("DELTA 冻结需要 --previous-report 指向上一轮 FULL 的规范化 JSON 报告")
+    previous_path = Path(args.previous_report)
+    if not previous_path.is_file():
+        raise StateError(f"--previous-report 不可读：{previous_path}")
+    try:
+        previous = json.loads(read_text_file(previous_path))
+    except (ValueError, StateError) as exc:
+        raise StateError(f"--previous-report 不是可读 JSON：{exc}") from exc
+    if not isinstance(previous, dict):
+        raise StateError("--previous-report 必须是 JSON 对象")
+    previous_digest = sha256_file(previous_path)
+    if args.previous_report_digest and args.previous_report_digest != previous_digest:
+        raise StateError("--previous-report-digest 与磁盘文件不符；不得拿旧摘要绑新报告")
+    # M2：上轮报告必须与台账登记的那一份逐字绑定；另造一份缩小阻塞集合的"上轮报告"
+    # 不得掉包防夹带谓词的被减数。旧台账缺 report_digest 键时不追溯新义务。
+    if previous_round.get("report_digest") and previous_digest != previous_round["report_digest"]:
+        raise StateError(
+            "--previous-report 与上一轮台账登记的报告摘要不符：DELTA 必须复核真实上轮报告，"
+            "不得换一份伪造报告缩小阻塞 Finding 集合"
+        )
+    context = previous.get("review_context") or {}
+    if previous.get("verdict") != "REQUEST_CHANGES" or (context.get("review_mode") or "FULL") != "FULL":
+        raise StateError("上轮报告必须是 FULL 模式的 REQUEST_CHANGES；DELTA-of-DELTA 报告链不合法")
+    if not args.repaired_findings:
+        raise StateError("DELTA 冻结需要 --repaired-findings FILE（非空 JSON 数组：finding_id/locations/remediation）")
+    try:
+        repaired = json.loads(read_text_file(Path(args.repaired_findings)))
+    except (ValueError, StateError) as exc:
+        raise StateError(f"--repaired-findings 不是可读 JSON：{exc}") from exc
+    if not isinstance(repaired, list) or not repaired:
+        raise StateError("repaired_findings 必须是非空数组：DELTA 轮只复核被修的阻塞 Finding")
+    blocking_ids = {item.get("id") for item in blocking_findings_of(previous)}
+    seen: set[str] = set()
+    for index, item in enumerate(repaired):
+        if not isinstance(item, dict):
+            raise StateError(f"repaired_findings[{index}] 必须是对象")
+        fid = item.get("finding_id")
+        if not isinstance(fid, str) or not fid:
+            raise StateError(f"repaired_findings[{index}].finding_id 必须是非空字符串")
+        if fid in seen:
+            raise StateError(f"repaired_findings 重复登记：{fid}")
+        seen.add(fid)
+        if fid not in blocking_ids:
+            raise StateError(
+                f"repaired_findings[{index}].finding_id {fid!r} 不属于上轮报告的阻塞 Finding 集合；"
+                "DELTA 只修被拒的阻塞项，不得借增量轮夹带其他改动"
+            )
+        locations = item.get("locations")
+        if not isinstance(locations, list) or not locations or not all(isinstance(loc, str) and loc for loc in locations):
+            raise StateError(f"repaired_findings[{index}].locations 必须是非空字符串数组")
+        if not isinstance(item.get("remediation"), str) or not item.get("remediation").strip():
+            raise StateError(f"repaired_findings[{index}].remediation 必须是非空字符串")
+    return {
+        "previous_report_path": str(previous_path.resolve()),
+        "previous_report_digest": previous_digest,
+        "repaired_findings": repaired,
+    }
+
+
+def cmd_render_proposal(args: argparse.Namespace) -> int:
+    """P0-4：从模板预渲染提案骨架，机械字段取自 state.json，判断性字段保留占位符。
+
+    快照转录、方案 ID/版本、审批口令绑定是校验器硬校且最容易触错的机械字段；
+    预填后模型只需填写判断性章节。模板与校验器零改动，渲染产物必须原样通过既有校验。
+    """
+    manifest = state_path(args.manifest)
+    state = load_state(manifest)
+    if not re.fullmatch(r"BF-\d{8}-[A-Za-z0-9][A-Za-z0-9-]*", args.proposal_id):
+        raise StateError(f"--proposal-id 必须符合 BF-YYYYMMDD-short-name：{args.proposal_id}")
+    if not re.fullmatch(r"\d+", str(args.version)):
+        raise StateError(f"--version 必须是整数：{args.version}")
+    output = Path(args.output) if args.output else manifest.parent / "proposal.md"
+    if output.exists() and not args.force:
+        raise StateError(f"{output} 已存在；用 --force 覆盖（新版本提案），或换一个 --output")
+    template_path = Path(__file__).resolve().parent.parent / "assets" / "code-fix-proposal-template.md"
+    text = read_text_file(template_path)
+    snapshot = state["snapshot"]
+    phrase = f"批准执行 {args.proposal_id} v{args.version}，按当前绑定快照和允许修改文件实施。"
+    replacements = {
+        "`<repository, branch, HEAD SHA, working-tree digest>`": (
+            f"repo={state['root']} branch={snapshot['branch']} "
+            f"HEAD={snapshot['head_sha']} tree={snapshot['working_tree_digest']}"
+        ),
+        "`<BF-YYYYMMDD-short-name>`": args.proposal_id,
+        "`<integer>`": str(args.version),
+        "`<HEAD SHA + working-tree/document digest>`": (
+            f"{snapshot['head_sha']} + {snapshot['working_tree_digest']}"
+        ),
+        "`批准执行 <proposal_id> v<proposal_version>，按当前绑定快照和允许修改文件实施。`": f"`{phrase}`",
+    }
+    for source, target in replacements.items():
+        if source not in text:
+            raise StateError(f"模板不再包含预期占位符，无法预渲染：{source}")
+        text = text.replace(source, target)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(text, encoding="utf-8", errors="surrogatepass")
+    return emit({
+        "verdict": "OK",
+        "proposal": str(output),
+        "proposal_id": args.proposal_id,
+        "version": str(args.version),
+        "prefilled": ["审查快照", "方案 ID", "方案版本", "绑定快照", "审批口令"],
+        "note": "只填写判断性章节后跑 validate_code_fix_proposal.py + record-proposal；机械字段不得手改",
+    })
+
+
 def planned_changes_from_proposal(proposal_path: Path) -> list[str]:
     text = read_text_file(proposal_path)
     rows: list[str] = []
@@ -936,6 +1422,11 @@ def git_names(root: Path, exclude: str | None, *args: str) -> set[str]:
 
 
 def cmd_verify_scope(args: argparse.Namespace) -> int:
+    return emit(evaluate_scope(args))
+
+
+def evaluate_scope(args: argparse.Namespace) -> dict:
+    """越界判定的唯一谓词：verify-scope 与 check-repair-scope 共用，不写第二份较软副本。"""
     manifest = state_path(args.manifest)
     state = load_state(manifest)
     root = Path(state["root"])
@@ -971,7 +1462,7 @@ def cmd_verify_scope(args: argparse.Namespace) -> int:
     # 冻结时就已修改、现在又出现在 diff 里的已跟踪文件：本次改动无法与用户原有修改区分。
     ambiguous = sorted(preexisting & (tracked | staged))
     verdict = "OK" if not out_of_scope and not ambiguous and contract_integrity != "TAMPERED" else "FAIL"
-    return emit({
+    return {
         "verdict": verdict,
         "base_sha": base,
         "changed_files": produced,
@@ -980,6 +1471,149 @@ def cmd_verify_scope(args: argparse.Namespace) -> int:
         "preexisting_touched": ambiguous,
         "contract_integrity": contract_integrity,
         "allowed": list(dict.fromkeys(allowed)),
+    }
+
+
+def cmd_check_repair_scope(args: argparse.Namespace) -> int:
+    """P1-1：审查反馈修复是否落在已批范围内的机械谓词（免重新审批分支的准入）。
+
+    两个条件同时成立才允许走 DELTA 增量复核：提案承重字段 gate_digest 未变（方案语义
+    与允许范围未扩），且实际变更通过 verify-scope 同一套越界判定。任一不满足即回
+    新提案 + 重新审批路径；本命令不放宽任何判据，只把分支选择变成退出码。
+    freeze-review DELTA 内联同一套谓词，跳过本命令不得绕过。
+    """
+    return emit(evaluate_repair_scope(args))
+
+
+def evaluate_repair_scope(args: argparse.Namespace) -> dict:
+    manifest = state_path(args.manifest)
+    state = load_state(manifest)
+    record = state.get("proposal")
+    if not record:
+        raise StateError("尚未 record-proposal，无法判定修复范围")
+    proposal_path = Path(args.proposal or record["path"])
+    gate = gate_digest_of(proposal_gate_payload(proposal_path, record.get("review_mode", "FULL")))
+    frozen_gate = record.get("gate_digest")
+    live_gate = (gate or sha256_file(proposal_path)) if frozen_gate else sha256_file(proposal_path)
+    gate_match = live_gate == (frozen_gate or record["digest"])
+    scope = evaluate_scope(argparse.Namespace(
+        manifest=str(manifest), allowed=[], allowed_file=None, contract=args.contract,
+    ))
+    ok = gate_match and scope["verdict"] == "OK"
+    return {
+        "verdict": "OK" if ok else "FAIL",
+        "proposal_gate_match": gate_match,
+        "scope": scope,
+        "note": (
+            "修复落在已批范围内：可在既有合同下继续，重跑验证后用 freeze-review --review-mode DELTA"
+            if ok else
+            "承重字段变化或实际变更越界：必须生成新提案并重新人工审批，不得走 DELTA 分支"
+        ),
+    }
+
+
+def cmd_record_review(args: argparse.Namespace) -> int:
+    """P1-1：登记系统 code-review 结论，轮次谓词与交付资格全部机械执行。
+
+    镜像 code-impl record-review 的已验证边界：首轮必须 FULL；DELTA 只紧跟 FULL 的
+    REQUEST_CHANGES、不得连续、不得登记 APPROVE；声明模式与报告内容交叉校验防改标；
+    交付资格 = 最新一轮 FULL + 当前审查模式下的可接受 verdict。
+    """
+    manifest = state_path(args.manifest)
+    state = load_state(manifest)
+    if args.verdict not in REVIEW_VERDICTS:
+        raise StateError(f"--verdict 必须是 {REVIEW_VERDICTS}：{args.verdict}")
+    if args.review_mode not in REVIEW_ROUND_MODES:
+        raise StateError(f"--review-mode 必须是 {REVIEW_ROUND_MODES}：{args.review_mode}")
+    freezes = state.get("review_freezes", [])
+    if not freezes:
+        raise StateError("尚未 freeze-review，不得登记审查结论：结论必须绑定已冻结快照")
+    if args.validator_exit_code != 0:
+        raise StateError(
+            f"下游报告结构校验退出码 {args.validator_exit_code} 非 0：结构拒绝不是审查结果，"
+            "先按下游修复循环补齐报告再登记"
+        )
+    rounds = state.get("review_rounds", [])
+    previous = rounds[-1] if rounds else None
+    if args.review_mode == "DELTA":
+        if previous is None:
+            raise StateError("首轮审查必须 FULL；DELTA 预设了一轮 FULL 的 REQUEST_CHANGES")
+        if previous.get("review_mode") != "FULL":
+            raise StateError("DELTA 轮不得连续：上一轮已是 DELTA，请改跑 FULL 审查轮")
+        if previous.get("verdict") != "REQUEST_CHANGES":
+            raise StateError(
+                f"DELTA 只能紧跟 FULL 的 REQUEST_CHANGES（上一轮 verdict：{previous.get('verdict')!r}）"
+            )
+        if args.verdict == "APPROVE":
+            raise StateError("DELTA 轮不得登记 APPROVE：覆盖面不全由设计保证，结论封顶 APPROVE_WITH_FOLLOW_UPS")
+    report_path = Path(args.report)
+    if not report_path.is_file():
+        raise StateError(f"--report 不可读：{report_path}")
+    try:
+        report = json.loads(read_text_file(report_path))
+    except (ValueError, StateError) as exc:
+        raise StateError(f"--report 不是可读 JSON：{exc}") from exc
+    if not isinstance(report, dict):
+        raise StateError("--report 必须是 JSON 对象")
+    context = report.get("review_context") or {}
+    declared = context.get("review_mode") or "FULL"
+    if declared != args.review_mode:
+        raise StateError(
+            f"报告声明 review_context.review_mode={declared!r} 但 --review-mode 是 {args.review_mode!r}；"
+            "DELTA 报告不得改标 FULL 绕过交付门禁——请跑一次真正的 FULL 审查轮"
+        )
+    if report.get("verdict") != args.verdict:
+        raise StateError(
+            f"报告 verdict 是 {report.get('verdict')!r} 但 --verdict 是 {args.verdict!r}；不得改写下游结论"
+        )
+    last = freezes[-1]
+    # M3：轮次与冻结配对——本轮登记必须落在同模式的新冻结上；"重新 freeze-review +
+    # 完整审查 + 登记"不得只剩 prose：把 FULL 确认轮登记在 DELTA 冻结上、或在同一冻结上
+    # 补登第二轮，都会在这里硬失败。旧冻结记录缺 review_mode 键时视同 FULL。
+    if last.get("review_mode", "FULL") != args.review_mode:
+        raise StateError(
+            f"最新冻结是 {last.get('review_mode', 'FULL')} 模式但本轮登记 {args.review_mode}："
+            "每轮审查必须先跑同模式的 freeze-review，不得把结论登记在别的模式的冻结上"
+        )
+    if rounds and len(freezes) <= rounds[-1].get("freeze_index", 0):
+        raise StateError(
+            "本轮登记必须消耗一次新冻结：上一轮已绑定当前冻结，请先重新 freeze-review 再登记"
+        )
+    review_mode_proposal = (state.get("proposal") or {}).get("review_mode", "FULL")
+    if review_mode_proposal == "WAIVED":
+        raise StateError("WAIVED run 不调用系统审查，不得登记 record-review；交付报告写 WAIVED_BY_USER")
+    acceptable = (
+        args.verdict in ("APPROVE", "APPROVE_WITH_FOLLOW_UPS")
+        if review_mode_proposal == "FULL"
+        else args.verdict == "APPROVE_WITH_FOLLOW_UPS"
+    )
+    delivery_eligible = args.review_mode == "FULL" and acceptable
+    entry = {
+        "verdict": args.verdict,
+        "review_mode": args.review_mode,
+        "report_path": str(report_path.resolve()),
+        "report_digest": sha256_file(report_path),
+        "validator_exit_code": args.validator_exit_code,
+        "target_id": last["target_id"],
+        "diff_digest": last["diff_digest"],
+        "freeze_index": len(freezes),
+        "recorded_at": now(),
+    }
+    state.setdefault("review_rounds", []).append(entry)
+    save_state(manifest, state)
+    return emit({
+        "verdict": "OK",
+        "review_verdict": args.verdict,
+        "review_mode": args.review_mode,
+        "rounds_total": len(state["review_rounds"]),
+        "freeze_index": entry["freeze_index"],
+        "delivery_eligible": delivery_eligible,
+        "note": (
+            "可进入交付判定（仍需范围检查与必需验证全部通过）"
+            if delivery_eligible else
+            "不可交付：REQUEST_CHANGES 走修复分支（范围内用 DELTA，越界重新审批）；"
+            "BLOCKED 停下报告；DELTA 通过后必须再跑一次最终 FULL 确认轮"
+        ),
     })
 
 
@@ -1035,7 +1669,7 @@ def save_record(path: Path, record: dict) -> None:
     os.replace(temporary, path)
 
 
-def run_check(root: Path, command: list[str], proves: str, timeout: float, tail_lines: int) -> dict:
+def run_check(root: Path, command: list[str], proves: str, timeout: float, tail_lines: int, name: str | None = None) -> dict:
     """执行一条已通过的验证命令并构造记录条目；命令不合法或程序缺失时抛 StateError。"""
     program = resolve_program(root, command[0])
     started = time.monotonic()
@@ -1057,8 +1691,9 @@ def run_check(root: Path, command: list[str], proves: str, timeout: float, tail_
         # 比抛栈更好，主 Agent 才能把它归到「需要人工/换入口」而不是读一段 traceback。
         raise StateError(f"命令无法启动：{program}：{exc}") from exc
     duration_ms = int((time.monotonic() - started) * 1000)
-    return {
+    entry = {
         "command": command,
+        "command_text": shlex.join(command),
         "cwd": str(root),
         "exit_code": exit_code,
         "result": "TIMEOUT" if timed_out else ("PASS" if exit_code == 0 else "FAIL"),
@@ -1069,11 +1704,28 @@ def run_check(root: Path, command: list[str], proves: str, timeout: float, tail_
         "executed_at": now(),
         "source": "executed",
     }
+    if name:
+        entry["name"] = name
+    entry.update(worktree_binding(root))
+    return entry
+
+
+def worktree_binding(root: Path) -> dict:
+    """执行时刻的工作树绑定；非 git 目录（run-validation --cwd 模式）记 null。
+
+    缺绑定的旧记录在 freeze-review 导出侧直接排除，不得猜测它属于哪棵树。
+    """
+    try:
+        capture = worktree_capture(root)
+    except StateError:
+        return {"head_sha": None, "diff_digest": None}
+    return {"head_sha": capture["head_sha"], "diff_digest": capture["digest"]}
 
 
 def not_available_entry(root: Path, command: list[str], proves: str, reason: str) -> dict:
-    return {
+    entry = {
         "command": command,
+        "command_text": shlex.join(command),
         "cwd": str(root),
         "exit_code": None,
         "result": "NOT_AVAILABLE",
@@ -1085,6 +1737,8 @@ def not_available_entry(root: Path, command: list[str], proves: str, reason: str
         "executed_at": now(),
         "source": "executed",
     }
+    entry.update(worktree_binding(root))
+    return entry
 
 
 def consecutive_failures(checks: list[dict], entry: dict) -> int:
@@ -1122,6 +1776,7 @@ def cmd_run_validation(args: argparse.Namespace) -> int:
         return 1
     record = load_record(record_path)
     consecutive = consecutive_failures(record["checks"], entry)
+    entry.setdefault("name", f"RV-{len(record['checks']) + 1:03d}")
     record["checks"].append(entry)
     save_record(record_path, record)
 
@@ -1166,7 +1821,8 @@ def cmd_run_plan(args: argparse.Namespace) -> int:
         else:
             try:
                 validate_command(command)
-                entry = run_check(root, command, proves, args.timeout, args.tail_lines)
+                entry = run_check(root, command, proves, args.timeout, args.tail_lines,
+                                  name=item.get("name") or f"PLAN-{len(record['checks']) + 1:03d}")
             except StateError as exc:
                 entry = not_available_entry(root, command, proves, str(exc))
         entry.setdefault("name", item.get("name"))
@@ -1302,6 +1958,38 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--tail-lines", type=int, default=OUTPUT_TAIL_LINES)
     plan.add_argument("--max-repeats", type=int, default=DEFAULT_MAX_REPEATS)
     plan.set_defaults(handler=cmd_run_plan)
+
+    review = sub.add_parser("freeze-review", help="验证通过后导出绑定当前工作树的证据产物并增强 review-handoff.json")
+    review.add_argument("--manifest", required=True)
+    review.add_argument("--review-mode", choices=REVIEW_ROUND_MODES, default="FULL",
+                        help="DELTA 为修复 REQUEST_CHANGES 后的增量复核轮，需携带上轮报告与 repaired_findings")
+    review.add_argument("--previous-report", help="DELTA 必填：上一轮 FULL 的规范化 JSON 报告路径")
+    review.add_argument("--previous-report-digest", help="可选：上轮报告摘要，给出时与磁盘文件机械比对")
+    review.add_argument("--repaired-findings", help="DELTA 必填：非空 JSON 数组文件，finding_id/locations/remediation")
+    review.set_defaults(handler=cmd_freeze_review)
+
+    record_review = sub.add_parser("record-review", help="登记系统 code-review 结论，机械执行轮次谓词与交付资格判定")
+    record_review.add_argument("--manifest", required=True)
+    record_review.add_argument("--report", required=True, help="下游规范化 JSON 报告路径")
+    record_review.add_argument("--verdict", required=True, choices=REVIEW_VERDICTS)
+    record_review.add_argument("--review-mode", choices=REVIEW_ROUND_MODES, default="FULL")
+    record_review.add_argument("--validator-exit-code", type=int, default=0,
+                               help="下游报告结构校验器退出码；非 0 的结构拒绝不是审查结果")
+    record_review.set_defaults(handler=cmd_record_review)
+
+    repair_scope = sub.add_parser("check-repair-scope", help="判定审查反馈修复是否落在已批范围内（DELTA 分支准入）")
+    repair_scope.add_argument("--manifest", required=True)
+    repair_scope.add_argument("--contract", required=True, help="implementation-contract.json，取其 allowed_write_files")
+    repair_scope.add_argument("--proposal", help="默认取 state.json 里记录的提案路径")
+    repair_scope.set_defaults(handler=cmd_check_repair_scope)
+
+    render = sub.add_parser("render-proposal", help="从模板预渲染提案骨架，机械字段取自 state.json")
+    render.add_argument("--manifest", required=True)
+    render.add_argument("--proposal-id", required=True)
+    render.add_argument("--version", type=int, required=True)
+    render.add_argument("--output", help=f"默认取 RUN_DIR/proposal.md")
+    render.add_argument("--force", action="store_true", help="覆盖已存在的提案（新版本提案）")
+    render.set_defaults(handler=cmd_render_proposal)
     return parser
 
 

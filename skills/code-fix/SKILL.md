@@ -16,7 +16,7 @@ allowed-tools: 'Bash, Read, Write, Agent, Grep, Skill'
 - **`SKILL_DIR`**：本 `SKILL.md` 所在目录的绝对路径；插件安装时该目录为 `<plugin-cache>/skills/code-fix`。本 Skill 的脚本、模板和参考资料一律按 `SKILL_DIR` 解析后调用，不得假设当前工作目录就是 Skill 目录，也不得把 `skills/code-fix/...` 当作仓库相对路径直接执行。
 - **`<PYTHON>`**：调用本 Skill 门禁脚本时使用的 Python 启动器占位符，执行前替换成字面量（不是 shell 变量）：Windows 用 `py -3`，macOS/Linux 用 `python3`，替换前用 `--version` 实测退出码为 0。Windows 上不要发 `python3`：干净系统里它是微软商店别名桩，`which` 找得到却无任何输出即以非零码退出，会被误判成本机没有 Python。完整解析纪律见 `$SKILLS_ROOT/_shared/prompts/path-convention.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。
 - **`RUN_DIR`**：`<仓库根目录>/.codekit/code-fix/<run-id>/`，由 `code_fix_state.py preflight` 创建，是本次 Code-Fix 唯一允许的产物落盘位置。该目录自带局部 `.gitignore`（内容 `*`），因此审批前保存提案仍然满足“审批前只读”，不会留下受版本控制的文件变化。
-- 产物布局：`state.json`（快照、提案与审批绑定）、`doc-map.md`（文档章节区间与读取预算，脚本生成）、`investigation.md`（业务模型、假设台账与反证结论）、`proposal.md`（修复提案）、`approval.txt`（用户批准原文）、`implementation-contract.json` 与 `validation-plan.json`（`freeze-contract` 从提案渲染的实施合同与验证计划）、`validation-record.json`（真实执行的验证证据）、`delivery-report.md`（最终交付报告）。这些中间产物一律不进版本库；最终 Diff 只能包含获批的源码与测试改动。
+- 产物布局：`state.json`（快照、提案与审批绑定）、`doc-map.md`（文档章节区间与读取预算，脚本生成）、`investigation.md`（业务模型、假设台账与反证结论）、`proposal.md`（修复提案）、`approval.txt`（用户批准原文）、`implementation-contract.json` 与 `validation-plan.json`（`freeze-contract` 从提案渲染的实施合同与验证计划）、`validation-record.json`（真实执行的验证证据）、`review-validation-evidence.json` 与增强后的 `review-handoff.json`（`freeze-review` 导出，供下游继承复用）、`delivery-report.md`（最终交付报告）。这些中间产物一律不进版本库；最终 Diff 只能包含获批的源码与测试改动。
 - **读取预算**：PRD/TDD/RPD 与仓库规范一律先查 `RUN_DIR/doc-map.md` 的标题区间，再用 `Read` 的 `offset`/`limit` 只取需要的那段；禁止把整篇文档读入正文或把它粘贴进子代理任务。阶段之间按**路径**交接（`RUN_DIR/…`），不按内容复述。
 
 派发 Sub-agent 时，必须在输入中显式给出 `SKILL_DIR`、`RUN_DIR` 和相关产物的**绝对路径**，不得让 Sub-agent 自行猜测脚本或产物位置，也不得把契约正文复制进任务正文。
@@ -26,11 +26,11 @@ allowed-tools: 'Bash, Read, Write, Agent, Grep, Skill'
 
 本 Skill 的独立角色使用全局 agents：`code-fix-investigator`、`code-fix-challenger`、`code-fix-implementer`，规范源文件在 `skills/code-fix/agents/`，由安装器注册为全局裸名角色。按名称派发即可，不需要再读取任何角色 Prompt 模板；`reviewer-prompt.md` 已废弃删除，独立审查只能由系统 `codekit:code-review` 完成。
 
-- 每次开始先读取 [references/contracts.md](references/contracts.md) 和 [references/investigation-playbook.md](references/investigation-playbook.md)；后者第 5 节是按症状触发的检查清单，只展开命中的小节。
+- 每次开始按锚点切片读取 [references/contracts.md](references/contracts.md)：主 Agent 启动只读 §0–7（锚点 `artifacts-and-gates` 至 `approval-record`），获批后再读 §8–11；该文件顶部的「节锚点与按角色读取」表规定每个角色只读自己那几节，派发时把角色对应的锚点清单原样写进任务正文，不得整读。同时读取 [references/investigation-playbook.md](references/investigation-playbook.md)；后者第 5 节是按症状触发的检查清单，只展开命中的小节。`NOT_A_BUG` / `INSUFFICIENT_EVIDENCE` 提前终止路径永不读 contracts.md §8–11。
 - 形成修复方案前读取 [references/repair-selection.md](references/repair-selection.md)。
 - 人工明确批准后，实施前读取 [references/execution-and-verification.md](references/execution-and-verification.md)。审批前不得读取该文件来提前开始实现。
 - 调查阶段使用 [assets/code-fix-proposal-template.md](assets/code-fix-proposal-template.md)；实施完成后使用 [assets/code-fix-delivery-report-template.md](assets/code-fix-delivery-report-template.md)。
-- 确定性门禁脚本：`scripts/validate_code_fix_proposal.py`（提案结构与审批语义校验）和 `scripts/code_fix_state.py`（资料门禁、快照冻结、提案与审批绑定、实施合同、范围检查与验证执行）；两者都按 `SKILL_DIR` 解析路径调用，不得用 Agent 自述替代其退出码。能用一条子命令完成的判定，不得拆成多次调用或改由模型逐条复述。
+- 确定性门禁脚本：`scripts/validate_code_fix_proposal.py`（提案结构、审批语义与 S 档披露校验）和 `scripts/code_fix_state.py`（资料门禁、快照冻结、提案预渲染与审批绑定、实施合同、范围检查、验证执行、审查证据冻结与轮次台账）；两者都按 `SKILL_DIR` 解析路径调用，不得用 Agent 自述替代其退出码。能用一条子命令完成的判定，不得拆成多次调用或改由模型逐条复述。
 
 ## Subagent 强制调用规则（Claude Code / Codex / OpenCode / Qoder / Qoder CN）
 
@@ -106,9 +106,9 @@ Skill 接受可选的 `feature-directory` 和必传的 `error-description`。必
 
 一条主线，17 步；括号内是执行者，命令细节见下文同名小节。判定与计算交给脚本，读与判断交给模型。
 
-01 冻结输入（`preflight`）→ 02 仓库与环境预检（`preflight` 输出 + 主 Agent）→ 03 业务建模（Investigator）→ 04 期望与实际定义（Investigator）→ 05 复现与采证（Investigator + 本地工具）→ 06 根因定位（Investigator）→ 07 独立反证（Challenger）→ 08 问题判定（主 Agent：`CONFIRMED_BUG` / `NOT_A_BUG` / `INSUFFICIENT_EVIDENCE`）→ 09 影响面与方案选择（主 Agent）→ 10 输出提案并停止（主 Agent + `validate_code_fix_proposal.py` + `record-proposal`）→ 11 人工审批（用户 + `verify-approval`）→ 12 冻结实施合同（`freeze-contract`）→ 13 实施最小修复（Implementer）→ 14 范围检查（`verify-scope`）→ 15 分层验证（`run-plan` / `run-validation`）→ 16 系统 Code Review（`codekit:code-review`）→ 17 交付判定（主 Agent）。
+01 冻结输入（`preflight`）→ 02 仓库与环境预检（`preflight` 输出 + 主 Agent）→ 03 业务建模（Investigator）→ 04 期望与实际定义（Investigator）→ 05 复现与采证（Investigator + 本地工具）→ 06 根因定位（Investigator）→ 07 独立反证（Challenger）→ 08 问题判定（主 Agent：`CONFIRMED_BUG` / `NOT_A_BUG` / `INSUFFICIENT_EVIDENCE`）→ 09 影响面与方案选择（主 Agent）→ 10 输出提案并停止（主 Agent + `validate_code_fix_proposal.py` + `record-proposal`）→ 11 人工审批（用户 + `verify-approval`）→ 12 冻结实施合同（`freeze-contract`）→ 13 实施最小修复（Implementer）→ 14 范围检查（`verify-scope`）→ 15 分层验证与证据冻结（`run-plan` / `run-validation` / `freeze-review`）→ 16 系统 Code Review（`codekit:code-review`）→ 17 交付判定（主 Agent）。
 
-分叉：08 判为 `NOT_A_BUG` 或 `INSUFFICIENT_EVIDENCE` 即输出证据化结论并停止；11 未批准则停在 `WAITING_APPROVAL`；14 越界、15 契约外失败或 16 要求改动，回到 09 并重新审批；权限、环境或重试超限则 `BLOCKED`。
+分叉：08 判为 `NOT_A_BUG` 或 `INSUFFICIENT_EVIDENCE` 即输出证据化结论并停止；11 未批准则停在 `WAITING_APPROVAL`；14 越界、15 契约外失败或 16 要求改动且修复超出已批范围，回到 09 并重新审批；16 要求改动但修复完全落在已批范围内（`check-repair-scope` 退出码 0）时，在既有合同下修复并走 DELTA 增量复核轮（见步骤 16）；权限、环境或重试超限则 `BLOCKED`。
 
 ## 第一阶段：只读调查与修复提案
 
@@ -145,6 +145,8 @@ Skill 接受可选的 `feature-directory` 和必传的 `error-description`。必
 
 文档一律按 `RUN_DIR/doc-map.md` 的标题区间读取（`Read` 带 `offset`/`limit`），只取与本症状相关的章节。03–07 的结论**追加**到 `preflight` 给出的 `investigation_file`（`RUN_DIR/investigation.md`），一份文件按节追加，不要为每个小节新建文件；派发角色时在任务正文只给路径与本轮问题，不复述已有结论。
 
+**S 档规模裁剪（P1-2）：**`record-proposal` 输出的 `fix_scale.tier` 由脚本机械判定（允许修改文件≤2 且计划修改表≤3 行→S），模型不自选。S 档时业务建模可只覆盖症状路径上的参与者/权限/实体/不变量（见 investigation-playbook §1），`investigation.md` 与提案『规模裁剪』字段必须披露裁剪范围；根因 E2/E3、替代假设、Challenger 反证、审批、验证与系统审查一律不减。
+
 ### 04 定义期望与实际行为
 
 将问题写成可检验断言：在明确前置条件和输入下，期望结果是什么、实际结果是什么、差异是什么。无法定义差异时，不进入修复规划。
@@ -175,7 +177,14 @@ Skill 接受可选的 `feature-directory` 和必传的 `error-description`。必
 
 ### 10 输出提案并停止
 
-严格使用提案模板输出：问题判定、问题原因、证据链、修复方案、允许修改文件、明确不修改、影响风险、验证计划和审批信息。提案必须写入 `RUN_DIR/proposal.md`，然后**用一条命令**完成结构校验并记录提案（结构校验失败时不会写入绑定，直接按报错改提案）：
+严格使用提案模板输出：问题判定、问题原因、证据链、修复方案、允许修改文件、明确不修改、影响风险、验证计划和审批信息。先用**一条** `render-proposal` 从模板预渲染骨架到 `RUN_DIR/proposal.md`（审查快照、方案 ID/版本、绑定快照、审批口令等机械字段由脚本从 `state.json` 预填，不得手抄），再只填写判断性章节；已存在提案时用 `--force` 覆盖（新版本）：
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/code_fix_state.py" render-proposal --manifest "$RUN_DIR/state.json" \
+  --proposal-id <BF-YYYYMMDD-short-name> --version <N> [--force]
+```
+
+填完后**用一条命令**完成结构校验并记录提案（结构校验失败时不会写入绑定，直接按报错改提案）：
 
 ```bash
 <PYTHON> "$SKILL_DIR/scripts/validate_code_fix_proposal.py" "$RUN_DIR/proposal.md" \
@@ -217,7 +226,7 @@ Skill 接受可选的 `feature-directory` 和必传的 `error-description`。必
 
 ### 12 冻结 Implementation Contract
 
-用一条命令把获批提案渲染成实施契约与验证计划，不要手抄允许文件、命令和摘要：
+用一条命令把获批提案渲染成实施契约与验证计划，不要手抄允许文件、命令和摘要。它已内联复核审批绑定与快照漂移（与 `verify-approval`/`check-snapshot` 同一套谓词），复核失败按同款 `checks`/`drift` 输出报错且不落盘合同，因此**不再单独跑 `verify-gates`**（该子命令保留供人工排查）：
 
 ```bash
 <PYTHON> "$SKILL_DIR/scripts/code_fix_state.py" freeze-contract --manifest "$RUN_DIR/state.json"
@@ -248,7 +257,7 @@ Implementer 只修改契约允许的文件，先添加或确认能暴露问题�
 <PYTHON> "$SKILL_DIR/scripts/code_fix_state.py" run-plan --manifest "$RUN_DIR/state.json"
 ```
 
-脚本按 `validation-plan.json` 顺序以 `shell=False` 在仓库根目录执行每条命令，逐条把退出码、耗时、输出尾部（默认 12 行）和错误指纹写入 `RUN_DIR/validation-record.json`，只在 stdout 回显摘要；`verdict` 为 `PASS` 当且仅当所有 `required` 项通过。含 shell 元字符或程序不存在的计划项记 `NOT_AVAILABLE`，不会中断其余项，也不能当作通过——这类项改用下面的单条命令补做，或在报告里列为未运行项与剩余风险：
+脚本按 `validation-plan.json` 顺序以 `shell=False` 在仓库根目录执行每条命令，逐条把退出码、耗时、输出尾部（默认 12 行）、错误指纹与执行时刻的工作树绑定（`head_sha`/`diff_digest`）写入 `RUN_DIR/validation-record.json`，只在 stdout 回显摘要；`verdict` 为 `PASS` 当且仅当所有 `required` 项通过。含 shell 元字符或程序不存在的计划项记 `NOT_AVAILABLE`，不会中断其余项，也不能当作通过——这类项改用下面的单条命令补做，或在报告里列为未运行项与剩余风险：
 
 ```bash
 <PYTHON> "$SKILL_DIR/scripts/code_fix_state.py" run-validation --manifest "$RUN_DIR/state.json" \
@@ -257,15 +266,40 @@ Implementer 只修改契约允许的文件，先添加或确认能暴露问题�
 
 计划外新增的验证（例如 L4 契约、L5 并发/故障注入、L6 发布检查）同样用 `run-validation` 真实执行并留痕。退出码 0 才是 `PASS`；返回 3 表示同一错误指纹连续出现次数超过重试预算，必须停止并报告。未经这两个子命令记录的口头结论、历史测试结果和 Agent 自检都不是验证证据。
 
+全部必需项 PASS 后，同一步收尾用**一条** `freeze-review` 导出绑定当前工作树的验证证据并增强 `review-handoff.json`（补 `worktree_state.diff_digest`/`changed_files` 与 `validation_evidence` 引用）：
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/code_fix_state.py" freeze-review --manifest "$RUN_DIR/state.json"
+```
+
+下游 code-review 据此可继承同目标同工作树、同命令同 cwd 的 PASS 证据而不重跑（披露 `REUSED_VALIDATION`，结论封顶 `APPROVE_WITH_FOLLOW_UPS`）；树在验证后动过时旧记录自动被排除，冻结后再动树会被下游直接拒绝，必须重跑验证后重新 `freeze-review`。必需项判定以合同绑定的验证计划为准（plan 的检查项必须与实施合同冻结的 `validation_commands` 逐项一致，声明的 `contract_digest` 也必须相符，事后改 plan 硬失败），且每个必需项必须在**当前工作树**上有 PASS 记录；同名异命令的检查各自独立判定，不得互相掩蔽。必需项未全部满足时该命令拒绝导出。
+
 ### 16 独立复核（系统 Code Review）
 
-验证通过后，主 Agent 必须调用宿主已注册的系统 `codekit:code-review` Skill，目标限定为 `local_diff`，并提供冻结的 PRD/TDD/RPD（或明确的 `documents: NOT_AVAILABLE`）、`review_mode`、仓库规范、`review-handoff.json` 的绝对路径与 `validation-record.json`。`review-handoff.json` 由 `freeze-contract` 写出，只声明 `target_id`、`digest_scheme: "sha256/hex"` 与 `worktree_state.head_sha`，并把 `committed_range` 显式置为 `null`（本 Skill 从不 commit）；下游据此对本次冻结做机械比对，`SCOPE_SUPERSET` 只是随报告登记的限制，不是 `BLOCKED`。不得手写该文件，也不得把批准时冻结的 `working_tree_digest`（描述的是动手前的树）当作审查目标的摘要写进去。本 Skill 未收到 `feature-directory` 时，仍按同一次调用把该参数显式置空：`codekit:code-review` 会自己递归收集 `docs/` 下的文档并在确实没有文档时降级，这不能成为跳过或取消调用的理由。系统 Skill 必须直接检查最终 Diff、相关代码和测试，确认根因已消除、没有掩盖症状、修改未越权、回归覆盖充分且 RPD 仍然可执行；Handoff 只给路径与摘要，不得把提案或验证记录正文复制过去，也不得用普通 Subagent 的摘要替代。
+验证通过后，主 Agent 必须调用宿主已注册的系统 `codekit:code-review` Skill，目标限定为 `local_diff`，并提供冻结的 PRD/TDD/RPD（或明确的 `documents: NOT_AVAILABLE`）、`review_mode`、仓库规范、`review-handoff.json` 的绝对路径与 `validation-record.json`。`review-handoff.json` 由 `freeze-contract` 写出最小形状、`freeze-review` 增强（只声明 `target_id`、`digest_scheme`、`worktree_state` 与 `validation_evidence`，并把 `committed_range` 显式置为 `null`，本 Skill 从不 commit）；下游据此对本次冻结做机械比对，`SCOPE_SUPERSET` 只是随报告登记的限制，不是 `BLOCKED`。不得手写该文件，也不得把批准时冻结的 `working_tree_digest`（描述的是动手前的树）当作审查目标的摘要写进去。本 Skill 未收到 `feature-directory` 时，仍按同一次调用把该参数显式置空：`codekit:code-review` 会自己递归收集 `docs/` 下的文档并在确实没有文档时降级，这不能成为跳过或取消调用的理由。系统 Skill 必须直接检查最终 Diff、相关代码和测试，确认根因已消除、没有掩盖症状、修改未越权、回归覆盖充分且 RPD 仍然可执行；Handoff 只给路径与摘要，不得把提案或验证记录正文复制过去，也不得用普通 Subagent 的摘要替代。
 
-系统 Code Review 的结果必须保留其结构化报告和校验证据：`FULL` 模式下 `APPROVE` 或 `APPROVE_WITH_FOLLOW_UPS` 才能进入交付；`LITE` 模式只接受 `APPROVE_WITH_FOLLOW_UPS`；`REQUEST_CHANGES` 按系统 Skill 自身的修复流程处理；`BLOCKED`、快照不一致或系统 Skill 不可用时必须停止并报告，不能降级为本地 `APPROVED`。
+系统 Code Review 的结果必须保留其结构化报告和校验证据，并用**一条** `record-review` 登记（轮次谓词与交付资格由脚本机械判定，不由主 Agent 自评）：
+
+```bash
+<PYTHON> "$SKILL_DIR/scripts/code_fix_state.py" record-review --manifest "$RUN_DIR/state.json" \
+  --report <下游规范化 JSON 报告路径> --verdict <APPROVE|APPROVE_WITH_FOLLOW_UPS|REQUEST_CHANGES|BLOCKED> \
+  --review-mode <FULL|DELTA> --validator-exit-code <下游结构校验退出码>
+```
+
+`FULL` 模式下 `APPROVE` 或 `APPROVE_WITH_FOLLOW_UPS` 才能进入交付；`LITE` 模式只接受 `APPROVE_WITH_FOLLOW_UPS`；`BLOCKED`、快照不一致或系统 Skill 不可用时必须停止并报告，不能降级为本地 `APPROVED`。输出的 `delivery_eligible` 为 true 才具备交付资格（最新一轮必须是 FULL）。每轮登记必须消耗一次**同模式的新冻结**：把结论登记在别的模式的冻结上、或在同一冻结上补登第二轮，都会被脚本拒绝。
+
+**REQUEST_CHANGES 的修复分支（P1-1 DELTA 增量复核轮）：**先用 `check-repair-scope --contract "$RUN_DIR/implementation-contract.json"` 判定修复是否落在已批范围（提案承重字段 gate_digest 未变 + verify-scope 同一套越界判定）：
+
+- 退出码 0（范围内）：不重新审批。Implementer 在既有合同下修复阻塞 Finding → 重跑受影响验证与 `run-plan` → `freeze-review --review-mode DELTA --previous-report <上轮 FULL 报告路径> --repaired-findings <JSON 文件路径，内容为非空数组：finding_id/locations/remediation>` → 以同一 Handoff 调用 `codekit:code-review` 的 DELTA 轮（只复核被修 Finding 与受影响维度，验证必须新鲜执行，结论封顶 `APPROVE_WITH_FOLLOW_UPS`）→ `record-review --review-mode DELTA` 登记。**DELTA 通过后仍须一次最终 FULL 确认轮**（重新 `freeze-review` + 完整 code-review + `record-review`）才能交付。`freeze-review --review-mode DELTA` 已内联 `check-repair-scope` 同一套 gate+scope 谓词，跳过 `check-repair-scope` 不得绕过；上轮报告必须与台账登记的摘要逐字一致，不得换报告缩小阻塞集合。
+- 退出码非 0（越界或承重字段变化）：生成新提案并重新人工审批，不得走 DELTA 分支。
+
+DELTA 只适用于 `FULL` 模式（快照已冻结到有效文档）；`LITE`/`WAIVED` 保持全量重审。轮次合法性由脚本机械执行：首轮必须 FULL，DELTA 只紧跟 FULL 的 `REQUEST_CHANGES`、不得连续、不得登记 `APPROVE`；冻结预算 3 次（典型 FULL→DELTA→FULL），第 4 次拒绝即人工介入。DELTA 轮禁用证据复用与一切降档标记（下游既有规则）。
+
+**下游降档标记的显式接纳（P1-3）：**下游 code-review 合法使用 `S_TIER_REDUCED`、`S_TIER_EMPTY_REGISTER`、`SCOPED_FINAL_RECHECK`、`REUSED_VALIDATION` 标记时，结论封顶 `APPROVE_WITH_FOLLOW_UPS` 属当前审查模式下的可接受交付结论，不得误判为 `BLOCKED` 或要求重跑；这些标记的准入与披露由下游脚本机械校验，本 Skill 不重复判定。下游报告的 `limitations` 必须逐字带入交付报告，不得省略或改写。
 
 ### 17 最终交付
 
-只有修复范围检查、必需验证和独立复核全部通过，才可报告完成。最终报告写入 `RUN_DIR/delivery-report.md`，列出根因、获批方案、实际 Diff、测试证据、未运行项、剩余风险、审查模式和人工验收项；不得声称未执行的部署、Migration 或外部验收已经完成。
+只有修复范围检查、必需验证和独立复核全部通过，才可报告完成；独立复核的交付资格以最后一次 `record-review` 输出的 `delivery_eligible=true` 为准（最新一轮必须是 FULL，DELTA 轮的结论只作修复确认）。最终报告写入 `RUN_DIR/delivery-report.md`，列出根因、获批方案、实际 Diff、测试证据、未运行项、剩余风险、审查模式、审查轮次（含 DELTA 增量复核轮）和人工验收项；不得声称未执行的部署、Migration 或外部验收已经完成。
 
 ### 失败与变更处理（跨步骤）
 

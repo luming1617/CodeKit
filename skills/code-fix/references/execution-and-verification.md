@@ -6,14 +6,14 @@
 
 ## 1. 实施前重新确认
 
-用**一条** `verify-gates` 连跑审批绑定与快照漂移两项门禁（它等价于依次执行 `verify-approval` 和 `check-snapshot`，分开跑只会多付一次模型往返）：
+审批绑定与快照漂移的复核已内联在 `freeze-contract` 里（与 `verify-approval`/`check-snapshot` 同一套谓词函数，复核失败按同款 `checks`/`drift` JSON 报错且不落盘合同），**不再单独跑 `verify-gates`**；步骤 11 的 `verify-approval` 与它也不构成重复：前者是审批时点的绑定，后者是动手前一刻的复核。`verify-gates` 子命令保留供人工排查：
 
 ```bash
 <PYTHON> "$SKILL_DIR/scripts/code_fix_state.py" verify-gates --manifest "$RUN_DIR/state.json" \
   --approval-file "$RUN_DIR/approval.txt" --proposal "$RUN_DIR/proposal.md"
 ```
 
-在它的 `approval.checks` 与 `snapshot` 字段里核对：
+在 `freeze-contract` 失败输出的 `approval.checks` 与 `snapshot` 字段里核对：
 
 - 当前 `HEAD SHA`、工作树摘要和文档摘要是否仍与提案绑定快照一致；
 - 预先存在的用户修改是否变化；
@@ -25,12 +25,13 @@
 
 ## 2. 实施顺序
 
-1. `verify-gates` 通过后用 `freeze-contract --manifest "$RUN_DIR/state.json"` 冻结 Implementation Contract 与验证计划；允许范围、起始摘要、禁止项和验证命令都从提案取，不手抄。
+1. `freeze-contract --manifest "$RUN_DIR/state.json"` 内联复核审批绑定与快照漂移，通过后冻结 Implementation Contract 与验证计划；允许范围、起始摘要、禁止项和验证命令都从提案取，不手抄。
 2. 在不修改生产逻辑的条件允许时，先添加或确认最小回归测试，并证明修复前能暴露问题。
 3. 在根因所属层实施最小修复。
 4. 用 `code_fix_state.py verify-scope --manifest "$RUN_DIR/state.json" --contract "$RUN_DIR/implementation-contract.json"` 检查实际 Diff 和修改文件范围。
 5. 用 `code_fix_state.py run-plan --manifest "$RUN_DIR/state.json"` 一次跑完整份验证计划（回归、模块、契约），只对计划外新增的检查补用 `run-validation`。
-6. 独立复核最终快照。
+6. 全部必需项 PASS 后用 `code_fix_state.py freeze-review --manifest "$RUN_DIR/state.json"` 导出绑定当前工作树的验证证据并增强 `review-handoff.json`，供下游继承复用；树再动则重跑验证后重新冻结。
+7. 独立复核最终快照。
 
 如果无法安全地先运行失败测试，说明原因，并使用代码路径或其他 E2/E3 证据替代，不能伪造 red-green 过程。
 
@@ -64,6 +65,7 @@
 
 - 契约内实现或测试错误：根据新证据修复；错误指纹由 `run-validation` 计算，相同指纹连续 3 次时脚本返回退出码 3，必须停止并报告。
 - 诊断错误或根因变化：回到只读调查，发布新版本提案并重新审批。
+- 系统审查 `REQUEST_CHANGES`：先用 `check-repair-scope --contract` 判定修复范围。范围内（退出码 0）且 FULL 模式：既有合同下修复 → 重跑验证 → `freeze-review --review-mode DELTA` → DELTA 复核轮 → 最终 FULL 确认轮，免重新审批；越界、承重字段变化或 LITE/WAIVED：新提案 + 重新审批 + 全量重审。轮次谓词与冻结预算（3 次）由 `record-review`/`freeze-review` 机械执行。
 - 新增修改文件、改变 API/Schema/消息/配置语义、增加依赖、数据修复或发布策略：重新审批。
 - 环境、权限或已有用户修改冲突：停止并请求最小必要决策。
 

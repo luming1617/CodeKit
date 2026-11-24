@@ -323,6 +323,50 @@ def diagnosis_region(sections: list[Section], schema: TemplateSchema) -> list[Se
     return [section for section in sections if int(section.number) < schema.proposal_start]
 
 
+# P1-2：S 档判档阈值与 code_fix_state.py 的 FIX_SCALE_S_MAX_* 同一口径；
+# 两侧由测试盯着，改阈值必须两处同改。档位从提案自身算出，不接受自报。
+FIX_SCALE_S_MAX_FILES = 2
+FIX_SCALE_S_MAX_PLANNED_ROWS = 3
+
+
+def proposal_fix_scale_tier(text: str) -> str:
+    allowed: list[str] = []
+    planned_rows = 0
+    for section in split_sections(text):
+        for label, values in section_fields(section.body).items():
+            if label.strip() == "允许修改文件":
+                for value in values:
+                    allowed += [token.strip().strip("`") for token in re.split(r"[,，;；\s]+", value.strip()) if token.strip()]
+        for header, rows in iter_tables(section.body):
+            if header and _bare(header[0]) == "文件/符号":
+                planned_rows += len(rows)
+    return "S" if len(set(allowed)) <= FIX_SCALE_S_MAX_FILES and planned_rows <= FIX_SCALE_S_MAX_PLANNED_ROWS else "M"
+
+
+def check_fix_scale_disclosure(
+    text: str, sections: list[Section], schema: TemplateSchema, errors: list[str]
+) -> None:
+    """P1-2：S 档小修复必须披露规模裁剪；M 档不强制。判档由脚本算，模型不自选。
+
+    放宽的只是业务建模覆盖面（见 investigation-playbook §1）；根因 E2/E3、替代假设、
+    独立反证、审批、验证与系统审查不因 S 档而减。披露缺失时裁剪不成立，按完整建模执行。
+    """
+    if proposal_fix_scale_tier(text) != "S":
+        return
+    values = [
+        value
+        for section in sections
+        for label, section_values in section_fields(section.body).items()
+        if label.strip() == "规模裁剪"
+        for value in section_values
+    ]
+    if not values or not any(has_meaningful_value(value, schema) for value in values):
+        errors.append(
+            "S 档小修复（允许修改文件≤2 且计划修改表≤3 行）必须填写『规模裁剪』披露裁剪范围；"
+            "不披露则按完整业务建模执行，不得自行裁剪"
+        )
+
+
 def check_confirmed_semantics(
     text: str, sections: list[Section], schema: TemplateSchema, errors: list[str]
 ) -> None:
@@ -409,6 +453,7 @@ def validate(path: Path, template: Path, allow_placeholders: bool) -> list[str]:
         if confirmed:
             if not allow_placeholders:
                 check_confirmed_semantics(text, sections, schema, errors)
+                check_fix_scale_disclosure(text, sections, schema, errors)
         elif not re.search(r"不(?:执行|进入|实施|创建).{0,12}修复", text):
             errors.append(f"{status} 必须明确说明不执行修复")
 

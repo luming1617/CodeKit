@@ -9,6 +9,8 @@
 - **Base / Final SHA**：`<sha> / <sha>`
 - **范围检查**：`verify-scope` 结果 `PASS/FAIL` + `out_of_scope`/`preexisting_touched` 摘要
 - **审查模式**：`FULL | LITE | WAIVED_BY_USER | NOT_RUN`
+- **审查轮次**：`<record-review 台账：FULL/DELTA 序列与各轮 verdict；交付轮必须是 FULL>`
+- **规模档位**：`fix_scale: S/M`（取自 `record-proposal` 输出；S 档时写明 investigation.md 中的裁剪范围）
 
 ## 2. 问题原因
 
