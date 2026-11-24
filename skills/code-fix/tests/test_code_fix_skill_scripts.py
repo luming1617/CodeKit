@@ -1,10 +1,10 @@
-"""Bugfix Skill 校验脚本的回归测试。
+"""Code-Fix Skill 校验脚本的回归测试。
 
 覆盖两件事：
-1. 提案模板与 ``validate_bugfix_proposal.py`` 的一致性（模板是唯一事实源）；
-2. ``bugfix_state.py`` 的快照冻结、范围校验与验证执行语义。
+1. 提案模板与 ``validate_code_fix_proposal.py`` 的一致性（模板是唯一事实源）；
+2. ``code_fix_state.py`` 的快照冻结、范围校验与验证执行语义。
 
-运行：python3 -m unittest discover -s skills/bugfix/tests -p 'test_*.py'
+运行：python3 -m unittest discover -s skills/code-fix/tests -p 'test_*.py'
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
-TEMPLATE = SKILL_DIR / "assets" / "bugfix-proposal-template.md"
+TEMPLATE = SKILL_DIR / "assets" / "code-fix-proposal-template.md"
 
 
 def load_script(name: str):
@@ -38,8 +38,8 @@ def load_script(name: str):
     return module
 
 
-validator = load_script("validate_bugfix_proposal.py")
-state = load_script("bugfix_state.py")
+validator = load_script("validate_code_fix_proposal.py")
+state = load_script("code_fix_state.py")
 
 # 一份「填完即可通过」的最小合规提案：模板里每个占位符都必须被显式替换，
 # 因此这张映射表同时也是模板改动的回归守卫。
@@ -131,7 +131,7 @@ class TemplateDerivedSchema(ProposalFixture):
 
     def test_rejects_template_without_region_marker(self):
         broken = self.root / "broken-template.md"
-        broken.write_text(re.sub(r"<!-- bugfix:proposal-required-start -->", "", TEMPLATE.read_text(encoding="utf-8")), encoding="utf-8")
+        broken.write_text(re.sub(r"<!-- code-fix:proposal-required-start -->", "", TEMPLATE.read_text(encoding="utf-8")), encoding="utf-8")
         with self.assertRaises(validator.ValidationError):
             validator.load_schema(broken)
 
@@ -266,7 +266,7 @@ class GateSemantics(ProposalFixture):
         outputs = set()
         for seed in range(3):
             result = subprocess.run(
-                [sys.executable, str(SKILL_DIR / "scripts" / "validate_bugfix_proposal.py"), str(path)],
+                [sys.executable, str(SKILL_DIR / "scripts" / "validate_code_fix_proposal.py"), str(path)],
                 capture_output=True, text=True, check=False, encoding="utf-8", errors="replace",
                 env={**os.environ, "PYTHONHASHSEED": str(seed)},
             )
@@ -305,7 +305,7 @@ class GitRepoFixture(unittest.TestCase):
         with redirect_stdout(out):
             code = state.main(argv)
         self.assertEqual(code, 0, out.getvalue())
-        return self.root / ".codekit" / "bugfix" / run_id / "state.json"
+        return self.root / ".codekit" / "code-fix" / run_id / "state.json"
 
     def read(self, path: Path) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -575,7 +575,7 @@ class PreflightGate(CliFixture):
         self.assertEqual(payload["suggested_review_mode"], "FULL")
         self.assertEqual([d["path"] for d in payload["documents"]], [str(doc)])
         self.assertTrue(payload["investigation_file"].endswith("investigation.md"))
-        doc_map = (self.root / ".codekit" / "bugfix" / "r1" / "doc-map.md").read_text(encoding="utf-8")
+        doc_map = (self.root / ".codekit" / "code-fix" / "r1" / "doc-map.md").read_text(encoding="utf-8")
         self.assertIn(doc.name, doc_map)
         self.assertRegex(doc_map, r"L\d+-L\d+ ## ")
         self.assertIn("禁止把整篇文档读入", doc_map)
@@ -599,7 +599,7 @@ class PreflightGate(CliFixture):
         self.assertEqual(payload["suggested_review_mode"], "LITE")
         self.assertEqual(code, 0)
         self.assertIn("directory-missing-or-unreadable", [d["reason"] for d in payload["rejected_documents"]])
-        self.assertFalse((self.root / ".codekit" / "bugfix" / "r3" / "doc-map.md").exists())
+        self.assertFalse((self.root / ".codekit" / "code-fix" / "r3" / "doc-map.md").exists())
 
     def test_default_output_is_a_summary_and_verbose_keeps_the_lists(self):
         doc = self.add_long_document()
@@ -736,7 +736,7 @@ class ContractAndPlan(CliFixture):
         self.assertRegex(handoff["worktree_state"]["head_sha"], r"^[0-9a-f]{40}$")
         self.assertEqual(handoff["digest_scheme"], "sha256/hex")
         self.assertIsNone(handoff["committed_range"])
-        self.assertEqual(handoff["produced_by"], "codekit:bugfix/scripts/bugfix_state.py")
+        self.assertEqual(handoff["produced_by"], "codekit:code-fix/scripts/code_fix_state.py")
         self.assertTrue(handoff["target_id"].endswith("@" + contract["start_head_sha"]))
         self.assertEqual(handoff["target_id"], payload["target_id"])
         plan = self.read(Path(payload["plan"]))
@@ -855,9 +855,9 @@ class ContractAndPlan(CliFixture):
 class LayoutGuard(unittest.TestCase):
     def test_skill_md_documents_state_script_and_skill_dir_paths(self):
         text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
-        self.assertNotIn("run-manifest.json", text, "bugfix 没有 run-manifest，派发指令不应引用它")
-        self.assertNotIn("python3 skills/bugfix/scripts/", text, "脚本调用必须用 SKILL_DIR 占位符")
-        self.assertIn("bugfix_state.py", text)
+        self.assertNotIn("run-manifest.json", text, "code-fix 没有 run-manifest，派发指令不应引用它")
+        self.assertNotIn("python3 skills/code-fix/scripts/", text, "脚本调用必须用 SKILL_DIR 占位符")
+        self.assertIn("code_fix_state.py", text)
         self.assertIn("SKILL_DIR", text)
 
 

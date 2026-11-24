@@ -151,7 +151,7 @@ flowchart TB
 
 文档不是硬性前置条件，但缺失会限缩结论：`DOCUMENTS: NOT_AVAILABLE` 时需求追踪与 Release Gate 只能基于仓库规范、代码证据和调用方审查意图，必须把文档缺失登记为 Open Question，结论不得为 `APPROVE`（最多 `APPROVE_WITH_FOLLOW_UPS`）并说明规格覆盖缺口。
 
-由其他 Skill 调用本 Skill 时（例如 `codekit:bugfix` 的 Code Review Handoff），调用方会随 Handoff 一起传入 `review_mode: FULL | LITE | WAIVED | DELTA` 和 `materials.documents: available | NOT_AVAILABLE`，本 Skill 必须按同一语义处理，不得另立判断：`LITE` 表示上游无有效 PRD/TDD/RPD，仍须完整执行代码、证据、验证和发布检查，但只能返回 `APPROVE_WITH_FOLLOW_UPS`、`REQUEST_CHANGES` 或 `BLOCKED`；`WAIVED` 表示上游已取得用户批准跳过系统审查，收到该值时直接返回 `BLOCKED` 并说明原因；`DELTA` 表示上游修复 `REQUEST_CHANGES` 后的增量复核轮，必须携带 `delta_recheck` 块，按下文「DELTA 增量复核轮」执行，结论封顶 `APPROVE_WITH_FOLLOW_UPS`。Handoff 与本次冻结的一致性由步骤 02 的 `--handoff` 机械比对，规则与退出码语义见步骤 02。
+由其他 Skill 调用本 Skill 时（例如 `codekit:code-fix` 的 Code Review Handoff），调用方会随 Handoff 一起传入 `review_mode: FULL | LITE | WAIVED | DELTA` 和 `materials.documents: available | NOT_AVAILABLE`，本 Skill 必须按同一语义处理，不得另立判断：`LITE` 表示上游无有效 PRD/TDD/RPD，仍须完整执行代码、证据、验证和发布检查，但只能返回 `APPROVE_WITH_FOLLOW_UPS`、`REQUEST_CHANGES` 或 `BLOCKED`；`WAIVED` 表示上游已取得用户批准跳过系统审查，收到该值时直接返回 `BLOCKED` 并说明原因；`DELTA` 表示上游修复 `REQUEST_CHANGES` 后的增量复核轮，必须携带 `delta_recheck` 块，按下文「DELTA 增量复核轮」执行，结论封顶 `APPROVE_WITH_FOLLOW_UPS`。Handoff 与本次冻结的一致性由步骤 02 的 `--handoff` 机械比对，规则与退出码语义见步骤 02。
 
 `review_mode` 与文档解析结果冲突时取更严格的一方：声明为 `FULL` 但 `materials.documents: NOT_AVAILABLE`（或本 Skill 按上述规则未能解析到任何有效文档）时，仍按文档缺失降级，结论不得为 `APPROVE`；反过来，文档齐备也不能把无法取证的 Release Gate 项拉高到 `APPROVE`。
 

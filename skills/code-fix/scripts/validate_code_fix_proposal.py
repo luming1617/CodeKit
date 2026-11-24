@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""校验后端 Bugfix 提案（proposal.md）的结构与门禁语义。
+"""校验后端 Code-Fix 提案（proposal.md）的结构与门禁语义。
 
 必需章节、字段标签、影响面维度、"必需"列和占位符清单全部从
-`assets/bugfix-proposal-template.md` 派生：模板是唯一事实源，改模板不需要再改本脚本。
+`assets/code-fix-proposal-template.md` 派生：模板是唯一事实源，改模板不需要再改本脚本。
 只有具备门禁语义的规则保留在代码里（三态判定、审批口令绑定、E2/E3 证据等级、
 允许修改文件必须是仓库相对路径），并且当模板不再提供这些锚点标签时会立即报错，
 而不是静默放过。
@@ -19,10 +19,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_TEMPLATE = SKILL_DIR / "assets" / "bugfix-proposal-template.md"
+DEFAULT_TEMPLATE = SKILL_DIR / "assets" / "code-fix-proposal-template.md"
 
 # 模板中用于划分「诊断区（任何判定都必须填）」与「方案区（仅 CONFIRMED_BUG 强制）」的锚点。
-PROPOSAL_MARKER = "bugfix:proposal-required-start"
+PROPOSAL_MARKER = "code-fix:proposal-required-start"
 
 # 这些标签承载审批绑定与写入范围语义；模板若重命名它们，校验器必须显式失败。
 ANCHOR_LABELS = ("方案 ID", "方案版本", "状态", "允许修改文件", "审批状态", "审批口令")
@@ -457,7 +457,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     mode = "draft" if args.allow_placeholders else "complete"
-    print(f"OK[{mode}]: bugfix proposal structure is valid: {args.proposal}")
+    print(f"OK[{mode}]: code-fix proposal structure is valid: {args.proposal}")
     return 0
 
 

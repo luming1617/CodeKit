@@ -28,7 +28,7 @@ interface:
 2. 三个字段一律使用**简体中文**；代码、命令、路径、参数占位符与技术标识符保留原文。
 3. `default_prompt` 必须以 `$<skill>`（技能目录名，等于 `SKILL.md` 的 `name`）开头调用，并带
    `SKILL.md` 中 `argument-hint` 声明的参数。
-4. `default_prompt` 的权限边界必须与 `SKILL.md` 一致，例如 bugfix/code-review 强调审批前只读、
+4. `default_prompt` 的权限边界必须与 `SKILL.md` 一致，例如 code-fix/code-review 强调审批前只读、
    release-doc 禁止真实发布。
 5. `SKILL.md` 的 `name` 必须与目录名一致；仓库内**不得**提交 `skills/<skill>/agents/openai.yaml`。
 
@@ -65,7 +65,7 @@ Markdown 角色文件。安装时：
 
 | Skill         | 全局 agent                                                                              |
 |---------------|-----------------------------------------------------------------------------------------|
-| bugfix        | bugfix-investigator、bugfix-challenger、bugfix-implementer                              |
+| code-fix        | code-fix-investigator、code-fix-challenger、code-fix-implementer                              |
 | code-impl     | impl-planner、impl-implementer、impl-debugger                                           |
 | code-review   | review-context、review-traceability、review-specialist、review-evidence、review-failure |
 | product-doc   | product-extractor、product-writer、product-reviewer                                     |

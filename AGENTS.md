@@ -8,11 +8,11 @@ CodeKit 是以插件形式分发给 Claude、Codex、OpenCode、Qoder 与 Qoder 
 
 ### Structure
 
-- `skills/`: 七个 AI 工作流技能目录（bugfix、code-impl、code-review、initialize、product-doc、release-doc、technical-doc），每个技能含 SKILL.md 与同级 openai.yaml；目录约定见 skills/README.md，实测校验输出为 7 skills / 26 agents。
+- `skills/`: 七个 AI 工作流技能目录（code-fix、code-impl、code-review、initialize、product-doc、release-doc、technical-doc），每个技能含 SKILL.md 与同级 openai.yaml；目录约定见 skills/README.md，实测校验输出为 7 skills / 26 agents。
 - `skills/initialize/`: 初始化技能本体：SKILL.md（Phase 0-4 流程）、openai.yaml、agents/（initialize-context-scanner 与 initialize-graphify 两个 subagent 角色正文）、references/（context-files、worker-contract、orchestration、tool-adapters、final-report 五份契约）、standard/（01-global 与 02-stack 多语言规范模板）与 tests/。
 - `skills/initialize/scripts/`: initialize 状态机的确定性实现，共 7 个脚本：_common.py（VALIDATION_PROGRAMS 白名单、VALIDATION_FORBIDDEN 禁用 shell 正则、错误码枚举、托管块标记、git 基线与 registry 探测）、prepare.py（Phase 0 冻结基线与工具探测）、controller.py（start/gate/analyze/reconcile/finish/abort 六个子命令）、reconcile.py（context 契约校验与 AGENTS.md/CLAUDE.md 渲染）、validate-result.py（worker 结果与 artifact 门禁、亲自执行 required_for_initialize 命令）、run-gitnexus.py 与 gitnexus-step.py。
 - `skills/initialize/tests/`: 控制器、worker 契约、路径边界、结果门禁与端到端状态流转测试（test_initialize_scripts.py）；实测其在 tempfile.TemporaryDirectory 中 git init 仓库，并用隔离的 GITNEXUS_HOME 环境变量运行，不写本仓库。
-- `skills/bugfix/`: Bug 诊断技能：agents/ 三个角色、scripts/bugfix_state.py 与 scripts/validate_bugfix_proposal.py 提案门禁、references/、assets/ 与 tests/test_bugfix_skill_scripts.py。
+- `skills/code-fix/`: Bug 诊断技能：agents/ 三个角色、scripts/code_fix_state.py 与 scripts/validate_code_fix_proposal.py 提案门禁、references/、assets/ 与 tests/test_code_fix_skill_scripts.py。
 - `skills/code-impl/`: 需求实现技能：agents/ 三个角色（Planner、Implementer、Debugger）、scripts/code_impl_controller.py 任务 DAG 编排、references/ 与 tests/test_code_impl_controller.py。
 - `skills/code-review/`: 多维代码审查技能：agents/ 五个角色、scripts/freeze_review_snapshot.py 快照与 scripts/validate_review_report.py 报告门禁、references/ 与 tests/test_review_contracts.py。
 - `skills/product-doc/`: PRD 生成与审查技能：agents/ 三个角色、scripts/review_state.py 与 scripts/validate_prd.py 契约校验、references/ 与 tests/test_product_doc_skill_scripts.py。
@@ -36,7 +36,7 @@ CodeKit 是以插件形式分发给 Claude、Codex、OpenCode、Qoder 与 Qoder 
 - 校验 Claude、Codex、Qoder 与 OpenCode 插件 manifest 的 JSON 语法、插件名、版本一致性与被引用文件是否存在（本 run 实测失败：missing manifest: .opencode\package.json，退出码 1，根因是当前分支把 .opencode/ 整体暂存删除，而非 initialize 造成，故不作为本次初始化的必过门禁）: `py -3 scripts/validate-plugin-manifests.py` (evidence: `scripts/validate-plugin-manifests.py`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `.qoder-plugin/plugin.json`, `lefthook.yml`)
 - 运行安装器、平台层、全局 agent 同步与 Qoder 安装的回归测试（pre-push test-installer 的等价命令；测试会在系统临时目录建目录并 fork sys.executable 子进程，属仓库外写入，故未标记为初始化必过验证，本 run 也未实测其通过状态）: `py -3 -m unittest discover -s scripts` (evidence: `scripts/test_installer_agents.py`, `scripts/test_installer_contracts.py`, `scripts/test_installer_qoder.py`, `scripts/test_installer_sources.py`, `lefthook.yml`)
 - 运行 initialize 控制器、worker contract、路径边界、结果门禁与端到端状态流转测试（在系统临时目录 git init 仓库并使用隔离 GITNEXUS_HOME；会 fork git 子进程，故不作为无副作用的初始化必过验证）: `py -3 -m unittest discover -s skills/initialize/tests` (evidence: `skills/initialize/tests/test_initialize_scripts.py`, `skills/initialize/scripts/controller.py`, `lefthook.yml`)
-- 运行 bugfix 技能脚本与提案契约测试: `py -3 -m unittest discover -s skills/bugfix/tests` (evidence: `skills/bugfix/tests/test_bugfix_skill_scripts.py`, `skills/bugfix/scripts/validate_bugfix_proposal.py`, `skills/bugfix/scripts/bugfix_state.py`)
+- 运行 code-fix 技能脚本与提案契约测试: `py -3 -m unittest discover -s skills/code-fix/tests` (evidence: `skills/code-fix/tests/test_code_fix_skill_scripts.py`, `skills/code-fix/scripts/validate_code_fix_proposal.py`, `skills/code-fix/scripts/code_fix_state.py`)
 - 运行 code-impl 任务编排控制器测试: `py -3 -m unittest discover -s skills/code-impl/tests` (evidence: `skills/code-impl/tests/test_code_impl_controller.py`, `skills/code-impl/scripts/code_impl_controller.py`)
 - 运行 code-review 快照与报告契约测试: `py -3 -m unittest discover -s skills/code-review/tests` (evidence: `skills/code-review/tests/test_review_contracts.py`, `skills/code-review/scripts/freeze_review_snapshot.py`, `skills/code-review/scripts/validate_review_report.py`)
 - 运行 product-doc 技能脚本测试（PRD 校验与审查状态机）: `py -3 -m unittest discover -s skills/product-doc/tests` (evidence: `skills/product-doc/tests/test_product_doc_skill_scripts.py`, `skills/product-doc/scripts/validate_prd.py`, `skills/product-doc/scripts/review_state.py`)

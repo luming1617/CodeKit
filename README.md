@@ -60,7 +60,7 @@ install.cmd
 ### 问题排查：多源取证，证据链根因分析
 
 ```bash
-/codekit:bugfix [<feature-directory>] <error-description>  # 系统化根因分析（目录可省略）
+/codekit:code-fix [<feature-directory>] <error-description>  # 系统化根因分析（目录可省略）
 ```
 
 > 实测案例：C++ 压测崩溃排查，AI 跨越业务日志、dmesg、源码、ps、nm/addr2line 多个证据源，定位到 use-after-free 并发 Bug，全程 4 条指令。
@@ -77,7 +77,7 @@ install.cmd
 | `/codekit:release-doc` | 基于 PRD + TDD 生成后端发布方案 |
 | `/codekit:code-impl` | 多 Agent 并行 TDD 开发 |
 | `/codekit:code-review` | 5 个维度并行 Code Review |
-| `/codekit:bugfix` | 基于 PRD/TDD/RPD 系统化排查并修复问题 |
+| `/codekit:code-fix` | 基于 PRD/TDD/RPD 系统化排查并修复问题 |
 
 ---
 

@@ -1,21 +1,21 @@
 ---
-name: bugfix
+name: code-fix
 description: 诊断互联网化和分布式后端系统中的疑似缺陷，支持可选的 feature-directory；基于可用的 PRD、TDD、RPD、项目规范、仓库上下文和运行证据确认根因或证明不是 Bug，先输出最小影响修复方案并等待人工审批，获批后才实施和验证。适用于 Bug 修复、线上异常复盘和回归缺陷；仅需代码审查、功能开发或无审批直接改代码时不要使用。
 argument-hint: '[<feature-directory>] <error-description>'
 allowed-tools: 'Bash, Read, Write, Agent, Grep, Skill'
 ---
 
-# Bugfix
+# Code-Fix
 
-把 Bugfix 分成严格隔离的两个阶段：先只读调查并交付“问题原因 + 修复方案”，人工批准固定方案后才允许修改代码。目标是修复真正根因，同时保持业务语义、兼容性和发布安全。
+把 Code-Fix 分成严格隔离的两个阶段：先只读调查并交付“问题原因 + 修复方案”，人工批准固定方案后才允许修改代码。目标是修复真正根因，同时保持业务语义、兼容性和发布安全。
 
-**输出语言（本轮第一句回复即生效；只用 `@bugfix` 等无自然语言方式触发时同样默认简体中文）：**面向用户的判断、方案、审批请求和报告使用简体中文；专有名词、参数、代码、命令、路径、JSON 字段名与状态字面量（如 `BLOCKED`）和原始日志保持英文原文；`.codekit/` 运行目录产物按 `references/` 契约的既有语言要求执行。规则原文见 `$SKILLS_ROOT/_shared/prompts/output-language.md`。派发子代理时**不要**把该规则复制进任务正文：`manage-global-agents.py` 已把它写进每个全局角色正文，重复粘贴只会增加每回合 token。
+**输出语言（本轮第一句回复即生效；只用 `@code-fix` 等无自然语言方式触发时同样默认简体中文）：**面向用户的判断、方案、审批请求和报告使用简体中文；专有名词、参数、代码、命令、路径、JSON 字段名与状态字面量（如 `BLOCKED`）和原始日志保持英文原文；`.codekit/` 运行目录产物按 `references/` 契约的既有语言要求执行。规则原文见 `$SKILLS_ROOT/_shared/prompts/output-language.md`。派发子代理时**不要**把该规则复制进任务正文：`manage-global-agents.py` 已把它写进每个全局角色正文，重复粘贴只会增加每回合 token。
 
 ## 路径与产物约定
 
-- **`SKILL_DIR`**：本 `SKILL.md` 所在目录的绝对路径；插件安装时该目录为 `<plugin-cache>/skills/bugfix`。本 Skill 的脚本、模板和参考资料一律按 `SKILL_DIR` 解析后调用，不得假设当前工作目录就是 Skill 目录，也不得把 `skills/bugfix/...` 当作仓库相对路径直接执行。
+- **`SKILL_DIR`**：本 `SKILL.md` 所在目录的绝对路径；插件安装时该目录为 `<plugin-cache>/skills/code-fix`。本 Skill 的脚本、模板和参考资料一律按 `SKILL_DIR` 解析后调用，不得假设当前工作目录就是 Skill 目录，也不得把 `skills/code-fix/...` 当作仓库相对路径直接执行。
 - **`<PYTHON>`**：调用本 Skill 门禁脚本时使用的 Python 启动器占位符，执行前替换成字面量（不是 shell 变量）：Windows 用 `py -3`，macOS/Linux 用 `python3`，替换前用 `--version` 实测退出码为 0。Windows 上不要发 `python3`：干净系统里它是微软商店别名桩，`which` 找得到却无任何输出即以非零码退出，会被误判成本机没有 Python。完整解析纪律见 `$SKILLS_ROOT/_shared/prompts/path-convention.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。
-- **`RUN_DIR`**：`<仓库根目录>/.codekit/bugfix/<run-id>/`，由 `bugfix_state.py preflight` 创建，是本次 Bugfix 唯一允许的产物落盘位置。该目录自带局部 `.gitignore`（内容 `*`），因此审批前保存提案仍然满足“审批前只读”，不会留下受版本控制的文件变化。
+- **`RUN_DIR`**：`<仓库根目录>/.codekit/code-fix/<run-id>/`，由 `code_fix_state.py preflight` 创建，是本次 Code-Fix 唯一允许的产物落盘位置。该目录自带局部 `.gitignore`（内容 `*`），因此审批前保存提案仍然满足“审批前只读”，不会留下受版本控制的文件变化。
 - 产物布局：`state.json`（快照、提案与审批绑定）、`doc-map.md`（文档章节区间与读取预算，脚本生成）、`investigation.md`（业务模型、假设台账与反证结论）、`proposal.md`（修复提案）、`approval.txt`（用户批准原文）、`implementation-contract.json` 与 `validation-plan.json`（`freeze-contract` 从提案渲染的实施合同与验证计划）、`validation-record.json`（真实执行的验证证据）、`delivery-report.md`（最终交付报告）。这些中间产物一律不进版本库；最终 Diff 只能包含获批的源码与测试改动。
 - **读取预算**：PRD/TDD/RPD 与仓库规范一律先查 `RUN_DIR/doc-map.md` 的标题区间，再用 `Read` 的 `offset`/`limit` 只取需要的那段；禁止把整篇文档读入正文或把它粘贴进子代理任务。阶段之间按**路径**交接（`RUN_DIR/…`），不按内容复述。
 
@@ -24,17 +24,17 @@ allowed-tools: 'Bash, Read, Write, Agent, Grep, Skill'
 
 ## 必须读取的资源
 
-本 Skill 的独立角色使用全局 agents：`bugfix-investigator`、`bugfix-challenger`、`bugfix-implementer`，规范源文件在 `skills/bugfix/agents/`，由安装器注册为全局裸名角色。按名称派发即可，不需要再读取任何角色 Prompt 模板；`reviewer-prompt.md` 已废弃删除，独立审查只能由系统 `codekit:code-review` 完成。
+本 Skill 的独立角色使用全局 agents：`code-fix-investigator`、`code-fix-challenger`、`code-fix-implementer`，规范源文件在 `skills/code-fix/agents/`，由安装器注册为全局裸名角色。按名称派发即可，不需要再读取任何角色 Prompt 模板；`reviewer-prompt.md` 已废弃删除，独立审查只能由系统 `codekit:code-review` 完成。
 
 - 每次开始先读取 [references/contracts.md](references/contracts.md) 和 [references/investigation-playbook.md](references/investigation-playbook.md)；后者第 5 节是按症状触发的检查清单，只展开命中的小节。
 - 形成修复方案前读取 [references/repair-selection.md](references/repair-selection.md)。
 - 人工明确批准后，实施前读取 [references/execution-and-verification.md](references/execution-and-verification.md)。审批前不得读取该文件来提前开始实现。
-- 调查阶段使用 [assets/bugfix-proposal-template.md](assets/bugfix-proposal-template.md)；实施完成后使用 [assets/bugfix-delivery-report-template.md](assets/bugfix-delivery-report-template.md)。
-- 确定性门禁脚本：`scripts/validate_bugfix_proposal.py`（提案结构与审批语义校验）和 `scripts/bugfix_state.py`（资料门禁、快照冻结、提案与审批绑定、实施合同、范围检查与验证执行）；两者都按 `SKILL_DIR` 解析路径调用，不得用 Agent 自述替代其退出码。能用一条子命令完成的判定，不得拆成多次调用或改由模型逐条复述。
+- 调查阶段使用 [assets/code-fix-proposal-template.md](assets/code-fix-proposal-template.md)；实施完成后使用 [assets/code-fix-delivery-report-template.md](assets/code-fix-delivery-report-template.md)。
+- 确定性门禁脚本：`scripts/validate_code_fix_proposal.py`（提案结构与审批语义校验）和 `scripts/code_fix_state.py`（资料门禁、快照冻结、提案与审批绑定、实施合同、范围检查与验证执行）；两者都按 `SKILL_DIR` 解析路径调用，不得用 Agent 自述替代其退出码。能用一条子命令完成的判定，不得拆成多次调用或改由模型逐条复述。
 
 ## Subagent 强制调用规则（Claude Code / Codex / OpenCode / Qoder / Qoder CN）
 
-`bugfix-investigator`、`bugfix-challenger` 和获批后使用的 `bugfix-implementer` 都是硬性阶段门禁，不是可选建议。进入对应阶段前，主 Agent 必须创建指定名称的独立 Sub-agent，并记录调用名称、输入快照、独立会话标识和返回状态；主 Agent 自己完成该阶段、普通串行自检或只写“建议调用”均不合规。无法创建指定 Sub-agent 时，阶段状态必须为 `BLOCKED`，不得伪造角色产出或继续通过门禁。**该门禁只约束主 Agent（Orchestrator）：被派发的角色 Sub-agent 一律不再派发下一级 Sub-agent，也绝不因自身缺少派发能力而返回 `BLOCKED`；它只需按自己的角色契约完成本阶段并返回结构化结果。**
+`code-fix-investigator`、`code-fix-challenger` 和获批后使用的 `code-fix-implementer` 都是硬性阶段门禁，不是可选建议。进入对应阶段前，主 Agent 必须创建指定名称的独立 Sub-agent，并记录调用名称、输入快照、独立会话标识和返回状态；主 Agent 自己完成该阶段、普通串行自检或只写“建议调用”均不合规。无法创建指定 Sub-agent 时，阶段状态必须为 `BLOCKED`，不得伪造角色产出或继续通过门禁。**该门禁只约束主 Agent（Orchestrator）：被派发的角色 Sub-agent 一律不再派发下一级 Sub-agent，也绝不因自身缺少派发能力而返回 `BLOCKED`；它只需按自己的角色契约完成本阶段并返回结构化结果。**
 
 按宿主派发的方式（Claude Code / Codex / OpenCode / Qoder / Qoder CN 的角色标识与语法差异、“不得把派发指令注入子代理”的纪律、以及 Skill 在各宿主下的调用名）见 `$SKILLS_ROOT/_shared/prompts/subagent-mandate.md`，其中 `SKILLS_ROOT` = `dirname(SKILL_DIR)`。进入任何派发阶段前必须读取该文件；角色由 `manage-global-agents.py`（仓库安装脚本）安装为**全局裸名**，不存在 `@agent-<plugin>:<name>` 这类插件作用域角色名。
 
@@ -56,7 +56,7 @@ allowed-tools: 'Bash, Read, Write, Agent, Grep, Skill'
 | `LITE` | 无有效 PRD/TDD/RPD，只能基于代码、Diff、测试和验证记录审查 | 系统 Skill 必须实际执行；`APPROVE` 不被接受，只有附带文档缺失 Open Question 的 `APPROVE_WITH_FOLLOW_UPS` 才能交付。 |
 | `WAIVED` | 用户明确书面批准跳过系统 Code Review | 只能输出“未独立复核”的交付结论：交付报告写明 `WAIVED_BY_USER`、用户批准原文位置和尚未经复核的维度；宿主不支持嵌套 Skill 调用而用户未批准豁免时，结论为 `BLOCKED`，不得静默降级。 |
 
-模式在步骤 10 的 `record-proposal --review-mode` 中冻结，合法性由 `bugfix_state.py` 按已冻结快照判定：`preflight` 的 `documents_status` 为 `NOT_AVAILABLE` 时不得声称 `FULL`（除非用户确认依靠仓库规范完成规格追踪并附 `--confirm-review-mode`）；已冻结到文档时不得降级为 `LITE`。`WAIVED` 无论有无文档都必须附 `--confirm-review-mode`，表示已取得用户明确批准；模式变化必须随提案版本一起重新审批。任何模式下都不得把 `WAIVED`、本地自检或普通 Subagent 摘要写成系统审查通过。
+模式在步骤 10 的 `record-proposal --review-mode` 中冻结，合法性由 `code_fix_state.py` 按已冻结快照判定：`preflight` 的 `documents_status` 为 `NOT_AVAILABLE` 时不得声称 `FULL`（除非用户确认依靠仓库规范完成规格追踪并附 `--confirm-review-mode`）；已冻结到文档时不得降级为 `LITE`。`WAIVED` 无论有无文档都必须附 `--confirm-review-mode`，表示已取得用户明确批准；模式变化必须随提案版本一起重新审批。任何模式下都不得把 `WAIVED`、本地自检或普通 Subagent 摘要写成系统审查通过。
 
 `WAIVED` 只是本 Skill 的交付台账状态，不得当作 Handoff 发给 `codekit:code-review`——它收到 `WAIVED` 会直接返回 `BLOCKED`；豁免时本 Skill 根本不调用系统 Skill，而是只在交付报告里记录 `WAIVED_BY_USER` 与未复核维度。经 `--confirm-review-mode` 得允许的无文档 `FULL`，在系统 Skill 侧仍按文档缺失降级，最多只能得到 `APPROVE_WITH_FOLLOW_UPS`。
 
@@ -68,7 +68,7 @@ Skill 接受可选的 `feature-directory` 和必传的 `error-description`。必
 2. `error-description` 必须是非空内容。它可以是任意形式的文本、图片、URL 或其他用户提供的错误材料；空字符串、仅空白字符、缺失参数仍必须拒绝执行下一步。
 3. 如果 `error-description` 是 URL，必须先访问并获取其具体信息，记录访问结果和来源；URL 无法访问、内容为空或权限不足时停止，不得只把 URL 字符串当作错误描述继续调查。图片或其他非文本材料必须先读取其可用内容或明确记录不可读取原因。
 
-参数解析后，第 4–7 条的判定全部由 `bugfix_state.py preflight` 一次完成（见步骤 01），不得改由模型逐条复述：文档有效性、`DOCUMENTS: NOT_AVAILABLE`、仅登记实际找到的文档、快照冻结与 `RUN_DIR/state.json` 落盘都是它的输出字段。下列文字是脚本判定标准的定义，不是让模型再走一遍的流程。
+参数解析后，第 4–7 条的判定全部由 `code_fix_state.py preflight` 一次完成（见步骤 01），不得改由模型逐条复述：文档有效性、`DOCUMENTS: NOT_AVAILABLE`、仅登记实际找到的文档、快照冻结与 `RUN_DIR/state.json` 落盘都是它的输出字段。下列文字是脚本判定标准的定义，不是让模型再走一遍的流程。
 
 4. 如果参数 `feature-directory` 非空，则只查找该目录及其子目录下名称匹配的 `product-doc.md`、`technical-doc.md` 和 `release-doc.md`。有效文档必须可读、有实际内容，且不是空文件、模板或含未替换占位符的草稿；不要求三种文档必须齐全。若该目录不存在、不可读或其中没有有效文档，记录 `DOCUMENTS: NOT_AVAILABLE`，忽略文档资料并继续使用错误描述、仓库代码和其他可用证据；不得因此拒绝、阻塞或提前结束任务，也不得转而扫描其他需求目录。
 5. 如果参数 `feature-directory` 为空（未传），则递归遍历仓库根目录的 `docs/` 目录及其子目录，收集所有名称匹配 `product-doc.md`、`technical-doc.md` 或 `release-doc.md` 且有效的文档（有效性标准同第 4 条）。若该目录不存在或没有有效文档，记录 `DOCUMENTS: NOT_AVAILABLE`，忽略文档资料并继续使用错误描述、仓库代码和其他可用证据；不得因此拒绝、阻塞或提前结束任务。
@@ -86,9 +86,9 @@ Skill 接受可选的 `feature-directory` 和必传的 `error-description`。必
 5. **修复根因而非掩盖症状。**最小影响不等于最少改动；应在拥有错误语义的正确层修复，同时明确保护不应改变的业务行为。
 6. **审批绑定具体方案。**审批必须绑定 `proposal_id`、`proposal_version`、代码快照、修复策略、允许修改文件和验证计划。问题讨论、补充信息或模糊的“继续看看”不算审批。
 7. **范围变化重新审批。**获批后若需要新增修改文件、改变外部契约、Schema、数据修复、依赖、方案语义或发布方式，立即停止并提交新版本方案；旧审批不覆盖新范围。实施合同只能由 `freeze-contract` 渲染，事后手改会被 `verify-scope` 的 `contract_integrity=TAMPERED` 判为硬失败。
-8. **验证独立且可重现。**Implementer 的自检不能代替主 Agent 使用本地工具得到的新鲜结果，而这类结果必须由 `bugfix_state.py run-plan` 或 `run-validation` 真实执行并留痕。历史测试结果、口头说明和 Agent 的 `DONE` 都不是通过证据。
+8. **验证独立且可重现。**Implementer 的自检不能代替主 Agent 使用本地工具得到的新鲜结果，而这类结果必须由 `code_fix_state.py run-plan` 或 `run-validation` 真实执行并留痕。历史测试结果、口头说明和 Agent 的 `DONE` 都不是通过证据。
 9. **保护现有工作。**预先存在的用户修改必须记录、保留并与本次 Diff 区分；无法可靠区分时停止实施。
-10. **门禁靠退出码，不靠自述。**快照、审批绑定、范围越界和验证结论一律以 `bugfix_state.py` 与 `validate_bugfix_proposal.py` 的退出码和 JSON 输出为准；脚本未能执行时，对应阶段为 `BLOCKED`，不得用自然语言描述代替。
+10. **门禁靠退出码，不靠自述。**快照、审批绑定、范围越界和验证结论一律以 `code_fix_state.py` 与 `validate_code_fix_proposal.py` 的退出码和 JSON 输出为准；脚本未能执行时，对应阶段为 `BLOCKED`，不得用自然语言描述代替。
 
 ## 角色模型
 
@@ -98,7 +98,7 @@ Skill 接受可选的 `feature-directory` 和必传的 `error-description`。必
 - **Hypothesis Challenger（只读、独立）**：尝试推翻候选根因，验证“不是 Bug”的可能性。
 - **Implementer（审批后可写）**：只执行获批的 Implementation Contract。
 - **Code Review（系统 Skill、只读）**：调用已注册的 `codekit:code-review`，复核最终 Diff、规格追踪、验证证据和发布门禁；不得用本 Skill 内的 Reviewer Prompt 替代。
-- **Local Validator（非 Agent）**：由主 Agent 通过 `bugfix_state.py run-plan`（整份计划）或 `run-validation`（单条）调用确定性工具执行测试和检查，退出码与错误指纹就是它的结论。
+- **Local Validator（非 Agent）**：由主 Agent 通过 `code_fix_state.py run-plan`（整份计划）或 `run-validation`（单条）调用确定性工具执行测试和检查，退出码与错误指纹就是它的结论。
 
 没有可用 Subagent 时，调查、反证和获批后的实施阶段均不得由主 Agent 代做；必须将无法创建的角色、缺失能力和受阻阶段记录为 `BLOCKED`，不得继续宣称完成。系统 `codekit:code-review` 仍须按宿主原生 Skill 机制单独调用。
 
@@ -106,7 +106,7 @@ Skill 接受可选的 `feature-directory` 和必传的 `error-description`。必
 
 一条主线，17 步；括号内是执行者，命令细节见下文同名小节。判定与计算交给脚本，读与判断交给模型。
 
-01 冻结输入（`preflight`）→ 02 仓库与环境预检（`preflight` 输出 + 主 Agent）→ 03 业务建模（Investigator）→ 04 期望与实际定义（Investigator）→ 05 复现与采证（Investigator + 本地工具）→ 06 根因定位（Investigator）→ 07 独立反证（Challenger）→ 08 问题判定（主 Agent：`CONFIRMED_BUG` / `NOT_A_BUG` / `INSUFFICIENT_EVIDENCE`）→ 09 影响面与方案选择（主 Agent）→ 10 输出提案并停止（主 Agent + `validate_bugfix_proposal.py` + `record-proposal`）→ 11 人工审批（用户 + `verify-approval`）→ 12 冻结实施合同（`freeze-contract`）→ 13 实施最小修复（Implementer）→ 14 范围检查（`verify-scope`）→ 15 分层验证（`run-plan` / `run-validation`）→ 16 系统 Code Review（`codekit:code-review`）→ 17 交付判定（主 Agent）。
+01 冻结输入（`preflight`）→ 02 仓库与环境预检（`preflight` 输出 + 主 Agent）→ 03 业务建模（Investigator）→ 04 期望与实际定义（Investigator）→ 05 复现与采证（Investigator + 本地工具）→ 06 根因定位（Investigator）→ 07 独立反证（Challenger）→ 08 问题判定（主 Agent：`CONFIRMED_BUG` / `NOT_A_BUG` / `INSUFFICIENT_EVIDENCE`）→ 09 影响面与方案选择（主 Agent）→ 10 输出提案并停止（主 Agent + `validate_code_fix_proposal.py` + `record-proposal`）→ 11 人工审批（用户 + `verify-approval`）→ 12 冻结实施合同（`freeze-contract`）→ 13 实施最小修复（Implementer）→ 14 范围检查（`verify-scope`）→ 15 分层验证（`run-plan` / `run-validation`）→ 16 系统 Code Review（`codekit:code-review`）→ 17 交付判定（主 Agent）。
 
 分叉：08 判为 `NOT_A_BUG` 或 `INSUFFICIENT_EVIDENCE` 即输出证据化结论并停止；11 未批准则停在 `WAITING_APPROVAL`；14 越界、15 契约外失败或 16 要求改动，回到 09 并重新审批；权限、环境或重试超限则 `BLOCKED`。
 
@@ -119,7 +119,7 @@ Skill 接受可选的 `feature-directory` 和必传的 `error-description`。必
 参数与资料解析完成后，用**一条** `preflight` 完成资料门禁、快照冻结、GitNexus 探测和文档地图落盘（`<run-id>` 用 `YYYYMMDD-short-name`；`--feature-directory` 只在用户传了该参数时给出）：
 
 ```bash
-<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" preflight --root <仓库根目录> --run-id <run-id> \
+<PYTHON> "$SKILL_DIR/scripts/code_fix_state.py" preflight --root <仓库根目录> --run-id <run-id> \
   [--feature-directory <当前需求目录>]
 ```
 
@@ -178,8 +178,8 @@ Skill 接受可选的 `feature-directory` 和必传的 `error-description`。必
 严格使用提案模板输出：问题判定、问题原因、证据链、修复方案、允许修改文件、明确不修改、影响风险、验证计划和审批信息。提案必须写入 `RUN_DIR/proposal.md`，然后**用一条命令**完成结构校验并记录提案（结构校验失败时不会写入绑定，直接按报错改提案）：
 
 ```bash
-<PYTHON> "$SKILL_DIR/scripts/validate_bugfix_proposal.py" "$RUN_DIR/proposal.md" \
-  && <PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" record-proposal --manifest "$RUN_DIR/state.json" \
+<PYTHON> "$SKILL_DIR/scripts/validate_code_fix_proposal.py" "$RUN_DIR/proposal.md" \
+  && <PYTHON> "$SKILL_DIR/scripts/code_fix_state.py" record-proposal --manifest "$RUN_DIR/state.json" \
   --proposal "$RUN_DIR/proposal.md" --proposal-id <BF-YYYYMMDD-short-name> --version <N> --review-mode <FULL|LITE>
 ```
 
@@ -202,7 +202,7 @@ Skill 接受可选的 `feature-directory` 和必传的 `error-description`。必
 条件 2–4 由脚本核验，不接受任何角色的自述。把用户批准原文逐字保存为 `RUN_DIR/approval.txt` 后运行：
 
 ```bash
-<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" verify-approval --manifest "$RUN_DIR/state.json" \
+<PYTHON> "$SKILL_DIR/scripts/code_fix_state.py" verify-approval --manifest "$RUN_DIR/state.json" \
   --approval-file "$RUN_DIR/approval.txt" --proposal "$RUN_DIR/proposal.md"
 ```
 
@@ -220,7 +220,7 @@ Skill 接受可选的 `feature-directory` 和必传的 `error-description`。必
 用一条命令把获批提案渲染成实施契约与验证计划，不要手抄允许文件、命令和摘要：
 
 ```bash
-<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" freeze-contract --manifest "$RUN_DIR/state.json"
+<PYTHON> "$SKILL_DIR/scripts/code_fix_state.py" freeze-contract --manifest "$RUN_DIR/state.json"
 ```
 
 它从 `state.json` 的审批绑定取 `start_head_sha`、`start_diff_digest` 和 `preexisting_changes`，从提案解析 `允许修改文件`、`明确不修改`、`必须保持的行为`、计划修改表和第 5 节验证表，写出 `RUN_DIR/implementation-contract.json` 与 `RUN_DIR/validation-plan.json`。只有在需要覆盖提案默认值时才追加 `--allowed`、`--allowed-file`、`--objective`、`--acceptance` 或 `--retry-budget`；契约缺少承重字段时脚本直接报错，不得改用手写契约绕过。Approval Record 由 `RUN_DIR/approval.txt` 与其中的审批口令构成；“已同意”或 Agent 自述不能放行。
@@ -234,7 +234,7 @@ Implementer 只修改契约允许的文件，先添加或确认能暴露问题�
 用契约里的允许范围核对实际变更，再人工核对 Diff 能否逐项映射到获批方案、明确不修改的行为是否保持：
 
 ```bash
-<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" verify-scope --manifest "$RUN_DIR/state.json" \
+<PYTHON> "$SKILL_DIR/scripts/code_fix_state.py" verify-scope --manifest "$RUN_DIR/state.json" \
   --contract "$RUN_DIR/implementation-contract.json"
 ```
 
@@ -245,13 +245,13 @@ Implementer 只修改契约允许的文件，先添加或确认能暴露问题�
 先跑提案第 5 节渲染出的整份计划，一条命令完成，不要逐项调用：
 
 ```bash
-<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" run-plan --manifest "$RUN_DIR/state.json"
+<PYTHON> "$SKILL_DIR/scripts/code_fix_state.py" run-plan --manifest "$RUN_DIR/state.json"
 ```
 
 脚本按 `validation-plan.json` 顺序以 `shell=False` 在仓库根目录执行每条命令，逐条把退出码、耗时、输出尾部（默认 12 行）和错误指纹写入 `RUN_DIR/validation-record.json`，只在 stdout 回显摘要；`verdict` 为 `PASS` 当且仅当所有 `required` 项通过。含 shell 元字符或程序不存在的计划项记 `NOT_AVAILABLE`，不会中断其余项，也不能当作通过——这类项改用下面的单条命令补做，或在报告里列为未运行项与剩余风险：
 
 ```bash
-<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" run-validation --manifest "$RUN_DIR/state.json" \
+<PYTHON> "$SKILL_DIR/scripts/code_fix_state.py" run-validation --manifest "$RUN_DIR/state.json" \
   --proves "<该检查证明的具体主张>" -- <命令与参数>
 ```
 

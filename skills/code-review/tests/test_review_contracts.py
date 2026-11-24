@@ -307,7 +307,7 @@ def load_skill_module(name: str, path: Path):
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
-    # bugfix_state 会 import 同目录的 validate_bugfix_proposal，兄弟目录不在 sys.path 上，
+    # code_fix_state 会 import 同目录的 validate_code_fix_proposal，兄弟目录不在 sys.path 上，
     # 所以按路径加载时临时把它的 home 顶进去（与直接把脚本当 CLI 跑的语义一致）。
     sys.path.insert(0, str(path.parent))
     try:
@@ -2827,7 +2827,7 @@ class SharedScriptHelperTests(unittest.TestCase):
 class CrossSkillHandoffTests(unittest.TestCase):
     """CW2-a 验收：同一工作树两侧冻结可机械比对——A5 的三个 `False` 各自变成有语义的等式。
 
-    这里刻意 import 真正的上游产物生成器（code-impl 控制器、bugfix 状态机），而不是手抄
+    这里刻意 import 真正的上游产物生成器（code-impl 控制器、code-fix 状态机），而不是手抄
     一份看起来像的 JSON：手抄的夹具只能证明"抄得像"，证明不了两侧真能对上。
     """
 
@@ -2837,9 +2837,9 @@ class CrossSkillHandoffTests(unittest.TestCase):
             "code_impl_controller_under_review_test",
             SKILL_DIR.parent / "code-impl" / "scripts" / "code_impl_controller.py",
         )
-        cls.bugfix = load_skill_module(
-            "bugfix_state_under_review_test",
-            SKILL_DIR.parent / "bugfix" / "scripts" / "bugfix_state.py",
+        cls.code_fix = load_skill_module(
+            "code_fix_state_under_review_test",
+            SKILL_DIR.parent / "code-fix" / "scripts" / "code_fix_state.py",
         )
 
     def _code_impl_artifact(self, repo: Path) -> tuple[str, str, dict]:
@@ -3001,13 +3001,13 @@ class CrossSkillHandoffTests(unittest.TestCase):
     def test_the_three_skills_state_one_encoding_and_one_join_key(self) -> None:
         # 三家没有共享 import 路径（各自独立分发），所以这里绑的是字面量与表达式。
         self.assertEqual(self.impl._DIGEST_SCHEME, DIGEST_SCHEME)
-        self.assertEqual(self.bugfix.DIGEST_SCHEME, DIGEST_SCHEME)
-        self.assertEqual(self.impl.SNAPSHOT_SCHEMA_VERSION, self.bugfix.SNAPSHOT_SCHEMA_VERSION)
+        self.assertEqual(self.code_fix.DIGEST_SCHEME, DIGEST_SCHEME)
+        self.assertEqual(self.impl.SNAPSHOT_SCHEMA_VERSION, self.code_fix.SNAPSHOT_SCHEMA_VERSION)
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
             head = "b" * 40
             self.assertEqual(target_id_for(root, head), self.impl._handoff_target_id(root, head))
-            self.assertEqual(target_id_for(root, head), self.bugfix.target_id_for(root, head))
+            self.assertEqual(target_id_for(root, head), self.code_fix.target_id_for(root, head))
 
     def test_validation_evidence_is_handed_over_and_bound_to_the_worktree(self) -> None:
         # P1-2 跨技能端到端：用真实上游生成器导出证据，冻结时核逐文件绑定；

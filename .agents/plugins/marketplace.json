@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "codekit",
-      "description": "AI-assisted development workflow: setup, product and technical proposals, release plans, coding, review, bug fixing (7 skills)",
+      "description": "AI-assisted development workflow: setup, product and technical proposals, release plans, coding, review, code fixing (7 skills)",
       "source": {
         "source": "local",
         "path": "./"

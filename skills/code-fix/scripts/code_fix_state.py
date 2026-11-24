@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bugfix 阶段的确定性状态控制器：冻结快照与文档地图、绑定审批、校验写入范围、批量执行验证。
+"""Code-Fix 阶段的确定性状态控制器：冻结快照与文档地图、绑定审批、校验写入范围、批量执行验证。
 
 本脚本存在的唯一理由是把「审批前只读、审批绑定快照、修改不越界、验证真实执行」
 这四条本来只写在文档里的要求，变成可复现的机器门禁；主 Agent 不再靠自述通过门禁。
@@ -27,7 +27,7 @@
 `--verbose` 才会打印；文档正文一律不进 stdout，改为写 `RUN_DIR/doc-map.md` 供按需
 分区间读取。
 
-产物目录固定为 ``<repo>/.codekit/bugfix/<run-id>/``，该目录已被 .gitignore 排除，
+产物目录固定为 ``<repo>/.codekit/code-fix/<run-id>/``，该目录已被 .gitignore 排除，
 因此审批前保存提案不会产生受版本控制的文件变化。
 
 退出码：0 门禁通过；1 门禁不通过（漂移、越界、验证失败）；2 用法、安全或 IO 错误；
@@ -51,7 +51,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import validate_bugfix_proposal as proposal_validator  # noqa: E402
+import validate_code_fix_proposal as proposal_validator  # noqa: E402
 
 # CW2-a①：摘要编码从 "sha256:<hex>" 改为裸 hex，与 code-review、code-impl 同一套；
 # 带前缀时任何跨 SKILL 的 `==` 都恒为 False（审核报告 A5）。SCHEMA_VERSION 随之升到 2：
@@ -60,7 +60,7 @@ import validate_bugfix_proposal as proposal_validator  # noqa: E402
 SCHEMA_VERSION = 2
 # 交给 code-review `--handoff` 的那一份自述块自己的版本，与 state.json 的版本各走各的。
 SNAPSHOT_SCHEMA_VERSION = 2
-PRODUCED_BY = "codekit:bugfix/scripts/bugfix_state.py"
+PRODUCED_BY = "codekit:code-fix/scripts/code_fix_state.py"
 DIGEST_SCHEME = "sha256/hex"
 STATE_NAME = "state.json"
 VALIDATION_NAME = "validation-record.json"
@@ -180,10 +180,10 @@ def head_sha(root: Path) -> str:
 def ensure_run_dir_ignored(root: Path) -> None:
     """让 RUN_DIR 自我 ignore，避免产物被当成仓库变更而污染快照与越界判定。
 
-    目标仓库的 .gitignore 不在本 Skill 的写入授权内，因此只在 `.codekit/bugfix/`
+    目标仓库的 .gitignore 不在本 Skill 的写入授权内，因此只在 `.codekit/code-fix/`
     下放置一份局部规则；已存在的仓库级 ignore 仍优先。
     """
-    directory = root / ".codekit" / "bugfix"
+    directory = root / ".codekit" / "code-fix"
     directory.mkdir(parents=True, exist_ok=True)
     marker = directory / ".gitignore"
     if not marker.exists() or marker.read_text(encoding="utf-8").strip() != "*":
@@ -277,7 +277,7 @@ def write_doc_map(run_dir: Path, documents: list[dict]) -> str | None:
     if not documents:
         return None
     lines = [
-        "# 文档地图（由 bugfix_state.py 生成，请勿手工编辑）",
+        "# 文档地图（由 code_fix_state.py 生成，请勿手工编辑）",
         "",
         "读取纪律：先在本文件按标题定位区间，再用 `Read` 的 offset/limit 只读命中区间；",
         "禁止把整篇文档读入上下文，禁止为了找一个落点而通读全文。",
@@ -542,7 +542,7 @@ def create_run(root: Path, run_id: str, documents: list[Path], force: bool) -> t
         raise StateError(f"{root} 不是 git 仓库根目录")
     if not SAFE_NAME.fullmatch(run_id):
         raise StateError(f"--run-id 只能是目录安全名称：{run_id}")
-    run_dir = root / ".codekit" / "bugfix" / run_id
+    run_dir = root / ".codekit" / "code-fix" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     ensure_run_dir_ignored(root)
     manifest = run_dir / STATE_NAME

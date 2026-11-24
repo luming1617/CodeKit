@@ -1,4 +1,4 @@
-# 后端 Bugfix 调查与修复方案
+# 后端 Code-Fix 调查与修复方案
 
 ## 1. 问题判定
 
@@ -31,8 +31,8 @@
 |---|---|---|
 | `<H01>` | `Rejected/Supported/Insufficient` | `<evidence>` |
 
-<!-- bugfix:proposal-required-start -->
-<!-- 上面这个锚点注释由 scripts/validate_bugfix_proposal.py 使用：它之前的章节任何判定都必须填， -->
+<!-- code-fix:proposal-required-start -->
+<!-- 上面这个锚点注释由 scripts/validate_code_fix_proposal.py 使用：它之前的章节任何判定都必须填， -->
 <!-- 之后的章节只在判定为 CONFIRMED_BUG 时强制校验。删除该注释会让校验器直接报错。 -->
 
 ## 3. 修复方案

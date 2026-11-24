@@ -30,8 +30,8 @@ SCHEMA_VERSION = 1
 # drift test -- the two producers stay separate skills with no import path between them.
 SNAPSHOT_SCHEMA_VERSION = 2
 PRODUCED_BY = "codekit:code-impl/scripts/code_impl_controller.py"
-# Byte-for-byte the literal code-review and bugfix declare; a mismatch is exactly the
-# bugfix-prefixed-digest defect that made every cross-skill ``==`` come out False.
+# Byte-for-byte the literal code-review and code-fix declare; a mismatch is exactly the
+# code-fix-prefixed-digest defect that made every cross-skill ``==`` come out False.
 _DIGEST_SCHEME = "sha256/hex"
 # porcelain's XY column collapsed to the single letter code-review's `changed_files`
 # entries carry; ``??`` (untracked) maps to ``A`` there.

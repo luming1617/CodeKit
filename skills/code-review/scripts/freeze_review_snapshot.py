@@ -53,7 +53,7 @@ GENERATOR_VERSION = "1.6"
 GIT_COMMAND_LOG: list[list[str]] = []
 # CW2-a①：三家 SKILL 的摘要编码统一为"裸小写 sha256 hexdigest，不带 `sha256:` 前缀"，
 # 并在各自产物里用 digest_scheme 自述这套编码。前缀曾经是跨 SKILL 比对恒为 False 的
-# 直接原因之一（bugfix 带前缀、另两家不带）。该字面量由 code-impl 与 bugfix 各自声明，
+# 直接原因之一（code-fix 带前缀、另两家不带）。该字面量由 code-impl 与 code-fix 各自声明，
 # 三个值的一致性由 tests 的跨 SKILL 漂移测试钉住，不靠散文约定。
 DIGEST_SCHEME = "sha256/hex"
 # CW2-a②：两段目标标识。committed_range 只覆盖 base..head 的已提交内容，
@@ -554,13 +554,13 @@ def resolve_auto_branch_target(repo: Path) -> dict[str, str]:
 
 
 # CW2-a②：manifest 已按 committed_range / worktree_state 分段，报告负载仍保持扁平形状
-# （报告是给审查读者与 code-impl/bugfix 回读门禁看的契约文本，contracts.md 与骨架都按
+# （报告是给审查读者与 code-impl/code-fix 回读门禁看的契约文本，contracts.md 与骨架都按
 # 扁平键渲染），所以这里单点声明"报告字段 -> manifest 路径"。骨架预填、校验器的
 # 逐字段核对、contracts.md 的复制清单都读这张表，两侧不会各说各话。
 SNAPSHOT_REPORT_FIELDS = {
     "base_sha": ("committed_range", "base_sha"),
     "head_sha": ("committed_range", "head_sha"),
-    # CW2-a③：连接键进报告负载，下游（bugfix/code-impl 的回读门禁）据此核对
+    # CW2-a③：连接键进报告负载，下游（code-fix/code-impl 的回读门禁）据此核对
     # "这份审查结论对应的就是我交给它的那个目标"，而不是比三个字面摘要。
     "target_id": ("target_id",),
     "diff_digest": ("worktree_state", "diff_digest"),
@@ -934,7 +934,7 @@ def resolve_handoff_check(path: Path, manifest: dict[str, object], *, committed_
                 )
             else:
                 # 上游与本技能对 diff_digest 的 material 定义不同（code-impl 只折工作树
-                # 条目，bugfix 折拼接文本）。值不等既不是缺陷也不是放行理由，比它没有意义。
+                # 条目，code-fix 折拼接文本）。值不等既不是缺陷也不是放行理由，比它没有意义。
                 comparable.append(f"{producer}:{theirs}")
     declared_ids = [
         entry.get("target_id") for entry in entries if isinstance(entry, dict) and entry.get("target_id") is not None
@@ -1286,7 +1286,7 @@ def main() -> int:
         default=None,
         metavar="PATH",
         help="JSON file (or array of files' payloads) published by an upstream Skill, e.g. code-impl's "
-        "review-snapshot.json or bugfix's Review Handoff; the freeze compares it field by field and "
+        "review-snapshot.json or code-fix's Review Handoff; the freeze compares it field by field and "
         "records the outcome into the signed manifest (CW2-a③)",
     )
     parser.add_argument(

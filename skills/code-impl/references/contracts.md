@@ -409,7 +409,7 @@ code_review_handoff:
   snapshot:                          # 即 freeze-review 落盘的 review-snapshot.json 本体，不得手抄
     schema_version: 2
     produced_by: "codekit:code-impl/scripts/code_impl_controller.py"
-    digest_scheme: "sha256/hex"      # 与 code-review、bugfix 逐字相同：裸小写 sha256 hex，无 `sha256:` 前缀
+    digest_scheme: "sha256/hex"      # 与 code-review、code-fix 逐字相同：裸小写 sha256 hex，无 `sha256:` 前缀
     target_id: "<absolute repository_root>@<head_sha>"   # 跨 SKILL 连接键，三家同一表达式
     committed_range: null            # 本 SKILL 从不 commit，因此显式声明"不含已提交范围"（null 而非缺键）
     worktree_state:

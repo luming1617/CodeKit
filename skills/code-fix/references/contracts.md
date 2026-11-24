@@ -1,22 +1,22 @@
-# Bugfix Contracts
+# Code-Fix Contracts
 
-本文件定义 Bugfix 各阶段必须保留的最小数据契约。可以使用 YAML、JSON 或等价的结构化 Markdown，但不得省略关键字段或记录密钥、Token、Cookie 和完整个人数据。
+本文件定义 Code-Fix 各阶段必须保留的最小数据契约。可以使用 YAML、JSON 或等价的结构化 Markdown，但不得省略关键字段或记录密钥、Token、Cookie 和完整个人数据。
 
 ## 0. 产物落盘与确定性门禁
 
-所有契约都落在 `RUN_DIR = <仓库根目录>/.codekit/bugfix/<run-id>/`（自带 `.gitignore` 内容 `*`，因此不产生受版本控制的变化）：
+所有契约都落在 `RUN_DIR = <仓库根目录>/.codekit/code-fix/<run-id>/`（自带 `.gitignore` 内容 `*`，因此不产生受版本控制的变化）：
 
 | 文件 | 内容 | 写入者 |
 |---|---|---|
-| `state.json` | Input Contract 的仓库快照、`fix_proposal` 绑定、`approval_record` | `bugfix_state.py preflight / start / record-proposal / verify-approval` |
-| `doc-map.md` | 每份 PRD/TDD/RPD 的 digest、行数、`approx_tokens` 与标题→行区间 | `bugfix_state.py preflight / start` |
+| `state.json` | Input Contract 的仓库快照、`fix_proposal` 绑定、`approval_record` | `code_fix_state.py preflight / start / record-proposal / verify-approval` |
+| `doc-map.md` | 每份 PRD/TDD/RPD 的 digest、行数、`approx_tokens` 与标题→行区间 | `code_fix_state.py preflight / start` |
 | `investigation.md` | 步骤 03–07 的 Business Model、Hypothesis Ledger、Diagnosis Result 与反证结论 | Investigator / Challenger 按节追加 |
-| `proposal.md` | Fix Proposal 正文（按 `assets/bugfix-proposal-template.md`） | 主 Agent |
+| `proposal.md` | Fix Proposal 正文（按 `assets/code-fix-proposal-template.md`） | 主 Agent |
 | `approval.txt` | 用户批准原文（含审批口令） | 主 Agent 逐字保存 |
-| `implementation-contract.json` | Implementation Contract（允许范围、禁止项、不变量、起始摘要、重试预算） | `bugfix_state.py freeze-contract` |
-| `validation-plan.json` | 从提案第 5 节验证表渲染的命令清单 | `bugfix_state.py freeze-contract` |
-| `validation-record.json` | Validation Record（真实执行的命令、退出码、错误指纹） | `bugfix_state.py run-plan / run-validation` |
-| `delivery-report.md` | 最终交付报告（按 `assets/bugfix-delivery-report-template.md`） | 主 Agent |
+| `implementation-contract.json` | Implementation Contract（允许范围、禁止项、不变量、起始摘要、重试预算） | `code_fix_state.py freeze-contract` |
+| `validation-plan.json` | 从提案第 5 节验证表渲染的命令清单 | `code_fix_state.py freeze-contract` |
+| `validation-record.json` | Validation Record（真实执行的命令、退出码、错误指纹） | `code_fix_state.py run-plan / run-validation` |
+| `delivery-report.md` | 最终交付报告（按 `assets/code-fix-delivery-report-template.md`） | 主 Agent |
 
 标为“写入者：脚本”的契约不得由 Agent 手写或事后补写；脚本不可用时对应阶段为 `BLOCKED`，而不是改用自述文本。
 
@@ -202,7 +202,7 @@ approval_record:
   approved_gate_digest: string          # state.json: proposal.gate_digest（审批真正绑定的对象）
   editorial_revisions:                  # 仅叙述修订的放行记录，空数组表示从未豁免
     - {from_digest: string, to_digest: string, from_gate: string, to_gate: string, at: timestamp, note: string}
-  verified_by: bugfix_state.py verify-approval | verify-gates
+  verified_by: code_fix_state.py verify-approval | verify-gates
   verdict: OK | FAIL
   approved_at: timestamp
 ```
@@ -233,7 +233,7 @@ implementation_contract:
   contract_digest: string             # 除本字段外整份合同的 canonical-json 摘要
 ```
 
-本契约由 `bugfix_state.py freeze-contract` 从 `state.json` 的审批绑定与提案正文渲染成 `RUN_DIR/implementation-contract.json`，并同步生成 `RUN_DIR/validation-plan.json`（其 `contract_digest` 与合同自摘要一致）；主 Agent 只提供覆盖项，不手写摘要或允许范围。`verify-scope --contract` 直接读取该文件的 `allowed_write_files`，并用同样的 canonical-json 摘要复核合同是否被事后改写，结果写入 `contract_integrity`：`OK` / `TAMPERED`（硬失败）/ `MISSING_DIGEST`（升级前的旧合同）/ `NOT_APPLICABLE`（未用 `--contract`）。事后改合同只会让越界判定变得更宽松，因此 `out_of_scope` 为空并不代表范围合法，必须同时看 `contract_integrity`。
+本契约由 `code_fix_state.py freeze-contract` 从 `state.json` 的审批绑定与提案正文渲染成 `RUN_DIR/implementation-contract.json`，并同步生成 `RUN_DIR/validation-plan.json`（其 `contract_digest` 与合同自摘要一致）；主 Agent 只提供覆盖项，不手写摘要或允许范围。`verify-scope --contract` 直接读取该文件的 `allowed_write_files`，并用同样的 canonical-json 摘要复核合同是否被事后改写，结果写入 `contract_integrity`：`OK` / `TAMPERED`（硬失败）/ `MISSING_DIGEST`（升级前的旧合同）/ `NOT_APPLICABLE`（未用 `--contract`）。事后改合同只会让越界判定变得更宽松，因此 `out_of_scope` 为空并不代表范围合法，必须同时看 `contract_integrity`。
 
 ## 9. Validation Record
 
@@ -256,7 +256,7 @@ validation_record:
   verdict: PASS | FAIL
 ```
 
-本记录由 `bugfix_state.py run-validation` 追加到 `RUN_DIR/validation-record.json`；`source: declared` 只用于登记确实无法执行的项目，不能被当作通过。`NOT_RUN`、`NOT_AVAILABLE` 和 `TIMEOUT` 不能满足必需验证项。不得把部分测试写成“全部测试通过”。
+本记录由 `code_fix_state.py run-validation` 追加到 `RUN_DIR/validation-record.json`；`source: declared` 只用于登记确实无法执行的项目，不能被当作通过。`NOT_RUN`、`NOT_AVAILABLE` 和 `TIMEOUT` 不能满足必需验证项。不得把部分测试写成“全部测试通过”。
 
 ## 10. System Code Review Result
 
@@ -292,7 +292,7 @@ review_result:
 
 ## 11. System Code Review Handoff
 
-Bugfix 实施后的独立审查必须交给宿主已注册的 `codekit:code-review` Skill，不得由本目录的 Reviewer Prompt 或普通 Subagent 模拟。Handoff 至少包含：
+Code-Fix 实施后的独立审查必须交给宿主已注册的 `codekit:code-review` Skill，不得由本目录的 Reviewer Prompt 或普通 Subagent 模拟。Handoff 至少包含：
 
 ```yaml
 code_review_handoff:
@@ -314,7 +314,7 @@ code_review_handoff:
 ```yaml
 # RUN_DIR/review-handoff.json
 schema_version: 2
-produced_by: "codekit:bugfix/scripts/bugfix_state.py"
+produced_by: "codekit:code-fix/scripts/code_fix_state.py"
 digest_scheme: "sha256/hex"           # 裸小写 sha256 hex，无 `sha256:` 前缀（三家同一声明）
 target_id: "<absolute repository_root>@<start_head_sha>"
 committed_range: null                 # 本 Skill 从不 commit：显式声明"不含已提交范围"，而非缺键

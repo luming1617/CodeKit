@@ -203,7 +203,7 @@ rtk gain          # 查看节省统计
 | 发布 | `/codekit:release-doc` | 基于 PRD + TDD 生成后端发布方案 |
 | 编码 | `/codekit:code-impl` | 多 Agent 并行 TDD 开发 |
 | 审查 | `/codekit:code-review` | 5 个维度并行 Code Review |
-| 排查 | `/codekit:bugfix` | 基于 PRD/TDD/RPD 系统化排查并修复问题 |
+| 排查 | `/codekit:code-fix` | 基于 PRD/TDD/RPD 系统化排查并修复问题 |
 
 > **Codex 调用方式：** Codex 中使用 `$<skill-name>` 调用对应技能，如 `$initialize`（旧版为 `$keel-initialize`，已去掉前缀）。Codex 也会根据 skill 描述自动匹配任务（隐式调用）。
 >
@@ -230,7 +230,7 @@ product-doc → technical-doc → release-doc → code-impl → code-review
 
 `product-doc` 不带 `feature-directory` 时创建新需求；带有效目录时按需求变更更新原 PRD，在文档内只追加 `修改、新增、删除` 台账与变更历史行，上一版正文另存为同目录 `history/` 下的独立快照（不得内嵌进 PRD）。独立评审的轮次、视角路由与 Finding 闭环由 `skills/product-doc/scripts/` 下的两个门禁脚本判定（状态枚举与上限见 `skills/product-doc/references/product-review-contract.md`），任一脚本非 0 时只能交付阻塞报告。目录缺少有效 `product-doc.md` 时会先提示并等待确认，再按新需求处理。
 
-`code-review` 的 `<feature-directory>` 可省略：上面的需求开发链路里应始终传目录，只在单独审查 PR、MR、分支或本地 Diff 时省略。省略时它递归收集仓库根目录 `docs/` 及其子目录下的 `product-doc.md`、`technical-doc.md`、`release-doc.md`；仍找不到有效文档则记录 `DOCUMENTS: NOT_AVAILABLE` 并降级为代码与证据驱动的审查，结论不得为 `APPROVE`（最多 `APPROVE_WITH_FOLLOW_UPS`）。`bugfix` 和 `code-impl` 调用它时还会随 Handoff 显式声明 `review_mode: FULL | LITE | WAIVED` 与文档可得性，两边共用同一套降级规则。
+`code-review` 的 `<feature-directory>` 可省略：上面的需求开发链路里应始终传目录，只在单独审查 PR、MR、分支或本地 Diff 时省略。省略时它递归收集仓库根目录 `docs/` 及其子目录下的 `product-doc.md`、`technical-doc.md`、`release-doc.md`；仍找不到有效文档则记录 `DOCUMENTS: NOT_AVAILABLE` 并降级为代码与证据驱动的审查，结论不得为 `APPROVE`（最多 `APPROVE_WITH_FOLLOW_UPS`）。`code-fix` 和 `code-impl` 调用它时还会随 Handoff 显式声明 `review_mode: FULL | LITE | WAIVED` 与文档可得性，两边共用同一套降级规则。
 
 ---
 
@@ -238,16 +238,16 @@ product-doc → technical-doc → release-doc → code-impl → code-review
 
 ```bash
 # 系统化根因分析（需求目录可选，错误材料必传）
-/codekit:bugfix [<feature-directory>] <error-description>
+/codekit:code-fix [<feature-directory>] <error-description>
 ```
 
-`bugfix` 严格走“只读调查 → 人工审批 → 实施验证”两阶段流程：
+`code-fix` 严格走“只读调查 → 人工审批 → 实施验证”两阶段流程：
 
 > 明确问题 → 多源取证 → 模式分析 → 关联假设（≥2 个独立源交叉验证）→ 验证假设 → 修复确认
 
 AI 会跨越业务日志、进程状态、中间件指标、源代码等多个证据源自行找路，不需要人教它"该去哪查"。
 
-门禁由两个脚本兜底，不依赖 Agent 自述：`validate_bugfix_proposal.py` 校验提案结构与审批语义，`bugfix_state.py` 负责冻结快照、绑定审批口令、检查写入越界和真实执行验证命令（以 `shell=False` 运行并记录退出码与错误指纹）。两者退出码不通过时流程必须停止。审批前的提案、批准原文和验证记录都写在已被 ignore 的 `.codekit/bugfix/<run-id>/`，不会污染工作树。当下游 `codekit:code-review` 拿不到有效 PRD/TDD/RPD 时，本次审查降级为 `LITE` 模式，最多只能得到 `APPROVE_WITH_FOLLOW_UPS`。
+门禁由两个脚本兜底，不依赖 Agent 自述：`validate_code_fix_proposal.py` 校验提案结构与审批语义，`code_fix_state.py` 负责冻结快照、绑定审批口令、检查写入越界和真实执行验证命令（以 `shell=False` 运行并记录退出码与错误指纹）。两者退出码不通过时流程必须停止。审批前的提案、批准原文和验证记录都写在已被 ignore 的 `.codekit/code-fix/<run-id>/`，不会污染工作树。当下游 `codekit:code-review` 拿不到有效 PRD/TDD/RPD 时，本次审查降级为 `LITE` 模式，最多只能得到 `APPROVE_WITH_FOLLOW_UPS`。
 
 ---
 

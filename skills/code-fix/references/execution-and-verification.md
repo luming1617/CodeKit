@@ -2,14 +2,14 @@
 
 只有存在有效 Approval Record 时读取和执行本文件。
 
-本文件里的范围、验证和漂移结论均以 `$SKILL_DIR/scripts/bugfix_state.py` 的退出码与 JSON 输出为准；脚本无法执行时对应阶段为 `BLOCKED`，不得改用自然语言自述。
+本文件里的范围、验证和漂移结论均以 `$SKILL_DIR/scripts/code_fix_state.py` 的退出码与 JSON 输出为准；脚本无法执行时对应阶段为 `BLOCKED`，不得改用自然语言自述。
 
 ## 1. 实施前重新确认
 
 用**一条** `verify-gates` 连跑审批绑定与快照漂移两项门禁（它等价于依次执行 `verify-approval` 和 `check-snapshot`，分开跑只会多付一次模型往返）：
 
 ```bash
-<PYTHON> "$SKILL_DIR/scripts/bugfix_state.py" verify-gates --manifest "$RUN_DIR/state.json" \
+<PYTHON> "$SKILL_DIR/scripts/code_fix_state.py" verify-gates --manifest "$RUN_DIR/state.json" \
   --approval-file "$RUN_DIR/approval.txt" --proposal "$RUN_DIR/proposal.md"
 ```
 
@@ -28,8 +28,8 @@
 1. `verify-gates` 通过后用 `freeze-contract --manifest "$RUN_DIR/state.json"` 冻结 Implementation Contract 与验证计划；允许范围、起始摘要、禁止项和验证命令都从提案取，不手抄。
 2. 在不修改生产逻辑的条件允许时，先添加或确认最小回归测试，并证明修复前能暴露问题。
 3. 在根因所属层实施最小修复。
-4. 用 `bugfix_state.py verify-scope --manifest "$RUN_DIR/state.json" --contract "$RUN_DIR/implementation-contract.json"` 检查实际 Diff 和修改文件范围。
-5. 用 `bugfix_state.py run-plan --manifest "$RUN_DIR/state.json"` 一次跑完整份验证计划（回归、模块、契约），只对计划外新增的检查补用 `run-validation`。
+4. 用 `code_fix_state.py verify-scope --manifest "$RUN_DIR/state.json" --contract "$RUN_DIR/implementation-contract.json"` 检查实际 Diff 和修改文件范围。
+5. 用 `code_fix_state.py run-plan --manifest "$RUN_DIR/state.json"` 一次跑完整份验证计划（回归、模块、契约），只对计划外新增的检查补用 `run-validation`。
 6. 独立复核最终快照。
 
 如果无法安全地先运行失败测试，说明原因，并使用代码路径或其他 E2/E3 证据替代，不能伪造 red-green 过程。

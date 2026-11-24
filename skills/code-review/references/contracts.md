@@ -46,7 +46,7 @@ review_input:
   documents_status: available | NOT_AVAILABLE
 ```
 
-`review_mode` 和 `documents_status` 是上游 Skill（如 `codekit:bugfix`、`codekit:code-impl`）Handoff 中 `review_mode` 与 `materials.documents` 的归一化落点：调用方声明的值优先于本 Skill 自己的推断，不得另立判断。独立调用（无 Handoff）时，`review_mode` 写 `null`，`documents_status` 由步骤 01 的文档解析结果填写：至少一份有效 PRD/TDD/RPD 为 `available`，否则为 `NOT_AVAILABLE`。`WAIVED` 只可能来自调用方，收到该值时结论固定为 `BLOCKED`。`DELTA` 是上游修复 `REQUEST_CHANGES` 后的增量复核轮，只可能来自携带 `delta_recheck` 块的 Handoff（见 `delta-recheck` 节），结论封顶 `APPROVE_WITH_FOLLOW_UPS`。
+`review_mode` 和 `documents_status` 是上游 Skill（如 `codekit:code-fix`、`codekit:code-impl`）Handoff 中 `review_mode` 与 `materials.documents` 的归一化落点：调用方声明的值优先于本 Skill 自己的推断，不得另立判断。独立调用（无 Handoff）时，`review_mode` 写 `null`，`documents_status` 由步骤 01 的文档解析结果填写：至少一份有效 PRD/TDD/RPD 为 `available`，否则为 `NOT_AVAILABLE`。`WAIVED` 只可能来自调用方，收到该值时结论固定为 `BLOCKED`。`DELTA` 是上游修复 `REQUEST_CHANGES` 后的增量复核轮，只可能来自携带 `delta_recheck` 块的 Handoff（见 `delta-recheck` 节），结论封顶 `APPROVE_WITH_FOLLOW_UPS`。
 
 `external_mutations` 默认为空。审查请求不等于授权发布评论、批准 PR/MR 或改变远端状态。
 
@@ -119,7 +119,7 @@ review_snapshot:
 
 三项来源指纹只用于**提高手工伪造 manifest 的成本**（伪造者必须精确复现脚本内部的命令序列与字面量），本技能没有密钥体系，不声称密码学不可伪造。`validate_review_report.py --check-worktree` 提供另一侧核对：按 `repository_root` 重放快照逻辑并比对 `target_id`/`committed_range.base_sha`/`committed_range.head_sha`/`committed_range.range_digest`/`worktree_state.diff_digest`/`worktree_state` 的三个分层 digest/`changed_files`/`changed_files_digest`/`preexisting_changes`/`documents`（不比对 `git_probe_digest`），并额外重算 `diff_artifact.path` 与每份 `documents[].locator` 指向文件的摘要，任一处漂移即 `STALE_SNAPSHOT`；文档在冻结后被改写或删除同样会被抓出。该开关默认关闭，历史报告仍可无参复校验。
 
-`digest_scheme` 与 `target_id` 是 CW2-a 的跨 SKILL 交接底座。三家（code-review、code-impl、bugfix）都自述 `"sha256/hex"`（裸小写十六进制，无 `sha256:` 前缀），因此任何一个摘要落到另一家手里都能按同一编码核对；`target_id` 不是摘要，而是 `<规范化的 repository_root>@<head_sha>`，每家都能从自己手上的 git 事实重算，所以它是"这份结论对应的就是我交给它的那个目标"的连接键，取代了旧规则里比对三个语义不同的 `diff_digest` 的做法。`changed_files` 的 `STATUS:path`（重命名 `R:old->new`）记法同样三家同源：权威实现是 `freeze_review_snapshot.py` 的 `parse_name_status`，code-impl 的 `_status_letter` 按同一口径镜像。
+`digest_scheme` 与 `target_id` 是 CW2-a 的跨 SKILL 交接底座。三家（code-review、code-impl、code-fix）都自述 `"sha256/hex"`（裸小写十六进制，无 `sha256:` 前缀），因此任何一个摘要落到另一家手里都能按同一编码核对；`target_id` 不是摘要，而是 `<规范化的 repository_root>@<head_sha>`，每家都能从自己手上的 git 事实重算，所以它是"这份结论对应的就是我交给它的那个目标"的连接键，取代了旧规则里比对三个语义不同的 `diff_digest` 的做法。`changed_files` 的 `STATUS:path`（重命名 `R:old->new`）记法同样三家同源：权威实现是 `freeze_review_snapshot.py` 的 `parse_name_status`，code-impl 的 `_status_letter` 按同一口径镜像。
 
 `handoff` 段是步骤 02 带 `--handoff` 时对上游产物的机械比对结果，四条规则全部可判：①`target_id` 不同即拒绝（退出码 `3`）；②只比两侧都带且 material 相同的共有字段，material 不同的 `diff_digest` 进 `uncomparable_digests` 而不算失败；③`digest_scheme` 不等时不比对摘要，记 `HANDOFF_SCHEME_MISMATCH` 限制；④上游不含 `committed_range` 而本轮审查确实含已提交内容时，这是范围超集，记 `SCOPE_SUPERSET` 限制后继续审查，**不得**判 BLOCKED。只有目标不同、上游声明的已提交范围与本轮回放出的范围互斥、以及工作树在上游冻结后又动了这三类才抛 `HandoffError`（退出码 `3`）。`limitations` 里的每条标记由 `validate_signed_disclosures` 要求逐字出现在报告 `$.limitations` 中，非空限制使结论最多为 `APPROVE_WITH_FOLLOW_UPS`——被压低的可见性正是这套机制的目的。
 
